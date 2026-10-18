@@ -8147,8 +8147,9 @@ conductor_reserved_reason() {
   elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$action_norm" ||
        { _cp_imatch '\bcurl\b' "$action_norm" && _cp_net_sends "$action_norm"; }; then
     printf 'remote mutation remains human-only\n'
-  elif _cp_imatch '\bherdr\b.*\b(tab|pane)\b.*\b(create|run)\b|\bspawn-agent\b.*(\.sh|sh\b)' "$norm" ||
-       _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; then
+  elif { _cp_imatch '\bherdr\b.*\b(tab|pane)\b.*\b(create|run)\b|\bspawn-agent\b.*(\.sh|sh\b)' "$norm" ||
+         _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; } &&
+       ! _cp_fleet_mention_harmless "$raw"; then
     printf 'unregistered fleet creation remains human-only\n'
   # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
   # round 4 by an independent security review): _cp_push_is_safe is
@@ -8415,6 +8416,46 @@ _cp_policy_mention_harmless() {         # raw
     case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
     [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
     case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+  done <<EOF
+$segments
+EOF
+  [ "$n" -gt 0 ]
+}
+
+# `_cp_fleet_mention_harmless <raw>` -> 0 when spawn-agent.sh / herdr tab
+# create / herdr pane run appear only as an OPERAND of a command that reads
+# and never executes: every segment's command word is a read-only verb (the
+# same `_CP_READONLY_VERBS` list above) or `git log|show|diff`, with no
+# output redirection, no `tee`, no `--output`, no substitution anywhere.
+# Mirrors `_cp_policy_mention_harmless`'s design one-for-one. Live incident
+# (2026-10-18, SPEC fleet-gate-readonly-fp): `wc -l …/spawn-task.sh
+# …/spawn-agent.sh …` from a review worker classified "unregistered fleet
+# creation remains human-only" for BOTH Approve and Deny (bound request) —
+# naming the script is not running it. Fails closed: anything this cannot
+# parse with confidence keeps today's reserved behaviour.
+_cp_fleet_mention_harmless() {          # raw
+  local raw="$1" seg n=0 segments tidy gitsub
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
+  segments="$(_cp_coderef_split "$tidy")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 1 ;; esac
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    n=$((n + 1))
+    case "$seg" in *--output*|*--pre*|*--hostname-bin*) return 1 ;; esac
+    _cp_locate_command_word "$seg" || return 1
+    case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
+    [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
+    if [ "$_cp_wcmd" = git ]; then
+      gitsub="${_CP_LOC[1]:-}"
+      case "$gitsub" in
+        log|show|diff) ;;
+        *) return 1 ;;
+      esac
+    else
+      case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+    fi
   done <<EOF
 $segments
 EOF
