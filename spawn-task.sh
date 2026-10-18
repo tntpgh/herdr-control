@@ -900,11 +900,18 @@ case "$job" in
 esac
 
 # Local caller authority is established once the final manifest is known.
+# root_real: the same canonicalized (pwd -P) repo root the proj: scope check
+# above compares against -- a bound orchestrator pane is eligible here ONLY
+# for the repo its live proj: claim actually covers, never for an arbitrary
+# spawn target (lib/pane-guard.sh pane_is_conductor_eligible's optional
+# second argument).
+_spawn_task_root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+[ -n "$_spawn_task_root_real" ] || _spawn_task_root_real="$root"
 if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
   source_pane="$(caller_pane_from_ancestry)" || {
     echo "spawn-task: authorization hold: local caller ancestry unavailable or outside Herdr" >&2; exit 1;
   }
-  pane_is_conductor_eligible "$source_pane" || {
+  pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real" || {
     echo "spawn-task: authorization hold: local caller is not an eligible conductor" >&2; exit 1;
   }
   source_birth="$(pane_birth_now "$source_pane")" || exit 1
@@ -1129,7 +1136,7 @@ if [ -n "$authorization_command_id" ]; then
     launch_source="$(caller_pane_from_ancestry)" || exit 1
     launch_source_birth="$(pane_birth_now "$source_pane")" || exit 1
     if [ "$launch_source" != "$source_pane" ] || [ "$launch_source_birth" != "$source_birth" ] || \
-       ! pane_is_conductor_eligible "$source_pane"; then
+       ! pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real"; then
       echo "spawn-task: authorization hold: local source identity changed before launch" >&2; exit 1
     fi
   fi

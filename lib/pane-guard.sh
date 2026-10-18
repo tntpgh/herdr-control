@@ -141,15 +141,57 @@ require_pane_birth_match() {            # pane_id -> 0 ok-to-proceed, 1 refuse
 # its (possibly empty) stdout, is checked below -- a failed registry read
 # must refuse (not a worker -> eligible is the WRONG default for "we
 # couldn't tell"), same fail-closed direction as pane_birth_now above.
-pane_is_conductor_eligible() {          # pane_id -> 0 eligible, 1 refuse
-  local pane="$1" task state
+#
+# ---- bound orchestrator mode (incident 2026-10-18, website pilot) ----------
+# A pane can be BOTH a bound worker (every tool call still hook-approved by
+# its own conductor, Main) AND conductor-eligible for ITS OWN children, but
+# only while it is the live holder of roles['orchestrator@<p>'] PLUS a live
+# proj:<root_real> claim under that exact pane+birth. The optional second
+# argument carries the target repo's canonicalized root -- callers that
+# never pass it (designate-main.sh, conductor-handover.sh, the launch
+# recheck's sibling calls) get EXACTLY today's behavior, unchanged: a
+# running task is refused outright, the same as before this carve-out
+# existed. `starting`/`blocked` are refused unconditionally even for an
+# orchestrator pane -- the carve-out only ever widens `running`, never the
+# states that mean "not actually at a prompt yet" or "waiting on a human".
+# The previous workaround (marking the task terminal to dodge this check)
+# is what made every subsequent tool call `stale_worker_hook_refused`
+# (task_terminal) -- this is the alternative that keeps the task, and the
+# hook's approval posture, exactly as registered.
+pane_is_conductor_eligible() {          # pane_id [root_real] -> 0 eligible, 1 refuse
+  local pane="$1" root_real="${2:-}" task state
   pane_is_agent "$pane" 2>/dev/null || return 1
   task="$(task_for_pane "$pane" 2>/dev/null)" || return 1
   state="$(printf '%s' "$task" | jq -r '.state // empty' 2>/dev/null)"
   case "$state" in
-    running|starting|blocked) return 1 ;;
+    starting|blocked) return 1 ;;
+    running)
+      [ -n "$root_real" ] && _pg_bound_orchestrator_eligible "$pane" "$root_real" && return 0
+      return 1 ;;
   esac
   return 0
+}
+
+# _pg_bound_orchestrator_eligible <pane> <root_real> -> 0 iff this exact
+# pane+birth is BOTH the live roles['orchestrator@*'] holder AND the live
+# holder of a proj:<root_real> claim. claim_holder (lib/claims.sh) only
+# ever returns the single live row for a scope -- an expired, released, or
+# superseded-by-regrant claim is never returned, so "live" here already
+# means not expired and the current generation; no separate generation
+# comparison is needed. Requires lib/run-registry.sh (role_for_live_pane,
+# task_for_pane) and lib/claims.sh (claim_holder) already sourced, same
+# convention as the rest of this file.
+_pg_bound_orchestrator_eligible() {
+  local pane="$1" root_real="$2" birth role held held_pane held_birth
+  birth="$(pane_birth_now "$pane" 2>/dev/null)"
+  [ -n "$birth" ] || return 1
+  role="$(role_for_live_pane "$pane" "$birth" 'orchestrator@' 2>/dev/null)"
+  [ -n "$role" ] || return 1
+  held="$(claim_holder "proj:$root_real" 2>/dev/null)"
+  [ -n "$held" ] || return 1
+  held_pane="$(printf '%s' "$held" | jq -r '.pane_id // ""' 2>/dev/null)"
+  held_birth="$(printf '%s' "$held" | jq -r '.pane_birth // ""' 2>/dev/null)"
+  [ "$held_pane" = "$pane" ] && [ "$held_birth" = "$birth" ]
 }
 
 # ---- caller identity from process ancestry (not self-asserted env) ---------

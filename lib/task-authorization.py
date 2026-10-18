@@ -23,6 +23,13 @@ CLAIM_FIELDS = {"version", "source", "command_id", "op", "remote_task_id",
                 "requester_actor", "requester_client", "scope", "repo", "mode",
                 "effective_scope", "payload_sha256", "issued_at", "expires_at"}
 BIND_FIELDS = ("task_id", "run_id", "worker_id", "repo", "worktree", "branch", "trunk", "approval", "pane_id", "pane_birth")
+NON_TERMINAL_STATES = ("starting", "running", "blocked")
+# Bound-orchestrator-mode pilot cap (brief-bound-orchestrator-mode.md req 3):
+# how many non-terminal children a live orchestrator@<p> pane may hold at
+# once. Env-overridable the same way lib/claims.sh's HERDR_CLAIM_TTL_S is --
+# "configurable per claim" without a new schema column for a single-value
+# pilot knob.
+ORCH_CHILD_CAP = int(os.environ.get("HERDR_ORCH_CHILD_CAP", "2"))
 
 
 class Refused(ValueError):
@@ -399,6 +406,28 @@ def register(db, raw_task, command_id=""):
     if task.get("approval") not in ("menu", "hook"):
         raise Refused("unsupported task approval posture")
     db.execute("BEGIN IMMEDIATE")
+    # ---- bound-orchestrator-mode worker cap (brief req 3) -------------------
+    # Checked INSIDE the write-locked transaction, never before it: BEGIN
+    # IMMEDIATE already holds SQLite's single writer lock for this connection,
+    # so a second concurrent register() for the same orchestrator blocks here
+    # until this one commits or rolls back -- count-then-insert is atomic by
+    # construction, no separate fencing token needed. Only applies when the
+    # conductor being assigned is itself a LIVE orchestrator@* pane (a plain
+    # Main-conducted spawn is never capped); a non-orchestrator conductor
+    # short-circuits the roles lookup and costs one extra read.
+    cpane, cbirth = task.get("conductor_pane_id", ""), task.get("conductor_pane_birth", "")
+    if cpane and cbirth:
+        is_orch = db.execute(
+            "SELECT 1 FROM roles WHERE pane_id=? AND pane_birth=? AND label LIKE 'orchestrator@%' LIMIT 1;",
+            (cpane, cbirth)).fetchone()
+        if is_orch is not None:
+            children = db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE conductor_pane_id=? AND conductor_pane_birth=? AND state IN (%s);"
+                % ",".join("?" for _ in NON_TERMINAL_STATES),
+                (cpane, cbirth) + NON_TERMINAL_STATES).fetchone()[0]
+            if children >= ORCH_CHILD_CAP:
+                raise Refused("orchestrator worker cap reached (%d non-terminal children, cap %d)"
+                               % (children, ORCH_CHILD_CAP))
     receipt = None
     if command_id:
         receipt = read(db, command_id)
