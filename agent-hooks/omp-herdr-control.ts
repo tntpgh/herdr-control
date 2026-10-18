@@ -863,6 +863,12 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>, cwd: st
     const s = skill as Record<string, unknown>;
     return managedSkillTarget(typeof s.name === "string" ? s.name : "");
   }
+  if (name === "memory_edit") {
+    // forget/invalidate/update rewrite shared mnemopi memories by id, no path
+    // to scope: the same id-addressed shared-state mutation as manage_skill
+    // (PR #323 review HIGH). Curation is the conductor's.
+    return "memory curation (forget/invalidate/update) is reserved for the conductor";
+  }
   if (KNOWN_READONLY_OR_INTERNAL[name]) return undefined;
   if (MUTATING_NAME.test(name)) {
     const targets = pathFields(rec);

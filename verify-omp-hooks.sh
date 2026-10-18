@@ -2046,6 +2046,9 @@ manage_skill_update_out|manage_skill|{"action":"update","name":"decisions-via-fo
 manage_skill_delete_out|manage_skill|{"action":"delete","name":"decisions-via-formserve"}
 learn_skill_out|learn|{"memory":"m","skill":{"action":"create","name":"new-skill","description":"d","body":"b"}}
 learn_plain|learn|{"memory":"a lesson learned","context":"ctx"}
+memory_edit_forget|memory_edit|{"op":"forget","id":"mem_1"}
+memory_edit_update|memory_edit|{"op":"update","id":"mem_1","content":"x"}
+xd_memory_edit|write|{"path":"xd://memory_edit","content":"{\"op\":\"invalidate\",\"id\":\"mem_1\"}"}
 unknown_tool_path_out|widget_sync|{"path":"$OTHER/widget.txt"}
 unknown_tool_no_path|widget_status|{"note":"hi"}
 EOF
