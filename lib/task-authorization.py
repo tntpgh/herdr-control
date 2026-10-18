@@ -416,7 +416,11 @@ def register(db, raw_task, command_id=""):
     # Main-conducted spawn is never capped); a non-orchestrator conductor
     # short-circuits the roles lookup and costs one extra read.
     cpane, cbirth = task.get("conductor_pane_id", ""), task.get("conductor_pane_birth", "")
-    if cpane and cbirth:
+    # A registry without a `roles` table (pre-v10 schema, bare test fixtures)
+    # cannot hold any orchestrator@* role, so there is nothing to cap.
+    has_roles = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roles';").fetchone() is not None
+    if cpane and cbirth and has_roles:
         is_orch = db.execute(
             "SELECT 1 FROM roles WHERE pane_id=? AND pane_birth=? AND label LIKE 'orchestrator@%' LIMIT 1;",
             (cpane, cbirth)).fetchone()
