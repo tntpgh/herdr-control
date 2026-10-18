@@ -113,6 +113,23 @@ if [ "$op_mode" = withhold ]; then
   # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
   op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
 fi
+# ---- offline MCP launch profile (SPEC.md "launch profile by job class") ----
+# Same rationale as spawn-task.sh's identical block: a credential-backed
+# project MCP server (tourguide's `.mcp.json` supabase entry, `op run --
+# npx ...`) falls back to an interactive 1Password prompt instead of
+# failing cleanly when this pane's secrets are withheld. No run/task
+# registry entity exists here (see this file's header) to record a
+# preflight failure against, so a missing overlay refuses with a stderr
+# message only — spawn-task.sh is the path that gets a registry event.
+if [ "$managed" = 1 ] && { [ -n "$job_class" ] && [ "$(offline_mcp_profile_for_job "$job_class")" = 1 ] || [ "$op_mode" = withhold ]; }; then
+  offline_mcp_cfg="$(offline_mcp_profile_path)"
+  if [ -r "$offline_mcp_cfg" ]; then
+    cli="$cli --config $(printf '%q' "$offline_mcp_cfg")"
+  else
+    echo "spawn-agent: refusing — job class '${job_class:-<none>}' (or withheld secrets) requires the offline MCP launch profile, but it is missing or unreadable at $offline_mcp_cfg." >&2
+    exit 1
+  fi
+fi
 eff_posture=$(resolved_posture "$posture_req")
 
 # repo_root (lib/repo-root.sh), not --show-toplevel: inside a linked worktree

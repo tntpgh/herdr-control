@@ -215,6 +215,32 @@ if [ "$op_mode" = withhold ]; then
   # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
   op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
 fi
+# ---- offline MCP launch profile (SPEC.md "launch profile by job class") ----
+# Read-only/offline job classes and any secrets-withheld spawn get the
+# project's MCP servers switched off before omp ever starts one: a project
+# .mcp.json can define a credential-backed server (tourguide's supabase
+# entry runs `op run -- npx ...`) that, with no token in this worker's
+# environment, falls back to an INTERACTIVE 1Password sign-in prompt
+# instead of failing cleanly — observed 2026-10-17, review workers in
+# ~/Code/tourguide stalled on "Do you want to add an account manually now?
+# [Y/n]"; --no-secrets alone did not prevent it (the token was withheld,
+# but the MCP server still started and still tried to reach for one).
+# lib/agent-profiles.sh's offline_mcp_profile_path overlay sets
+# mcp.enableProjectConfig:false (omp://mcp-config.md), removing every
+# project-level MCP source before any server process is ever spawned.
+# Non-interactive preflight: a missing/unreadable overlay file refuses the
+# whole spawn (below, once run_id/task_id exist to record it against)
+# rather than silently launching a worker this profile cannot protect.
+# Decision only here (job/op_mode are known); the actual `cli` mutation is
+# applied AFTER the --approval hook/menu case statement below (fix/offline-
+# launch-profile review: that block suffix-matches cli for "... --approval-
+# mode write" to swap in --auto-approve, and an earlier --config append
+# broke the match — "could not find the write-floor approval flag").
+offline_mcp_cfg="" offline_mcp_missing=0
+if [ "$managed" = 1 ] && { [ "$(offline_mcp_profile_for_job "$job")" = 1 ] || [ "$op_mode" = withhold ]; }; then
+  offline_mcp_cfg="$(offline_mcp_profile_path)"
+  [ -r "$offline_mcp_cfg" ] || offline_mcp_missing=1
+fi
 # The posture actually in force for this spawn (floor composed with the
 # request — can only tighten). Stamped into the worker below as ITS floor,
 # so a child spawn from inside the worktree can tighten further but never
@@ -313,6 +339,15 @@ case "$approval_req" in
     esac ;;
   *) echo "spawn-task: invalid --approval '$approval_req' (menu|hook) — refusing the spawn" >&2; exit 2 ;;
 esac
+# offline_mcp_cfg mutation (decided earlier, above): applied here, strictly
+# AFTER the --approval case statement, so it can never land inside a
+# suffix match ("... --approval-mode write") that block depends on. omp
+# accepts a repeated --config (later files override earlier ones on the
+# SAME key; omp://mcp-config.md) so this coexists fine with --approval
+# hook's own --config $worker_overlay a few lines up — different keys,
+# order does not matter between them.
+[ -n "$offline_mcp_cfg" ] && [ "$offline_mcp_missing" != 1 ] && \
+  cli="$cli --config $(printf '%q' "$offline_mcp_cfg")"
 
 # repo_root (lib/repo-root.sh): --show-toplevel alone returns a linked
 # worktree's own path, not the shared main-repo root — calling spawn-task.sh
@@ -385,6 +420,17 @@ fi
 run_id="${HERDR_RUN_ID:-$(gen_id run)}"
 task_id=$(gen_id task)
 worker_id=$(gen_id worker)
+# offline_mcp_missing (computed above, before run_id/task_id existed to
+# record it against): the overlay this spawn needs to stay non-interactive
+# is missing — refuse now rather than launch a worker an interactive MCP
+# credential prompt could stall.
+if [ "$offline_mcp_missing" = 1 ]; then
+  echo "spawn-task: refusing — job class '$job' (or withheld secrets) requires the offline MCP launch profile, but it is missing or unreadable at $offline_mcp_cfg. Restore lib/offline-mcp-profile.yml; refusing rather than starting a worker an interactive MCP credential prompt could stall." >&2
+  append_event "$run_id" "$task_id" "offline_mcp_profile_missing" \
+    "$(jq -nc --arg job "$job" --arg op "$op_mode" --arg path "$offline_mcp_cfg" \
+       '{job:$job, op_mode:$op, path:$path}')" >/dev/null 2>&1 || true
+  exit 1
+fi
 conductor_pane_id="${HERDR_PANE_ID:-}"
 # remote-research-answer-approval (2026-10-02): a spawn with no HERDR_PANE_ID
 # (the remote-mcp publisher's own _spawn call, which runs on the Mac outside
@@ -996,6 +1042,49 @@ for _ in 1 2 3 4 5; do
 done
 [ -n "$agent_session" ] && set_task_agent_session "$run_id" "$task_id" "$agent_session"
 
+# Startup-failure reconciliation (fix/offline-launch-profile, conductor
+# 2026-10-17): previously only the --brief kickoff path below waited for
+# any pane output before this flipped to "running" — a bound-launcher
+# die() (rc!=0, nothing ever reaches a prompt — v18's launcher rejecting
+# a 2nd --config did exactly this to every patched spawn) or a pane that
+# vanished right after `herdr pane run` left the registry at "running"
+# (or stuck at "starting") forever, with nothing live behind it.
+#
+# Managed-only, keyed on the launcher/agent process itself (not a separate
+# `herdr pane list` existence probe): "Model scope"/"to change thinking
+# effort" is omp UI text, and only omp's bound launcher can die() with its
+# own "omp-herdr-bound: " line before ever reaching it. An unmanaged
+# literal command (e.g. `spawn-task.sh ... quick /bin/true`) has no such
+# signal to wait for and must not be held to a 60s omp-shaped timeout it
+# could never satisfy. A pane that vanished entirely surfaces here too,
+# indistinguishably from a stall: `herdr pane wait-output` against a dead
+# pane returns the same nonzero rc as a genuine timeout, which is already
+# the failure branch below (found by independent review: a SEPARATE
+# `herdr pane list`-based existence probe here broke every test harness
+# that doesn't bother stubbing `pane list` to echo back a pane it was
+# never asked to track, e.g. verify-worktree-archival.sh's unmanaged
+# `quick /bin/true` spawns — a test-harness-shape problem this managed-
+# only, wait-output-only design does not have, since those spawns never
+# reach this branch).
+if [ "$managed" = 1 ]; then
+  first_output="$(herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort|^omp-herdr-bound: ' --timeout 60000 2>&1)"
+  wait_rc=$?
+  if printf '%s' "$first_output" | grep -q '^omp-herdr-bound: '; then
+    launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
+    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" '{reason:$r, launcher_error:$e}')" >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — the bound omp launcher rejected this spawn at startup ($launcher_err); see registry task $task_id" >&2
+    exit 1
+  fi
+  if [ "$wait_rc" != 0 ]; then
+    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      '{"reason":"no readiness output within 60s of launch (the process may have exited or the pane vanished)"}' >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — the worker produced no readiness output within 60s of launch; see registry task $task_id" >&2
+    exit 1
+  fi
+fi
 set_task_state "$run_id" "$task_id" "running"
 
 # --brief used to stop at writing SPEC.md: the worker booted to an empty
@@ -1010,8 +1099,10 @@ if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
   else
     kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
   fi
-  if herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort' --timeout 60000 >/dev/null 2>&1 \
-     && bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
+  # Readiness already confirmed above (wait_rc=0, "Model scope"/"to change
+  # thinking effort" matched — the omp-herdr-bound error branch would have
+  # exited before this point) — send the kickoff directly.
+  if bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
     kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"
   else
     kickoff_note="⚠ NOT DELIVERED — the worker is idle. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\""

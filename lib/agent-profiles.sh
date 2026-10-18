@@ -143,6 +143,42 @@ secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 	esac
 }
 
+# ---- offline MCP launch profile ---------------------------------------------
+# SPEC.md "Launch profile by job class" (fix/offline-launch-profile,
+# 2026-10-17): a read-only/offline job never needs the project's MCP
+# servers, and starting one it does not need is actively dangerous —
+# tourguide's `.mcp.json` supabase entry runs `op run -- npx ...`, and with
+# no 1Password token in a withheld worker's environment `op run` falls back
+# to an INTERACTIVE "Do you want to add an account manually now? [Y/n]"
+# prompt instead of failing cleanly. `--no-secrets` alone does not prevent
+# this: it withholds the CREDENTIAL, not the server that goes looking for
+# one. Measured 2026-10-17: review workers in ~/Code/tourguide (tasks
+# review/tourguide-report-truth-r1 and r2) stalled exactly there.
+#
+# offline_mcp_profile_for_job <job-class> -> "1" when this class gets no
+# project MCP by default, else "". Literal classes only (review, debug,
+# explore), not secrets_default_for_job's broader substring match above —
+# this is about what a job NEEDS to talk to, not what it is trusted to read.
+offline_mcp_profile_for_job() {
+	case "$1" in
+		review|debug|explore) printf '1\n' ;;
+		*)                    printf '\n' ;;
+	esac
+}
+
+# offline_mcp_profile_path -> absolute path to the omp --config overlay that
+# sets mcp.enableProjectConfig:false (omp://mcp-config.md: "set
+# mcp.enableProjectConfig: false to exclude every project-level source
+# before deduplication"), which removes a project's .omp/mcp.json AND root
+# mcp.json/.mcp.json fallback before omp ever spawns a server process —
+# never a credential change, never a flag the server itself could ignore.
+# Absolute (not project-relative): --config paths resolve against the
+# SPAWNED project's cwd, which differs per worktree, but this file lives in
+# herdr-control's own checkout regardless of which project is being spawned.
+offline_mcp_profile_path() {
+	printf '%s\n' "$_ap_dir/offline-mcp-profile.yml"
+}
+
 model_for_agent() {
   local a="$1" j="$2"
   case "$a:$j" in

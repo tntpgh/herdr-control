@@ -1,0 +1,17 @@
+# lib/offline-mcp-profile.yml — omp `--config` overlay for read-only/offline
+# job classes (review, debug, explore) and any --no-secrets spawn.
+#
+# SPEC.md "Launch profile by job class" (fix/offline-launch-profile,
+# 2026-10-17): removes every project-level MCP source (.omp/mcp.json,
+# .omp/.mcp.json, root mcp.json/.mcp.json fallback) before omp ever spawns a
+# server process, so a project's MCP server with no credential to resolve
+# (tourguide's `.mcp.json` supabase entry, which runs `op run -- npx ...`)
+# never starts and never falls back to an interactive 1Password prompt. See
+# lib/agent-profiles.sh's offline_mcp_profile_for_job /
+# offline_mcp_profile_path for which spawns load this file, and
+# omp://mcp-config.md for what the setting does.
+# User-level MCP config (~/.omp/agent/mcp.json) is untouched — this
+# only removes PROJECT-level sources, which is where an unaudited per-repo
+# server definition lives.
+mcp:
+  enableProjectConfig: false
