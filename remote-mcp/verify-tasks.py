@@ -32,7 +32,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
 BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-18-orchbound-v24/omp")
-BOUND_LAUNCHER_SHA256 = "6f2029a4862bbe59fee8c1b1c43d598ca26894e7eec52973edeff35557df8a1d"
+BOUND_LAUNCHER_SHA256 = "12389bdf3ef9d4074f0ab5f608af53d912d5d5a085a60cebd33b69d8aadbf92e"
 
 
 def _isolated_control(name: str) -> tuple[Path, Path, Path]:
