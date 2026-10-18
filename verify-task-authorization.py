@@ -167,7 +167,7 @@ class RegistryAuthorization(unittest.TestCase):
         self.execute("DROP TABLE task_authorizations")
         self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
         self.sh("registry_init")
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("13",)])
         self.assertEqual(self.query("SELECT type,payload FROM events ORDER BY sequence"), history)
         self.call("check", canonical(task), ok=False, reason="missing verified task source")
         self.assertEqual(self.query("SELECT COUNT(*) FROM task_authorizations"), [(0,)])
@@ -266,7 +266,7 @@ class RegistryAuthorization(unittest.TestCase):
         self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("7",)])
         self.assertEqual(self.query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners'"), [(0,)])
         self.sh("registry_init")  # No stale lock or partial migration remains.
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("13",)])
 
     def test_remote_source_is_not_main_approval(self):
         cmd, claims, task = self.launch()
@@ -346,7 +346,7 @@ class RegistryAuthorization(unittest.TestCase):
         self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         self.assertEqual(self.query("PRAGMA integrity_check"), [("ok",)])
         self.assertEqual(self.query("SELECT count(*) FROM task_authorizations"), [(0,)])
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("13",)])
 
     def test_parallel_shell_initializers_share_cold_registry(self):
         for attempt in range(10):

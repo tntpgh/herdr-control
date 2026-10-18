@@ -333,32 +333,40 @@ def _reservation(db, receipt, task):
     reservation.validate_reservation(db, receipt, task)
 
 
-def _ensure_claims_table(db):
-    """Mirror lib/claims.sh claims_init's DDL exactly (same table, same
-    additive generation column) rather than diverging from it -- this is
-    the ONE other writer of that table, needed here because register()'s
-    pane: lease insert must land in the SAME transaction as the task INSERT
-    (plan v2 §4.1: "written only inside register_task and
-    set_task_conductor, in the same SQLite transaction as tasks.conductor_*"),
-    and a fresh bash `claim_acquire` call would be a fresh connection /
-    fresh transaction.
-    """
-    db.execute("""CREATE TABLE IF NOT EXISTS claims (
-        claim_id    TEXT PRIMARY KEY,
-        scope       TEXT NOT NULL,
-        pane_id     TEXT NOT NULL DEFAULT '',
-        pane_birth  TEXT NOT NULL DEFAULT '',
-        purpose     TEXT NOT NULL DEFAULT '',
-        parent      TEXT NOT NULL DEFAULT '',
-        claimed_at  TEXT NOT NULL,
-        renewed_at  TEXT NOT NULL,
-        expires_at  TEXT NOT NULL,
-        released_at TEXT
-    )""")
-    db.execute("CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL")
-    has_gen = db.execute("SELECT 1 FROM pragma_table_info('claims') WHERE name='generation'").fetchone()
-    if has_gen is None:
-        db.execute("ALTER TABLE claims ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+def schema_v13(db):
+    # Additive v13 (review r1 finding 2, orch-p2-r2): the `claims` table used
+    # to be created by two ad hoc, hand-duplicated helpers outside any
+    # numbered migration (lib/run-registry.sh's _registry_ensure_claims_table,
+    # this file's old _ensure_claims_table), so schema_version could not tell
+    # you whether a given registry actually had it, and the DDL had to be
+    # kept byte-identical across three copies by inspection. lib/claims.sh's
+    # own claims_init (the table's canonical DDL/comment) is the authority
+    # this mirrors exactly -- same table, same additive generation column.
+    # Run through the same backup-verify-stamp pattern as v11->v12
+    # (_migrate_schema_v13 in lib/run-registry.sh), not inline here: a fresh
+    # bash `claim_acquire` is a separate connection/transaction from this
+    # one, so set_task_conductor/_acquire_pane_lease now rely entirely on
+    # registry_init (which always runs before either) having applied this.
+    with db:
+        db.execute("""CREATE TABLE IF NOT EXISTS claims (
+            claim_id    TEXT PRIMARY KEY,
+            scope       TEXT NOT NULL,
+            pane_id     TEXT NOT NULL DEFAULT '',
+            pane_birth  TEXT NOT NULL DEFAULT '',
+            purpose     TEXT NOT NULL DEFAULT '',
+            parent      TEXT NOT NULL DEFAULT '',
+            claimed_at  TEXT NOT NULL,
+            renewed_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            released_at TEXT
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL")
+        has_gen = db.execute("SELECT 1 FROM pragma_table_info('claims') WHERE name='generation'").fetchone()
+        if has_gen is None:
+            db.execute("ALTER TABLE claims ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+        db.execute("""INSERT INTO schema_meta(key,value) VALUES ('schema_version','13')
+            ON CONFLICT(key) DO UPDATE SET value='13'
+            WHERE CAST(schema_meta.value AS INTEGER)<13""")
 
 
 def _acquire_pane_lease(db, task):
@@ -374,7 +382,6 @@ def _acquire_pane_lease(db, task):
     cpane, cbirth = task.get("conductor_pane_id", ""), task.get("conductor_pane_birth", "")
     if not (pane_id and pane_birth and cpane and cbirth):
         return
-    _ensure_claims_table(db)
     scope = "pane:%s@%s" % (pane_id, pane_birth)
     at = now_iso()
     db.execute(

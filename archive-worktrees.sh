@@ -382,7 +382,13 @@ _read_registry
 # The EXIT trap also unlocks a worktree this run `git worktree lock`ed, and
 # only then drops the spawn fence it holds (r3 L1) — never the other order.
 run_lock=""; locked_wt=""; locked_repo=""; fenced=""
-_ARCHIVE_PANE="${HERDR_PANE_ID:-archive-worktrees.sh}"
+# Falls back to a per-invocation identity (this process's own pid), never a
+# shared constant: two separate OS processes racing the same `path:` scope
+# with no HERDR_PANE_ID must present DISTINCT pane_ids to claim_acquire, or
+# the second's acquire reads as a renewal of the first's claim (same string
+# compared in lib/claims.sh's _claim_acquire_core) instead of the conflict
+# it actually is (review r1 finding 1; verify-namespaced-leases.sh pins it).
+_ARCHIVE_PANE="${HERDR_PANE_ID:-archive-worktrees.sh:$$}"
 _wt_path_claim_scope=""
 # Releases BOTH fences every call: the file fence (spawn-task.sh's side) and
 # the P2 registry `path:` lease (plan v2 §4.6) taken below, in that order —
