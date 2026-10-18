@@ -350,6 +350,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v9 || return 1
   _migrate_schema_v10 || return 1
   _migrate_schema_v11 "$existed" || return 1
+  _migrate_schema_v13 "$existed" || return 1
   _migrate_legacy_files || return 1
   _HERDR_REGISTRY_READY=1
   return 0
@@ -717,6 +718,70 @@ except Exception as exc:
 PY
 }
 
+# ---- schema v12 -> v13: consolidate the `claims` table into the numbered
+# chain (review r1 finding 2, orch-p2-r2) -------------------------------------
+# Same backup-verify-stamp shape as _migrate_schema_v11 above, targeting
+# storage.schema_v13 instead of storage.schema: the `claims` table used to
+# be created by two ad hoc, hand-duplicated helpers
+# (_registry_ensure_claims_table below, task-authorization.py's
+# _ensure_claims_table — both deleted) called lazily from inside
+# set_task_conductor/_acquire_pane_lease, neither stamping schema_version,
+# taking a pre-migration backup, or running under the registry's write lock.
+_migrate_schema_v13() {
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+
+path, helper, existed = sys.argv[1:]
+backup = None
+verified = False
+try:
+    spec = importlib.util.spec_from_file_location("task_authorization_storage", helper)
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    with storage.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        current = row[0] if row else ""
+        if not current.isdecimal():
+            raise ValueError("invalid pre-migration schema version")
+        if int(current) < 13 and existed == "1":
+            # Same reasoning as the v12 backup above: a separate read-only
+            # connection takes the online snapshot while this one holds the
+            # writer lock, so no other migrator can advance the version
+            # until verification completes.
+            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v13.bak",
+                                          dir=os.path.dirname(os.path.abspath(path)))
+            os.close(fd)
+            with storage.connect(path, readonly=True) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            with storage.connect(backup, readonly=True) as saved:
+                integrity = saved.execute("PRAGMA integrity_check").fetchone()[0]
+                version = saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            if integrity != "ok" or version != current:
+                raise ValueError("pre-migration backup failed integrity/version verification")
+            verified = True
+            print(f"run-registry: backed up {path} -> {backup} before migration v13 (integrity+version verified)", file=sys.stderr)
+        # schema_v13() uses this connection's existing transaction and commits
+        # only after both DDL and the monotonic stamp succeed. Closing on
+        # error rolls everything back and releases the writer lock without a
+        # stale lockfile.
+        storage.schema_v13(db)
+except Exception as exc:
+    if backup and not verified:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
+    print(f"run-registry: v13 migration aborted: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 # ---- one-time import of the pre-SQLite file layout --------------------------
 # A registry holding LIVE task state cannot simply be abandoned: dropping a
 # running worker's registration is not a clean slate, it silently disables
@@ -921,6 +986,22 @@ task_authorization_check() {
   return 1
 }
 
+# role_for_live_pane <pane_id> <pane_birth> [label_prefix] -> the role label
+# if a live `roles` row matches this exact pane+birth, else empty. Used to
+# tell "this caller IS a registered orchestrator@<project>" from "this is an
+# ordinary pane" without trusting anything the caller asserts about itself
+# (plan v2 §6.1: "'Owns' is a registry fact written by Main, never a label
+# the caller chooses").
+role_for_live_pane() {
+  local pane="$1" birth="$2" prefix="${3:-}"
+  registry_init || return 1
+  [ -n "$pane" ] && [ -n "$birth" ] || { printf '\n'; return 0; }
+  _sql "SELECT label FROM roles
+        WHERE pane_id=$(_sq "$pane") AND pane_birth=$(_sq "$birth")
+          AND label LIKE $(_sq "${prefix}%")
+        LIMIT 1;" 2>/dev/null
+}
+
 # set_task_conductor <run_id> <task_id> <from_pane> <from_birth> <to_pane>
 #                     <to_birth> <to_conductor_id> <by> [reason]
 #
@@ -940,15 +1021,30 @@ task_authorization_check() {
 # set_task_state's CAS shape, same race it closes (two callers racing a
 # handover of the same task; a caller acting on a conductor that already
 # moved on). 0 rows changed = stale/raced, nonzero exit, no event -- the
-# caller re-reads reality instead of retrying blind. A `conductor_handover`
-# event is appended only when exactly 1 row changed, gated the same way
-# set_task_state gates `state_changed` (`WHERE (SELECT changes())>0`).
+# caller re-reads reality instead of retrying blind.
 #
-# Authority (who may call this), target validation (must be a live,
-# non-worker pane) and the re-wake/notify steps are conductor-handover.sh's
-# job, not this function's -- this is the one compare-and-swap write, reused
-# by anything that needs it, the same split register_task/set_task_state
-# already draw between "record a fact" and "decide whether to."
+# ---- P2: project-scoped handover (plan v2 §6.1 item 5) ---------------------
+# A precondition, read before the transaction: if the TARGET pane is a live
+# `orchestrator@*` role, the task's own repo must be inside a live `proj:`
+# claim held by that exact pane+birth -- otherwise Main (or anyone) handing
+# a task to an orchestrator would hand it conductor authority over a repo it
+# does not own, exactly the cross-project authority §6 forbids. This binds
+# Main's own handovers too, per the plan. A small TOCTOU window exists
+# between this read and the transaction below (a re-grant mid-call); that is
+# the same order spawn-task.sh's existing authorization-hold checks already
+# accept elsewhere in this codebase, documented rather than papered over.
+#
+# ---- P2: the pane: lease swap (plan v2 §4.1, §4.3) --------------------------
+# `pane:<task's own pane>@<birth>` records WHO may answer that worker pane.
+# The swap (release the old conductor's lease, insert a new one for the
+# incoming conductor with a bumped generation) runs in the SAME transaction
+# as the conductor_pane_id UPDATE, gated on that UPDATE's own success via an
+# EXISTS check against the just-written row -- not via changes() chaining,
+# which only ever reflects the single immediately-preceding statement and
+# would silently decouple once more statements were appended after the
+# existing changes()-gated events INSERT. No TTL (expires_at is a sentinel
+# far future): the lease lives until the task goes terminal or reconcile
+# marks it lost, never on a clock (plan v2 §4.3).
 set_task_conductor() {
   local run_id="$1" task_id="$2" from_pane="$3" from_birth="$4" to_pane="$5" \
         to_birth="$6" to_conductor_id="$7" by="$8" reason="${9:-}"
@@ -957,9 +1053,27 @@ set_task_conductor() {
     printf 'run-registry: set_task_conductor requires run_id, task_id, to_pane, to_birth, to_conductor_id\n' >&2
     return 1
   }
-  local at eid payload changed
+  local target_role
+  target_role="$(role_for_live_pane "$to_pane" "$to_birth" 'orchestrator@')"
+  if [ -n "$target_role" ]; then
+    local task_repo has_proj
+    task_repo="$(_sql "SELECT repo FROM tasks WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id");" 2>/dev/null)"
+    has_proj="$(_sql "SELECT 1 FROM claims
+                       WHERE scope=$(_sq "proj:$task_repo") AND pane_id=$(_sq "$to_pane") AND pane_birth=$(_sq "$to_birth")
+                         AND released_at IS NULL AND expires_at > $(_sq "$(_now_iso)") LIMIT 1;" 2>/dev/null)"
+    if [ -z "$has_proj" ]; then
+      printf 'run-registry: set_task_conductor refused — %s holds no proj: claim for %s\n' "$target_role" "$task_repo" >&2
+      append_event "$run_id" "$task_id" "conductor_handover_refused" \
+        "$(jq -nc --arg to_role "$target_role" --arg repo "$task_repo" --arg to_pane "$to_pane" --arg to_birth "$to_birth" \
+          '{reason:"target_not_project_scoped", to_role:$to_role, repo:$repo, conductor_pane:$to_pane, conductor_pane_birth:$to_birth}')" \
+        >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+  local at eid payload changed lease_id
   at="$(_now_iso)"
   eid="$(gen_id ev)"
+  lease_id="$(gen_id claim)"
   payload="$(jq -nc --arg f "$from_pane" --arg fb "$from_birth" --arg t "$to_pane" \
     --arg tb "$to_birth" --arg by "$by" --arg reason "$reason" \
     '{from:$f, from_birth:$fb, to:$t, to_birth:$tb, by:$by, reason:$reason}')"
@@ -973,8 +1087,24 @@ set_task_conductor() {
       SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'conductor_handover', $(_sq "$at"),
         $(_sq "$payload")
       WHERE (SELECT changes()) > 0;
+    UPDATE claims SET released_at=$(_sq "$at")
+      WHERE released_at IS NULL
+        AND scope = 'pane:' || (SELECT pane_id FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"))
+                   || '@' || (SELECT pane_birth FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"))
+        AND EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                     AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"));
+    INSERT INTO claims(claim_id, scope, pane_id, pane_birth, purpose, parent, claimed_at, renewed_at, expires_at, generation)
+      SELECT $(_sq "$lease_id"), 'pane:'||t.pane_id||'@'||t.pane_birth, $(_sq "$to_pane"), $(_sq "$to_birth"),
+             $(_sq "$task_id"), '', $(_sq "$at"), $(_sq "$at"), '9999-12-31T23:59:59Z',
+             (SELECT COALESCE(MAX(generation),0)+1 FROM claims WHERE scope = 'pane:'||t.pane_id||'@'||t.pane_birth)
+      FROM tasks t
+      WHERE t.task_id=$(_sq "$task_id") AND t.run_id=$(_sq "$run_id") AND t.pane_id<>'' AND t.pane_birth<>''
+        AND EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                     AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"));
     COMMIT;
-    SELECT changes();" 2>/dev/null)
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                               AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"))
+                THEN 1 ELSE 0 END;" 2>/dev/null)
   [ "$changed" = "1" ] && return 0
   printf 'run-registry: set_task_conductor CAS miss for %s/%s (from %s/%s no longer matches the live conductor, or the task is not active)\n' \
     "$run_id" "$task_id" "$from_pane" "$from_birth" >&2
