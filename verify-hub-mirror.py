@@ -93,6 +93,21 @@ class MirrorVerification(unittest.TestCase):
         self.assertEqual(local("race")["answers"], {"pr": "local"})
         self.assertEqual(self.delivered, [])
 
+    def test_signed_answer_failing_the_required_schema_is_rejected(self):
+        schema = {"pilot": {"enum": ["approve", "hold"]}}
+        bad = {"missing": {"notes": ""}, "null": {"pilot": None}, "off-enum": {"pilot": "zzz"},
+               "incident shape": {"choice": None, "confirmed": False, "notes": ""}}
+        for i, (why, answers) in enumerate(bad.items()):
+            with self.subTest(why):
+                fid = f"schema{i}"
+                make_form(fid, schema=schema)
+                self.assertEqual(hub.record_remote_answer(fid, signed(fid, answers), KEY), "rejected")
+                self.assertEqual(local(fid)["status"], "open", "an invalid answer must leave the row open")
+        self.assertEqual(self.delivered, [])
+        make_form("schemaok", schema=schema)
+        self.assertEqual(hub.record_remote_answer("schemaok", signed("schemaok", {"pilot": "hold"}), KEY), "delivered")
+        self.assertEqual(local("schemaok")["answers"], {"pilot": "hold"})
+
     def test_unknown_or_path_shaped_ids_are_missing(self):
         self.assertEqual(hub.record_remote_answer("../../etc/passwd", signed("x", {"a": 1}), KEY), "missing")
         self.assertEqual(hub.record_remote_answer("nope", signed("nope", {"a": 1}), KEY), "missing")
