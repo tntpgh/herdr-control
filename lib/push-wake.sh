@@ -65,7 +65,7 @@ _wake_outcome_for() {                   # <exit-code> -> token
   esac
 }
 
-# _pw_forced_wake_argv <pane> <cpane> <run> <task> <label> <msg> <where> <full_cmd> <tool>
+# _pw_forced_wake_argv <pane> <cpane> <run> <task> <label> <msg> <where> <full_cmd> <tool> [pid]
 #
 # Builds, into _PW_FORCED_WAKE_ARGV (a bash array), the exact re-entry into
 # push_wake with HERDR_ALERT_FORCE=1 — the command grace_realert's own 90s
@@ -79,14 +79,39 @@ _wake_outcome_for() {                   # <exit-code> -> token
 # per-prompt dedupe key (`${base}_input`) means the ORIGINAL push_wake call
 # already recorded it before this re-entry could ever fire for the same
 # prompt_id, so this never overwrites a real recorded value with a missing
-# one.
+# one — PROVIDED the re-entry actually targets that same prompt_id. It does
+# not by default: push_wake recomputes pid from whatever is CURRENTLY on
+# screen, and the re-entry is detached (`& disown`, release_wake_hold below)
+# with no bound on when it actually runs. A peer that refuses several
+# write/edit prompts back to back can have this fire after the pane has
+# moved on to a LATER, still-pending prompt — the re-entry then lands on
+# THAT prompt_id instead, writing a fresh input_required row with no tool
+# (herdr-select.sh never threads one through a release) at a HIGHER
+# sequence than the live hook's own correctly-tooled row, so
+# task_input_required_tool's `ORDER BY sequence DESC LIMIT 1` returns the
+# new, empty one and every answer to that still-open prompt is refused as
+# "the hook recorded '<none>'" (measured: verify-approval-payload.sh's
+# hold()-then-refuse cases, 4th occurrence onward, 100% reproducible).
+# <pid>, when given, closes this: it is the EXACT prompt_id this release is
+# for (release_wake_hold already has it — the pid a wake was HELD against,
+# never a live screen read), threaded into the re-entrant push_wake as
+# HERDR_RELEASE_PID so it resolves THAT prompt again, never whatever is
+# newly painted. A dedicated var, not HERDR_DEFERRED_PID: a real panel WAS
+# painted for this prompt (unlike omp-notify.sh's genuinely panel-less
+# exclusiveResolver case), so push_wake's wake-message branch must still
+# emit the READ IT/ANSWER IT panel instructions — HERDR_DEFERRED_PID
+# suppresses those. Optional and appended last so grace_realert's three
+# existing call sites (which legitimately want a fresh live read — a 90s
+# timer re-checking whether the ORIGINAL prompt is even still the one
+# showing) are unchanged.
 _pw_forced_wake_argv() {
-  local pane="$1" cpane="$2" run="$3" task="$4" label="$5" msg="$6" where="$7" full_cmd="$8" tool="${9:-}"
+  local pane="$1" cpane="$2" run="$3" task="$4" label="$5" msg="$6" where="$7" full_cmd="$8" tool="${9:-}" pid="${10:-}"
   _PW_FORCED_WAKE_ARGV=(
     env HERDR_ALERT_FORCE=1
         HERDR_PANE_ID="$pane" HERDR_CONDUCTOR_PANE_ID="$cpane"
         HERDR_RUN_ID="$run" HERDR_TASK_ID="$task"
         HERDR_TASK_LABEL="$label"
+        ${pid:+HERDR_RELEASE_PID="$pid"}
         bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3" "$4"' \
         "$_pw_dir" "$msg" "$where" "$full_cmd" "$tool"
   )
@@ -137,6 +162,17 @@ push_wake() {
     # registry occurrence before calling push_wake, never against the
     # screen, so that identity is used here as-is.
     pid="$HERDR_DEFERRED_PID"
+  elif [ -n "${HERDR_RELEASE_PID:-}" ]; then
+    # release_wake_hold (below): a REAL panel WAS painted and the caller
+    # already proved this exact prompt_id against the wake_held row it is
+    # releasing — distinct from HERDR_DEFERRED_PID because the wake-message
+    # branch further down must still emit the READ IT/ANSWER IT panel
+    # instructions (there IS a pane to read), unlike the genuinely
+    # panel-less deferred case. Re-deriving pid from whatever is CURRENTLY
+    # painted would be wrong here: this call can fire detached, at an
+    # unbounded delay, after the pane has moved on to a LATER, still-open
+    # prompt (herdr-control fix/human-only-fixture, 2026-10-18).
+    pid="$HERDR_RELEASE_PID"
   elif [ -n "${HERDR_PANE_ID:-}" ]; then
     pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
   fi
@@ -177,7 +213,7 @@ push_wake() {
   # HERDR_EXPECT_PROMPT_ID from a read of HERDR_PANE_ID itself, so the two
   # are never set/unset independently) but refuse here too rather than rely
   # on that invariant holding forever.
-  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && { [ -z "$full_cmd" ] || [ -z "${HERDR_PANE_ID:-}" ]; } && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -z "${HERDR_RELEASE_PID:-}" ] && [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && { [ -z "$full_cmd" ] || [ -z "${HERDR_PANE_ID:-}" ]; } && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
     return 1
   fi
   local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
@@ -258,7 +294,7 @@ push_wake() {
   # full_cmd against the SAME snapshot each pass (the exact rule change 5
   # below already enforced on a single snapshot), until the screen is
   # actually showing the prompt this call is about.
-  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -z "${HERDR_RELEASE_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
     prompt_id_settled "$HERDR_PANE_ID" "$full_cmd" "$pid"
     pid="$PROMPT_SETTLE_PID"
     base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
@@ -541,7 +577,7 @@ push_wake() {
   return 1
 }
 
-# release_wake_hold <pane> <pid> <run> <task> <cpane> <label> <msg> <where> <full_cmd> <reason>
+# release_wake_hold <pane> <pid> <run> <task> <cpane> <label> <msg> <where> <full_cmd> <reason> [tool]
 #
 # Change 3 (fix/peer-waits-for-record): a wake_held row means push_wake
 # decided "a peer may take it" for THIS exact prompt — but the peer path can
@@ -561,8 +597,22 @@ push_wake() {
 # push_wake through a fresh bash process, exactly like a delayed
 # grace_realert — runs detached, so a caller that must still exit promptly
 # (herdr-select.sh, exit 8) is never held open by it.
+#
+# <pid> is passed straight through to _pw_forced_wake_argv as the detached
+# delivery's HERDR_RELEASE_PID: it pins the re-entrant push_wake to the
+# EXACT prompt this hold was for, so it resolves that prompt again if it
+# fires late, never whatever is newly painted on the pane by then (a peer
+# refusing several write/edit prompts back to back previously let this
+# detached, unbounded-delay fork land on a LATER, still-pending prompt and
+# write it a tool-less input_required row at a higher sequence than the
+# live hook's own — herdr-select.sh's #191 corroboration then refused every
+# answer to that still-open prompt as "the hook recorded '<none>'").
+# <tool>, when the caller has it (herdr-select.sh does, as the
+# panel-corroborated registry_tool_lc), is threaded the same way so a
+# delivery that DOES write a row leaves it correctly tooled rather than
+# empty.
 release_wake_hold() {
-  local pane="$1" pid="$2" run="$3" task="$4" cpane="$5" label="$6" msg="$7" where="$8" full_cmd="$9" reason="${10:-}"
+  local pane="$1" pid="$2" run="$3" task="$4" cpane="$5" label="$6" msg="$7" where="$8" full_cmd="$9" reason="${10:-}" tool="${11:-}"
   [ -n "$run" ] && [ -n "$task" ] && [ -n "$pid" ] || return 1
   registry_init || return 1
   local held
@@ -591,7 +641,7 @@ release_wake_hold() {
   # logged at `errors`. The hooks' human-stale ERROR timer claims its own
   # human_stale_* key (HERDR_GRACE_CLAIM_KIND), so this claim never silences
   # it. The forced wake above is what reaches Main.
-  _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd"
+  _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd" "$tool" "$pid"
   (
     "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1
     local notify

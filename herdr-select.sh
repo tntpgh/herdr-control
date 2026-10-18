@@ -670,7 +670,7 @@ _refuse_non_human() {                   # verdict reason
   release_wake_hold "$pane" "$current_prompt_id" "$own_run" "$own_task" \
     "$own_cpane" "$own_label" \
     "a peer refused this prompt ($v): ${r:-no reason given} — a human must answer it" \
-    "$own_label" "$c" "peer refused: $v" >/dev/null 2>&1 || true
+    "$own_label" "$c" "peer refused: $v" "${registry_tool_lc:-}" >/dev/null 2>&1 || true
   exit 8
 }
 
