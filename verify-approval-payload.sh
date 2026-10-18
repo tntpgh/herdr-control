@@ -173,6 +173,23 @@ attempt_all() {                         # <label> : peer, conductor, conductor w
   reset_keys; sel 1 --authority peer; rc=$?; human_only "peer: $1"
   reset_keys; conductor; rc=$?; human_only "conductor: $1"
 }
+# The companion negative to human_only(): no hook ever recorded a tool for
+# this prompt at all (herdr-control #191, the gate human_only's own cases
+# deliberately reach PAST) — refused before #277 is ever consulted, with no
+# key, no Approve row, and the exact "hook recorded '<none>'" message.
+hook_none() {                           # <label>
+  if [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && [ "$(approve_rows)" = "$approves_before" ] &&
+     grep -qF "the hook recorded '<none>' for this prompt" "$WORK/err.txt"; then
+    ok "$1"
+  else
+    bad "$1: rc=$rc keys=$(keys_pressed) approve_rows=$(approve_rows)/$approves_before; $(tail -2 "$WORK/err.txt")"
+  fi
+}
+attempt_all_none() {                    # <label> : peer, conductor
+  approves_before="$(approve_rows)"
+  reset_keys; sel 1 --authority peer; rc=$?; hook_none "peer: $1"
+  reset_keys; conductor; rc=$?; hook_none "conductor: $1"
+}
 write_input() { jq -nc --arg p "$1" --arg c "$2" '{path:$p, content:$c}'; }
 # Slice (b), bound-bash: same shape as record() above, but for a bash/shell
 # occurrence, never a write/edit one -- no panel is rendered (Path A never
@@ -457,6 +474,16 @@ S=SENTINEL277noocc; render_panel write "$(write_input "$WT/.handoffs/s5.md" "$S 
 append_event run1 task1 input_required "$(jq -nc --arg pid "$PID" '{message:"m", prompt_id:$pid, command:"", tool:"write"}')" >/dev/null 2>&1; hold
 approves_before="$(approve_rows)"; reset_keys; sel 1 --authority peer; rc=$?; human_only "peer: no recorded occurrence"
 no_raw "no recorded occurrence" "$S" "Allow tool: write [$WITHHELD]"
+
+printf '== missing-hook negative: no input_required row at all is refused by #191, never reaches #277 ==\n'
+# The inverse of every case above: a real panel is on screen but NO hook
+# ever wrote an input_required row for this exact prompt_id at all (a
+# hand-started session, an older omp build, a non-bash prompt). herdr-
+# select.sh's #191 corroboration refuses this before #277 is ever
+# consulted -- confirms the two gates are still distinct and #191 still
+# fires on a genuinely missing hook record, not just on every write/edit.
+S=SENTINELNOHOOK; render_panel write "$(write_input "$WT/.handoffs/s6.md" "$S body")" > "$SCREEN"; PID="$(prompt_id "$PANE")"
+attempt_all_none "no hook record for this prompt at all"
 
 printf '== hard links and path escapes: the review artifact refuses them ==\n'
 HL="$WT/.handoffs/linked.md"; printf 'old\n' > "$HL"; ln "$HL" "$WORK/outside/other-name.md"
