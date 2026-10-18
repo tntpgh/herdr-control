@@ -449,11 +449,21 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // lib/bash-write-targets.sh, the SAME parser lib/command-policy.sh's
 // classify_command uses for the peer-approval side of this guard; a
 // target it cannot read statically fails closed, same as everything
-// below), and by shape any tool
+// below), `manage_skill` (create/update/delete all write
+// `~/.omp/agent/managed-skills/<name>/SKILL.md`, exactly like any other
+// file target — the 2026-10-18 incident this fix closes was a worker
+// overwriting a skill this way with NO check at all) and `learn` when it
+// carries a `skill` block (same managed-skills path), and by shape any tool
 // whose name says it mutates (write/edit/patch/rename/…) AND carries a
-// path-like field. NOT covered here: `eval` (arbitrary code; omp's approval
-// layer governs it — #174's closed-world design), and tools that write
-// omp's own state rather than a path (learn, manage_skill, retain).
+// path-like field. Beyond that: a tool name this guard has never seen gives
+// no verb signal (manage_skill didn't either), so it is judged by what it
+// carries — any path-like field fails closed exactly like a write, unless the
+// name is on the known-read-only/omp-internal-state allowlist just above
+// `mutationTargets` (read, grep, glob, task, retain, recall, …: omp memory
+// and delegation, not a host path — docs/design/pretool-approval.md §3).
+// NOT covered here: `eval` (arbitrary code; omp's approval layer governs it
+// — #174's closed-world design), and plain `learn` (no `skill` block: writes
+// the shared mnemopi.db, never a worktree-scoped path).
 const WORKER_TASK_ID = process.env.HERDR_TASK_ID?.trim() ?? "";
 const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
 const LOAD_HOME = process.env.HOME?.trim() || homedir();
@@ -709,6 +719,35 @@ const LSP_MUTATING_ACTION = /(rename|code_?action|format|fix|organi[sz]e|apply|r
 const LSP_READONLY_ACTION =
   /^(definition|type_?definition|declaration|implementation|references|hover|signature(_help)?|symbols?|document_symbols?|workspace_symbols?|diagnostics|status|incoming_calls|outgoing_calls|call_hierarchy|completion|highlight)$/;
 
+// Known read-only or omp-internal-state tools: reaching the fallback below
+// with a path-like field is incidental for these (read's/grep's own search
+// target, not a write), never a mutation. `retain`/`recall`/`reflect`/
+// `report_issue`/`secret_present` and the read-only xd:// devices write
+// omp's own shared state (mnemopi.db) or nothing at all, never a
+// worktree-scoped path (docs/design/pretool-approval.md §3). `mcp__*` has
+// its own existing registration guard (lib/pretool-registration.sh).
+const KNOWN_READONLY_OR_INTERNAL: Record<string, true> = {
+  read: true, grep: true, glob: true, find: true, ast_grep: true, web_search: true, hub: true, github: true,
+  task: true, agent: true, todo: true, wait: true, ask: true, checkpoint: true, rewind: true, resolve: true,
+  security_scan: true, new_context: true, context_notes: true, retain: true, recall: true,
+  reflect: true, report_issue: true, secret_present: true, fleet_status: true, pr_ready: true,
+  handoff_debt: true, single_copy_scan: true, worktree_debt: true, suite_wired: true,
+  decisions_open: true, project_status: true,
+};
+
+// manage_skill create/update/delete and learn's optional `skill` block both
+// name a skill by `name`, resolved the same way manage_skill itself resolves
+// it (kebab-case; see its SKILL.md): reject anything with a path separator
+// or `..` rather than let a crafted slug pick a different target file.
+function managedSkillTarget(skillName: string): string | MutationTargets {
+  const n = skillName.trim();
+  if (!n) return "names no skill";
+  if (n.includes("/") || n.includes("\\") || n === ".." || n.includes("\0")) {
+    return `skill name ${JSON.stringify(skillName)} is not a safe slug`;
+  }
+  return { raw: [path.join(LOAD_HOME, ".omp", "agent", "managed-skills", n, "SKILL.md")] };
+}
+
 // The raw targets a file-mutating call names; undefined when the tool is not
 // file-mutating (it is never checked); a string when it is mutating but its
 // targets cannot be read (refused).
@@ -808,11 +847,34 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>, cwd: st
     const targets = pathFields(rec);
     return targets.length > 0 ? { raw: targets } : `${toolName} names no path`;
   }
+  if (name === "manage_skill") {
+    // create/update/delete all target the same file by `name`; a worker's
+    // `manage_skill` call never has a legitimate reason to resolve inside
+    // its own worktree, so this always refuses one (the 2026-10-18 incident
+    // this fix closes: see SPEC.md).
+    return managedSkillTarget(typeof rec.name === "string" ? rec.name : "");
+  }
+  if (name === "learn") {
+    // Plain learn writes the shared mnemopi.db (not a worktree-scoped path:
+    // see KNOWN_READONLY_OR_INTERNAL's `retain`/`recall` note above); a
+    // `skill` block additionally mints/updates a managed skill file.
+    const skill = rec.skill;
+    if (!skill || typeof skill !== "object") return undefined;
+    const s = skill as Record<string, unknown>;
+    return managedSkillTarget(typeof s.name === "string" ? s.name : "");
+  }
+  if (KNOWN_READONLY_OR_INTERNAL[name]) return undefined;
   if (MUTATING_NAME.test(name)) {
     const targets = pathFields(rec);
     return targets.length > 0 ? { raw: targets } : undefined;
   }
-  return undefined;
+  // An omp tool/xd:// device this guard has never named above: its tool name
+  // gives no verb signal either way (manage_skill didn't — the incident this
+  // fix closes), so judge it by what it carries. A path-like field fails
+  // closed exactly like a write; nothing path-like stays unchecked, same as
+  // every tool above that returns undefined.
+  const targets = pathFields(rec);
+  return targets.length > 0 ? { raw: targets } : undefined;
 }
 
 // A file path's absolute spellings (see HOW above), or a refusal string.
