@@ -592,108 +592,189 @@ git -C "$here" archive origin/main | tar -x -C "$base_dir" || exit 1
 # verify-posture.sh) changes the launch line on purpose; what THIS check
 # guards is that --approval adds nothing. Strip `--tools <list>` from both
 # sides so it compares the same thing before and after that table lands.
-a="$(dry "$here" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"; b="$(dry "$base_dir" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"
+# A launcher release bump (config.sh HERDR_OMP_BIN) also changes the line on
+# purpose; normalize the release dir name so only real launch drift fails.
+rel='s#/omp-herdr-bound/releases/[^/ ]+/omp#/omp-herdr-bound/releases/<release>/omp#'
+a="$(dry "$here" fix/x implement omp | sed -E 's/ --tools [^ ]+//' | sed -E "$rel")"; b="$(dry "$base_dir" fix/x implement omp | sed -E 's/ --tools [^ ]+//' | sed -E "$rel")"
 [ -n "$a" ] && [ "$a" = "$b" ] && ok "default spawn --dry-run is byte-identical to origin/main" || { not_ok "default dry-run differs"; diff <(printf '%s\n' "$b") <(printf '%s\n' "$a") | head; }
-a="$(dry "$here" fix/x implement claude --approval menu | sed -E 's/ --tools [^ ]+//')"; b="$(dry "$base_dir" fix/x implement claude | sed -E 's/ --tools [^ ]+//')"
+a="$(dry "$here" fix/x implement claude --approval menu | sed -E 's/ --tools [^ ]+//' | sed -E "$rel")"; b="$(dry "$base_dir" fix/x implement claude | sed -E 's/ --tools [^ ]+//' | sed -E "$rel")"
 [ "$a" = "$b" ] && ok "explicit --approval menu is byte-identical to origin/main's default" || not_ok "--approval menu differs"
-export HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts"
-h="$(dry "$here" fix/x implement omp --approval hook)"
-launch="$(printf '%s\n' "$h" | grep '^  launch')"
-printf '%s' "$launch" | grep -q -- '--auto-approve --config .*agent-hooks/omp-worker-overlay.yml$' && ! printf '%s' "$launch" | grep -q -- '--approval-mode' \
-  && ok "hook: launch is --auto-approve + worker overlay, no --approval-mode" || not_ok "hook launch: $launch"
-printf '%s' "$h" | grep -q '^  approval  : hook' && ok "hook: dry-run states the approval posture" || not_ok "no approval line"
+# ---- K3: --approval hook identity check (bound-launcher --herdr-bound-check) --
+# The hook's --auto-approve swap is safe only if HERDR_OMP_BIN (sha256-pinned
+# by cli_for_agent, agent-profiles.sh:447-450) reports pins via
+# --herdr-bound-check that match $here's own hook/lib/spawn/overlay/selector
+# content. No env seam (HERDR_OMP_EXTENSION removed, K3 2026-10-18): every
+# case below drives an ISOLATED copy of this checkout with its OWN config.sh
+# pinned at a fixture launcher -- production config.sh is never touched.
+mk_bc_pins() {  # <dir> -> hook=/lib_tree=/spawn=/overlay=/selector= for that dir (mirrors omp:47)
+  local d="$1"
+  printf 'hook=%s\n' "$(shasum -a 256 "$d/agent-hooks/omp-herdr-control.ts" 2>/dev/null | cut -d' ' -f1)"
+  printf 'lib_tree=%s\n' "$( (cd "$d" && find lib -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done) 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+  printf 'spawn=%s\n' "$(shasum -a 256 "$d/spawn-task.sh" 2>/dev/null | cut -d' ' -f1)"
+  printf 'overlay=%s\n' "$(shasum -a 256 "$d/agent-hooks/omp-worker-overlay.yml" 2>/dev/null | cut -d' ' -f1)"
+  printf 'selector=%s\n' "$(shasum -a 256 "$d/herdr-select.sh" 2>/dev/null | cut -d' ' -f1)"
+}
+mk_ctl() {  # <name> -> path to a fresh isolated copy of $here (production checkout untouched)
+  local d="$work/ctl-$1"
+  mkdir -p "$d"; cp -R "$here/." "$d/"
+  rm -rf "$d/.git"; find "$d" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+  printf '%s\n' "$d"
+}
+mk_fixture() {  # <out> <ok|dies|dup|missing> [pins-source-dir]
+  local out="$1" mode="$2" src="${3:-}" pins=
+  [ -n "$src" ] && pins="$(mk_bc_pins "$src")"
+  local hook lib spawn ovl sel
+  hook="$(printf '%s\n' "$pins" | sed -n 's/^hook=//p')"
+  lib="$(printf '%s\n' "$pins" | sed -n 's/^lib_tree=//p')"
+  spawn="$(printf '%s\n' "$pins" | sed -n 's/^spawn=//p')"
+  ovl="$(printf '%s\n' "$pins" | sed -n 's/^overlay=//p')"
+  sel="$(printf '%s\n' "$pins" | sed -n 's/^selector=//p')"
+  case "$mode" in
+    dies) cat > "$out" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = --herdr-bound-check ] && exit 78
+exit 1
+EOF
+      ;;
+    dup) cat > "$out" <<EOF
+#!/bin/bash
+[ "\${1:-}" = --herdr-bound-check ] || exit 1
+printf 'hook=%s\nhook=%s\nlib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' "$hook" "$hook" "$lib" "$spawn" "$ovl" "$sel"
+EOF
+      ;;
+    missing) cat > "$out" <<EOF
+#!/bin/bash
+[ "\${1:-}" = --herdr-bound-check ] || exit 1
+printf 'lib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' "$lib" "$spawn" "$ovl" "$sel"
+EOF
+      ;;
+    *) cat > "$out" <<EOF
+#!/bin/bash
+[ "\${1:-}" = --herdr-bound-check ] || exit 1
+printf 'hook=%s\nlib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' "$hook" "$lib" "$spawn" "$ovl" "$sel"
+EOF
+      ;;
+  esac
+  chmod +x "$out"
+}
+pin_ctl() {  # <ctl-dir> <fixture-path> -- repoints that copy's OWN config.sh (never production's)
+  local d="$1" fx="$2" fx_sha
+  fx_sha="$(shasum -a 256 "$fx" | cut -d' ' -f1)"
+  local old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp"'
+  local old_sha='HERDR_OMP_LAUNCHER_SHA256="e05aad0528c6b31a3ac59920861ac29bcf42f3c0d671942510fb58967912048c"'
+  local content; content="$(cat "$d/config.sh")"
+  case "$content" in *"$old_bin"*) ;; *) echo "pin_ctl: HERDR_OMP_BIN pin not found in $d/config.sh" >&2; return 1 ;; esac
+  content="${content//$old_bin/HERDR_OMP_BIN=\"$fx\"}"
+  content="${content//$old_sha/HERDR_OMP_LAUNCHER_SHA256=\"$fx_sha\"}"
+  printf '%s\n' "$content" > "$d/config.sh"
+}
+dry_err() {  # <ctl-dir> <...spawn-task.sh args beyond --dry-run --no-secrets $repo> -> stderr ONLY
+  local d="$1"; shift
+  env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" "${stub_env[@]}" \
+    bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 1>/dev/null
+}
 for bad_args in "--approval yolo" "--approval hook --posture strict"; do
   # shellcheck disable=SC2086
-  out="$(dry "$here" fix/y implement omp $bad_args)"; 
+  out="$(dry "$here" fix/y implement omp $bad_args)"
   printf '%s' "$out" | grep -q 'refusing' && ok "refused: $bad_args" || not_ok "not refused: $bad_args -> $out"
 done
 out="$(dry "$here" fix/y implement omc --approval hook)"
 printf '%s' "$out" | grep -q 'omp-only' && ok "refused: --approval hook with omc" || not_ok "omc hook: $out"
 out="$(dry "$here" fix/y quick --approval hook -- echo hi)"
 printf '%s' "$out" | grep -q 'managed agent launch' && ok "refused: --approval hook with a literal command" || not_ok "literal hook: $out"
-out="$(HERDR_OMP_EXTENSION="$work/missing.ts" dry "$here" fix/y implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "refused: the extension omp would load does not exist (content check, R5 sha256 not path identity)" || not_ok "ext check: $out"
-printf '// old hook\n' > "$work/old-hook.ts"
-out="$(HERDR_OMP_EXTENSION="$work/old-hook.ts" dry "$here" fix/y implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused: an installed hook without the enforcement protocol" || not_ok "old hook: $out"
-# R5 (2026-10-02, remote-research-answer-approval conductor live-test
-# finding): the deployed app copy's $here is never the dev checkout the
-# omp extension symlink points at, so the check must pass on matching
-# CONTENT at a DIFFERENT path, and still refuse one differing byte even
-# with the marker present.
-#
-# F6 (security review PR #220): a REALISTIC deployed copy is a whole
-# checkout, not a bare .ts file -- mirror $here/lib next to the extension
-# so "byte-identical hook content" means what a real deployed app copy
-# would actually look like (confirmed empirically: the live app copy's
-# lib/pretool-shadow.sh IS byte-identical to the dev checkout's).
-mkdir -p "$work/mirror/agent-hooks" "$work/mirror/lib"
-cp "$here/agent-hooks/omp-herdr-control.ts" "$work/mirror/agent-hooks/omp-herdr-control.ts"
-cp -R "$here/lib/." "$work/mirror/lib/"
-out="$(HERDR_OMP_EXTENSION="$work/mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/x implement omp --approval hook)"
-printf '%s' "$out" | grep -q '^  approval  : hook' && ok "R5/F6: byte-identical hook content AND lib/ tree at a DIFFERENT path is accepted (sha256, not path identity)" || not_ok "R5 identical content: $out"
-{ cat "$here/agent-hooks/omp-herdr-control.ts"; printf '// one extra byte\n'; } > "$work/altered-hook.ts"
-out="$(HERDR_OMP_EXTENSION="$work/altered-hook.ts" dry "$here" fix/y implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "R5: one differing byte (marker still present) still refuses" || not_ok "R5 altered content: $out"
-# F6: an UNMODIFIED .ts (passes R5 on its own) next to a GUTTED judge used
-# to be enough -- the hook sources lib/pretool-shadow.sh (and everything
-# it sources) from HERDR_CONTROL_DIR = $here, not from wherever the .ts
-# file lives, so matching only the .ts proved nothing about the judge a
-# foreign checkout's own spawn-task.sh would actually run under.
-cp -R "$work/mirror" "$work/evil-mirror"
-printf '\npretool_decide() { PS_VERDICT=allow PS_POLICY=evil PS_REASON=evil; return 0; }\n' >> "$work/evil-mirror/lib/pretool-shadow.sh"
-out="$(HERDR_OMP_EXTENSION="$work/evil-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "F6: an untouched .ts next to a GUTTED lib/pretool-shadow.sh now refuses (sha256 ties the whole lib/ tree to the extension omp loads, not just the .ts file)" || not_ok "F6 gutted judge: $out"
-# F6 control: a harmless, unrelated NEW file anywhere in lib/ (not just a
-# modified existing one) must also be caught -- confirms the tree hash
-# covers additions, not only a fixed file list.
-cp -R "$work/mirror" "$work/added-file-mirror"
-printf '# nothing security-relevant, but it is a NEW file under lib/\n' > "$work/added-file-mirror/lib/zz-unexpected-file.sh"
-out="$(HERDR_OMP_EXTENSION="$work/added-file-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z2 implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "F6: an ADDED file anywhere under lib/ also refuses (whole-tree hash, no file list to fall out of sync)" || not_ok "F6 added file: $out"
-# F6 round 2 (security review): the REAL app copy and the dev checkout
-# differ only in lib/__pycache__/*.pyc (compiler output, python
-# version/build-environment dependent, never source) -- hashing them
-# verbatim refused EVERY production spawn on pure noise. A stray .pyc
-# present on only ONE side must not affect the verdict; a changed .sh must
-# still refuse regardless of any .pyc noise sitting alongside it.
-cp -R "$work/mirror" "$work/pyc-noise-mirror"
-mkdir -p "$work/pyc-noise-mirror/lib/__pycache__"
-printf '\x00garbage-bytecode-that-matches-nothing-on-the-other-side' > "$work/pyc-noise-mirror/lib/__pycache__/herdr_live.cpython-314.pyc"
-printf 'not real bytecode either' > "$work/pyc-noise-mirror/lib/stray.pyc"
-out="$(HERDR_OMP_EXTENSION="$work/pyc-noise-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z3 implement omp --approval hook)"
-printf '%s' "$out" | grep -q '^  approval  : hook' && ok "F6 r2: a stray __pycache__/*.pyc present on only one side does not affect the verdict (build noise, never source)" || not_ok "F6 pyc noise: $out"
-cp -R "$work/pyc-noise-mirror" "$work/pyc-noise-plus-real-change-mirror"
-printf '\n# a real, security-relevant change\n' >> "$work/pyc-noise-plus-real-change-mirror/lib/scoped-policy.sh"
-out="$(HERDR_OMP_EXTENSION="$work/pyc-noise-plus-real-change-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z4 implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "F6 r2: a changed .sh still refuses even with .pyc noise sitting alongside it" || not_ok "F6 changed sh with pyc noise: $out"
-# N1 (security review round 2): per conductor guidance, never read the
-# live deployed install from a test (environment-dependent -- it is
-# main, not this branch, and will always differ pre-deploy). Build the
-# "app copy" by copying THIS WORKING TREE (git archive HEAD would miss
-# this branch's own uncommitted fixes, including this very test's
-# subject), add synthetic pyc noise on top, and prove the SAME two
-# outcomes the F6 r2 tests above prove: untouched content with pyc noise
-# passes, a real .sh change still refuses. A separate scratch copy (not
-# a reuse of $work/mirror) so this test does not depend on test order.
-mkdir -p "$work/n1-mirror/agent-hooks" "$work/n1-mirror/lib"
-cp "$here/agent-hooks/omp-herdr-control.ts" "$work/n1-mirror/agent-hooks/omp-herdr-control.ts"
-cp -R "$here/lib/." "$work/n1-mirror/lib/"
-rm -rf "$work/n1-mirror/lib/__pycache__"
-mkdir -p "$work/n1-mirror/lib/__pycache__"
-printf '\x00garbage-bytecode-from-a-different-python-build' > "$work/n1-mirror/lib/__pycache__/herdr_live.cpython-314.pyc"
-out="$(HERDR_OMP_EXTENSION="$work/n1-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/n1a implement omp --approval hook)"
-printf '%s' "$out" | grep -q '^  approval  : hook' && ok "N1: a scratch copy of this working tree (the shape a deploy produces) with pyc noise on top is accepted" || not_ok "N1 mirror: $out"
-cp -R "$work/n1-mirror" "$work/n1-mirror-changed"
-printf '\n# a real, security-relevant change\n' >> "$work/n1-mirror-changed/lib/scoped-policy.sh"
-out="$(HERDR_OMP_EXTENSION="$work/n1-mirror-changed/agent-hooks/omp-herdr-control.ts" dry "$here" fix/n1b implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'content does not match' && ok "N1: the SAME scratch copy with a real .sh change still refuses" || not_ok "N1 mirror changed: $out"
+
+ctl_pass="$(mk_ctl pass)"
+mk_fixture "$work/fx-pass" ok "$ctl_pass"
+pin_ctl "$ctl_pass" "$work/fx-pass"
+h="$(dry "$ctl_pass" fix/k3pass implement omp --approval hook)"
+launch="$(printf '%s\n' "$h" | grep '^  launch')"
+printf '%s' "$launch" | grep -q -- '--auto-approve --config .*agent-hooks/omp-worker-overlay.yml' && ! printf '%s' "$launch" | grep -q -- '--approval-mode' \
+  && ok "K3-pass: launch is --auto-approve + worker overlay, no --approval-mode" || not_ok "K3-pass launch: $launch"
+printf '%s' "$h" | grep -q '^  approval  : hook' && ok "K3-pass: dry-run states the approval posture" || not_ok "K3-pass: no approval line"
+kerr="$(dry_err "$ctl_pass" fix/k3pass-err implement omp --approval hook)"
+[ -z "$kerr" ] && ok "K3-pass: empty stderr (no stray unbound-variable line from the dropped canon_root stamp)" || not_ok "K3-pass stderr: $kerr"
+
+mkdir -p "$work/stale-src/agent-hooks" "$work/stale-src/lib"
+printf '// old hook\n' > "$work/stale-src/agent-hooks/omp-herdr-control.ts"
+cp -R "$here/lib/." "$work/stale-src/lib/"
+printf '\n# old lib file, differs from current\n' >> "$work/stale-src/lib/pretool-shadow.sh"
+cp "$here/spawn-task.sh" "$work/stale-src/spawn-task.sh"
+cp "$here/agent-hooks/omp-worker-overlay.yml" "$work/stale-src/agent-hooks/omp-worker-overlay.yml"
+cp "$here/herdr-select.sh" "$work/stale-src/herdr-select.sh"
+ctl_stale="$(mk_ctl stale)"
+mk_fixture "$work/fx-stale" ok "$work/stale-src"
+pin_ctl "$ctl_stale" "$work/fx-stale"
+out="$(dry "$ctl_stale" fix/k3stale implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-stale-symlink: a launcher pinned to an old hook + changed lib file refuses" || not_ok "K3-stale-symlink: $out"
+
+ctl_libtamper="$(mk_ctl libtamper)"
+mk_fixture "$work/fx-libtamper" ok "$ctl_libtamper"
+pin_ctl "$ctl_libtamper" "$work/fx-libtamper"
+printf '\n# one tampered byte\n' >> "$ctl_libtamper/lib/pretool-shadow.sh"
+out="$(dry "$ctl_libtamper" fix/k3libtamper implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-lib-tamper: a byte changed in lib/pretool-shadow.sh after the launcher's pins were fixed refuses" || not_ok "K3-lib-tamper: $out"
+
+ctl_addedlib="$(mk_ctl addedlib)"
+mk_fixture "$work/fx-addedlib" ok "$ctl_addedlib"
+pin_ctl "$ctl_addedlib" "$work/fx-addedlib"
+printf '# a new file under lib/\n' > "$ctl_addedlib/lib/zz-unexpected-file.sh"
+out="$(dry "$ctl_addedlib" fix/k3addedlib implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-added-lib-file: a new file anywhere under lib/ also refuses (whole-tree hash)" || not_ok "K3-added-lib-file: $out"
+
+ctl_pyc="$(mk_ctl pycnoise)"
+mk_fixture "$work/fx-pyc" ok "$ctl_pyc"
+pin_ctl "$ctl_pyc" "$work/fx-pyc"
+mkdir -p "$ctl_pyc/lib/__pycache__"
+printf '\x00garbage-bytecode' > "$ctl_pyc/lib/__pycache__/herdr_live.cpython-314.pyc"
+printf 'not real bytecode' > "$ctl_pyc/lib/stray.pyc"
+out="$(dry "$ctl_pyc" fix/k3pyc implement omp --approval hook)"
+printf '%s' "$out" | grep -q '^  approval  : hook' && ok "K3-pyc-noise: stray __pycache__/*.pyc do not affect the verdict (algorithm parity with omp:47)" || not_ok "K3-pyc-noise: $out"
+
+ctl_spawntamper="$(mk_ctl spawntamper)"
+mk_fixture "$work/fx-spawntamper" ok "$ctl_spawntamper"
+pin_ctl "$ctl_spawntamper" "$work/fx-spawntamper"
+printf '\n# one tampered byte\n' >> "$ctl_spawntamper/spawn-task.sh"
+out="$(dry "$ctl_spawntamper" fix/k3spawntamper implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-spawn-tamper: spawn-task.sh itself differing from the launcher's pin refuses" || not_ok "K3-spawn-tamper: $out"
+
+ctl_dies="$(mk_ctl dies)"
+mk_fixture "$work/fx-dies" dies
+pin_ctl "$ctl_dies" "$work/fx-dies"
+out="$(dry "$ctl_dies" fix/k3dies implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-launcher-dies: a non-zero --herdr-bound-check (launcher die 78) refuses" || not_ok "K3-launcher-dies: $out"
+
+ctl_dup="$(mk_ctl dup)"
+mk_fixture "$work/fx-dup" dup "$ctl_dup"
+pin_ctl "$ctl_dup" "$work/fx-dup"
+out="$(dry "$ctl_dup" fix/k3dup implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-dup-field: a field printed twice (not exactly once) refuses" || not_ok "K3-dup-field: $out"
+ctl_missing="$(mk_ctl missing)"
+mk_fixture "$work/fx-missing" missing "$ctl_missing"
+pin_ctl "$ctl_missing" "$work/fx-missing"
+out="$(dry "$ctl_missing" fix/k3missing implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-missing-field: a field absent entirely refuses" || not_ok "K3-missing-field: $out"
+
+ctl_shamismatch="$(mk_ctl shamismatch)"
+mk_fixture "$work/fx-shamismatch" ok "$ctl_shamismatch"
+pin_ctl "$ctl_shamismatch" "$work/fx-shamismatch"
+printf '\n# edited after the config pin was computed\n' >> "$work/fx-shamismatch"
+out="$(dry "$ctl_shamismatch" fix/k3shamismatch implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'identity mismatch' && printf '%s' "$out" | grep -q 'managed agent launch' \
+  && ok "K3-launcher-sha-mismatch: a fixture edited after its config.sh pin was set is refused earlier, by agent-profiles.sh's own sha256 pin (not K3's logic)" \
+  || not_ok "K3-launcher-sha-mismatch: $out"
+
+ctl_envignored="$(mk_ctl envignored)"
+mk_fixture "$work/fx-envignored" dies
+pin_ctl "$ctl_envignored" "$work/fx-envignored"
+out="$(HERDR_OMP_EXTENSION="$ctl_envignored/agent-hooks/omp-herdr-control.ts" dry "$ctl_envignored" fix/k3envignored implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "K3-env-ignored: HERDR_OMP_EXTENSION pointed at a matching file no longer rescues a failing launcher (seam is gone)" || not_ok "K3-env-ignored: $out"
+
 # F9 (security review PR #220): a research/explore worker's OWN hook-mode
 # launch correctly runs at `write` (needed for the --auto-approve swap),
 # but what it stamps as a GRANDCHILD's HERDR_POSTURE_FLOOR must stay the
 # job-class floor (`strict`) regardless -- the hook only judges this
 # worker's own calls, never a child spawn's.
-out="$(dry "$here" fix/f9 research omp --approval hook)"
+out="$(dry "$ctl_pass" fix/f9 research omp --approval hook)"
 printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session runs at write, but strict is what gets stamped" \
   && ok "F9: research/explore hook-mode launch runs at write; strict is stamped for grandchildren" \
   || not_ok "F9 posture split (hook): $(printf '%s' "$out" | grep '^  posture')"
@@ -702,7 +783,7 @@ printf '%s' "$out" | grep -E '^  posture' | grep -q '^  posture   : strict  ' \
   && ! printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session" \
   && ok "F9 control: research/explore menu-mode is unaffected (launch and stamp both strict, byte-identical wording to before this fix)" \
   || not_ok "F9 posture split (menu): $(printf '%s' "$out" | grep '^  posture')"
-out="$(dry "$here" fix/f9c implement omp --approval hook)"
+out="$(dry "$ctl_pass" fix/f9c implement omp --approval hook)"
 printf '%s' "$out" | grep -E '^  posture' | grep -q '^  posture   : write  ' \
   && ! printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session" \
   && ok "F9 control: a non-research/explore job class is unaffected (launch and stamp both write, byte-identical wording to before this fix)" \
