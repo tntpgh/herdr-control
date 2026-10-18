@@ -281,58 +281,50 @@ case "$approval_req" in
     [ "$eff_posture" = write ] || { echo "spawn-task: --approval hook requires the write posture floor (effective: $eff_posture) — refusing rather than loosening or re-interpreting it" >&2; exit 2; }
     worker_overlay="$here/agent-hooks/omp-worker-overlay.yml"
     [ -r "$worker_overlay" ] || { echo "spawn-task: --approval hook: worker overlay missing ($worker_overlay)" >&2; exit 2; }
-    # --auto-approve is only safe if the extension omp will load at session
-    # start IS this checkout's enforcing hook: otherwise (an older main
-    # checkout, a missing or foreign symlink) the worker runs with no judge.
+    # --auto-approve is only safe if the BOUND launcher (agent-profiles.sh
+    # :447-450 already sha256-pins HERDR_OMP_BIN before cli_for_agent ever
+    # returns) will actually load THIS checkout's hook, lib/ tree,
+    # spawn-task.sh, worker overlay and selector -- otherwise the worker
+    # runs --auto-approve with no judge, or a stale/foreign one.
     #
-    # remote-research-answer-approval (2026-10-02, conductor live-test
-    # finding): compared by PATH identity until this fix, which refused
-    # every production spawn -- the publisher runs tasks.py from the
-    # deployed app copy (~/.local/share/herdr-control/app), so $here there
-    # is NOT ~/Code/herdr-control, yet ~/.omp/agent/extensions/herdr-control.ts
-    # is symlinked to the latter. Compare by CONTENT (sha256) instead: sound
-    # because spawn-task.sh stamps HERDR_CONTROL_DIR=$here below, so the
-    # hook's library root (lib/pretool-shadow.sh, etc.) comes from $here
-    # regardless of which byte-identical copy of the .ts file omp actually
-    # loaded. Still refuses on a missing/unreadable file, any byte
-    # difference, or a missing enforcement-protocol marker.
-    #
-    # F6 (security review PR #220): matching only the .ts file proves
-    # nothing about the JUDGE it loads -- the hook sources lib/pretool-
-    # shadow.sh (and everything it sources in turn: command-policy.sh,
-    # hook-approval-rules.tsv, bash-write-targets.sh, ...) from
-    # HERDR_CONTROL_DIR, i.e. $here, not from wherever the .ts file itself
-    # lives. A foreign checkout with an untouched .ts but a gutted
-    # lib/pretool-shadow.sh passed the check above and then ran under its
-    # own gutted judge. Tie $here's WHOLE lib/ tree (every file the judge
-    # loads, present and future, with no file list to keep in sync here) to
-    # the lib/ tree sitting next to the extension omp actually resolved —
-    # and stamp HERDR_CONTROL_DIR to THAT validated directory below, never
-    # the raw, unvalidated $here.
-    omp_ext="${HERDR_OMP_EXTENSION:-$HOME/.omp/agent/extensions/herdr-control.ts}"
-    omp_ext_real="$(cd "$(dirname "$omp_ext")" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$omp_ext" 2>/dev/null)"
-    here_hook="$here/agent-hooks/omp-herdr-control.ts"
-    omp_ext_sha="$(shasum -a 256 "$omp_ext_real" 2>/dev/null | cut -d' ' -f1)"
-    here_hook_sha="$(shasum -a 256 "$here_hook" 2>/dev/null | cut -d' ' -f1)"
-    _herdr_tree_sha() {  # dir -> sha256 of (relpath, content-sha256) for every regular SOURCE file, sorted by relpath
-      local d="$1"
-      [ -d "$d" ] || return 1
-      # __pycache__/*.pyc are compiler output, not source -- they differ by
-      # python version/mtime/build environment between two otherwise
-      # byte-identical checkouts (confirmed: the real app copy and the dev
-      # checkout differ ONLY in a stray .pyc), so hashing them refused
-      # every production spawn on pure noise. Skip anything a worktree's
-      # own .gitignore already treats as build output, never source.
-      ( cd "$d" && find . -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' \
+    # K3 (2026-10-18, replacing the prior PATH/symlink-then-content compare
+    # of ~/.omp/agent/extensions/herdr-control.ts): that compare checked an
+    # artifact nothing in production ever loads -- a bound worker launches
+    # with --no-extensions -e <release copies> (omp:76-78) and the release
+    # hook pinned by hook_sha (omp:19,42-44), so every real --approval hook
+    # spawn refused despite a correct install, while the old comparison
+    # proved nothing about what actually runs. Ask the bound launcher
+    # itself what it will serve (--herdr-bound-check) and compare that to
+    # $here's own content: sound because the launcher's $control is
+    # hardcoded (omp:11, not $here) and re-exported immediately before exec
+    # (omp:74), so matching $here to the launcher's self-report ties the
+    # artifact actually served to the one sitting in this checkout. No env
+    # seam: HERDR_OMP_BIN comes from config.sh only (no override, no
+    # fallback) -- hook mode requires the bound launcher or nothing.
+    bc="$("$HERDR_OMP_BIN" --herdr-bound-check 2>/dev/null)"; bc_rc=$?
+    field() { printf '%s\n' "$bc" | awk -F= -v k="$1" '$1==k{print substr($0,length(k)+2); n++} END{exit n!=1}'; }
+    want_hook=$(field hook); want_lib=$(field lib_tree); want_spawn=$(field spawn)
+    want_ovl=$(field overlay); want_sel=$(field selector)
+    # Mirrors omp:47 exactly (cd into the target, `find lib -type f ...`,
+    # relpaths like `lib/x`) -- the OLD `_herdr_tree_sha` helper cd'd into
+    # lib/ itself and listed `./x`, a different hash input for an identical
+    # tree (R1, security review r2). __pycache__/*.pyc/*.pyo/.DS_Store are
+    # compiler/OS output, never source, and differ by build environment
+    # between two otherwise byte-identical checkouts.
+    lib_tree_sha_as_launcher() {
+      ( cd "$1" && find lib -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' \
           | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) 2>/dev/null | shasum -a 256 | cut -d' ' -f1
     }
-    canon_root="$(cd "$(dirname "$omp_ext_real")/.." 2>/dev/null && pwd)"
-    here_lib_sha="$(_herdr_tree_sha "$here/lib")"
-    canon_lib_sha="$(_herdr_tree_sha "$canon_root/lib")"
-    if [ -z "$omp_ext_real" ] || [ -z "$omp_ext_sha" ] || [ "$omp_ext_sha" != "$here_hook_sha" ] \
-       || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null \
-       || [ -z "$canon_root" ] || [ -z "$here_lib_sha" ] || [ -z "$canon_lib_sha" ] || [ "$here_lib_sha" != "$canon_lib_sha" ]; then
-      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, whose content does not match this checkout's enforcing hook ($here_hook), or whose lib/ judge tree at $here does not match the lib/ tree next to it — refusing an --auto-approve worker with no judge" >&2
+    if [ "$bc_rc" = 0 ] && [ -n "$want_hook" ] && [ -n "$want_lib" ] && [ -n "$want_spawn" ] && [ -n "$want_ovl" ] && [ -n "$want_sel" ] \
+       && [ "$want_hook" = "$(shasum -a 256 "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null | cut -d' ' -f1)" ] \
+       && [ "$want_lib" = "$(lib_tree_sha_as_launcher "$here")" ] \
+       && [ "$want_spawn" = "$(shasum -a 256 "$here/spawn-task.sh" 2>/dev/null | cut -d' ' -f1)" ] \
+       && [ "$want_ovl" = "$(shasum -a 256 "$worker_overlay" 2>/dev/null | cut -d' ' -f1)" ] \
+       && [ "$want_sel" = "$(shasum -a 256 "$here/herdr-select.sh" 2>/dev/null | cut -d' ' -f1)" ] \
+       && grep -qF 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null; then
+      :
+    else
+      echo "spawn-task: --approval hook: omp (\$HERDR_OMP_BIN) would not load this checkout's hook, lib/ tree, spawn-task.sh, worker overlay or selector — refusing an --auto-approve worker with no judge" >&2
       exit 2
     fi
     case "$cli" in
@@ -1139,7 +1131,12 @@ true
 #     see the SAME value for this worker, never a bare unset default.
 stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q HERDR_BOUND_BASH=%q' \
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$stamp_posture" "$HERDR_BOUND_BASH")
-[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$canon_root")"
+# HERDR_CONTROL_DIR is never stamped here: omp:74 unconditionally
+# re-exports it to the launcher's own hardcoded $control right before
+# exec, overriding anything the worker's shell carried -- a stamped value
+# was always dead by the time the hook ever ran (security review r2,
+# K3 :1142 finding).
+[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook"
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a

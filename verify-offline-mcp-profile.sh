@@ -56,6 +56,42 @@ grep -q 'enableProjectConfig: *false' "$profile_path" \
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
 wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
 
+# ---- K3 (2026-10-18): --approval hook needs a launcher whose own
+# --herdr-bound-check matches $here's content; no HERDR_OMP_EXTENSION env
+# seam exists anymore. Build ONE isolated copy of this checkout with a
+# fixture launcher that reports pins computed from that copy's own
+# content, pinned into that copy's OWN config.sh (production config.sh is
+# never touched). Every hook-mode call below runs against $ctl, not $here.
+ctl_work=$(mktemp -d); trap 'rm -rf "$ctl_work"' EXIT
+ctl="$ctl_work/ctl"; mkdir -p "$ctl"; cp -R "$here/." "$ctl/"
+rm -rf "$ctl/.git"; find "$ctl" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+ctl_lib_tree_sha() {
+  ( cd "$ctl" && find lib -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' \
+      | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) 2>/dev/null | shasum -a 256 | cut -d' ' -f1
+}
+ctl_fx="$ctl_work/fake-omp"
+cat > "$ctl_fx" <<EOF
+#!/bin/bash
+[ "\${1:-}" = --herdr-bound-check ] || exit 1
+printf 'hook=%s\nlib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' \
+  "$(shasum -a 256 "$ctl/agent-hooks/omp-herdr-control.ts" | cut -d' ' -f1)" \
+  "$(ctl_lib_tree_sha)" \
+  "$(shasum -a 256 "$ctl/spawn-task.sh" | cut -d' ' -f1)" \
+  "$(shasum -a 256 "$ctl/agent-hooks/omp-worker-overlay.yml" | cut -d' ' -f1)" \
+  "$(shasum -a 256 "$ctl/herdr-select.sh" | cut -d' ' -f1)"
+EOF
+chmod +x "$ctl_fx"
+ctl_fx_sha="$(shasum -a 256 "$ctl_fx" | cut -d' ' -f1)"
+ctl_old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp"'
+ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="3895279b403ba7c9193a496517d55ae7dd1e40d103ab249fc2347ce2065224a7"'
+ctl_cfg="$(cat "$ctl/config.sh")"
+case "$ctl_cfg" in *"$ctl_old_bin"*) ;; *) echo "FATAL: HERDR_OMP_BIN pin not found in $ctl/config.sh" >&2; exit 1 ;; esac
+ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"
+ctl_cfg="${ctl_cfg//$ctl_old_sha/HERDR_OMP_LAUNCHER_SHA256=\"$ctl_fx_sha\"}"
+printf '%s\n' "$ctl_cfg" > "$ctl/config.sh"
+ctl_profile_path="$ctl/lib/offline-mcp-profile.yml"
+ctl_wt_overlay="$ctl/agent-hooks/omp-worker-overlay.yml"
+
 dry_launch() {  # <job-class> [extra spawn-task.sh args...] -> the "launch :" line
   local job="$1"; shift
   HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
@@ -73,12 +109,12 @@ for j in review debug explore; do
 done
 
 printf '== spawn-task.sh --dry-run: explore + --approval hook keeps BOTH --config flags (review regression fix) ==\n'
-launch_line="$(HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts" HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-  bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-explore-hook-$$" explore omp --approval hook 2>&1)"
+launch_line="$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
+  bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-explore-hook-$$" explore omp --approval hook 2>&1)"
 case "$launch_line" in
   *"could not find the write-floor approval flag"*)
     bad "explore + --approval hook: the hook block's suffix match broke (regression reproduced): $launch_line" ;;
-  *"--auto-approve"*"--config"*"omp-worker-overlay.yml"*"--config $profile_path"*)
+  *"--auto-approve"*"--config"*"omp-worker-overlay.yml"*"--config $ctl_profile_path"*)
     ok "explore + --approval hook: --auto-approve, the hook's own worker overlay, AND the offline MCP overlay are all present" ;;
   *) bad "explore + --approval hook: unexpected launch line: $launch_line" ;;
 esac
@@ -103,20 +139,20 @@ for j in $KNOWN_JOB_CLASSES; do
         secret_env=(env -u HERDR_SECRETS_WITHHELD)
         secret_flag=(--secrets)
       fi
+      target="$here"; want_profile_path="$profile_path"
       if [ "$appr" = hook ]; then
         extra=(--approval hook ${secret_flag[@]+"${secret_flag[@]}"})
-        ext_env=(HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts")
+        target="$ctl"; want_profile_path="$ctl_profile_path"
       else
         extra=(${secret_flag[@]+"${secret_flag[@]}"})
-        ext_env=()
       fi
       # ${arr[@]+"${arr[@]}"} (not bare "${arr[@]}"): under `set -u`, bash
       # before 4.4 treats an EMPTY array's [@] expansion as an unbound
-      # variable, not an empty list -- every menu-mode row (ext_env=())
+      # variable, not an empty list -- every menu-mode row (extra=())
       # aborted the command with "unbound variable" and left $out empty.
       # Found by live review: "every */menu/* matrix row ... EMPTY output".
-      out="$("${secret_env[@]}" ${ext_env[@]+"${ext_env[@]}"} HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-        bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-mx-$j-$appr-$sec-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1)"
+      out="$("${secret_env[@]}" HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
+        bash "$target/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-mx-$j-$appr-$sec-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1)"
       row="$j/$appr/$sec"
       case "$out" in
         *"could not find the write-floor approval flag"*)
@@ -126,7 +162,7 @@ for j in $KNOWN_JOB_CLASSES; do
           [ "$(offline_mcp_profile_for_job "$j")" = 1 ] && want_overlay=1
           [ "$sec" = withheld ] && want_overlay=1
           has_overlay=0
-          case "$out" in *"--config $profile_path"*) has_overlay=1 ;; esac
+          case "$out" in *"--config $want_profile_path"*) has_overlay=1 ;; esac
           if [ "$want_overlay" = "$has_overlay" ]; then
             : # fine, counted in the summary line below
           else
@@ -167,15 +203,18 @@ launcher_allows_argv() {  # <overlay-path> <offline-overlay-path> -- <rest of th
 wt_overlay="$here/agent-hooks/omp-worker-overlay.yml"
 for j in review debug explore; do
   for appr in menu hook; do
-    extra=(); [ "$appr" = hook ] && extra=(--approval hook)
-    cli_tail="$(HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts" HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-      bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-launcher-$j-$appr-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1 \
+    extra=(); target="$here"; use_wt_overlay="$wt_overlay"; use_profile_path="$profile_path"
+    if [ "$appr" = hook ]; then
+      extra=(--approval hook); target="$ctl"; use_wt_overlay="$ctl_wt_overlay"; use_profile_path="$ctl_profile_path"
+    fi
+    cli_tail="$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
+      bash "$target/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-launcher-$j-$appr-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1 \
       | sed -n 's/^  launch    : //p')"
     [ -n "$cli_tail" ] || { bad "$j/$appr: no launch line to test the launcher against"; continue; }
     eval "argv=($cli_tail)"
     # argv[0] is the omp binary path itself (what the pane actually execs);
     # the launcher's own guard scans everything AFTER it, i.e. its own "$@".
-    if launcher_allows_argv "$wt_overlay" "$profile_path" "${argv[@]:1}"; then
+    if launcher_allows_argv "$use_wt_overlay" "$use_profile_path" "${argv[@]:1}"; then
       ok "$j/$appr: the real launcher's argv-scan accepts this composed launch line"
     else
       bad "$j/$appr: the real launcher would REJECT this composed launch line ($_guard_fail): ${argv[*]:1}"

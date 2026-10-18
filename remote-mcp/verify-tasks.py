@@ -31,8 +31,28 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
-BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-18-capconst-v25/omp")
-BOUND_LAUNCHER_SHA256 = "c7d12661d65499507472664224853fbff3ad62ea14f17e11a7531104f1a3cd25"
+BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp")
+BOUND_LAUNCHER_SHA256 = "3895279b403ba7c9193a496517d55ae7dd1e40d103ab249fc2347ce2065224a7"
+
+
+def _lib_tree_sha(control: Path) -> str:
+    """Mirrors spawn-task.sh's lib_tree_sha_as_launcher / the bound
+    launcher's own omp:47 formula exactly (verified byte-identical output
+    against the bash implementation): sorted relpaths under lib/, skipping
+    compiler/OS noise that is never source."""
+    buf = b""
+    files = []
+    for p in (control / "lib").rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(control).as_posix()
+        if "__pycache__" in rel or rel.endswith((".pyc", ".pyo")) or p.name == ".DS_Store":
+            continue
+        files.append(rel)
+    for rel in sorted(files):
+        h = hashlib.sha256((control / rel).read_bytes()).hexdigest()
+        buf += f"{h}  {rel}\n".encode()
+    return hashlib.sha256(buf).hexdigest()
 
 
 def _isolated_control(name: str) -> tuple[Path, Path, Path]:
@@ -41,18 +61,33 @@ def _isolated_control(name: str) -> tuple[Path, Path, Path]:
     Production config stays non-overridable and byte-untouched. The clean CI
     runner gets a test-only config whose absolute launcher and digest are both
     explicit, so the real parser is exercised without a production escape hatch.
+    The fixture launcher implements --herdr-bound-check (K3, 2026-10-18) by
+    reporting pins computed from THIS copy's own content, so a hook-mode
+    --approval hook spawn against an isolated control sees a launcher that
+    actually matches it -- there is no HERDR_OMP_EXTENSION seam to do that
+    for the caller anymore.
     """
     control = TMP / f"control-{name}"
     shutil.copytree(HERE.parent, control, ignore=shutil.ignore_patterns(".git", "node_modules", "__pycache__"))
     home = TMP / f"home-{name}"
     target = home / BOUND_RELEASE_REL
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("#!/bin/sh\nexit 99\n")
+    hook_sha = hashlib.sha256((control / "agent-hooks/omp-herdr-control.ts").read_bytes()).hexdigest()
+    lib_sha = _lib_tree_sha(control)
+    spawn_sha = hashlib.sha256((control / "spawn-task.sh").read_bytes()).hexdigest()
+    overlay_sha = hashlib.sha256((control / "agent-hooks/omp-worker-overlay.yml").read_bytes()).hexdigest()
+    selector_sha = hashlib.sha256((control / "herdr-select.sh").read_bytes()).hexdigest()
+    target.write_text(
+        "#!/bin/sh\n"
+        '[ "${1:-}" = --herdr-bound-check ] || exit 99\n'
+        "printf 'hook=%s\\nlib_tree=%s\\nspawn=%s\\noverlay=%s\\nselector=%s\\n' "
+        f"{hook_sha} {lib_sha} {spawn_sha} {overlay_sha} {selector_sha}\n"
+    )
     target.chmod(0o755)
     fixture_sha = hashlib.sha256(target.read_bytes()).hexdigest()
     config = control / "config.sh"
     text = config.read_text()
-    old_bin = 'HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-18-capconst-v25/omp"'
+    old_bin = 'HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp"'
     old_sha = f'HERDR_OMP_LAUNCHER_SHA256="{BOUND_LAUNCHER_SHA256}"'
     assert text.count(old_bin) == 1 and text.count(old_sha) == 1
     config.write_text(text.replace(old_bin, f'HERDR_OMP_BIN="{target}"').replace(
@@ -345,15 +380,14 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
         real_spawn = str(control / "spawn-task.sh")
         # research now spawns with --approval hook (remote-research-answer-
         # answer-approval, 2026-10-02): spawn-task.sh's own safety check
-        # refuses --auto-approve unless the omp extension it would load IS
-        # this checkout's enforcing hook (never true for ~/.omp/agent/
-        # extensions/herdr-control.ts, which is normally symlinked to the
-        # deployed MAIN checkout, not this test's worktree) --
-        # HERDR_OMP_EXTENSION overrides that lookup for exactly this reason
-        # (same seam verify-pretool-enforce.sh's own hook dry-run tests use).
+        # refuses --auto-approve unless the bound launcher's own
+        # --herdr-bound-check report matches this checkout's hook/lib/
+        # spawn/overlay/selector content (K3, 2026-10-18) -- no env seam.
+        # _isolated_control's fixture launcher reports pins computed from
+        # its OWN copy's content for exactly this reason, so this isolated
+        # copy matches itself with no override needed.
         hook_env = {**os.environ, "HOME": str(fixture_home),
-                    "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs"),
-                    "HERDR_OMP_EXTENSION": str(control / "agent-hooks" / "omp-herdr-control.ts")}
+                    "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs")}
         for argv in captured:
             brief.write_text("objective\n")  # _spawn unlinks its brief once spawn-task.sh returns
             out = subprocess.run(["bash", real_spawn, *argv[1:], "--dry-run"], capture_output=True, text=True,
