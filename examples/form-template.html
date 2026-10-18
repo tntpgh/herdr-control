@@ -87,14 +87,26 @@
   // The whole contract: gather whatever shape you want, call submitAnswers().
   // formserve.py injects that function; it POSTs to /submit, disables the form,
   // and shows a confirmation. The agent gets this object as JSON on stdout.
+  //
+  // Collected GENERICALLY from the form's own field names — never retyped by
+  // hand — so a copied template whose questions get renamed can't silently
+  // send the wrong key (2026-10-18: a radio named `pilot` here, a script
+  // still sending `choice`, saved {choice:null} and the row still answered).
+  // formserve/hub now also validate every `required` field server-side, but
+  // the fix starts here: there is no second name to keep in sync.
+  function collectAnswers(form) {
+    var out = Object.fromEntries(new FormData(form).entries());
+    // Unchecked checkboxes are OMITTED from FormData entirely, so a plain
+    // fromEntries() would just drop the key — walk them explicitly instead.
+    form.querySelectorAll("input[type=checkbox]").forEach(function (cb) {
+      out[cb.name] = cb.checked;
+    });
+    return out;
+  }
+
   document.getElementById("f").addEventListener("submit", function (e) {
     e.preventDefault();
-    var fd = new FormData(e.target);
-    window.submitAnswers({
-      choice: fd.get("choice"),
-      confirmed: fd.get("confirmed") === "on",
-      notes: (fd.get("notes") || "").trim(),
-    });
+    window.submitAnswers(collectAnswers(e.target));
   });
 
   document.getElementById("cancel").addEventListener("click", function () {

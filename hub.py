@@ -71,6 +71,7 @@ from record_store import NotClaimable, claim_and_update  # noqa: E402
 import herdr_live  # noqa: E402
 import conductor_prompt as _cp  # noqa: E402
 from form_theme import force_dark  # noqa: E402
+from form_schema import validate_answers  # noqa: E402
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr"))
@@ -1275,15 +1276,23 @@ HUB_SUBMIT_SHIM = """
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error(r.status + ": " + t); });
-      document.querySelectorAll("button,input,select,textarea").forEach(function (el) { el.disabled = true; });
-      var b = document.createElement("div");
-      b.setAttribute("role", "status");
-      b.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
-        "font:600 14px system-ui,sans-serif;text-align:center;background:#1f6e7e;color:#fff";
-      b.textContent = "Answer recorded in the hub. The agent has been notified.";
-      document.body.appendChild(b);
-      return true;
+      return r.text().then(function (t) {
+        var data = {};
+        try { data = JSON.parse(t); } catch (e) {}
+        if (!r.ok) throw new Error((data && data.error) || (r.status + ": " + t));
+        document.querySelectorAll("button,input,select,textarea").forEach(function (el) { el.disabled = true; });
+        var b = document.createElement("div");
+        b.setAttribute("role", "status");
+        b.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
+          "font:600 14px system-ui,sans-serif;text-align:center;background:#1f6e7e;color:#fff";
+        var saved = data.answers || {};
+        var pairs = Object.keys(saved).map(function (k) { return k + "=" + saved[k]; }).join(", ");
+        b.textContent = body.cancelled
+          ? "Cancelled. The agent has been notified."
+          : "Saved: " + pairs + ". The agent has been notified.";
+        document.body.appendChild(b);
+        return true;
+      });
     }).catch(function (e) {
       var b = document.createElement("div");
       b.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
@@ -1361,6 +1370,16 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
     submitted = payload.pop("__formserve_token", None)
     if not token or not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
         return 403, b"forbidden: missing or invalid token"
+    # Validate BEFORE claiming status=answered (contract point 2): same rule,
+    # same schema as formserve's own /submit — see lib/form_schema.py. A
+    # failing submit stays `open` so the human can retry, instead of
+    # recording the plausible-looking wrong answer the 2026-10-18 pilot
+    # incident did.
+    cancelled = payload.get("cancelled") is True
+    if not cancelled:
+        err = validate_answers(row.get("schema"), payload)
+        if err:
+            return 400, json.dumps({"ok": False, "error": err}).encode()
     # The status read above is already stale — formserve's own port may answer
     # between it and this line. claim_and_update re-reads under an exclusive
     # lock and writes via rename, so the loser genuinely loses (409) instead of
@@ -1377,10 +1396,9 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
         exp = row.get("expires_at")
         if isinstance(exp, (int, float)) and exp > 0 and time.time() * 1000 > exp:
             raise NotClaimable("expired", row)
-        row.update(status="answered", answers=payload,
+        row.update(status="cancelled" if cancelled else "answered", answers=payload,
                    answered_at=int(time.time() * 1000), answered_via="hub")
         return row
-
     try:
         row = claim_and_update(path, _answer)
     except NotClaimable as e:
@@ -1398,7 +1416,7 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
     key = _sidecar_key(row.get("form_path"))
     if key and key.startswith(RATINGS_KEY_PREFIX):
         _dispatch_ratings_answer(key[len(RATINGS_KEY_PREFIX):], row)
-    return 200, b'{"ok":true}'
+    return 200, json.dumps({"ok": True, "answers": row.get("answers") or {}}).encode()
 
 
 def notify_owner(row: dict) -> None:

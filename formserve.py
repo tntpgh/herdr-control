@@ -54,6 +54,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 from record_store import NotClaimable, claim_and_update  # noqa: E402
 from form_theme import force_dark  # noqa: E402
+from form_schema import parse_schema, validate_answers  # noqa: E402
 
 # Injected before </body> so a served page needs no boilerplate to answer back.
 SHIM = """
@@ -73,19 +74,27 @@ SHIM = """
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(function (r) {
-      if (!r.ok) throw new Error("submit failed: " + r.status);
-      document.querySelectorAll("button,input,select,textarea").forEach(function (el) {
-        el.disabled = true;
+      return r.text().then(function (t) {
+        var data = {};
+        try { data = JSON.parse(t); } catch (e) {}
+        if (!r.ok) throw new Error((data && data.error) || (r.status + ": " + t));
+        document.querySelectorAll("button,input,select,textarea").forEach(function (el) {
+          el.disabled = true;
+        });
+        var banner = document.createElement("div");
+        banner.setAttribute("role", "status");
+        banner.style.cssText =
+          "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
+          "font:600 14px system-ui,-apple-system,sans-serif;text-align:center;" +
+          "background:#1f6e7e;color:#fff";
+        var saved = data.answers || {};
+        var pairs = Object.keys(saved).map(function (k) { return k + "=" + saved[k]; }).join(", ");
+        banner.textContent = body.cancelled
+          ? "Cancelled. You can close this pane."
+          : "Saved: " + pairs + ". You can close this pane.";
+        document.body.appendChild(banner);
+        return true;
       });
-      var banner = document.createElement("div");
-      banner.setAttribute("role", "status");
-      banner.style.cssText =
-        "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
-        "font:600 14px system-ui,-apple-system,sans-serif;text-align:center;" +
-        "background:#1f6e7e;color:#fff";
-      banner.textContent = "Answers sent back to the terminal. You can close this pane.";
-      document.body.appendChild(banner);
-      return true;
     }).catch(function (e) {
       // Surfacing the failure matters: a silent one leaves the agent blocking on
       // a submit that never arrives, which reads as a hang rather than an error.
@@ -103,7 +112,7 @@ SHIM = """
 """
 
 
-def build_handler(html: bytes, result: dict, done: threading.Event, token: str):
+def build_handler(html: bytes, result: dict, done: threading.Event, token: str, schema: dict):
     class Handler(BaseHTTPRequestHandler):
         # default logging writes a line per asset request into the agent's stdout
         def log_message(self, *_args):
@@ -158,6 +167,17 @@ def build_handler(html: bytes, result: dict, done: threading.Event, token: str):
             if not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
                 self._send(403, b"forbidden: missing or invalid token")
                 return
+            # Validate BEFORE claiming status=answered (contract point 2): a
+            # row that fails validation stays `open` so the human can retry,
+            # rather than recording a plausible-looking but wrong answer the
+            # way the pilot form's name mismatch did on 2026-10-18.
+            cancelled = isinstance(payload, dict) and payload.get("cancelled") is True
+            if not cancelled:
+                err = validate_answers(schema, payload)
+                if err:
+                    self._send(400, json.dumps({"ok": False, "error": err}).encode(),
+                               "application/json")
+                    return
             # CLAIM BEFORE ACKNOWLEDGING. Two-model review, 2026-09-09: the 200
             # used to go out here unconditionally, the claim happened later in
             # main(), and when the hub had already recorded a different answer
@@ -165,16 +185,21 @@ def build_handler(html: bytes, result: dict, done: threading.Event, token: str):
             # anyway - the record was protected, the agent got a contradictory
             # decision. Now the durable claim is the acknowledgement: a loser
             # gets 409 with the canonical outcome and nothing is delivered.
-            outcome, row = update_form(result.get("registry"), status="answered", answers=payload)
+            status = "cancelled" if cancelled else "answered"
+            outcome, row = update_form(result.get("registry"), status=status, answers=payload)
             if outcome == "lost":
                 self._send(409, json.dumps({"ok": False, "already": row.get("status"),
                                             "via": row.get("answered_via"),
                                             "answers": row.get("answers")}).encode(),
                            "application/json")
                 return
-            result["answers"] = payload
+            # Readback: the persisted row, not the in-memory payload, so the
+            # confirmation and stdout reflect what actually landed on disk.
+            persisted = row.get("answers", payload) if outcome == "won" else payload
+            result["answers"] = persisted
             result["claimed"] = outcome          # "won", or "unregistered" when no hub record exists
-            self._send(200, b'{"ok":true}', "application/json")
+            self._send(200, json.dumps({"ok": True, "answers": persisted}).encode(),
+                       "application/json")
             # let the response flush before the server is torn down
             done.set()
 
@@ -252,7 +277,7 @@ def _title_of(html_bytes: bytes, fallback: str) -> str:
 
 
 def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
-                  token: str = "", deliver_to: str = "") -> Path | None:
+                  token: str = "", deliver_to: str = "", schema: dict | None = None) -> Path | None:
     """Register the form AND hand the hub a copy it can serve itself.
 
     The HTML copy plus the token are what make the decision outlive this
@@ -277,6 +302,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
             "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
             "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
+            "schema": schema or {},
             "created_at": int(now * 1000),
             "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
         }, indent=1))
@@ -423,6 +449,11 @@ def main() -> int:
     shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token).encode()
 
     raw_html = form.read_bytes()
+    # Required-field schema derived from the SOURCE markup, not the page's own
+    # script — the thing that lied in the 2026-10-18 incident. Computed once,
+    # used by this process's own /submit AND stored on the registry row so
+    # the hub's /decisions/<id>/submit validates from the same source.
+    schema = parse_schema(raw_html.decode("utf-8", errors="replace"))
     # The hub gets the PRISTINE bytes: it appends its own shim, whose
     # submitAnswers() posts to /decisions/<id>/submit. Handing it this
     # process's shimmed copy would point the hub's page at /submit on the hub,
@@ -440,7 +471,7 @@ def main() -> int:
 
     # 127.0.0.1, never 0.0.0.0 — see the module docstring.
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port),
-                                build_handler(html, result, done, token))
+                                build_handler(html, result, done, token, schema))
     port = httpd.server_address[1]
     url = f"http://127.0.0.1:{port}/"
 
@@ -448,7 +479,7 @@ def main() -> int:
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
     registry = register_form(form, raw_html, url, port, args.timeout,
-                             token=token, deliver_to=args.deliver or "")
+                             token=token, deliver_to=args.deliver or "", schema=schema)
     result["registry"] = registry            # the handler claims against it before any 200
 
     if not args.no_open:
