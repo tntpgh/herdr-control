@@ -61,6 +61,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/op-env.sh"
 . "$here/lib/pane-guard.sh"
 . "$here/lib/worktree-archive.sh"
+. "$here/lib/claims.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -367,6 +368,56 @@ root=$(repo_root "$proj")
   echo "  The first argument is a PATH, not a repo name: ~/Code/<repo>" >&2
   exit 1; }
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
+
+# ---- P2: project-scoped spawn (plan v2 §6.1) --------------------------------
+# "Owns" is a registry fact written by Main, never a label the caller
+# chooses: an orchestrator@<project> pane may spawn only into a repo it
+# holds a live proj: claim for. Runs on EVERY spawn (not only managed
+# launches, unlike the authorization-hold block further down) and before
+# any side effect -- no worktree, no tab, no task row created on refusal.
+# A caller that is NOT a registered orchestrator@* pane (Main, or an
+# ordinary human pane) is unaffected: the check below is a no-op for it,
+# same as today.
+_spawn_scope_role=""; _spawn_scope_root_real=""
+_spawn_scope_caller_pane="$(caller_pane_from_ancestry 2>/dev/null)"; _spawn_scope_rc=$?
+if [ "$_spawn_scope_rc" -eq 0 ] && [ -n "$_spawn_scope_caller_pane" ]; then
+  _spawn_scope_caller_birth="$(pane_birth_now "$_spawn_scope_caller_pane" 2>/dev/null)"
+  [ -n "$_spawn_scope_caller_birth" ] && \
+    _spawn_scope_role="$(role_for_live_pane "$_spawn_scope_caller_pane" "$_spawn_scope_caller_birth" 'orchestrator@' 2>/dev/null)"
+elif [ -n "${HERDR_PANE_ID:-}" ]; then
+  # Ancestry unavailable: fail CLOSED only for the case that matters (a
+  # self-asserted HERDR_PANE_ID naming a live orchestrator pane could
+  # otherwise dodge the check entirely by not resolving ancestry); an
+  # ordinary pane with no ancestry and no orchestrator HERDR_PANE_ID is
+  # unaffected, same as every other caller identity check in this file.
+  _spawn_scope_env_birth="${HERDR_PANE_BIRTH:-$(pane_birth_now "$HERDR_PANE_ID" 2>/dev/null)}"
+  if [ -n "$_spawn_scope_env_birth" ] && \
+     _spawn_scope_env_role="$(role_for_live_pane "$HERDR_PANE_ID" "$_spawn_scope_env_birth" 'orchestrator@' 2>/dev/null)" && \
+     [ -n "$_spawn_scope_env_role" ]; then
+    echo "spawn-task: refusing — orchestrator identity must come from process ancestry, not HERDR_PANE_ID" >&2
+    append_event "" "" "spawn_scope_refused" \
+      "$(jq -nc --arg actor "$_spawn_scope_env_role" --arg root "$root" '{reason:"ancestry_unavailable", actor:$actor, root:$root}')" \
+      >/dev/null 2>&1 || true
+    exit 2
+  fi
+fi
+if [ -n "$_spawn_scope_role" ]; then
+  _spawn_scope_root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+  [ -n "$_spawn_scope_root_real" ] || _spawn_scope_root_real="$root"
+  _spawn_scope_held="$(claim_holder "proj:$_spawn_scope_root_real" 2>/dev/null)"
+  _spawn_scope_held_pane="$(printf '%s' "$_spawn_scope_held" | jq -r '.pane_id // ""' 2>/dev/null)"
+  _spawn_scope_held_birth="$(printf '%s' "$_spawn_scope_held" | jq -r '.pane_birth // ""' 2>/dev/null)"
+  _spawn_scope_generation="$(printf '%s' "$_spawn_scope_held" | jq -r '.generation // empty' 2>/dev/null)"
+  if [ "$_spawn_scope_held_pane" != "$_spawn_scope_caller_pane" ] || [ "$_spawn_scope_held_birth" != "$_spawn_scope_caller_birth" ]; then
+    echo "spawn-task: refusing — orchestrator@<p> may spawn only into its own project's repos; $_spawn_scope_root_real is not one" >&2
+    append_event "" "" "spawn_scope_refused" \
+      "$(jq -nc --arg actor "$_spawn_scope_role" --arg root "$_spawn_scope_root_real" \
+           --arg conductor_pane "$_spawn_scope_caller_pane" --arg conductor_pane_birth "$_spawn_scope_caller_birth" \
+        '{reason:"no_live_proj_claim", actor:$actor, root:$root, conductor_pane:$conductor_pane, conductor_pane_birth:$conductor_pane_birth}')" \
+      >/dev/null 2>&1 || true
+    exit 2
+  fi
+fi
 # Default project label = the repo's own basename (project-contract-plan.md
 # #2). --project overrides it; two workers on two branches of the SAME repo
 # share this project unless one is given a narrower --project of its own.
@@ -890,6 +941,31 @@ jq -n \
     # told its ids by hand, which is exactly the status quo this replaces.
     echo "spawn-task: warning — could not write $(handoff_identity "$wt")" >&2
   }
+
+# ---- P2: re-verify the proj: generation right before registration ----------
+# plan v2 §6.1 step 3: "The generation read here is compared again inside
+# register_task's transaction; a bump in between refuses." A bump means
+# Main force-released and re-granted (or re-granted elsewhere) while this
+# call was mid-flight -- the earlier read is stale and this caller's
+# authority to be THIS task's conductor is no longer current. Ceiling: the
+# worktree/tab created above are NOT torn down here (that would duplicate
+# archive-worktrees.sh's own removal machinery for a narrow, deliberately
+# triggered race); the task row itself is still refused, which is the
+# authority boundary that matters (no conductor_pane_id is ever granted to
+# a lease that already moved on).
+if [ -n "$_spawn_scope_role" ]; then
+  _spawn_scope_recheck="$(claim_holder "proj:$_spawn_scope_root_real" 2>/dev/null)"
+  _spawn_scope_recheck_gen="$(printf '%s' "$_spawn_scope_recheck" | jq -r '.generation // empty' 2>/dev/null)"
+  if [ "$_spawn_scope_recheck_gen" != "$_spawn_scope_generation" ]; then
+    echo "spawn-task: refusing — proj:$_spawn_scope_root_real generation changed since the scope check (stale lease)" >&2
+    append_event "" "" "spawn_scope_refused" \
+      "$(jq -nc --arg actor "$_spawn_scope_role" --arg root "$_spawn_scope_root_real" \
+           --arg was "$_spawn_scope_generation" --arg now "$_spawn_scope_recheck_gen" \
+        '{reason:"stale_generation", actor:$actor, root:$root, generation_read:$was, generation_now:$now}')" \
+      >/dev/null 2>&1 || true
+    exit 2
+  fi
+fi
 
 if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req" "$authorization_command_id"; then

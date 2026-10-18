@@ -921,6 +921,51 @@ task_authorization_check() {
   return 1
 }
 
+# _registry_ensure_claims_table — the `claims` table belongs to lib/claims.sh
+# (its schema comment there is the authority), but set_task_conductor below
+# writes a `pane:` lease row directly, in the SAME transaction as
+# tasks.conductor_*, which rules out sourcing claims.sh's claim_acquire (a
+# fresh `_sql` call is a fresh connection, a fresh transaction). Mirrors
+# claims.sh claims_init's DDL exactly rather than diverging from it: CREATE
+# TABLE IF NOT EXISTS is idempotent, and the generation column is added only
+# if pragma_table_info does not already show it (an unconditional ALTER
+# would abort the whole script with "duplicate column" on every call after
+# the first).
+_registry_ensure_claims_table() {
+  _sql "CREATE TABLE IF NOT EXISTS claims (
+  claim_id    TEXT PRIMARY KEY,
+  scope       TEXT NOT NULL,
+  pane_id     TEXT NOT NULL DEFAULT '',
+  pane_birth  TEXT NOT NULL DEFAULT '',
+  purpose     TEXT NOT NULL DEFAULT '',
+  parent      TEXT NOT NULL DEFAULT '',
+  claimed_at  TEXT NOT NULL,
+  renewed_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL;" >/dev/null 2>&1
+  if [ -z "$(_sql "SELECT 1 FROM pragma_table_info('claims') WHERE name='generation';" 2>/dev/null)" ]; then
+    _sql "ALTER TABLE claims ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;" >/dev/null 2>&1
+  fi
+}
+
+# role_for_live_pane <pane_id> <pane_birth> [label_prefix] -> the role label
+# if a live `roles` row matches this exact pane+birth, else empty. Used to
+# tell "this caller IS a registered orchestrator@<project>" from "this is an
+# ordinary pane" without trusting anything the caller asserts about itself
+# (plan v2 §6.1: "'Owns' is a registry fact written by Main, never a label
+# the caller chooses").
+role_for_live_pane() {
+  local pane="$1" birth="$2" prefix="${3:-}"
+  registry_init || return 1
+  [ -n "$pane" ] && [ -n "$birth" ] || { printf '\n'; return 0; }
+  _sql "SELECT label FROM roles
+        WHERE pane_id=$(_sq "$pane") AND pane_birth=$(_sq "$birth")
+          AND label LIKE $(_sq "${prefix}%")
+        LIMIT 1;" 2>/dev/null
+}
+
 # set_task_conductor <run_id> <task_id> <from_pane> <from_birth> <to_pane>
 #                     <to_birth> <to_conductor_id> <by> [reason]
 #
@@ -940,15 +985,30 @@ task_authorization_check() {
 # set_task_state's CAS shape, same race it closes (two callers racing a
 # handover of the same task; a caller acting on a conductor that already
 # moved on). 0 rows changed = stale/raced, nonzero exit, no event -- the
-# caller re-reads reality instead of retrying blind. A `conductor_handover`
-# event is appended only when exactly 1 row changed, gated the same way
-# set_task_state gates `state_changed` (`WHERE (SELECT changes())>0`).
+# caller re-reads reality instead of retrying blind.
 #
-# Authority (who may call this), target validation (must be a live,
-# non-worker pane) and the re-wake/notify steps are conductor-handover.sh's
-# job, not this function's -- this is the one compare-and-swap write, reused
-# by anything that needs it, the same split register_task/set_task_state
-# already draw between "record a fact" and "decide whether to."
+# ---- P2: project-scoped handover (plan v2 §6.1 item 5) ---------------------
+# A precondition, read before the transaction: if the TARGET pane is a live
+# `orchestrator@*` role, the task's own repo must be inside a live `proj:`
+# claim held by that exact pane+birth -- otherwise Main (or anyone) handing
+# a task to an orchestrator would hand it conductor authority over a repo it
+# does not own, exactly the cross-project authority §6 forbids. This binds
+# Main's own handovers too, per the plan. A small TOCTOU window exists
+# between this read and the transaction below (a re-grant mid-call); that is
+# the same order spawn-task.sh's existing authorization-hold checks already
+# accept elsewhere in this codebase, documented rather than papered over.
+#
+# ---- P2: the pane: lease swap (plan v2 §4.1, §4.3) --------------------------
+# `pane:<task's own pane>@<birth>` records WHO may answer that worker pane.
+# The swap (release the old conductor's lease, insert a new one for the
+# incoming conductor with a bumped generation) runs in the SAME transaction
+# as the conductor_pane_id UPDATE, gated on that UPDATE's own success via an
+# EXISTS check against the just-written row -- not via changes() chaining,
+# which only ever reflects the single immediately-preceding statement and
+# would silently decouple once more statements were appended after the
+# existing changes()-gated events INSERT. No TTL (expires_at is a sentinel
+# far future): the lease lives until the task goes terminal or reconcile
+# marks it lost, never on a clock (plan v2 §4.3).
 set_task_conductor() {
   local run_id="$1" task_id="$2" from_pane="$3" from_birth="$4" to_pane="$5" \
         to_birth="$6" to_conductor_id="$7" by="$8" reason="${9:-}"
@@ -957,9 +1017,28 @@ set_task_conductor() {
     printf 'run-registry: set_task_conductor requires run_id, task_id, to_pane, to_birth, to_conductor_id\n' >&2
     return 1
   }
-  local at eid payload changed
+  local target_role
+  target_role="$(role_for_live_pane "$to_pane" "$to_birth" 'orchestrator@')"
+  if [ -n "$target_role" ]; then
+    local task_repo has_proj
+    task_repo="$(_sql "SELECT repo FROM tasks WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id");" 2>/dev/null)"
+    has_proj="$(_sql "SELECT 1 FROM claims
+                       WHERE scope=$(_sq "proj:$task_repo") AND pane_id=$(_sq "$to_pane") AND pane_birth=$(_sq "$to_birth")
+                         AND released_at IS NULL AND expires_at > $(_sq "$(_now_iso)") LIMIT 1;" 2>/dev/null)"
+    if [ -z "$has_proj" ]; then
+      printf 'run-registry: set_task_conductor refused — %s holds no proj: claim for %s\n' "$target_role" "$task_repo" >&2
+      append_event "$run_id" "$task_id" "conductor_handover_refused" \
+        "$(jq -nc --arg to_role "$target_role" --arg repo "$task_repo" --arg to_pane "$to_pane" --arg to_birth "$to_birth" \
+          '{reason:"target_not_project_scoped", to_role:$to_role, repo:$repo, conductor_pane:$to_pane, conductor_pane_birth:$to_birth}')" \
+        >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+  _registry_ensure_claims_table
+  local at eid payload changed lease_id
   at="$(_now_iso)"
   eid="$(gen_id ev)"
+  lease_id="$(gen_id claim)"
   payload="$(jq -nc --arg f "$from_pane" --arg fb "$from_birth" --arg t "$to_pane" \
     --arg tb "$to_birth" --arg by "$by" --arg reason "$reason" \
     '{from:$f, from_birth:$fb, to:$t, to_birth:$tb, by:$by, reason:$reason}')"
@@ -973,8 +1052,24 @@ set_task_conductor() {
       SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'conductor_handover', $(_sq "$at"),
         $(_sq "$payload")
       WHERE (SELECT changes()) > 0;
+    UPDATE claims SET released_at=$(_sq "$at")
+      WHERE released_at IS NULL
+        AND scope = 'pane:' || (SELECT pane_id FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"))
+                   || '@' || (SELECT pane_birth FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"))
+        AND EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                     AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"));
+    INSERT INTO claims(claim_id, scope, pane_id, pane_birth, purpose, parent, claimed_at, renewed_at, expires_at, generation)
+      SELECT $(_sq "$lease_id"), 'pane:'||t.pane_id||'@'||t.pane_birth, $(_sq "$to_pane"), $(_sq "$to_birth"),
+             $(_sq "$task_id"), '', $(_sq "$at"), $(_sq "$at"), '9999-12-31T23:59:59Z',
+             (SELECT COALESCE(MAX(generation),0)+1 FROM claims WHERE scope = 'pane:'||t.pane_id||'@'||t.pane_birth)
+      FROM tasks t
+      WHERE t.task_id=$(_sq "$task_id") AND t.run_id=$(_sq "$run_id") AND t.pane_id<>'' AND t.pane_birth<>''
+        AND EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                     AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"));
     COMMIT;
-    SELECT changes();" 2>/dev/null)
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+                               AND conductor_pane_id=$(_sq "$to_pane") AND conductor_pane_birth=$(_sq "$to_birth"))
+                THEN 1 ELSE 0 END;" 2>/dev/null)
   [ "$changed" = "1" ] && return 0
   printf 'run-registry: set_task_conductor CAS miss for %s/%s (from %s/%s no longer matches the live conductor, or the task is not active)\n' \
     "$run_id" "$task_id" "$from_pane" "$from_birth" >&2

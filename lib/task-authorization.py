@@ -333,6 +333,60 @@ def _reservation(db, receipt, task):
     reservation.validate_reservation(db, receipt, task)
 
 
+def _ensure_claims_table(db):
+    """Mirror lib/claims.sh claims_init's DDL exactly (same table, same
+    additive generation column) rather than diverging from it -- this is
+    the ONE other writer of that table, needed here because register()'s
+    pane: lease insert must land in the SAME transaction as the task INSERT
+    (plan v2 §4.1: "written only inside register_task and
+    set_task_conductor, in the same SQLite transaction as tasks.conductor_*"),
+    and a fresh bash `claim_acquire` call would be a fresh connection /
+    fresh transaction.
+    """
+    db.execute("""CREATE TABLE IF NOT EXISTS claims (
+        claim_id    TEXT PRIMARY KEY,
+        scope       TEXT NOT NULL,
+        pane_id     TEXT NOT NULL DEFAULT '',
+        pane_birth  TEXT NOT NULL DEFAULT '',
+        purpose     TEXT NOT NULL DEFAULT '',
+        parent      TEXT NOT NULL DEFAULT '',
+        claimed_at  TEXT NOT NULL,
+        renewed_at  TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        released_at TEXT
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL")
+    has_gen = db.execute("SELECT 1 FROM pragma_table_info('claims') WHERE name='generation'").fetchone()
+    if has_gen is None:
+        db.execute("ALTER TABLE claims ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+
+
+def _acquire_pane_lease(db, task):
+    """Write the `pane:<worker pane>@<birth>` lease (plan v2 §4.1): who may
+    answer this worker's pane. Holder is the CONDUCTOR, not the worker --
+    the scope names the pane being protected, the holder names who may act
+    on it. No TTL (expires_at is a sentinel far future): the lease lives
+    until the task goes terminal or reconcile marks it lost, never on a
+    clock. Skipped when either side is unknown (an older call shape, or a
+    conductorless registration) -- nothing to fence yet.
+    """
+    pane_id, pane_birth = task.get("pane_id", ""), task.get("pane_birth", "")
+    cpane, cbirth = task.get("conductor_pane_id", ""), task.get("conductor_pane_birth", "")
+    if not (pane_id and pane_birth and cpane and cbirth):
+        return
+    _ensure_claims_table(db)
+    scope = "pane:%s@%s" % (pane_id, pane_birth)
+    at = now_iso()
+    db.execute(
+        """INSERT INTO claims(claim_id, scope, pane_id, pane_birth, purpose, parent,
+                               claimed_at, renewed_at, expires_at, generation)
+           SELECT ?, ?, ?, ?, ?, '', ?, ?, '9999-12-31T23:59:59Z',
+                  (SELECT COALESCE(MAX(generation),0)+1 FROM claims WHERE scope = ?)
+           WHERE NOT EXISTS (SELECT 1 FROM claims WHERE scope = ? AND released_at IS NULL)""",
+        ("claim_" + uuid.uuid4().hex, scope, cpane, cbirth, task["task_id"], at, at, scope, scope),
+    )
+
+
 def register(db, raw_task, command_id=""):
     task = parse(raw_task)
     if task.get("approval") not in ("menu", "hook"):
@@ -371,6 +425,7 @@ def register(db, raw_task, command_id=""):
     db.execute("INSERT INTO tasks (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")",
                tuple(task[k] for k in columns))
     event(db, task["run_id"], task["task_id"], "registered", {"pane_id": task["pane_id"], "label": task["label"]})
+    _acquire_pane_lease(db, task)
     if task["approval"] == "hook":
         event(db, task["run_id"], task["task_id"], "approval_posture",
               {"approval": "hook", "assigned_supervisor": task["conductor_id"], "conductor_pane": task["conductor_pane_id"]})
