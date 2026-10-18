@@ -321,7 +321,10 @@ if [ -n "$bound_request_id" ]; then
   # gate stands in for a permission check that bash's shell semantics need
   # and write/edit never did. Only reachable when registry_tool_lc is
   # bash|shell, which the tool gate above only allows with the flag on.
-  case "$registry_tool_lc" in
+  # A Deny executes nothing, so it is never gated on the command's class:
+  # gating it left a reserved-class request undeniable and the worker stuck
+  # (live 2026-10-18, v21: `wc` naming spawn-agent.sh). Approve stays gated.
+  [ "$label" = Deny ] || case "$registry_tool_lc" in
     bash|shell)
       _bound_command="$(printf '%s' "$rechecked" | jq -r '.command // empty')"
       _bound_verdict="$(classify_command "$_bound_command" "$own_worktree")"

@@ -170,6 +170,30 @@ check_reserved "function alias herdr pane run human-only" "h(){ herdr \"\$@\"; }
 check_reserved "variable alias spawn-agent human-only" "s=spawn-agent; bash ./\$s.sh /repo child omp"
 check_reserved "raw herdr tab create remains human-only"   "herdr tab create --cwd /repo --label child"
 check_reserved "raw herdr pane run remains human-only"     "herdr pane run pane1 --agent omp"
+check_reserved "direct ./spawn-agent.sh invocation remains human-only" "./spawn-agent.sh /repo child omp"
+check_reserved "env-prefixed spawn-agent.sh remains human-only" "env X=1 spawn-agent.sh /repo child omp"
+check_reserved "xargs spawn-agent.sh remains human-only" "printf '%s' /repo | xargs spawn-agent.sh"
+
+echo "== fix/fleet-gate-readonly-fp: a read-only MENTION of the fleet scripts is not fleet creation =="
+# Live incident (2026-10-18, v21, app 5c8963d): a review worker ran
+# `wc -l …/app/spawn-task.sh …/app/spawn-agent.sh …` and lib/command-policy.sh
+# reserved it as "unregistered fleet creation remains human-only" for BOTH
+# Approve and Deny — naming the script as an operand is not running it.
+check_unreserved "wc naming spawn-agent.sh is not fleet creation" "wc -l spawn-agent.sh"
+check_unreserved "cat naming spawn-agent.sh is not fleet creation" "cat spawn-agent.sh"
+check_unreserved "ls naming spawn-agent.sh is not fleet creation" "ls -la spawn-agent.sh"
+check_unreserved "grep naming spawn-agent.sh is not fleet creation" "grep -n create spawn-agent.sh"
+check_unreserved "head naming spawn-agent.sh is not fleet creation" "head -5 spawn-agent.sh"
+check_unreserved "shasum naming spawn-agent.sh is not fleet creation" "shasum -a 256 spawn-agent.sh"
+check_unreserved "stat naming spawn-agent.sh is not fleet creation" "stat spawn-agent.sh"
+check_unreserved "file naming spawn-agent.sh is not fleet creation" "file spawn-agent.sh"
+check_unreserved "git log naming spawn-agent.sh is not fleet creation" "git log -- spawn-agent.sh"
+check_unreserved "git show naming spawn-agent.sh is not fleet creation" "git show HEAD:spawn-agent.sh"
+check_unreserved "git diff naming spawn-agent.sh is not fleet creation" "git diff -- spawn-agent.sh"
+check_unreserved "wc naming herdr tab create in prose is not fleet creation" "wc -l docs/herdr-tab-create-notes.md"
+check_reserved "bash executing spawn-agent.sh stays fleet creation" "bash spawn-agent.sh /repo child omp"
+check_reserved "wc mixed with an execution segment stays fleet creation" "wc -l spawn-agent.sh && bash spawn-agent.sh /repo child omp"
+check_reserved "raw herdr tab create stays fleet creation" "herdr tab create --cwd /repo --label child"
 
 echo "== the worker flow stays peer-answerable (else the alert flood returns) =="
 check_unreserved "push a feature branch"        "git push -u origin feat/x"

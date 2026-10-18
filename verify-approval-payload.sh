@@ -157,6 +157,7 @@ print(hashlib.sha256(body.encode()).hexdigest())
 PY
 }
 approve_rows() { sqlite3 "$DB" "SELECT count(*) FROM approvals WHERE choice_text='Approve';" 2>/dev/null || echo 0; }
+deny_rows() { sqlite3 "$DB" "SELECT count(*) FROM approvals WHERE choice_text='Deny';" 2>/dev/null || echo 0; }
 last_escalation() { sqlite3 "$DB" "SELECT json_extract(payload,'\$.command') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;"; }
 # A non-human Enter attempt on a write/edit: exit 8, no key, no Approve row,
 # refused by the human-only rule.
@@ -638,6 +639,23 @@ for CMD in "git push origin main" "sqlite3 /tmp/hc-probe.db 'DROP TABLE x;'" "rm
   reset_keys; conductor_bound; rc=$?
   [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "deny/reserved bound command refused despite a benign panel: $CMD" \
     || bad "deny/reserved bound command NOT refused: $CMD rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+  BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+done
+
+printf '== flag on (fix/fleet-gate-readonly-fp): a bound Deny executes nothing, so a reserved/deny-class bound command still resolves and records Deny ==\n'
+j=0
+for CMD in "git push origin main" "sqlite3 /tmp/hc-probe.db 'DROP TABLE x;'" "rm -rf /"; do
+  j=$((j + 1))
+  BOUND_REQUEST="request-bash-deny-ok-$j"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+  DENY_OK_JSON="$(bash_input "$CMD" | jq -cS .)"
+  BOUND_DIGEST="sha256:$(printf '%s' "$DENY_OK_JSON" | shasum -a 256 | awk '{print $1}')"
+  printf 'Allow tool: bash\nCommand: ls -la [unrelated, benign panel]\n\n Approve\n\033[48;2;42;47;65m Deny\033[0m\n\n' > "$SCREEN"
+  record_bash "$CMD"; BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$CMD")")"
+  deny_before="$(deny_rows)"; reset_keys; conductor_bound_choice 2; rc=$?
+  deny_after="$(deny_rows)"
+  [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$deny_after" = $((deny_before + 1)) ] \
+    && ok "Deny of a reserved-class bound command resolves and is recorded: $CMD" \
+    || bad "Deny of a reserved-class bound command NOT resolved/recorded: $CMD rc=$rc keys=$(keys_pressed) deny_rows=$deny_before->$deny_after; $(tail -3 "$WORK/err.txt")"
   BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
 done
 unset HERDR_BOUND_BASH
