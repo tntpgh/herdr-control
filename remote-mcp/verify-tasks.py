@@ -32,7 +32,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
 BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp")
-BOUND_LAUNCHER_SHA256 = "e05aad0528c6b31a3ac59920861ac29bcf42f3c0d671942510fb58967912048c"
+BOUND_LAUNCHER_SHA256 = "3895279b403ba7c9193a496517d55ae7dd1e40d103ab249fc2347ce2065224a7"
 
 
 def _lib_tree_sha(control: Path) -> str:

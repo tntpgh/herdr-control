@@ -83,7 +83,7 @@ EOF
 chmod +x "$ctl_fx"
 ctl_fx_sha="$(shasum -a 256 "$ctl_fx" | cut -d' ' -f1)"
 ctl_old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-18-k3resolver-v26/omp"'
-ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="e05aad0528c6b31a3ac59920861ac29bcf42f3c0d671942510fb58967912048c"'
+ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="3895279b403ba7c9193a496517d55ae7dd1e40d103ab249fc2347ce2065224a7"'
 ctl_cfg="$(cat "$ctl/config.sh")"
 case "$ctl_cfg" in *"$ctl_old_bin"*) ;; *) echo "FATAL: HERDR_OMP_BIN pin not found in $ctl/config.sh" >&2; exit 1 ;; esac
 ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"
