@@ -7,9 +7,17 @@ daily series:
 
   - blocked episodes / total minutes / >=10-minute share       (Appendix A §a)
   - top approval_escalated reasons (top 5) + total              (Appendix A §b)
-  - conductor-authority signal->answer latency p50/p90/p99      (Appendix A §c, block 1)
-  - write-tool binding (prompt_occ_seen->prompt_occ_authorized)
-    latency p50/p90/p99                                         (Appendix A §c, block 2)
+  - conductor-authority signal->answer latency p50/p90/p99,
+    plus `unresolved` (arrived, never decided)                  (Appendix A §c, block 1)
+  - occurrence lifecycle latencies, each occ_key-joined and each
+    with an `unresolved` denominator that is never censored out:
+      dispatch   prompt_occ_seen.dispatched_at_ms -> .at_ms
+      decision   prompt_occ_seen.at_ms -> prompt_occ_authorized.at_ms
+      completion prompt_occ_authorized.at_ms -> prompt_occ_completed.at_ms
+                                                                  (Appendix A §c, block 2;
+                                                                   plan P0 items 1 + 2)
+  - every `decided_by` actor, full breakdown, no top-N truncation,
+    totals reconciled against the sum                            (plan P0 item 4)
   - unsubmitted-wake share                                      (Appendix A §d, block 1)
   - conductor decisions per day                                 (Appendix A §d, block 2)
   - repeated (task_id, command) approval pairs, n>=3             (Appendix A §d, block 3)
@@ -19,12 +27,21 @@ daily series:
   - stop-rule series: daily arrivals (lambda) and mean wait (W);
     queue depth L is explicitly NOT computed (see
     `compute_stop_rule_series`'s docstring)                      (plan §8 stop rule, §9.3)
-  - "Main drops threads" daily series                           (plan §9.3)
+  - "Main drops threads" daily series, reason-classified against
+    the real emitting code (attention-tick.sh), not a guessed
+    enum                                                         (plan §9.3; plan P0 item 4)
+  - cost proxies where the schema has one (none for tokens/$;
+    `prompts_per_task` as the available workload proxy)          (plan P0 item 5)
+  - optional version-scoped windows: bucket the whole report by
+    deployed app revision when `--deploys` is given              (plan P0 item 3)
 
 The DB is opened strictly read-only via a `file:...?mode=ro` URI: any write
 attempted through the connection this script opens raises
 `sqlite3.OperationalError`. This script never opens, reads, or infers the
 path to a real registry on its own; the caller supplies `--db` explicitly.
+Likewise it never shells out to git to find deploy times -- `--deploys`
+takes a file the caller builds from the deploy log (see `load_deploys`'s
+docstring) so this script's only inputs stay `--db` and that one file.
 
 Percentile method (stated per Appendix A's instruction to record one):
 nearest-rank on the ascending-sorted sample, matching SQLite's `NTILE(100)`
@@ -33,21 +50,48 @@ clamped to [1, n]. n=0 -> None for every percentile. n=1 -> every percentile
 returns the single value.
 
 Schema expected (names drawn from Appendix A's "schema the reviewer
-confirmed" plus the `roles` primitive described in plan §1.3/§2):
+confirmed" plus the `roles` primitive described in plan §1.3/§2, verified
+against lib/run-registry.sh's actual CREATE TABLE statements):
   events(sequence, event_id, run_id, task_id, type, occurred_at, payload)
   approvals(approval_id, run_id, task_id, pane_id, prompt_id, choice,
             decided_by, authority, policy_verdict, command, decided_at,
             attempted_at, outcome)
   tasks(task_id, state, project, updated_at, conductor_pane_id, ...)
-  roles(role, pane_id, ...)                      -- optional; see --main-pane
+  roles(label, pane_id, ...)                     -- optional; see --main-pane
 
 `payload` is a JSON text column; fields are pulled with SQLite's
-`json_extract`. The "Main drops threads" query assumes `attention_form_served`
-payloads carry an escalation-reason field named `reason` (the same key name
-`approval_escalated` payloads use elsewhere in the registry) with values
-`human_reserved` / `unanswerable_overlay` for the two excluded categories
-named in plan §9.3; the plan does not spell out the exact key, so this is an
-explicit convention choice, not a verified fact.
+`json_extract`.
+
+Verified schema notes (P0 item 1/4 -- read from the emitting code, not
+assumed from the plan's Appendix A, which the plan itself marks UNRUN):
+
+- `prompt_occ_seen` / `prompt_occ_authorized` / `prompt_occ_completed` /
+  `prompt_occ_declined` / `prompt_occ_withdrawn` (lib/prompt-occurrence.py)
+  key every row by `$.occ_key` (a hash of run_id/task_id/pane_id/pane_birth/
+  native_session/tool_call_id), NEVER `$.prompt_id` -- the module's own
+  docstring: "never prompt_id -- a repaint changes prompt_id without being a
+  new question." `input_required`/`approvals` are a different identity
+  scheme and DO use `$.prompt_id`/`prompt_id`; that join is correct as-is.
+- `prompt_occ_seen` carries two independent timestamps: `dispatched_at_ms`
+  (optional, caller-supplied, often absent) and `at_ms` (always present,
+  when the hook itself first recorded the occurrence). `prompt_occ_authorized`
+  and the resolution events each carry their own `at_ms`. These four
+  timestamps are exactly the lifecycle verify-approval-payload.sh's synthetic
+  check proves in production, under the names `dispatched`, `proposal_created`,
+  `approval_resolved`, `exec_end_result` -- the stage labels below reuse that
+  vocabulary rather than inventing new ones (e.g. never "resume", a word the
+  emitting code does not use for any of these transitions).
+- `roles` (schema v10, lib/run-registry.sh `_migrate_schema_v10`) is the
+  CANONICAL table for Main's designation; its primary key column is `label`,
+  not `role`. It was split out from the older, still-live `owners` table
+  specifically so Main's row would be invisible to every generic `owners`
+  reader (security review PR #252 finding F1) -- `owners` must never be
+  read for this purpose, and this script now only ever reads `roles`.
+- `attention_form_served` payloads carry a free-text `reason` (attention-
+  tick.sh `_attn_maybe_form`'s only two call sites), not the two-value enum
+  the plan's prose implies; see `_classify_drop_reason`'s docstring for the
+  verified prefixes and why a literal "unanswerable_overlay" string never
+  matches anything.
 """
 from __future__ import annotations
 
@@ -58,9 +102,6 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from typing import Optional
-
-
-EXCLUDED_DROP_REASONS = ("human_reserved", "unanswerable_overlay")
 
 
 def connect_ro(db_path: str) -> sqlite3.Connection:
@@ -79,6 +120,10 @@ def percentile(sorted_vals: list, p: float) -> Optional[float]:
         return None
     idx = max(1, min(n, math.ceil(p / 100.0 * n)))
     return sorted_vals[idx - 1]
+
+
+PERCENTILE_METHOD = ("nearest-rank on ascending-sorted deltas, "
+                      "index=ceil(p/100*n) 1-based (NTILE(100)-equivalent)")
 
 
 def _parse_ts(s: str) -> float:
@@ -180,7 +225,16 @@ def compute_top_escalations(conn: sqlite3.Connection, since: Optional[str],
 def compute_conductor_latency(conn: sqlite3.Connection, since: Optional[str],
                                until: Optional[str]) -> dict:
     """Appendix A §c: input_required -> conductor-authority decision latency,
-    seconds, p50/p90/p99."""
+    seconds, p50/p90/p99, for prompts that WERE decided by a conductor.
+
+    `unresolved` additionally counts `input_required` arrivals in the same
+    window (by their own `occurred_at`, since an undecided prompt has no
+    `decided_at` to window on) with NO matching `approvals` row of ANY
+    authority -- plan P0 item 2: a prompt nobody ever decided is exactly the
+    backlog/loss this figure exists to surface, and silently excluding it
+    from the denominator would hide that. `n`/the percentiles keep the
+    original decided_at-windowed basis; `unresolved` is a second, honestly
+    different-basis count, not folded into the same total."""
     clause, params = _since_until_clause("a.decided_at", since, until)
     rows = conn.execute(
         f"""
@@ -195,50 +249,194 @@ def compute_conductor_latency(conn: sqlite3.Connection, since: Optional[str],
         params,
     ).fetchall()
     deltas = sorted(_parse_ts(r["decided_at"]) - _parse_ts(r["seen_at"]) for r in rows)
+
+    ir_clause, ir_params = _since_until_clause("ir.occurred_at", since, until)
+    unresolved = conn.execute(
+        f"""
+        SELECT count(*) AS n FROM events ir
+        WHERE ir.type='input_required'{ir_clause}
+          AND NOT EXISTS (
+            SELECT 1 FROM approvals a WHERE a.prompt_id = json_extract(ir.payload,'$.prompt_id')
+          )
+        """,
+        ir_params,
+    ).fetchone()["n"]
     return {
         "n": len(deltas),
+        "unresolved": unresolved,
         "p50": percentile(deltas, 50),
         "p90": percentile(deltas, 90),
         "p99": percentile(deltas, 99),
-        "method": "nearest-rank on ascending-sorted deltas, "
-                  "index=ceil(p/100*n) 1-based (NTILE(100)-equivalent)",
+        "method": PERCENTILE_METHOD,
     }
 
 
-def compute_write_binding_latency(conn: sqlite3.Connection, since: Optional[str],
-                                   until: Optional[str]) -> dict:
-    """Appendix A §c, second block: `prompt_occ_seen` (tool='write') ->
-    `prompt_occ_authorized` latency, seconds, p50/p90/p99. This is the
-    "omp binding seen -> authorized, write" / "write seen->decision" figure
-    (§1.1, §8 P1 target) and is a distinct figure from
-    `compute_conductor_latency`'s generic signal->answer latency: it measures
-    the write-tool binding round trip, not every conductor-authority decision."""
+def compute_dispatch_latency(conn: sqlite3.Connection, since: Optional[str],
+                              until: Optional[str], tool: Optional[str] = None) -> dict:
+    """Lifecycle stage 1 ("dispatched" -> "proposal_created" in verify-
+    approval-payload.sh's synthetic timeline): `prompt_occ_seen.dispatched_at_ms`
+    -> `prompt_occ_seen.at_ms`, both in the same payload (lib/prompt-
+    occurrence.py `record_seen`), so this is a single-table read, not a join.
+    `dispatched_at_ms` is optional and caller-supplied; a seen row that never
+    recorded one is excluded from `n` entirely (not counted as a 0 or as
+    unresolved -- the information was simply never captured for that row).
+    `tool=None` (default) covers every tool; pass e.g. `tool="write"` to
+    match a single one."""
+    tool_clause = ""
+    tool_params: list = []
+    if tool is not None:
+        tool_clause = " AND json_extract(payload,'$.tool')=?"
+        tool_params = [tool]
+    clause, since_params = _since_until_clause("occurred_at", since, until)
+    rows = conn.execute(
+        f"""
+        SELECT json_extract(payload,'$.dispatched_at_ms') AS d_ms,
+               json_extract(payload,'$.at_ms') AS a_ms
+        FROM events
+        WHERE type='prompt_occ_seen'{tool_clause}{clause}
+        """,
+        tool_params + since_params,
+    ).fetchall()
+    deltas = sorted(
+        (r["a_ms"] - r["d_ms"]) / 1000.0 for r in rows
+        if r["d_ms"] is not None and r["a_ms"] is not None
+    )
+    return {
+        "tool": tool, "n": len(deltas),
+        "p50": percentile(deltas, 50), "p90": percentile(deltas, 90), "p99": percentile(deltas, 99),
+        "method": PERCENTILE_METHOD,
+    }
+
+
+def compute_decision_latency(conn: sqlite3.Connection, since: Optional[str],
+                              until: Optional[str], tool: str = "write") -> dict:
+    """Lifecycle stage 2 ("proposal_created" -> "approval_resolved"):
+    `prompt_occ_seen` -> `prompt_occ_authorized`, joined on `occ_key` -- the
+    identity these two event types actually carry (lib/prompt-occurrence.py:
+    occ_key is a hash of run_id/task_id/pane_id/pane_birth/native_session/
+    tool_call_id; `$.prompt_id` does not exist on either payload). The prior
+    version of this function (then named `compute_write_binding_latency`)
+    joined on `json_extract(payload,'$.prompt_id')`, which both payloads
+    never write -- the join matched zero rows against a real registry, so
+    the figure silently reported `n=0` in production instead of raising.
+    Fixed here; `tool` defaults to "write" to keep the plan's "omp binding
+    seen -> authorized, write" figure (§1.1) directly reproducible.
+
+    `unresolved` counts `prompt_occ_seen` occurrences (tool-filtered,
+    windowed by their own `occurred_at`) with NO matching `prompt_occ_authorized`
+    at all -- never authorized, never silently dropped from the denominator
+    (plan P0 item 2)."""
     clause, params = _since_until_clause("auth.auth_at", since, until)
     rows = conn.execute(
         f"""
         WITH seen AS (
-          SELECT task_id, json_extract(payload,'$.prompt_id') AS pid, occurred_at AS seen_at
-          FROM events WHERE type='prompt_occ_seen' AND json_extract(payload,'$.tool')='write'
+          SELECT json_extract(payload,'$.occ_key') AS key, occurred_at AS seen_at
+          FROM events WHERE type='prompt_occ_seen' AND json_extract(payload,'$.tool')=?
         ),
         auth AS (
-          SELECT task_id, json_extract(payload,'$.prompt_id') AS pid, occurred_at AS auth_at
+          SELECT json_extract(payload,'$.occ_key') AS key, occurred_at AS auth_at
           FROM events WHERE type='prompt_occ_authorized'
         )
         SELECT auth.auth_at AS auth_at, seen.seen_at AS seen_at
-        FROM seen JOIN auth ON seen.task_id = auth.task_id AND seen.pid = auth.pid
+        FROM seen JOIN auth ON seen.key = auth.key
+        WHERE 1=1{clause}
+        """,
+        [tool] + params,
+    ).fetchall()
+    deltas = sorted(_parse_ts(r["auth_at"]) - _parse_ts(r["seen_at"]) for r in rows)
+
+    seen_clause, seen_params = _since_until_clause("occurred_at", since, until)
+    unresolved = conn.execute(
+        f"""
+        SELECT count(*) AS n FROM events seen
+        WHERE seen.type='prompt_occ_seen' AND json_extract(seen.payload,'$.tool')=?{seen_clause}
+          AND NOT EXISTS (
+            SELECT 1 FROM events auth WHERE auth.type='prompt_occ_authorized'
+              AND json_extract(auth.payload,'$.occ_key') = json_extract(seen.payload,'$.occ_key')
+          )
+        """,
+        [tool] + seen_params,
+    ).fetchone()["n"]
+    return {
+        "tool": tool, "n": len(deltas), "unresolved": unresolved,
+        "p50": percentile(deltas, 50), "p90": percentile(deltas, 90), "p99": percentile(deltas, 99),
+        "method": PERCENTILE_METHOD,
+    }
+
+
+def compute_completion_latency(conn: sqlite3.Connection, since: Optional[str],
+                                until: Optional[str]) -> dict:
+    """Lifecycle stage 3 ("approval_resolved" -> "exec_end_result"):
+    `prompt_occ_authorized` -> `prompt_occ_completed`, occ_key-joined (same
+    identity as `compute_decision_latency`).
+
+    `unresolved` counts authorized occurrences in-window with NO resolution
+    event at all -- not `prompt_occ_completed`, not `_declined`, not
+    `_withdrawn`. A declined/withdrawn occurrence is a REAL resolution
+    (plan: "approval is never completion") and is correctly excluded from
+    `unresolved`; only a genuinely lost-mid-execution occurrence counts,
+    never silently excluded (plan P0 item 2)."""
+    clause, params = _since_until_clause("auth.auth_at", since, until)
+    rows = conn.execute(
+        f"""
+        WITH auth AS (
+          SELECT json_extract(payload,'$.occ_key') AS key, occurred_at AS auth_at
+          FROM events WHERE type='prompt_occ_authorized'
+        ),
+        comp AS (
+          SELECT json_extract(payload,'$.occ_key') AS key, occurred_at AS comp_at
+          FROM events WHERE type='prompt_occ_completed'
+        )
+        SELECT auth.auth_at AS auth_at, comp.comp_at AS comp_at
+        FROM auth JOIN comp ON auth.key = comp.key
         WHERE 1=1{clause}
         """,
         params,
     ).fetchall()
-    deltas = sorted(_parse_ts(r["auth_at"]) - _parse_ts(r["seen_at"]) for r in rows)
+    deltas = sorted(_parse_ts(r["comp_at"]) - _parse_ts(r["auth_at"]) for r in rows)
+
+    a_clause, a_params = _since_until_clause("occurred_at", since, until)
+    unresolved = conn.execute(
+        f"""
+        SELECT count(*) AS n FROM events auth
+        WHERE auth.type='prompt_occ_authorized'{a_clause}
+          AND NOT EXISTS (
+            SELECT 1 FROM events r
+            WHERE r.type IN ('prompt_occ_completed','prompt_occ_declined','prompt_occ_withdrawn')
+              AND json_extract(r.payload,'$.occ_key') = json_extract(auth.payload,'$.occ_key')
+          )
+        """,
+        a_params,
+    ).fetchone()["n"]
     return {
-        "n": len(deltas),
-        "p50": percentile(deltas, 50),
-        "p90": percentile(deltas, 90),
-        "p99": percentile(deltas, 99),
-        "method": "nearest-rank on ascending-sorted deltas, "
-                  "index=ceil(p/100*n) 1-based (NTILE(100)-equivalent)",
+        "n": len(deltas), "unresolved": unresolved,
+        "p50": percentile(deltas, 50), "p90": percentile(deltas, 90), "p99": percentile(deltas, 99),
+        "method": PERCENTILE_METHOD,
     }
+
+
+def compute_decided_by_actors(conn: sqlite3.Connection, since: Optional[str],
+                               until: Optional[str]) -> dict:
+    """Every distinct `decided_by` actor, full breakdown, no LIMIT (plan P0
+    item 4). The live registry has dozens of single-occurrence values --
+    individual hub-form ids, raw pane ids, `sentinel` -- alongside the
+    high-volume ones (`cli`, `conductor:<pane>`, `peer-answer`); a top-N
+    truncation (as `compute_top_escalations` uses, deliberately, for a
+    different figure) would silently drop most of that tail. `total`
+    reconciles exactly against `sum(a['n'] for a in actors)` -- same query,
+    two projections of the same rows, nothing computed from a second pass
+    that could drift out of sync."""
+    clause, params = _since_until_clause("decided_at", since, until)
+    rows = conn.execute(
+        f"""
+        SELECT decided_by, count(*) AS n
+        FROM approvals WHERE 1=1{clause}
+        GROUP BY decided_by ORDER BY n DESC
+        """,
+        params,
+    ).fetchall()
+    actors = [{"decided_by": r["decided_by"], "n": r["n"]} for r in rows]
+    return {"actors": actors, "total": sum(a["n"] for a in actors)}
 
 
 def compute_wake_outcomes(conn: sqlite3.Connection, since: Optional[str],
@@ -426,59 +624,209 @@ def compute_stop_rule_series(conn: sqlite3.Connection, since: Optional[str],
 
 
 def resolve_main_pane(conn: sqlite3.Connection, main_pane_override: Optional[str]) -> Optional[str]:
+    """`roles` (schema v10) is the CANONICAL table for Main's designation --
+    deliberately split out from the older, still-live `owners` table so
+    Main's row is invisible to every generic `owners` reader (security
+    review PR #252 finding F1, lib/run-registry.sh `_migrate_schema_v10`'s
+    comment). Its primary-key column is `label`, not `role` -- the prior
+    version of this query (`WHERE role='main'`) named a column that does not
+    exist, which `sqlite3.OperationalError`s, is caught below, and silently
+    resolves to "unresolved" every time: in production this made `--main-pane`
+    the ONLY way `compute_main_drops_threads` ever worked, with no visible
+    error explaining why the plain run always returned an empty series."""
     if main_pane_override:
         return main_pane_override
     try:
         row = conn.execute(
-            "SELECT pane_id FROM roles WHERE role='main' LIMIT 1"
+            "SELECT pane_id FROM roles WHERE label='main' LIMIT 1"
         ).fetchone()
     except sqlite3.OperationalError:
         return None
     return row["pane_id"] if row else None
 
 
+def _classify_drop_reason(reason: Optional[str]) -> str:
+    """attention-tick.sh's sole emitter of `attention_form_served`
+    (`_attn_maybe_form`, exactly two call sites) writes a free-text prose
+    `reason`, never an enum -- verified both against the source and against
+    every `reason` value actually present in the live registry snapshot:
+
+      - reserved/deny class (attention-tick.sh, the `[ -n "$reserved" ] ||
+        [ "$verdict" = "deny" ]` branch): "Only a human can approve this
+        (...)". Excluded by design, matching plan §9.3's "human_reserved":
+        only a human may approve it, and its conductor may still deny/
+        redirect it before the form is ever answered.
+      - escalation-ladder timeout (the other branch): "No response Ns after
+        its conductor was alerted; ...". This is the ONLY other shape the
+        emitting code produces.
+
+    The plan's second exclusion category, "unanswerable_overlay" (a panel-
+    less overlay only a human can clear), names a SCENARIO, not a distinct
+    reason string -- the emitting code records nothing that tells the two
+    "No response" cases apart. Matching a literal "unanswerable_overlay"
+    string (the prior version of this script) therefore matched zero rows,
+    ever, against a real registry -- the exclusion silently never fired.
+
+    A reason that is empty or matches neither known prefix classifies as
+    `unverified`: reported as its own bucket and counted as a drop (plan P0
+    item 2 -- excluding on an unproven guess would censor a real drop), never
+    silently folded into `no_response` or discarded."""
+    if not reason:
+        return "unverified"
+    if reason.startswith("Only a human can approve this"):
+        return "human_reserved"
+    if reason.startswith("No response "):
+        return "no_response"
+    return "unverified"
+
+
 def compute_main_drops_threads(conn: sqlite3.Connection, since: Optional[str],
                                 until: Optional[str],
                                 main_pane_override: Optional[str] = None) -> dict:
-    """Plan §9.3: per day, count of `attention_form_served` events on tasks
-    whose conductor is Main's pane, excluding forms whose escalation reason is
-    human-reserved or unanswerable_overlay (those go to a form by design)."""
+    """Plan §9.3: per day, `attention_form_served` events on tasks whose
+    conductor is Main's pane, classified by `_classify_drop_reason`.
+    `human_reserved` is excluded from `drops` by design; `no_response` and
+    `unverified` are both counted as drops and reported as separate
+    breakdown entries rather than silently merged, so a reason string that
+    drifts from the two known prefixes stays visible. `served` = `drops` +
+    `excluded_human_reserved` always reconciles against the raw row count
+    for that day (every served form lands in exactly one bucket)."""
     main_pane = resolve_main_pane(conn, main_pane_override)
     if main_pane is None:
         return {
             "main_pane": None,
             "series": [],
-            "note": "main pane unresolved: no `roles` row for role='main' and "
+            "note": "main pane unresolved: no `roles` row for label='main' and "
                     "no --main-pane override given; series is empty, not zero",
         }
     clause, params = _since_until_clause("e.occurred_at", since, until)
-    placeholders = ",".join("?" for _ in EXCLUDED_DROP_REASONS)
     rows = conn.execute(
         f"""
-        SELECT date(e.occurred_at) AS d, count(*) AS n
+        SELECT date(e.occurred_at) AS d, json_extract(e.payload,'$.reason') AS reason
         FROM events e JOIN tasks t ON e.task_id = t.task_id
         WHERE e.type='attention_form_served'
           AND t.conductor_pane_id = ?
-          AND COALESCE(json_extract(e.payload,'$.reason'), '') NOT IN ({placeholders})
           {clause}
-        GROUP BY d ORDER BY d
         """,
-        [main_pane, *EXCLUDED_DROP_REASONS] + params,
+        [main_pane] + params,
     ).fetchall()
+    by_day: dict = {}
+    for r in rows:
+        bucket = by_day.setdefault(r["d"], {"human_reserved": 0, "no_response": 0, "unverified": 0})
+        bucket[_classify_drop_reason(r["reason"])] += 1
+    series = []
+    for d in sorted(by_day):
+        b = by_day[d]
+        drops = b["no_response"] + b["unverified"]
+        series.append({
+            "date": d,
+            "drops": drops,
+            "no_response": b["no_response"],
+            "unverified": b["unverified"],
+            "excluded_human_reserved": b["human_reserved"],
+            "served": drops + b["human_reserved"],
+        })
+    return {"main_pane": main_pane, "series": series}
+
+
+def compute_cost_proxies(conn: sqlite3.Connection, since: Optional[str],
+                          until: Optional[str]) -> dict:
+    """Plan P0 item 5: report a cost proxy where the schema has one,
+    otherwise say plainly that none exists rather than fabricating a figure.
+    Checked against the real schema (lib/run-registry.sh's `tasks`/`events`/
+    `approvals`/`roles`/`owners` CREATE TABLE statements): no column
+    anywhere stores a token count or a dollar cost, so `tokens` is always
+    `None` here, with a note instead of a silently-omitted key.
+
+    The one proxy the registry does support is approval volume per task --
+    `prompts_per_task`, the count of decided `approvals` rows grouped by
+    `task_id` in-window. This is a workload stand-in (more approvals asked
+    of a task roughly tracks more tool calls made), explicitly NOT a token
+    or dollar figure."""
+    clause, params = _since_until_clause("decided_at", since, until)
+    rows = conn.execute(
+        f"""
+        SELECT task_id, count(*) AS n FROM approvals WHERE 1=1{clause}
+        GROUP BY task_id ORDER BY n DESC
+        """,
+        params,
+    ).fetchall()
+    per_task = [{"task_id": r["task_id"], "n": r["n"]} for r in rows]
+    avg = round(sum(p["n"] for p in per_task) / len(per_task), 2) if per_task else None
     return {
-        "main_pane": main_pane,
-        "series": [{"date": r["d"], "n": r["n"]} for r in rows],
+        "tokens": None,
+        "tokens_note": "no token or dollar-cost column exists in the registry schema "
+                       "(tasks/events/approvals/roles/owners) -- not computed, not estimated",
+        "prompts_per_task": per_task,
+        "prompts_per_task_avg": avg,
     }
 
 
+def load_deploys(path: str) -> list:
+    """Caller-supplied JSON file: a list of `{"revision": str, "deployed_at":
+    ISO8601}` objects, sorted ascending by `deployed_at` on load. This
+    script stays a pure reader of `--db` plus (optionally) this one file; it
+    never shells out to git or infers a deploy-log path itself, the same
+    discipline as never guessing the registry path.
+
+    Build the file from the real deploy log -- this repo's deploy log IS
+    config.sh's git history (every `release: pin vNN bound launcher` commit
+    repoints `HERDR_OMP_BIN` to a new `releases/<label>/` path; the commit's
+    author date is the deploy time, `<label>` is the revision):
+
+      git log --format='%aI %H' -- config.sh
+
+    then pair each commit with the `releases/<label>/` component of
+    `HERDR_OMP_BIN` as checked out at that commit, oldest first."""
+    with open(path, "r", encoding="utf-8") as f:
+        deploys = json.load(f)
+    return sorted(deploys, key=lambda d: d["deployed_at"])
+
+
+def deploy_windows(deploys: list, since: Optional[str], until: Optional[str]) -> list:
+    """Split `[since, until]` into consecutive `(revision, win_since,
+    win_until)` windows at every deploy boundary that falls inside it.
+    `since`/`until` of `None` bind to the deploy list's own first/last
+    `deployed_at` -- an unbounded window can't otherwise be split into
+    finitely many pieces. A window's revision is the most recent deploy at
+    or before its start; a span before the earliest deploy in `deploys` is
+    labelled `pre-<first revision>` rather than silently attributed to it."""
+    if not deploys:
+        return [(None, since, until)]
+    lo = since or deploys[0]["deployed_at"]
+    hi = until or deploys[-1]["deployed_at"]
+    edges = sorted({lo, hi} | {d["deployed_at"] for d in deploys if lo <= d["deployed_at"] <= hi})
+
+    def revision_at(ts: str) -> str:
+        active = None
+        for d in deploys:
+            if d["deployed_at"] <= ts:
+                active = d["revision"]
+        return active if active is not None else f"pre-{deploys[0]['revision']}"
+
+    windows = []
+    for i in range(len(edges) - 1):
+        w_since, w_until = edges[i], edges[i + 1]
+        if w_since == w_until:
+            continue
+        windows.append((revision_at(w_since), w_since, w_until))
+    if not windows:
+        windows = [(revision_at(lo), lo, hi)]
+    return windows
+
+
 def build_report(conn: sqlite3.Connection, since: Optional[str], until: Optional[str],
-                  main_pane_override: Optional[str]) -> dict:
+                  main_pane_override: Optional[str], revision: Optional[str] = None) -> dict:
     return {
         "window": {"since": since, "until": until},
+        "revision": revision,
         "blocked_episodes": compute_blocked_episodes(conn, since, until),
         "top_escalations": compute_top_escalations(conn, since, until),
         "conductor_latency_s": compute_conductor_latency(conn, since, until),
-        "write_binding_latency_s": compute_write_binding_latency(conn, since, until),
+        "dispatch_latency_s": compute_dispatch_latency(conn, since, until, tool="write"),
+        "decision_latency_s": compute_decision_latency(conn, since, until, tool="write"),
+        "completion_latency_s": compute_completion_latency(conn, since, until),
+        "decided_by_actors": compute_decided_by_actors(conn, since, until),
         "wake_outcomes": compute_wake_outcomes(conn, since, until),
         "decisions_per_day": compute_decisions_per_day(conn, since, until),
         "repeated_commands": compute_repeated_commands(conn, since, until),
@@ -487,13 +835,15 @@ def build_report(conn: sqlite3.Connection, since: Optional[str], until: Optional
         "daily_conductor_pairs": compute_daily_conductor_pairs(conn, since, until),
         "stop_rule_series": compute_stop_rule_series(conn, since, until),
         "main_drops_threads": compute_main_drops_threads(conn, since, until, main_pane_override),
+        "cost_proxies": compute_cost_proxies(conn, since, until),
     }
 
 
 def format_text(report: dict) -> str:
     lines = []
     w = report["window"]
-    lines.append(f"window: since={w['since'] or '-'} until={w['until'] or '-'}")
+    lines.append(f"window: since={w['since'] or '-'} until={w['until'] or '-'} "
+                 f"revision={report.get('revision') or '-'}")
 
     be = report["blocked_episodes"]
     lines.append(
@@ -509,14 +859,26 @@ def format_text(report: dict) -> str:
 
     lat = report["conductor_latency_s"]
     lines.append(
-        f"conductor latency s: n={lat['n']} p50={lat['p50']} p90={lat['p90']} p99={lat['p99']}"
+        f"conductor latency s: n={lat['n']} unresolved={lat['unresolved']} "
+        f"p50={lat['p50']} p90={lat['p90']} p99={lat['p99']}"
     )
-    lines.append(f"  method: {lat['method']}")
 
-    wbl = report["write_binding_latency_s"]
-    lines.append(
-        f"write-binding latency s: n={wbl['n']} p50={wbl['p50']} p90={wbl['p90']} p99={wbl['p99']}"
-    )
+    disp = report["dispatch_latency_s"]
+    lines.append(f"dispatch latency s (tool={disp['tool']}): n={disp['n']} "
+                 f"p50={disp['p50']} p90={disp['p90']} p99={disp['p99']}")
+
+    dec = report["decision_latency_s"]
+    lines.append(f"decision latency s (tool={dec['tool']}): n={dec['n']} "
+                 f"unresolved={dec['unresolved']} p50={dec['p50']} p90={dec['p90']} p99={dec['p99']}")
+
+    comp = report["completion_latency_s"]
+    lines.append(f"completion latency s: n={comp['n']} unresolved={comp['unresolved']} "
+                 f"p50={comp['p50']} p90={comp['p90']} p99={comp['p99']}")
+
+    dba = report["decided_by_actors"]
+    lines.append(f"decided_by actors (total={dba['total']}):")
+    for row in dba["actors"]:
+        lines.append(f"  {row['decided_by']}: {row['n']}")
 
     wo = report["wake_outcomes"]
     lines.append(f"wake outcomes: {wo['counts']} total={wo['total']} "
@@ -553,9 +915,16 @@ def format_text(report: dict) -> str:
     mdt = report["main_drops_threads"]
     lines.append(f"main drops threads (main_pane={mdt['main_pane']}):")
     for row in mdt.get("series", []):
-        lines.append(f"  {row['date']}: {row['n']}")
+        lines.append(f"  {row['date']}: drops={row['drops']} (no_response={row['no_response']} "
+                     f"unverified={row['unverified']}) excluded_human_reserved="
+                     f"{row['excluded_human_reserved']} served={row['served']}")
     if mdt.get("note"):
         lines.append(f"  note: {mdt['note']}")
+
+    cp = report["cost_proxies"]
+    lines.append(f"cost proxies: tokens={cp['tokens']} ({cp['tokens_note']})")
+    lines.append(f"  prompts_per_task_avg={cp['prompts_per_task_avg']} "
+                 f"({len(cp['prompts_per_task'])} tasks)")
 
     return "\n".join(lines)
 
@@ -568,19 +937,28 @@ def main(argv=None) -> int:
     ap.add_argument("--until", default=None, help="ISO8601 upper bound (inclusive)")
     ap.add_argument("--main-pane", default=None,
                      help="override Main's pane id (skips the `roles` table lookup)")
+    ap.add_argument("--deploys", default=None,
+                     help="path to a JSON deploy list (see load_deploys docstring); "
+                          "when given, the report is split into one per deployed revision")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
     args = ap.parse_args(argv)
 
     conn = connect_ro(args.db)
     try:
-        report = build_report(conn, args.since, args.until, args.main_pane)
+        if args.deploys:
+            deploys = load_deploys(args.deploys)
+            windows = deploy_windows(deploys, args.since, args.until)
+            reports = [build_report(conn, w_since, w_until, args.main_pane, revision=rev)
+                       for rev, w_since, w_until in windows]
+        else:
+            reports = [build_report(conn, args.since, args.until, args.main_pane)]
     finally:
         conn.close()
 
     if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
+        print(json.dumps(reports if args.deploys else reports[0], indent=2, sort_keys=True))
     else:
-        print(format_text(report))
+        print("\n\n".join(format_text(r) for r in reports))
     return 0
 
 
