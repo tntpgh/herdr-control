@@ -98,6 +98,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/lib/run-registry.sh"
 # shellcheck source=lib/worktree-archive.sh
 source "$HERE/lib/worktree-archive.sh"
+# shellcheck source=lib/claims.sh
+source "$HERE/lib/claims.sh"
 
 _die() { printf 'archive-worktrees: %s\n' "$1" >&2; exit 1; }
 _realdir() { (cd "$1" 2>/dev/null && pwd -P); }
@@ -380,9 +382,24 @@ _read_registry
 # The EXIT trap also unlocks a worktree this run `git worktree lock`ed, and
 # only then drops the spawn fence it holds (r3 L1) — never the other order.
 run_lock=""; locked_wt=""; locked_repo=""; fenced=""
+# Falls back to a per-invocation identity (this process's own pid), never a
+# shared constant: two separate OS processes racing the same `path:` scope
+# with no HERDR_PANE_ID must present DISTINCT pane_ids to claim_acquire, or
+# the second's acquire reads as a renewal of the first's claim (same string
+# compared in lib/claims.sh's _claim_acquire_core) instead of the conflict
+# it actually is (review r1 finding 1; verify-namespaced-leases.sh pins it).
+_ARCHIVE_PANE="${HERDR_PANE_ID:-archive-worktrees.sh:$$}"
+_wt_path_claim_scope=""
+# Releases BOTH fences every call: the file fence (spawn-task.sh's side) and
+# the P2 registry `path:` lease (plan v2 §4.6) taken below, in that order —
+# never leave the lease held once the file fence (or the run) is gone.
 _release_fence() {
   [ -z "$fenced" ] || rm -f "$fenced"
   fenced=""
+  if [ -n "$_wt_path_claim_scope" ]; then
+    claim_release "$_wt_path_claim_scope" "$_ARCHIVE_PANE" >/dev/null 2>&1
+    _wt_path_claim_scope=""
+  fi
 }
 _cleanup() {
   [ -n "$locked_wt" ] && git -C "$locked_repo" worktree unlock "$locked_wt" >/dev/null 2>&1
@@ -663,9 +680,22 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     # that says it is unfinished), with the worktree fenced off from
     # spawn-task.sh from here until AFTER the remove (r3 L1) and locked
     # against git for the archive window (r2 H1).
-    refuse=""; part="$dest.partial"; manifest=""
+    refuse=""; part="$dest.partial"; manifest=""; path_claim_gen=""
     head_sha=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
     [ -n "$head_sha" ] || refuse="could not resolve HEAD"
+    # P2 single-writer worktree removal (plan v2 §4.6): a registry `path:`
+    # lease, held across the whole archive+remove window, fenced by its
+    # generation re-checked immediately before the remove below — a second
+    # concurrent writer against this exact path is refused here, same as
+    # the file fence archive_fence_take already gives spawn-task.sh.
+    if [ -z "$refuse" ]; then
+      if claim_out=$(claim_acquire "path:$wt_real" "$_ARCHIVE_PANE" "archive-worktrees.sh pid $$" 2>/dev/null); then
+        _wt_path_claim_scope="path:$wt_real"
+        path_claim_gen="$(printf '%s' "$claim_out" | jq -r '.generation // empty' 2>/dev/null)"
+      else
+        refuse="path: $wt_real is already claimed by another archive run"
+      fi
+    fi
     if [ -z "$refuse" ]; then
       if archive_fence_take "$wt"; then fenced="$_ARCHIVE_FENCE"; else refuse="$_ARCHIVE_WHY"; fi
     fi
@@ -704,6 +734,13 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     if [ -z "$refuse" ]; then
       recheck=$(_recheck_why "$wt" "$wt_real" "$head_sha" "$files" "$excluded" "$manifest")
       [ -n "$recheck" ] && refuse="changed while archiving: $recheck"
+    fi
+    if [ -z "$refuse" ] && [ -n "$path_claim_gen" ]; then
+      _wt_claim_now=$(claim_holder "path:$wt_real" 2>/dev/null)
+      _wt_claim_now_gen="$(printf '%s' "$_wt_claim_now" | jq -r '.generation // empty' 2>/dev/null)"
+      if [ "$_wt_claim_now_gen" != "$path_claim_gen" ]; then
+        refuse="path: lease generation changed since acquire (re-granted or force-released) — not removing"
+      fi
     fi
     if [ -z "$refuse" ] && { [ -e "$dest" ] || ! mv "$part" "$dest" 2>/dev/null; }; then
       refuse="could not rename $part to $dest"
