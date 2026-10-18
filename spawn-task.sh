@@ -393,6 +393,7 @@ wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 case "$wt" in
   *//*|*/) echo "spawn-task: refusing a malformed worktree path: $wt" >&2; exit 1 ;;
 esac
+_spawn_scope_authorized_by_receipt=0  # never inherited from the environment
 if [ "$dry" != 1 ]; then
   # Source authority is separate from the pane assigned to supervise the task.
   # In particular, the publisher's Main fallback is never proof Main approved
@@ -417,6 +418,10 @@ if [ "$dry" != 1 ]; then
     # This durable once-only claim precedes git worktree changes and every
     # .handoffs write. Expiry/crash never releases an uncertain reservation.
     claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null || exit 1
+    # The verified, now-consumed receipt IS this spawn's authority. P2 must not
+    # run after the once-only claim: a P2 refusal here would burn a legitimate
+    # reservation that nothing may release (task-reservation.py no-release design).
+    _spawn_scope_authorized_by_receipt=1
   else
     # Preserve an already reserved remote worktree even for a local/unmanaged
     # invocation. This read-only guard does not serialize two brand-new intents.
@@ -433,13 +438,16 @@ fi
 # A caller that is NOT a registered orchestrator@* pane (Main, or an
 # ordinary human pane) is unaffected: the check below is a no-op for it,
 # same as today.
-_spawn_scope_role=""; _spawn_scope_root_real=""
-_spawn_scope_caller_pane="$(caller_pane_from_ancestry 2>/dev/null)"; _spawn_scope_rc=$?
+_spawn_scope_role=""; _spawn_scope_root_real=""; _spawn_scope_caller_pane=""; _spawn_scope_rc=1
+# Set only after the receipt above was verified AND claimed -- never by a flag alone.
+if [ "${_spawn_scope_authorized_by_receipt:-0}" != 1 ]; then
+  _spawn_scope_caller_pane="$(caller_pane_from_ancestry 2>/dev/null)"; _spawn_scope_rc=$?
+fi
 if [ "$_spawn_scope_rc" -eq 0 ] && [ -n "$_spawn_scope_caller_pane" ]; then
   _spawn_scope_caller_birth="$(pane_birth_now "$_spawn_scope_caller_pane" 2>/dev/null)"
   [ -n "$_spawn_scope_caller_birth" ] && \
     _spawn_scope_role="$(role_for_live_pane "$_spawn_scope_caller_pane" "$_spawn_scope_caller_birth" 'orchestrator@' 2>/dev/null)"
-elif [ -n "${HERDR_PANE_ID:-}" ]; then
+elif [ "${_spawn_scope_authorized_by_receipt:-0}" != 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
   # Ancestry unavailable: fail CLOSED only for the case that matters (a
   # self-asserted HERDR_PANE_ID naming a live orchestrator pane could
   # otherwise dodge the check entirely by not resolving ancestry); an

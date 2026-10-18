@@ -101,6 +101,10 @@ printf '== S2: --project herdr-control does not change the real check (label ign
 out=$(run_as "$ORCH_PANE" "$ORCH_BIRTH" spawn-task.sh "$KB_RAW" s2-branch --project herdr-control 2>&1); rc=$?
 check "still refused (rc=2)" "$rc" "2"
 
+printf '== S3: an inherited _spawn_scope_authorized_by_receipt=1 cannot skip P2 (only a verified, claimed receipt can) ==\n'
+out=$(_spawn_scope_authorized_by_receipt=1 run_as "$ORCH_PANE" "$ORCH_BIRTH" spawn-task.sh "$KB_RAW" s3-branch 2>&1); rc=$?
+check "env-injected receipt flag still refused (rc=2)" "$rc" "2"
+
 printf '== S4: ancestry resolves the orchestrator; HERDR_PANE_ID pointing at Main does not override it ==\n'
 out=$(HERDR_PANE_ID="$MAIN_PANE" HERDR_PANE_BIRTH="$MAIN_BIRTH" \
   HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$STATE_ROOT" \
