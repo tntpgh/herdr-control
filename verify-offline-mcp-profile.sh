@@ -139,6 +139,55 @@ for j in $KNOWN_JOB_CLASSES; do
 done
 [ "$matrix_fail" = 0 ] && ok "all $(set -- $KNOWN_JOB_CLASSES; echo $#) job classes x 2 approval modes x 2 secrets states (dry-run) launch cleanly with correct overlay placement"
 
+printf '== bound launcher argv allowlist: every composed launch line would be ACCEPTED by the real $HERDR_OMP_BIN ==\n'
+# Extracted live from the launcher script's own case statement (not hand-
+# transcribed) so a future launcher version drifting its allowlist shape
+# fails this test instead of silently going unverified. Root cause this
+# guards (conductor, 2026-10-17): v18's launcher allowlisted only the
+# worker overlay as --config; this fix's offline overlay made every
+# patched managed spawn exit 78 ("only the bound Herdr worker overlay is
+# allowed") before any pane output, and --dry-run tests never invoke the
+# launcher at all, so nothing caught it. v19 allowlists both.
+launcher_bin_line="$(grep -n '^HERDR_OMP_BIN=' "$here/config.sh")"
+eval "${launcher_bin_line#*:}"
+[ -x "$HERDR_OMP_BIN" ] && ok "the configured bound launcher exists and is executable: $HERDR_OMP_BIN" \
+  || bad "configured HERDR_OMP_BIN is missing/not executable: $HERDR_OMP_BIN"
+guard_src="$(awk '/^args=\("\$@"\)$/,/^done$/' "$HERDR_OMP_BIN" 2>/dev/null)"
+case "$guard_src" in
+  *'"$overlay"|"$offline_overlay"'*) ok "launcher's argv-scan shape (the \$overlay|\$offline_overlay case arm) still matches what this extraction assumes" ;;
+  *) bad "launcher's argv-scan shape changed or the marker lines are gone — extraction found: ${guard_src:-<empty>}" ;;
+esac
+launcher_allows_argv() {  # <overlay-path> <offline-overlay-path> -- <rest of the launch argv>
+  local overlay="$1" offline_overlay="$2"; shift 2
+  local _guard_fail=""
+  die() { _guard_fail="$*"; }
+  eval "$guard_src"
+  [ -z "$_guard_fail" ]
+}
+wt_overlay="$here/agent-hooks/omp-worker-overlay.yml"
+for j in review debug explore; do
+  for appr in menu hook; do
+    extra=(); [ "$appr" = hook ] && extra=(--approval hook)
+    cli_tail="$(HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts" HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
+      bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-launcher-$j-$appr-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1 \
+      | sed -n 's/^  launch    : //p')"
+    [ -n "$cli_tail" ] || { bad "$j/$appr: no launch line to test the launcher against"; continue; }
+    eval "argv=($cli_tail)"
+    # argv[0] is the omp binary path itself (what the pane actually execs);
+    # the launcher's own guard scans everything AFTER it, i.e. its own "$@".
+    if launcher_allows_argv "$wt_overlay" "$profile_path" "${argv[@]:1}"; then
+      ok "$j/$appr: the real launcher's argv-scan accepts this composed launch line"
+    else
+      bad "$j/$appr: the real launcher would REJECT this composed launch line ($_guard_fail): ${argv[*]:1}"
+    fi
+  done
+done
+if "$HERDR_OMP_BIN" --herdr-bound-check >/dev/null 2>&1; then
+  ok "the live installed app is already pinned to this launcher (--herdr-bound-check passed)"
+else
+  echo "  info  --herdr-bound-check failed against the LIVE install — expected: installing lib/offline-mcp-profile.yml into ~/.local/share/herdr-control/app is the separate owner-approved release step SPEC.md forbids this task from doing; the argv-scan checks above prove the composed line is correct independent of whether that install has happened yet"
+fi
+
 printf '== spawn-task.sh --dry-run: implement (no withholding) gets NO offline overlay ==\n'
 launch_line="$(env -u HERDR_SECRETS_WITHHELD HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
   bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-implement-$$" implement omp 2>&1 | grep '^  launch')"

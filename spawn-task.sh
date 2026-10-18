@@ -1042,6 +1042,49 @@ for _ in 1 2 3 4 5; do
 done
 [ -n "$agent_session" ] && set_task_agent_session "$run_id" "$task_id" "$agent_session"
 
+# Startup-failure reconciliation (fix/offline-launch-profile, conductor
+# 2026-10-17): previously only the --brief kickoff path below waited for
+# any pane output before this flipped to "running" — a bound-launcher
+# die() (rc!=0, nothing ever reaches a prompt — v18's launcher rejecting
+# a 2nd --config did exactly this to every patched spawn) or a pane that
+# vanished right after `herdr pane run` left the registry at "running"
+# (or stuck at "starting") forever, with nothing live behind it.
+#
+# Managed-only, keyed on the launcher/agent process itself (not a separate
+# `herdr pane list` existence probe): "Model scope"/"to change thinking
+# effort" is omp UI text, and only omp's bound launcher can die() with its
+# own "omp-herdr-bound: " line before ever reaching it. An unmanaged
+# literal command (e.g. `spawn-task.sh ... quick /bin/true`) has no such
+# signal to wait for and must not be held to a 60s omp-shaped timeout it
+# could never satisfy. A pane that vanished entirely surfaces here too,
+# indistinguishably from a stall: `herdr pane wait-output` against a dead
+# pane returns the same nonzero rc as a genuine timeout, which is already
+# the failure branch below (found by independent review: a SEPARATE
+# `herdr pane list`-based existence probe here broke every test harness
+# that doesn't bother stubbing `pane list` to echo back a pane it was
+# never asked to track, e.g. verify-worktree-archival.sh's unmanaged
+# `quick /bin/true` spawns — a test-harness-shape problem this managed-
+# only, wait-output-only design does not have, since those spawns never
+# reach this branch).
+if [ "$managed" = 1 ]; then
+  first_output="$(herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort|^omp-herdr-bound: ' --timeout 60000 2>&1)"
+  wait_rc=$?
+  if printf '%s' "$first_output" | grep -q '^omp-herdr-bound: '; then
+    launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
+    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" '{reason:$r, launcher_error:$e}')" >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — the bound omp launcher rejected this spawn at startup ($launcher_err); see registry task $task_id" >&2
+    exit 1
+  fi
+  if [ "$wait_rc" != 0 ]; then
+    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      '{"reason":"no readiness output within 60s of launch (the process may have exited or the pane vanished)"}' >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — the worker produced no readiness output within 60s of launch; see registry task $task_id" >&2
+    exit 1
+  fi
+fi
 set_task_state "$run_id" "$task_id" "running"
 
 # --brief used to stop at writing SPEC.md: the worker booted to an empty
@@ -1056,8 +1099,10 @@ if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
   else
     kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
   fi
-  if herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort' --timeout 60000 >/dev/null 2>&1 \
-     && bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
+  # Readiness already confirmed above (wait_rc=0, "Model scope"/"to change
+  # thinking effort" matched — the omp-herdr-bound error branch would have
+  # exited before this point) — send the kickoff directly.
+  if bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
     kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"
   else
     kickoff_note="⚠ NOT DELIVERED — the worker is idle. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\""
