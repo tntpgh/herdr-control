@@ -228,6 +228,14 @@ check "F1: spoofed HERDR_PANE_ID refused (exit 1)" "$rc" "1"
 check "F1: no child row registered for the spoofed spawn" \
   "$(reg_sql "SELECT count(*) FROM tasks WHERE repo='$HC' AND branch='f1-spoof';")" "0"
 
+out=$(env -u HERDR_MCP_CONDUCTOR_PANE -u HERDR_MCP_CONDUCTOR_BIRTH -u HERDR_CONDUCTOR_ID \
+  HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$STATE_ROOT" \
+  HERDR_PANE_ID="not-the-orchestrator" HERDR_PANE_BIRTH="spoof-birth" \
+  HERDR_FG_PANE="$ORCH_PANE" HERDR_FG_BIRTH="$ORCH_BIRTH" HERDR_FG_PID="1" \
+  bash "$HERE/spawn-task.sh" "$HC_RAW" f1b-detached quick /bin/true 2>&1); rc=$?
+check "F1b: spoofed HERDR_PANE_ID with ancestry resolving NO pane (detached caller) refused (exit 1)" "$rc" "1"
+check "F1b: no child row registered" \
+  "$(reg_sql "SELECT count(*) FROM tasks WHERE repo='$HC' AND branch='f1b-detached';")" "0"
 printf '== F2 (security review #334): an orchestrator@* pane cannot use spawn-agent.sh (no task row -> no cap) ==\n'
 out=$(run_as "$ORCH_PANE" "$ORCH_BIRTH" spawn-agent.sh "$HC_RAW" f2-agent 2>&1); rc=$?
 check "F2: in-scope spawn-agent.sh by the orchestrator refused (exit 2)" "$rc" "2"

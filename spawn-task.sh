@@ -925,15 +925,22 @@ fi
 # remote-mcp/tasks.py's HERDR_MCP_REMOTE_SPAWN) it must be the
 # ancestry-verified calling pane, never the self-asserted $HERDR_PANE_ID read
 # above -- managed or not. A mismatch means the env lies about who is
-# spawning: refuse.
-if [ -z "${HERDR_MCP_REMOTE_SPAWN:-}" ] && _bind_pane="$(caller_pane_from_ancestry 2>/dev/null)" && [ -n "$_bind_pane" ]; then
-  if [ -n "$conductor_pane_id" ] && [ "$conductor_pane_id" != "$_bind_pane" ]; then
-    echo "spawn-task: refusing — HERDR_PANE_ID ($conductor_pane_id) is not the calling pane ($_bind_pane)" >&2; exit 1
+# spawning: refuse. If the ancestry walk does NOT resolve a pane (rc 1/2,
+# e.g. a double-forked caller reparented away from its pane) a
+# self-asserted HERDR_PANE_ID is unverifiable: refuse rather than trust it.
+if [ -z "${HERDR_MCP_REMOTE_SPAWN:-}" ]; then
+  _bind_pane="$(caller_pane_from_ancestry 2>/dev/null)" || _bind_pane=""
+  if [ -n "$_bind_pane" ]; then
+    if [ -n "$conductor_pane_id" ] && [ "$conductor_pane_id" != "$_bind_pane" ]; then
+      echo "spawn-task: refusing — HERDR_PANE_ID ($conductor_pane_id) is not the calling pane ($_bind_pane)" >&2; exit 1
+    fi
+    _bind_birth="$(pane_birth_now "$_bind_pane" 2>/dev/null)"
+    [ -n "$_bind_birth" ] || { echo "spawn-task: refusing — calling pane birth unavailable" >&2; exit 1; }
+    conductor_pane_id="$_bind_pane"; conductor_pane_birth="$_bind_birth"
+    conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id}}"
+  elif [ -n "${HERDR_PANE_ID:-}" ]; then
+    echo "spawn-task: refusing — HERDR_PANE_ID ($HERDR_PANE_ID) is set but process ancestry resolves no herdr pane; conductor identity is unverifiable" >&2; exit 1
   fi
-  _bind_birth="$(pane_birth_now "$_bind_pane" 2>/dev/null)"
-  [ -n "$_bind_birth" ] || { echo "spawn-task: refusing — calling pane birth unavailable" >&2; exit 1; }
-  conductor_pane_id="$_bind_pane"; conductor_pane_birth="$_bind_birth"
-  conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id}}"
 fi
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
