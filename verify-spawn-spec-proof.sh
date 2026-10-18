@@ -160,6 +160,92 @@ dryrun_out2=$(env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
 printf '%s' "$dryrun_out2" | grep -qF '(template — no --brief passed)' \
   && ok "dry-run no-brief spec line unchanged" || bad "dry-run no-brief spec line wrong: $dryrun_out2"
 
+printf '== bashlex preflight (fix/bashlex-preflight): fresh worktree gets a working parser, or fails closed with why ==\n'
+# .venv-bashlex is gitignored and relative to the worktree it runs in
+# (lib/command-policy.sh _cp_bashlex_findgit_present), so a worktree
+# `git worktree add` just cut never has one -- the find/git parser gate
+# escalated every shaped command with no indication why until this fix.
+# lib/bashlex-preflight.sh's provision_worktree_bashlex_venv is called right
+# after worktree creation (spawn-task.sh, same section as the SPEC.md/
+# PROOF.md writes this file already exercises above).
+. "$here/lib/bashlex-preflight.sh"
+
+# A fake `python3` that answers exactly the two invocations
+# provision_worktree_bashlex_venv makes, with no real interpreter or network
+# -- same stubbing technique as the herdr stub above.
+make_fake_bashlex_venv() {  # <dir> <bashlex-version>
+  local dir="$1" ver="$2"
+  mkdir -p "$dir/bin"
+  cat > "$dir/bin/python3" <<PYSTUB
+#!/usr/bin/env bash
+case "\$*" in
+  *importlib.metadata*) echo "$ver" ;;
+  *"import bashlex"*)   exit 0 ;;
+  *)                    exit 1 ;;
+esac
+PYSTUB
+  chmod +x "$dir/bin/python3"
+}
+
+pinned_ver="$(sed -n 's/^bashlex==\([0-9.][0-9.]*\).*/\1/p' "$here/lib/bashlex-requirements.txt" | head -1)"
+check "pin sanity: lib/bashlex-requirements.txt pins 0.18" "$pinned_ver" "0.18"
+
+empty_app_dir=$(mktemp -d)  # deterministic "no deployed app" candidate for every case below
+
+printf -- '-- case 1: shared checkout has a venv at the PINNED version -> linked, provenance records it --\n'
+src1=$(mktemp -d); make_fake_bashlex_venv "$src1/.venv-bashlex" "$pinned_ver"
+wt1=$(mktemp -d)
+HERDR_APP_DIR="$empty_app_dir" provision_worktree_bashlex_venv "$wt1" "$src1"
+bashlex_rc1=$?
+check "case 1: provision returns success" "$bashlex_rc1" "0"
+[ -L "$wt1/.venv-bashlex" ] && ok "case 1: worktree .venv-bashlex is a symlink" || bad "case 1: no symlink created"
+check "case 1: symlink targets the shared checkout's venv" "$(readlink "$wt1/.venv-bashlex" 2>/dev/null)" "$src1/.venv-bashlex"
+"$wt1/.venv-bashlex/bin/python3" -c 'import bashlex' >/dev/null 2>&1 \
+  && ok "case 1: linked interpreter imports bashlex through the worktree-local path" \
+  || bad "case 1: linked interpreter does not import"
+grep -q "linked" "$wt1/.handoffs/bashlex-provenance.txt" 2>/dev/null \
+  && ok "case 1: provenance records a link" || bad "case 1: provenance missing/wrong: $(cat "$wt1/.handoffs/bashlex-provenance.txt" 2>/dev/null)"
+grep -q "$pinned_ver" "$wt1/.handoffs/bashlex-provenance.txt" 2>/dev/null \
+  && ok "case 1: provenance records the matched version" || bad "case 1: version not recorded"
+
+printf -- '-- case 2: no venv anywhere (shared checkout or deployed app) -> no link, fails closed, says why --\n'
+src2=$(mktemp -d)  # no .venv-bashlex at all
+wt2=$(mktemp -d)
+HERDR_APP_DIR="$empty_app_dir" provision_worktree_bashlex_venv "$wt2" "$src2"
+bashlex_rc2=$?
+check "case 2: provision returns failure (rc!=0)" "$([ "$bashlex_rc2" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+[ -e "$wt2/.venv-bashlex" ] && bad "case 2: a symlink was created with no valid source" || ok "case 2: no symlink created"
+grep -q "NOT linked" "$wt2/.handoffs/bashlex-provenance.txt" 2>/dev/null \
+  && ok "case 2: provenance says NOT linked" || bad "case 2: provenance missing/wrong: $(cat "$wt2/.handoffs/bashlex-provenance.txt" 2>/dev/null)"
+grep -qi "install.sh --apply" "$wt2/.handoffs/bashlex-provenance.txt" 2>/dev/null \
+  && ok "case 2: provenance names the actionable fix" || bad "case 2: no actionable fix in provenance"
+
+printf -- '-- case 3: shared checkout has a venv at the WRONG version (0.17 vs pinned %s) -> refused, no link --\n' "$pinned_ver"
+src3=$(mktemp -d); make_fake_bashlex_venv "$src3/.venv-bashlex" "0.17"
+wt3=$(mktemp -d)
+HERDR_APP_DIR="$empty_app_dir" provision_worktree_bashlex_venv "$wt3" "$src3"
+bashlex_rc3=$?
+check "case 3: provision returns failure (rc!=0)" "$([ "$bashlex_rc3" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+[ -e "$wt3/.venv-bashlex" ] && bad "case 3: a symlink was created from a version-mismatched venv" || ok "case 3: no symlink created"
+grep -q "0.17 != pinned $pinned_ver" "$wt3/.handoffs/bashlex-provenance.txt" 2>/dev/null \
+  && ok "case 3: provenance names the exact version mismatch against lib/bashlex-requirements.txt's pin" \
+  || bad "case 3: mismatch not explained: $(cat "$wt3/.handoffs/bashlex-provenance.txt" 2>/dev/null)"
+
+printf -- "-- end-to-end: a REAL spawn-task.sh run links a fresh task worktree's .venv-bashlex --\n"
+e2e_repo=$(mktemp -d); git -C "$e2e_repo" init -q -b main 2>/dev/null
+git -C "$e2e_repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+make_fake_bashlex_venv "$e2e_repo/.venv-bashlex" "$pinned_ver"
+env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_APP_DIR="$empty_app_dir" \
+  HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+  bash "$here/spawn-task.sh" "$e2e_repo" bashlex-e2e-branch quick /bin/true >/tmp/spawn-bashlex-e2e-$$.log 2>&1 \
+  || bad "end-to-end spawn failed: $(cat /tmp/spawn-bashlex-e2e-$$.log)"
+e2e_wt="$WT_ROOT/$(basename "$e2e_repo")/bashlex-e2e-branch"
+[ -L "$e2e_wt/.venv-bashlex" ] && ok "end-to-end: spawn-task.sh linked .venv-bashlex into the real new worktree" \
+  || bad "end-to-end: no .venv-bashlex symlink in $e2e_wt"
+"$e2e_wt/.venv-bashlex/bin/python3" -c 'import bashlex' >/dev/null 2>&1 \
+  && ok "end-to-end: the real worktree's linked interpreter imports bashlex" \
+  || bad "end-to-end: linked interpreter broken in the real worktree"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

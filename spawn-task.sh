@@ -61,6 +61,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/op-env.sh"
 . "$here/lib/pane-guard.sh"
 . "$here/lib/worktree-archive.sh"
+. "$here/lib/bashlex-preflight.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -655,6 +656,20 @@ mkdir -p "$(dirname "$events_file")"
 # whole thing as nothing. A worker then can't accidentally commit its own
 # coordination log into the branch it was sent to write.
 printf '*\n' > "$(dirname "$events_file")/.gitignore"
+
+# ---- bashlex parser venv (fix/bashlex-preflight, 2026-10-18): a freshly
+# created worktree has no .venv-bashlex of its own and `install.sh --apply`
+# was never run inside it, so lib/command-policy.sh's find/git parser gate
+# (_cp_bashlex_findgit_present) and every bashlex-prereq verify-*.sh suite
+# fail closed with no indication why — 3 workers in one day burned whole
+# suite runs (verify-omp-hooks 352/5, verify-command-policy,
+# verify-approval-payload) discovering this the hard way. Read-only-links the
+# SHARED checkout's (or, failing that, the deployed app's) already-provisioned,
+# version-pinned venv in — never provisions a NEW one (no network from a
+# spawn) and never weakens the gate: a worktree this still leaves unlinked is
+# exactly as fail-closed as before, just with an actionable
+# .handoffs/bashlex-provenance.txt explaining why and what to run.
+provision_worktree_bashlex_venv "$wt" "$root" || true
 
 # ---- SPEC.md / PROOF.md: written FIRST, before any herdr/registry side
 # effect (tab, pane, task registration, claim) — a write failure here exits
