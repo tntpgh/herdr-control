@@ -460,6 +460,40 @@ provision_bashlex_venv() {
   fi
 }
 
+# _deploy_launcher_preflight SRC REV — rc 0 iff REV's tree satisfies every
+# content pin of the launcher REV's own config.sh names (HERDR_OMP_BIN, whose
+# sha256 must also equal HERDR_OMP_LAUNCHER_SHA256). Same hash formula as the
+# launcher. Fails closed on any missing input.
+_deploy_launcher_preflight() {
+  local src="$1" rev="$2" tmp bin want_sha launcher pin got f
+  tmp="$(mktemp -d)" || return 1
+  git -C "$src" archive "$rev" config.sh lib spawn-task.sh herdr-select.sh agent-hooks/omp-worker-overlay.yml \
+    | tar -x -C "$tmp" 2>/dev/null || { echo "deploy: preflight could not extract $rev" >&2; rm -r "$tmp"; return 1; }
+  bin="$(HOME="$HOME" bash -c '. "$1/config.sh" >/dev/null 2>&1; printf %s "$HERDR_OMP_BIN"' _ "$tmp")"
+  want_sha="$(HOME="$HOME" bash -c '. "$1/config.sh" >/dev/null 2>&1; printf %s "$HERDR_OMP_LAUNCHER_SHA256"' _ "$tmp")"
+  if [ -z "$bin" ] || [ ! -r "$bin" ]; then
+    echo "deploy: preflight — launcher '$bin' named by $rev config.sh is not installed" >&2; rm -r "$tmp"; return 1
+  fi
+  got="$(shasum -a 256 "$bin" | awk '{print $1}')"
+  [ -n "$want_sha" ] && [ "$got" = "$want_sha" ] || {
+    echo "deploy: preflight — launcher $bin sha $got != config HERDR_OMP_LAUNCHER_SHA256 '$want_sha'" >&2; rm -r "$tmp"; return 1; }
+  launcher="$(cat "$bin")"
+  for pin in lib_tree_sha spawn_sha selector_sha overlay_sha; do
+    want_sha="$(printf '%s\n' "$launcher" | awk -F= -v k="$pin" '$1==k {print $2; exit}')"
+    case "$pin" in
+      lib_tree_sha) got="$( (cd "$tmp" && find lib -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done) | shasum -a 256 | awk '{print $1}')" ;;
+      spawn_sha) got="$(shasum -a 256 "$tmp/spawn-task.sh" | awk '{print $1}')" ;;
+      selector_sha) got="$(shasum -a 256 "$tmp/herdr-select.sh" | awk '{print $1}')" ;;
+      overlay_sha) got="$(shasum -a 256 "$tmp/agent-hooks/omp-worker-overlay.yml" | awk '{print $1}')" ;;
+    esac
+    if [ -z "$want_sha" ] || [ "$got" != "$want_sha" ]; then
+      echo "deploy: REFUSED — $rev $pin $got does not match launcher $bin pin '$want_sha'; every spawn would fail. Cut a new launcher release and pin it in config.sh first." >&2
+      rm -r "$tmp"; return 1
+    fi
+  done
+  rm -r "$tmp"
+}
+
 # resolve_hub_python — the bash-side call into the ONE canonical interpreter
 # resolver, launchd/resolve-hub-python.sh (full rationale there: NEVER
 # `/usr/bin/env python3`, which resolves through PATH at launchd load time
@@ -500,6 +534,18 @@ deploy_app() {
   fi
   rev="$(git -C "$src" rev-parse --verify "$want^{commit}" 2>/dev/null)" || {
     echo "deploy: cannot resolve revision '$want'" >&2; return 2; }
+
+  # Launcher-pin preflight. The bound launcher named by the CANDIDATE's
+  # config.sh pins sha256 of lib/ (tree), spawn-task.sh, herdr-select.sh and
+  # the worker overlay, and refuses to start on any mismatch. 2026-10-18: the
+  # #333 and #334 deploys changed lib/ under launcher v23, and every new spawn
+  # died "authority library tree mismatch" for ~80 min. Refuse a candidate
+  # whose tree does not satisfy its own launcher BEFORE touching the app dir.
+  # Skipped only under HERDR_APP_SRC, the existing verify-deploy.sh scratch-repo
+  # seam (its synthetic repos carry no config.sh/launcher); never in real use.
+  if [ -z "${HERDR_APP_SRC:-}" ]; then
+    _deploy_launcher_preflight "$src" "$rev" || return 2
+  fi
 
   if [ ! -e "$HERDR_APP_DIR/.git" ]; then
     mkdir -p "$(dirname "$HERDR_APP_DIR")"
