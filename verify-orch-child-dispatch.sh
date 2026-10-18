@@ -265,6 +265,30 @@ check "N7: outside-worktree file refused (exit 8)" "$rc" "8"
 printf '%s' "$out" | grep -qF "does not resolve inside the caller's own worktree" && ok "N7: refusal names the write-scope gate" || bad "N7 message: $out"
 check "N7: no Enter pressed (nothing delivered)" "$(enters_pressed)" "0"
 
+printf '\n== N7b (dot-dot traversal): a message_file path with a literal .. escaping the worktree is refused ==\n'
+reset_screens; screen 0 <<'EOF'
+❯
+EOF
+last_as 0
+echo "top secret outside content" >"$OUTSIDE/secret.md"
+out="$(kickoff_as "$ORCH_PANE" "$CHILD_PANE" "$ORCH_WT/tmp/../../outside/secret.md" 2>&1)"; rc=$?
+check "N7b: dot-dot traversal refused (exit 8)" "$rc" "8"
+printf '%s' "$out" | grep -qF "does not resolve inside the caller's own worktree" && ok "N7b: refusal names the write-scope gate" || bad "N7b message: $out"
+check "N7b: secret content never delivered" "$(cat "$SENDTEXT" 2>/dev/null)" ""
+
+printf '\n== N7c (symlink escape): a symlink INSIDE the worktree whose TARGET is outside it is refused, not followed ==\n'
+reset_screens; screen 0 <<'EOF'
+❯
+EOF
+last_as 0
+echo "exfiltrated host secret: AKIA-fake-outside-content" >"$OUTSIDE/payload.txt"
+ln -sf "$OUTSIDE/payload.txt" "$ORCH_WT/tmp/evil-link.md"
+out="$(kickoff_as "$ORCH_PANE" "$CHILD_PANE" "$ORCH_WT/tmp/evil-link.md" 2>&1)"; rc=$?
+check "N7c: symlink-escape message_file refused (exit 8)" "$rc" "8"
+printf '%s' "$out" | grep -qF "is a symlink" && ok "N7c: refusal names the symlink rejection" || bad "N7c message: $out"
+check "N7c: outside target content never delivered (not just unsubmitted -- never typed)" "$(cat "$SENDTEXT" 2>/dev/null)" ""
+check "N7c: no Enter pressed (nothing delivered)" "$(enters_pressed)" "0"
+
 printf '\n== N8 (missing file): a message file that does not exist is refused, not silently skipped ==\n'
 out="$(kickoff_as "$ORCH_PANE" "$CHILD_PANE" "$ORCH_WT/tmp/does-not-exist.md" 2>&1)"; rc=$?
 check "N8: missing file refused (exit 8)" "$rc" "8"

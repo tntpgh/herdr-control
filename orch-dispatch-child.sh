@@ -168,6 +168,18 @@ _ODC_DF_DIR_REAL="$(cd "$(dirname "$_ODC_DF_ABS")" 2>/dev/null && pwd -P)"
 [ -n "$_ODC_DF_DIR_REAL" ] ||
   _odc_refuse 8 "$data_file's directory does not exist." '{"reason":"file_missing"}'
 _ODC_DF_REAL="$_ODC_DF_DIR_REAL/$(basename "$_ODC_DF_ABS")"
+# The containment check below only trusts a DIRECTORY realpath (`pwd -P`
+# above resolves every symlink in the chain up to and including the parent
+# directory); the leaf itself is never passed through `readlink`/`realpath`.
+# A symlink planted at that leaf, pointing outside the caller's own
+# worktree, would otherwise textually pass the prefix check while `cat`/
+# `jq` follow it to the target's bytes -- exactly the cross-worktree read
+# this check exists to prevent (security review of PR #340, HIGH finding).
+# Reject any symlink leaf outright rather than resolving-and-recomparing:
+# the orchestrator's own `write` tool never creates one, so a real symlink
+# here is never a legitimate call shape.
+[ -L "$_ODC_DF_REAL" ] &&
+  _odc_refuse 8 "$data_file is a symlink -- refusing rather than following it outside the caller's own worktree." '{"reason":"file_is_symlink"}'
 case "$_ODC_DF_REAL" in
   "$_ODC_CALLER_WT_REAL"/*) ;;
   *) _odc_refuse 8 "$data_file does not resolve inside the caller's own worktree $_ODC_CALLER_WT_REAL." '{"reason":"file_outside_worktree"}' ;;
