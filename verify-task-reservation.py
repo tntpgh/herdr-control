@@ -15,6 +15,7 @@ import hmac
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -63,6 +64,11 @@ class WorktreeReservations(unittest.TestCase):
         self.db.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY," +
                         ",".join(name + " TEXT NOT NULL DEFAULT ''" for name in columns) + ")")
         self.db.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY, run_id TEXT, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        # Real registry schema v10 `roles` (lib/run-registry.sh): register()'s
+        # orchestrator cap reads it and deliberately fails closed without it.
+        self.db.execute("CREATE TABLE roles (label TEXT PRIMARY KEY, pane_id TEXT NOT NULL,"
+                        " pane_birth TEXT NOT NULL DEFAULT '', agent_session TEXT NOT NULL DEFAULT '',"
+                        " workspace TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
         self.db.commit()
         AUTH.schema(self.db)
         AUTH.schema_v13(self.db)
@@ -367,6 +373,36 @@ class WorktreeReservations(unittest.TestCase):
         local = {**self.task(source), "task_id": "local_task", "run_id": "local_run"}
         AUTH.register(self.db, canonical(local))
         self.refused(self.reserve, source, reason="worktree already has a task")
+
+    def test_unmigrated_registry_without_roles_fails_closed(self):
+        # PR #334: the orchestrator cap must never be skipped because the
+        # schema is old. No roles table -> register() raises, nothing lands.
+        self.db.execute("DROP TABLE roles")
+        self.db.commit()
+        source = self.source(1)
+        local = {**self.task(source), "task_id": "unmig_task", "run_id": "unmig_run"}
+        with self.assertRaises(sqlite3.OperationalError):
+            AUTH.register(self.db, canonical(local))
+        self.db.rollback()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
+
+    def test_migrated_registry_caps_orchestrator_children(self):
+        # Same fixture with the real roles table: a live orchestrator@* conductor
+        # gets at most ORCH_CHILD_CAP non-terminal children.
+        source = self.source(1)
+        base = self.task(source)
+        cp, cb = base["conductor_pane_id"] or "orch:p", base["conductor_pane_birth"] or "orchbirth"
+        self.db.execute("INSERT INTO roles VALUES ('orchestrator@sample', ?, ?, '', '', 'now', 'now')", (cp, cb))
+        self.db.commit()
+        for n in range(AUTH.ORCH_CHILD_CAP):
+            self.db.execute("INSERT INTO tasks(task_id,conductor_pane_id,conductor_pane_birth,state) VALUES (?,?,?,'running')",
+                            ("child%d" % n, cp, cb))
+        self.db.commit()
+        over = {**base, "task_id": "over_cap", "run_id": "over_run", "conductor_pane_id": cp, "conductor_pane_birth": cb}
+        with self.assertRaises(AUTH.Refused):
+            AUTH.register(self.db, canonical(over))
+        self.db.rollback()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks WHERE task_id='over_cap'").fetchone()[0], 0)
 
     def test_unrelated_legacy_empty_paths_do_not_block_new_worktree(self):
         self.db.execute("INSERT INTO tasks(task_id,state) VALUES ('legacy_empty','running')")

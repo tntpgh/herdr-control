@@ -69,7 +69,9 @@ MAIN_PANE="mainpane1"; MAIN_BIRTH="mainbirth1"
 
 run_as() {   # <fg_pane|""> <fg_birth> <script> <repo> <branch> [extra args...]
   local fg_pane="$1" fg_birth="$2" script="$3" repo="$4" branch="$5"; shift 5
-  env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
+  # Never leak the caller's own pane identity: spawn-task.sh now refuses a
+  # HERDR_PANE_ID that differs from the ancestry-resolved pane (PR #334 F1).
+  env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
     HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$STATE_ROOT" \
     HERDR_FG_PANE="$fg_pane" HERDR_FG_BIRTH="$fg_birth" HERDR_FG_PID="$$" \
     bash "$HERE/$script" "$repo" "$branch" "$@" quick /bin/true

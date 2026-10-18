@@ -900,17 +900,47 @@ case "$job" in
 esac
 
 # Local caller authority is established once the final manifest is known.
+# root_real: the same canonicalized (pwd -P) repo root the proj: scope check
+# above compares against -- a bound orchestrator pane is eligible here ONLY
+# for the repo its live proj: claim actually covers, never for an arbitrary
+# spawn target (lib/pane-guard.sh pane_is_conductor_eligible's optional
+# second argument).
+_spawn_task_root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+[ -n "$_spawn_task_root_real" ] || _spawn_task_root_real="$root"
 if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
   source_pane="$(caller_pane_from_ancestry)" || {
     echo "spawn-task: authorization hold: local caller ancestry unavailable or outside Herdr" >&2; exit 1;
   }
-  pane_is_conductor_eligible "$source_pane" || {
+  pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real" || {
     echo "spawn-task: authorization hold: local caller is not an eligible conductor" >&2; exit 1;
   }
   source_birth="$(pane_birth_now "$source_pane")" || exit 1
   [ -n "$source_birth" ] || { echo "spawn-task: authorization hold: caller birth unavailable" >&2; exit 1; }
   authorization_command_id="$(gen_id local_auth)"
   accept_local_task_authorization "$authorization_command_id" "$source_pane" "$source_birth" "$root" "$manifest_json" >/dev/null || exit 1
+fi
+
+# Security review PR #334 F1: conductor_pane_id decides who may answer the
+# child's bound prompts (herdr-select.sh), so for a LOCAL spawn (anything but
+# remote-mcp/tasks.py's HERDR_MCP_REMOTE_SPAWN) it must be the
+# ancestry-verified calling pane, never the self-asserted $HERDR_PANE_ID read
+# above -- managed or not. A mismatch means the env lies about who is
+# spawning: refuse. If the ancestry walk does NOT resolve a pane (rc 1/2,
+# e.g. a double-forked caller reparented away from its pane) a
+# self-asserted HERDR_PANE_ID is unverifiable: refuse rather than trust it.
+if [ -z "${HERDR_MCP_REMOTE_SPAWN:-}" ]; then
+  _bind_pane="$(caller_pane_from_ancestry 2>/dev/null)" || _bind_pane=""
+  if [ -n "$_bind_pane" ]; then
+    if [ -n "$conductor_pane_id" ] && [ "$conductor_pane_id" != "$_bind_pane" ]; then
+      echo "spawn-task: refusing — HERDR_PANE_ID ($conductor_pane_id) is not the calling pane ($_bind_pane)" >&2; exit 1
+    fi
+    _bind_birth="$(pane_birth_now "$_bind_pane" 2>/dev/null)"
+    [ -n "$_bind_birth" ] || { echo "spawn-task: refusing — calling pane birth unavailable" >&2; exit 1; }
+    conductor_pane_id="$_bind_pane"; conductor_pane_birth="$_bind_birth"
+    conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id}}"
+  elif [ -n "${HERDR_PANE_ID:-}" ]; then
+    echo "spawn-task: refusing — HERDR_PANE_ID ($HERDR_PANE_ID) is set but process ancestry resolves no herdr pane; conductor identity is unverifiable" >&2; exit 1
+  fi
 fi
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
@@ -1129,7 +1159,7 @@ if [ -n "$authorization_command_id" ]; then
     launch_source="$(caller_pane_from_ancestry)" || exit 1
     launch_source_birth="$(pane_birth_now "$source_pane")" || exit 1
     if [ "$launch_source" != "$source_pane" ] || [ "$launch_source_birth" != "$source_birth" ] || \
-       ! pane_is_conductor_eligible "$source_pane"; then
+       ! pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real"; then
       echo "spawn-task: authorization hold: local source identity changed before launch" >&2; exit 1
     fi
   fi
