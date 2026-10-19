@@ -231,7 +231,14 @@ def proposal_path(db_path: str, key: str) -> Path:
 
 def _write_proposal(db_path: str, key: str, record: dict) -> str:
     """Atomic, 0600, never overwrites an existing proposal for the key (the
-    first recorded input is the one the registry digest describes)."""
+    first recorded input is the one the registry digest describes). Safe
+    under concurrent callers writing the SAME key (a repaired retry racing
+    the original writer, or two first-seen callers racing the DB insert):
+    the final step is `os.link`, which fails closed with `FileExistsError`
+    if another writer's proposal already landed, rather than `os.replace`,
+    which would silently overwrite it. No TOCTOU gap between "does it exist"
+    and "write it" -- `path.exists()` above is just a cheap skip, never the
+    safety property."""
     path = proposal_path(db_path, key)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -246,10 +253,12 @@ def _write_proposal(db_path: str, key: str, record: dict) -> str:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
-        os.replace(tmp, path)
-    except BaseException:
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return "exists"
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
     return "written"
 
 
@@ -408,6 +417,19 @@ def record_seen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_b
                 return proposal("enriched") if won else {"occ_key": key, "written": "enriched"}
             return {"occ_key": key, "written": "duplicate"}
         if digest is None or digest == prior_digest:
+            # A retry resending the SAME payload (digest == prior_digest, and
+            # a payload was actually resent) repairs a proposal file lost to
+            # a crash between the prompt_occ_seen commit and the file write
+            # (the non-atomic gap `_write_proposal`'s os.link closes for
+            # concurrent writers, but a writer that is simply dead needs a
+            # NEW call to retry at all). `proposal()` -> `_write_proposal` is
+            # itself idempotent (returns "exists" once a valid file is
+            # already there), so this is a safe no-op on every ordinary
+            # duplicate `seen` where nothing was ever lost. A retry that
+            # sends no payload at all (digest is None) has nothing to
+            # repair with.
+            if digest is not None and digest == prior_digest:
+                return proposal("duplicate")
             return {"occ_key": key, "written": "duplicate"}
         meid = f"prompt_occ_mismatch_{key}_{digest}"
         _put(conn, meid, run_id, task_id, "prompt_occ_mismatch",
@@ -1201,8 +1223,22 @@ def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pan
         if path.stat().st_size > PROPOSAL_MAX_BYTES:
             return no("proposal file exceeds the size bound")
         doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # Named and explicit on purpose (#orch-decide-proposal-missing):
+        # this occurrence is durably "seen" (its prompt_occ_seen row
+        # committed) but the proposal file that should carry its payload
+        # never landed -- most likely a crash/kill between that commit and
+        # `_write_proposal` (a two-step sequence with nothing to make it
+        # atomic for a writer that dies mid-sequence). Never treat a missing
+        # proposal as approved or as a hard dead end: a fresh `seen` call
+        # with the SAME payload repairs it (record_seen's duplicate-digest
+        # branch), after which `decide` resolves normally.
+        return no("proposal file missing -- recoverable: re-issue a fresh `seen` "
+                   "for this exact occurrence (same run/task/pane/call-id/payload) "
+                   "to recreate it, then retry decide; never infer approval from a "
+                   "missing proposal")
     except (OSError, ValueError) as exc:
-        return no(f"proposal file missing, unreadable or malformed: {exc.__class__.__name__}")
+        return no(f"proposal file unreadable or malformed: {exc.__class__.__name__}")
     if not isinstance(doc, dict) or doc.get("version") != PROPOSAL_VERSION:
         return no("proposal file is not a version-1 proposal")
     want = {"occ_key": rec["occ_key"], "run_id": run_id, "task_id": task_id, "pane_id": pane_id,
