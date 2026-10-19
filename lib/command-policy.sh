@@ -1823,23 +1823,59 @@ _cp_python_risk() {                     # text -> prints a reason, 0 when risky
 # eval/exec, or a `./path` run escalates. Python: an import whose top-level
 # name is a .py file or package directory beside the script (sys.path[0] when
 # run as `python3 <file>`), or any relative import, escalates.
+# `_cp_bashlex_nested_resolve_helper` -> 0 once `.venv-bashlex/bin/python3` and
+# `lib/bashlex_nested_classify.py` (fix/shell-nested-command-word: the
+# command-word-only parser replacing the old raw-text regex scan below)
+# are both present, caching the result like `_cp_bashlex_resolve_helper`
+# above it does for the find/git gate's own, separate script. Never exits
+# nonzero in a way that loosens anything: `_cp_shell_nested` treats a
+# failed resolve as NESTED (fail closed), the same convention
+# `_cp_bashlex_findgit_present` uses for its own helper.
+_CP_BASHLEX_NESTED_PY=""
+_CP_BASHLEX_NESTED_PY_CHECKED=0
+_cp_bashlex_nested_resolve_helper() {
+  [ -n "$_CP_BASHLEX_NESTED_PY" ] && return 0
+  [ "$_CP_BASHLEX_NESTED_PY_CHECKED" = 1 ] && return 1
+  _CP_BASHLEX_NESTED_PY_CHECKED=1
+  local src="${BASH_SOURCE[0]}" here py script
+  here="$(cd "$(dirname "$src")/.." && pwd 2>/dev/null)" || return 1
+  py="$here/.venv-bashlex/bin/python3"
+  script="$here/lib/bashlex_nested_classify.py"
+  [ -x "$py" ] && [ -f "$script" ] || {
+    _cp_bashlex_log_once "nested-classify helper interpreter/script missing ($py / $script) — EVERY shell script content classifies nested until install.sh --apply (or restart.sh --deploy with uv on PATH) provisions it"
+    return 1
+  }
+  _CP_BASHLEX_NESTED_PY="$py"
+  _CP_BASHLEX_NESTED_SCRIPT="$script"
+  return 0
+}
+# `_cp_shell_nested <content>` -> 0 when CONTENT runs another file/program.
+# fix/shell-nested-command-word: judges only COMMAND-WORD positions, parsed
+# by bashlex (`lib/bashlex_nested_classify.py`, full rules in its own
+# header) — not a raw-text regex scan over the whole script, which used to
+# false-positive on a `#!/bin/bash` shebang, a quoted path ARGUMENT
+# (`cp "$A/x" "$B/y"`), and an interpreter word appearing inside a string
+# (`echo "run: bash x"`). A failed helper resolve, a non-zero helper exit,
+# or any output other than the two words the helper ever prints all fail
+# closed to NESTED — never loosened by a broken or missing interpreter.
 _cp_shell_nested() {                    # shell source -> 0 when it runs another file/program
-  printf '%s' "$1" | python3 -c '
-import re, sys
-s = sys.stdin.read()
-prefix = r"(?:^|[;&|({`\x22\x27\\\s])"
-interp = r"(?:[^;&|(){}\s]+/)?(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|deno|bun|php|lua|osascript|eval|exec|xargs)(?:\s|$)"
-source = r"(?:^|[;&|({`\x22\x27\\\s])(?:\.|source)(?:\s|$)"
-direct = r"(?:^|[;&|({`\x22\x27])(?:[^;&|(){}\s]+/)[^;&|(){}\s]+(?:\s|$)"
-# A command word that is a VARIABLE — "$@", "$1", "$cmd", "${cmd}" — runs
-# whatever the CALLER passed, so approving this file'"'"'s bytes approves
-# nothing (fix/coderef-compound, exec-trampoline red tests). Anchored to a
-# real command-start boundary (start of text, or right after `;&|(){` or a
-# backtick, with only spaces/tabs and an optional quote between) rather than
-# `\s` generally — that would also fire on "echo $1", an ordinary argument.
-varword = r"(?:^|[;&|(){`])[ \t]*[\x22\x27]?\$\{?(?:@|\*|[0-9]+|[A-Za-z_][A-Za-z0-9_]*)\}?"
-sys.exit(0 if re.search(prefix + interp, s, re.I) or re.search(source, s, re.I) or re.search(direct, s, re.I) or re.search(varword, s) else 1)
-'
+  local out rc
+  if ! _cp_bashlex_nested_resolve_helper; then
+    return 0
+  fi
+  out="$("$_CP_BASHLEX_NESTED_PY" "$_CP_BASHLEX_NESTED_SCRIPT" <<<"$1" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _cp_bashlex_log_once "nested-classify helper exited rc=$rc — failing closed"
+    return 0
+  fi
+  case "$out" in
+    NESTED) return 0 ;;
+    CLEAN) return 1 ;;
+    *)
+      _cp_bashlex_log_once "nested-classify helper emitted unrecognized output — failing closed: $out"
+      return 0 ;;
+  esac
 }
 _cp_python_local_imports() {            # content origdir -> prints local module names, 0 if any
   local names

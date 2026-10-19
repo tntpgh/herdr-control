@@ -272,6 +272,115 @@ cd @WT@ && bash tmp/tramp1.sh "$(printf gh)" pr view 1
 cd @WT@ && bash tmp/tramp2.sh `echo ls` -la
 EOF
 
+printf '== fix/shell-nested-command-word: _cp_shell_nested judges command words only ==\n'
+# Previously a raw-text regex scan over the WHOLE script: false-positived on
+# a shebang line, a quoted path ARGUMENT, and an interpreter word inside a
+# string. Now bashlex-parsed (lib/bashlex_nested_classify.py) and judged by
+# COMMAND-WORD position only.
+nested_clean() {                        # label content
+  local label="$1" content="$2"
+  _cp_shell_nested "$content" && bad "false positive: $label classifies nested" || ok "$label classifies clean"
+}
+nested_nested() {                       # label content
+  local label="$1" content="$2"
+  _cp_shell_nested "$content" && ok "$label stays nested" || bad "false negative: $label classifies clean"
+}
+nested_clean "shebang line"            "$(printf '#!/bin/bash\necho hi')"
+nested_clean "quoted path argument"    'cp "$A/x" "$B/y"'
+nested_clean "interpreter word in a string" 'echo "run: bash x"'
+nested_clean "varword inside echo text" 'echo "... ($pin ..."'
+nested_clean "ordinary command"        'echo hi'
+nested_nested "quoted var run (existing)" '"$A/run.sh" go'
+nested_nested "bash other.sh (existing)"  'bash other.sh'
+nested_nested "bare quoted-var command word" '"$A/run.sh"'
+nested_nested "./x.sh"                 './x.sh'
+nested_nested "bash x"                 'bash x'
+nested_nested 'sh -c "..."'            'sh -c "..."'
+nested_nested "env bash x"             'env bash x'
+nested_nested "command ./x"            'command ./x'
+nested_nested 'exec "$@"'              'exec "$@"'
+nested_nested '$cmd arg'               '$cmd arg'
+nested_nested '${CMD}'                 '${CMD}'
+nested_nested 'eval "$s"'              'eval "$s"'
+nested_nested ". ./lib.sh"             '. ./lib.sh'
+nested_nested "source x"               'source x'
+nested_nested 'x=$(./y.sh)'            'x=$(./y.sh)'
+nested_nested '`./y`'                  '`./y`'
+nested_nested "cat x | bash"           'cat x | bash'
+nested_nested "xargs sh"               'xargs sh'
+nested_nested "python3 -c ..."         'python3 -c "import os"'
+nested_nested 'find . -exec ./x {} \;' 'find . -exec ./x {} \;'
+nested_nested "trap './x' EXIT"        "$(printf "trap './x' EXIT")"
+nested_nested "f(){ ./x; }; f"         'f(){ ./x; }; f'
+nested_nested "bash <<EOF heredoc"     "$(printf 'bash <<EOF\necho hi\nEOF\n')"
+nested_nested "unparseable input"      'if then fi((('
+printf '== fix/shell-nested-allowlist-r2e: CLEAN-for-the-first-time (v27-shaped) + HIGH findings + option rules ==\n'
+nested_clean "mkdir+cp+chmod sequence"  'mkdir -p "$DIR" && cp "$A/x" "$DIR/y" && chmod 644 "$DIR/y"'
+nested_nested "git removed entirely (REVIEW-r2d HIGH, r2e)" 'git -C "$WT" status'
+nested_clean "tar create with safe long opts" 'tar --create --gzip --file "$OUT" --directory "$SRC" .'
+nested_clean "find without -exec"      'find . -name "*.sh"'
+nested_clean "sed literal substitution" 'sed -e "s/a/b/" "$F"'
+nested_clean "rm non-recursive"        'rm "$F"'
+nested_nested "PATH=. x (REVIEW-r1 HIGH)"       'PATH=. x'
+nested_nested "PATH+=:. (REVIEW-r1 HIGH)"       'PATH+=:.'
+nested_nested "hash -p (REVIEW-r1 HIGH)"        'hash -p ./x cmd'
+nested_nested "enable -f (REVIEW-r1 HIGH)"      'enable -f ./x cmd'
+nested_nested "PS4 + set -x (REVIEW-r2b HIGH)"  "$(printf 'PS4=\$(./x)\nset -x')"
+nested_nested "printf -v (REVIEW-r2b HIGH)"     'printf -v out "%s" x'
+nested_nested "read (REVIEW-r2b HIGH)"          'read -r line'
+nested_nested "mapfile (REVIEW-r2b HIGH)"       'mapfile -t lines'
+nested_nested "declare -n (REVIEW-r2c HIGH)"    'declare -n ref=x'
+nested_nested '${v@P} (REVIEW-r2c HIGH)'        'echo ${v@P}'
+nested_nested "find -exec"              'find . -exec ./x {} \;'
+nested_nested "tar --to-command"        'tar -x --to-command=./x'
+nested_nested "tar -I"                  'tar -I ./compressor -cf out.tar .'
+nested_nested "sed bare e command"      "sed 'e'"
+nested_nested "sed s///e trailing flag" "sed 's/a/b/e'"
+nested_nested "git -c core.pager=./x log" 'git -c core.pager=./x log'
+nested_nested "git archive --remote"    'git archive --remote=./x HEAD'
+nested_nested "git submodule"           'git submodule update'
+nested_nested "cat heredoc, unquoted delim, cmdsub body (REVIEW-r2d HIGH, r2e)" "$(printf 'cat <<EOF\n$(touch pwned)\nEOF\n')"
+# r2h: quoted heredoc delimiters (e.g. `<<'EOF'`) always NESTED, not because
+# _heredoc_delim_quoted is wrong but because bashlex.parse() itself raises
+# ParsingError first on any quoted heredoc delimiter — .venv-bashlex's
+# bashlex/heredoc.py:15 has `string_quote_removal(redirectnode.word)`
+# commented out, so heredoc.py:31's terminator match compares the raw
+# quoted delimiter (e.g. `'EOF'`) against each bare candidate line (`EOF`)
+# and never matches; makeheredoc runs out of input and raises at
+# heredoc.py:41, which bashlex_nested_classify.py's generic parse-error
+# handler turns into NESTED before _walk/_check_redirect ever run. Fail
+# closed is correct here and v27 has no heredoc use, so this is accepted
+# as a documented limitation rather than fixed (conductor decision, r2h).
+nested_nested "cat heredoc, quoted delim — documented limitation: bashlex can't parse it (r2h, bashlex/heredoc.py:15,31,41)" "$(printf "cat <<'EOF'\necho hi\nEOF\n")"
+nested_nested "tar bundled short opt -xIfoo (REVIEW-r2d HIGH, r2e)" 'tar -xIfoo -f out.tar .'
+nested_clean  "tar bundled short opt -xzf (r2e control)"      'tar -xzf archive.tar.gz'
+nested_nested "sort --compress-program (REVIEW-r2d HIGH, r2e)" 'sort --compress-program=./evil bigfile'
+nested_clean  "sort explicit option allowlist (r2e control)"  'sort -rn -k 2 -t , -o out.txt bigfile'
+nested_nested "git log (REVIEW-r2d HIGH, r2e)" 'git log'
+nested_nested "git -C d diff (REVIEW-r2d HIGH, r2e)" 'git -C d diff'
+printf '== fix/shell-nested-allowlist-r2f: REVIEW-r2e HIGH findings closed ==\n'
+nested_nested "bare heredoc, no owning command (REVIEW-r2e Finding 1, r2f)" "$(printf '<<EOF\n$(touch pwned)\nEOF\n')"
+nested_nested "assignment-prefixed heredoc, no owning command (REVIEW-r2e Finding 1, r2f)" "$(printf 'x=1 <<EOF\n$(touch pwned)\nEOF\n')"
+nested_nested "cat <<< here-string, always nested regardless of content (r2f)" 'cat <<< hello'
+nested_nested "sed -f external script file (REVIEW-r2e Finding 2, r2f)" 'sed -f ./evil.sed input'
+nested_nested "sed --file= external script file (REVIEW-r2e Finding 2, r2f)" 'sed --file=./evil.sed input'
+nested_nested "sed bundled -nf cluster (REVIEW-r2e Finding 2, r2f)" 'sed -nf ./evil.sed input'
+nested_nested "sed -e attached dangerous script, no space (REVIEW-r2e Finding 2, r2f)" "sed -e'e touch pwned'"
+nested_nested "sed r/R read-file command (REVIEW-r2e Finding 2, r2f)" "sed 'r ./evil'"
+nested_clean  "sed address + s/// + p/d allowlist control (r2f)" "sed -e '1,3s/a/b/g;4p;5d' \"\$F\""
+nested_nested "printf -vNAME attached form, no space (REVIEW-r2e Finding 3, r2f)" 'printf -vOUT "%s" x'
+printf '== fix/shell-nested-allowlist-r2g: REVIEW-r2f HIGH (BSD sed -i) closed ==\n'
+nested_nested "sed -i BSD-style write-to-file via w command (REVIEW-r2f HIGH, r2g)" "sed -i '' 'w /tmp/pwned' file"
+nested_nested "sed -i.bak GNU-attached suffix, in-place edit (r2g)" "sed -i.bak 's/a/b/' f"
+nested_nested "sed -ni bundled cluster containing i, in-place edit (r2g)" "sed -ni 's/a/b/p' f"
+nested_clean  "sed without -i, control (r2g)" "sed 's/a/b/' f"
+
+for t in tramp1 tramp2 tramp3; do
+  r="$(_cp_code_content_reason shell "$CRWT/tmp/$t.sh" "$CRWT/tmp")"
+  [ -n "$r" ] && ok "exec trampoline $t.sh still not clean after the fix: $r" || bad "exec trampoline $t.sh classifies clean after the fix"
+done
+
+
 
 printf '== PR #160 review round 1: findings 1-11 must never allow, only judge (0) or refuse (3) ==\n'
 RWT="$WORK/routside"; mkdir -p "$RWT"
