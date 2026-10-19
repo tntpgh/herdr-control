@@ -94,6 +94,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/claims.sh"
 . "$here/lib/command-policy.sh"
 
+# Sourceable reuse: when ORCH_CHILD_LIB_SOURCED=1 is set BEFORE this file is
+# sourced (not executed), the libs above load but orch_approve_child_main is
+# NOT auto-invoked -- a caller (orch-dispatch-child.sh's `decide`
+# subcommand) calls it directly in-process, with its OWN fixed argv, after
+# that caller has already sourced the identical lib set and performed the
+# identical ancestry/eligibility checks. This is plain function reuse, not
+# a second copy of the authorization logic: every check below is unchanged.
+orch_approve_child_main() {
+
 _usage() {
   echo "usage: orch-approve-child.sh review <child_pane> <approval_request_id> <tool_call_id> <arguments_digest>" >&2
   echo "       orch-approve-child.sh decide <child_pane> <approval_request_id> <tool_call_id> <arguments_digest> <payload_sha> <approve|deny> <local-read|local-build|branch-work> <reason>" >&2
@@ -310,3 +319,6 @@ _audit orch_child_approval_decided \
 jq -nc --arg request "$request_id" --arg call "$tool_call_id" --arg decision "$label" \
   '{resolved:true,approval_request_id:$request,tool_call_id:$call,decision:$decision}'
 exit 0
+}
+
+[ "${ORCH_CHILD_LIB_SOURCED:-0}" = 1 ] || orch_approve_child_main "$@"
