@@ -31,17 +31,32 @@ proj="${1:?usage: ensure-workspace.sh [--no-focus|--lookup] <project-path>}"
 root=$(repo_root "$proj")
 label=$(basename "$root")
 
-# Find an open workspace whose panes sit in this repo. Panes are matched through
-# the same resolver, so a pane sitting in a worktree of this repo counts as being
-# "on" the repo — which is what makes an existing project workspace get reused.
-ws=$(
-  herdr pane list 2>/dev/null \
-    | jq -r '(.result.panes // .panes)[] | select((.cwd // "") != "") | [.workspace_id, .cwd] | @tsv' \
-    | while IFS=$'\t' read -r w cwd; do
-        cr=$(repo_root "$cwd")
-        [ "$cr" = "$root" ] && { printf '%s\n' "$w"; break; }
-      done | head -1
-)
+# Canonical first: a workspace already labelled for this repo wins outright.
+ws_list_json=$(herdr workspace list 2>/dev/null)
+ws=$(printf '%s' "$ws_list_json" | jq -r --arg label "$label" '.result.workspaces[] | select(.label == $label) | .workspace_id' | head -1)
+
+if [ -z "$ws" ]; then
+  # Fallback: find an open workspace whose panes sit in this repo. Panes are
+  # matched through the same resolver, so a pane sitting in a worktree of
+  # this repo counts as being "on" the repo. Skip any candidate workspace
+  # that is labelled for a DIFFERENT repo (a non-numeric label that isn't
+  # ours) — that space is contaminated, not canonical; only an untagged
+  # (default-numeric-label) space is an acceptable fallback match.
+  ws=$(
+    herdr pane list 2>/dev/null \
+      | jq -r '(.result.panes // .panes)[] | select((.cwd // "") != "") | [.workspace_id, .cwd] | @tsv' \
+      | while IFS=$'\t' read -r w cwd; do
+          cr=$(repo_root "$cwd")
+          [ "$cr" = "$root" ] || continue
+          wlabel=$(printf '%s' "$ws_list_json" | jq -r --arg w "$w" '.result.workspaces[] | select(.workspace_id == $w) | .label // empty')
+          if [ -n "$wlabel" ] && [ "$wlabel" != "$label" ] && ! [[ "$wlabel" =~ ^[0-9]+$ ]]; then
+            continue
+          fi
+          printf '%s\n' "$w"
+          break
+        done | head -1
+  )
+fi
 
 if [ -n "$ws" ]; then
   [ "$focus" = 1 ] && herdr workspace focus "$ws" >/dev/null 2>&1
