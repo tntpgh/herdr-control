@@ -74,6 +74,13 @@ export HERDR_SANCTIONED_ANSWER=1
 _here=$(cd "$(dirname "$0")" && pwd)
 . "$_here/lib/prompt-parse.sh"
 
+# Sourceable reuse: when SEND_TO_AGENT_LIB_SOURCED=1 is set BEFORE this file
+# is sourced (not executed), prompt-parse.sh loads above but
+# send_to_agent_run is NOT auto-invoked -- a caller (orch-dispatch-child.sh's
+# `kickoff` subcommand) calls it directly in-process, with its own fixed
+# argv, after performing its own ancestry/eligibility checks. Plain function
+# reuse: every delivery/confirmation check below is unchanged.
+send_to_agent_run() {
 pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--submit-only] [--not-an-answer] <text>}"; shift
 force=0
 submit_only=0
@@ -419,3 +426,6 @@ if [ "$unreadable" -eq 1 ]; then
 fi
 echo "UNSUBMITTED: $pane composer looked unchanged after 6 Enters — deliver by hand" >&2
 exit 4
+}
+
+[ "${SEND_TO_AGENT_LIB_SOURCED:-0}" = 1 ] || send_to_agent_run "$@"
