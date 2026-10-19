@@ -26,6 +26,10 @@ WORK="$(mktemp -d)"; WORK="$(cd "$WORK" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_BRIDGE_STATE="$WORK/bridge"
+# Fixture-only, not a runtime default -- see verify-orch-child-dispatch.sh's
+# identical export for the full explanation (herdr-control
+# debug/orch-decide-proposal-missing, 2026-10-19).
+export HERDR_BOUND_BASH=1
 DB="$HERDR_RUN_STATE_DIR/registry.sqlite3"
 
 HC_RAW=$(mktemp -d -p "$WORK"); git -C "$HC_RAW" init -q -b main 2>/dev/null

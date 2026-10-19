@@ -30,6 +30,15 @@ WORK="$(mktemp -d)"; WORK="$(cd "$WORK" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_BRIDGE_STATE="$WORK/bridge"
+# Fixture-only, not a runtime default: this suite's bash/decide fixtures are
+# bound-request proposals, which lib/prompt-occurrence.py's PROPOSAL_TOOLS
+# only includes "bash"/"shell" for when HERDR_BOUND_BASH=1 (its own
+# runtime gate, unchanged here). Without this export the suite silently
+# depended on that var being ambiently 1 in the invoking shell/pane -- true
+# in a bound-launcher pane, false from a plain/conductor shell or CI, which
+# is the real trigger behind the deploy-window passed=31 failed=3 report
+# (herdr-control debug/orch-decide-proposal-missing, 2026-10-19).
+export HERDR_BOUND_BASH=1
 DB="$HERDR_RUN_STATE_DIR/registry.sqlite3"
 SCREEN_DIR="$WORK/screens"; DETECTION_DIR="$WORK/detection"; COUNTER="$WORK/enter-count"
 KEYS="$WORK/keys.log"; SENDTEXT="$WORK/send-text.log"
