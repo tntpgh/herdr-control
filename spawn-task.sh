@@ -103,6 +103,7 @@ while [ $# -gt 0 ]; do
     # `omp --tools` verbatim (omp rejects unknown names at launch).
     --tools) tools_req="${2:?spawn-task: --tools needs a comma list or all}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
+    --grant) grant_id="${2:?spawn-task: --grant needs a grant id}"; shift 2 ;;
     --focus) foc=--focus; shift ;;
     # Explicit form of the default. remote-mcp/tasks.py passes it; before this
     # case existed it fell through to positional and reached omp's argv.
@@ -624,6 +625,26 @@ if [ "$dry" = 1 ]; then
   exit 0
 fi
 
+# ---- approved-worker budget (lib/worker-grant.py) --------------------------
+# INACTIVE unless HERDR_WORKER_GRANT_ENFORCE=1 (turning it on is an owner
+# gate). When active, every spawn must name --grant and claims one slot in
+# ONE BEGIN IMMEDIATE transaction BEFORE any worktree/tab/registry side
+# effect; review classes count, smoke draws on its own pool. Refused -> exit
+# with nothing created. A claim whose spawn then fails before registration is
+# released; a registered task frees its slot only at a terminal state.
+grant_claimed=""
+if [ "${HERDR_WORKER_GRANT_ENFORCE:-0}" = 1 ]; then
+  [ -n "${grant_id:-}" ] || { echo "spawn-task: refusing — worker-grant enforcement is on and no --grant was given; nothing created" >&2; exit 3; }
+  registry_init >/dev/null 2>&1 || { echo "spawn-task: refusing — registry unavailable for grant claim" >&2; exit 3; }
+  if ! python3 "$here/lib/worker-grant.py" "$(registry_db)" claim "$grant_id" "$task_id" "$job" >/dev/null; then
+    echo "spawn-task: refusing — worker grant $grant_id did not admit this $job spawn; nothing created" >&2
+    exit 3
+  fi
+  grant_claimed=1
+  _grant_release_unregistered() { [ -n "$grant_claimed" ] && python3 "$here/lib/worker-grant.py" "$(registry_db)" release "$task_id" >/dev/null 2>&1; :; }
+  trap _grant_release_unregistered EXIT
+fi
+
 # ---- worktree: create or reuse ---------------------------------------------
 # A NEW branch is cut from origin's default branch, never from the local
 # checkout's HEAD: the local checkout is routinely a dirty, stale lane (2026-09-05:
@@ -687,7 +708,11 @@ fi
 # The intent stays until this script exits, so an archive run that fences
 # after this check sees it and refuses its remove. A normal spawn never meets
 # a fence; the cost is one `git rev-parse` and two file operations.
-trap archive_fence_leave EXIT
+if [ -n "$grant_claimed" ]; then
+  trap 'archive_fence_leave; _grant_release_unregistered' EXIT
+else
+  trap archive_fence_leave EXIT
+fi
 trap 'exit 130' INT TERM HUP
 if ! archive_fence_enter "$wt"; then
   echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2
@@ -1031,6 +1056,8 @@ if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor
   echo "spawn-task: registration or source binding failed; worker was not launched" >&2
   exit 1
 fi
+# Registered: the grant slot now frees only at this task's terminal state.
+grant_claimed=""
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone
