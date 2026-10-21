@@ -54,6 +54,8 @@ source "$HERE/lib/run-registry.sh"
 source "$HERE/lib/pane-guard.sh"
 # shellcheck source=lib/worktree-archive.sh
 source "$HERE/lib/worktree-archive.sh"
+# shellcheck source=lib/provisioned-links.sh
+source "$HERE/lib/provisioned-links.sh"
 
 apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; task_given=0; superseded_by=""
 for a in "$@"; do
@@ -659,7 +661,13 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
       br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
-      dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      # Launcher-provisioned symlinks (manifest-recorded, target unchanged)
+      # are not the worker's work; anything else, or a git failure, HOLDs.
+      if dirty_lines=$(porcelain_without_provisioned "$wt"); then
+        dirty=$(printf '%s' "$dirty_lines" | grep -c .)
+      else
+        dirty=0; reason="git status failed in $wt"
+      fi
       up=$(git -C "$wt" for-each-ref --format='%(upstream:short)' "refs/heads/$br" 2>/dev/null)
       [ "${dirty:-0}" != 0 ] && reason="$dirty uncommitted file(s)"
       if [ -z "$reason" ]; then

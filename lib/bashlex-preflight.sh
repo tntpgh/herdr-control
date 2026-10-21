@@ -79,6 +79,10 @@ provision_worktree_bashlex_venv() {
     ln -sfn "$chosen" "$wt/.venv-bashlex" 2>/dev/null
     if [ -x "$wt/.venv-bashlex/bin/python3" ] &&
        "$wt/.venv-bashlex/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
+      # shellcheck source=lib/provisioned-links.sh
+      . "$here/lib/provisioned-links.sh"
+      record_provisioned_link "$wt" .venv-bashlex "$chosen" ||
+        echo "spawn-task: could not record .venv-bashlex in the provisioned-links manifest; close will HOLD on it" >&2
       {
         printf 'bashlex venv: linked (read-only reuse)\n'
         printf 'worktree_path: %s\n' "$wt/.venv-bashlex"
