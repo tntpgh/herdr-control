@@ -1143,12 +1143,29 @@ console.log("BOUND_FAILURE:" + JSON.stringify(boundResolutions));
 
   printf '== TS shim: bound-bash boundTool gate (HERDR_BOUND_BASH, slice b) ==\n'
   # Same mechanism the probe used (onApprovalRequested's synchronous `defer`
-  # return IS the boundTool decision): default absent, boundTool stays
-  # EXACTLY write|edit; with the flag set it widens to write|edit|bash|shell,
-  # and every other negative (missing digest/session/requestId, a tool
-  # outside the set, exclusiveResolver=false, no resolver callback) still
+  # return IS the boundTool decision). OFF is the explicit rollback value
+  # HERDR_BOUND_BASH=0: boundTool stays EXACTLY write|edit. UNSET now means
+  # ON, the same default config.sh applies (fix/deferred-bash-resolver: a
+  # worker omp env without the stamp left every deferred bash request
+  # unanswerable). Every other negative (missing digest/session/requestId, a
+  # tool outside the set, exclusiveResolver=false, no resolver callback) still
   # never defers -- binding proves identity only, never which tool may bind.
-  bb_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+  bb_unset_out="$(env -u HERDR_BOUND_BASH HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { command: "git status --short --branch" };
+const json = JSON.stringify(input);
+const f = { toolName: "bash", toolCallId: "call-bb-unset", sessionId: "session-bb-unset",
+  requestId: "request-bb-unset", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true };
+console.log("BASH_FLAG_UNSET:" + JSON.stringify(handlers["tool_approval_requested"](f, { resolveToolApproval: () => true })));
+' 2>&1)"
+  printf '%s' "$bb_unset_out" | grep -q 'BASH_FLAG_UNSET:{"defer":true}' \
+    && ok "flag UNSET (worker env without the stamp): a complete v1-bound bash approval defers, same default as config.sh" \
+    || bad "flag-unset bash did not defer (split-brain with config.sh): $bb_unset_out"
+  bb_out="$(HERDR_BOUND_BASH=0 HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
     HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
@@ -1168,7 +1185,7 @@ console.log("BASH_FLAG_OFF:" + JSON.stringify(handlers["tool_approval_requested"
 console.log("WRITE_FLAG_OFF:" + JSON.stringify(handlers["tool_approval_requested"](fields("write"), ctx)));
 ' 2>&1)"
   printf '%s' "$bb_out" | grep -q 'BASH_FLAG_OFF:undefined' \
-    && ok "flag off: a complete v1-bound bash approval still never defers (today's exact boundTool gate)" \
+    && ok "flag off (explicit 0): a complete v1-bound bash approval never defers (the rollback boundTool gate)" \
     || bad "flag-off bash wrongly deferred: $bb_out"
   printf '%s' "$bb_out" | grep -q 'WRITE_FLAG_OFF:{"defer":true}' \
     && ok "positive control: write still defers under the SAME complete v1 fields" \

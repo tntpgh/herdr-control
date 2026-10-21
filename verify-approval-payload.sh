@@ -209,7 +209,7 @@ record_bash() {                         # <command> -> sets CALL_ID PID OCC_KEY
     bound_envelope="--bound-envelope"
     recorded_input="$(jq -nc --argjson i "$input_json" --arg j "$(printf '%s' "$input_json" | jq -cS .)" '{input:$i,core_arguments_json:$j}')"
   fi
-  OCC_KEY="$(printf '%s' "$recorded_input" | "${OCC[@]}" seen "${id[@]}" --tool bash --input-json - $bound_envelope \
+  OCC_KEY="$(printf '%s' "$recorded_input" | "${OCC[@]}" seen "${id[@]}" --tool "${RECORD_TOOL:-bash}" --input-json - $bound_envelope \
     ${BOUND_REQUEST:+--approval-request-id "$BOUND_REQUEST"} \
     ${BOUND_DIGEST:+--core-arguments-digest "$BOUND_DIGEST"} \
     ${BOUND_PROTOCOL:+--binding-protocol "$BOUND_PROTOCOL"} \
@@ -657,6 +657,83 @@ for CMD in "git push origin main" "sqlite3 /tmp/hc-probe.db 'DROP TABLE x;'" "rm
     && ok "Deny of a reserved-class bound command resolves and is recorded: $CMD" \
     || bad "Deny of a reserved-class bound command NOT resolved/recorded: $CMD rc=$rc keys=$(keys_pressed) deny_rows=$deny_before->$deny_after; $(tail -3 "$WORK/err.txt")"
   BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+done
+unset HERDR_BOUND_BASH
+
+# fix/deferred-bash-resolver: the worker's hook and its record-seen child run
+# in the worker's omp env, which does NOT source config.sh. With the flag
+# absent there, prompt-occurrence.py used to default OFF, wrote no bash
+# proposal, and every deferred bash request fell to T (live: w72:p24
+# `git status --short --branch`). Every case below records with the flag
+# UNSET, exactly that shape; herdr-select.sh still applies all its checks.
+printf '== flag UNSET at record time (worker hook env): deferred bash binds; every identity change is refused ==\n'
+bb_record() {                            # <request-id> <command>
+  BOUND_REQUEST="$1"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"; BB_CMD="$2"
+  BOUND_DIGEST="sha256:$(bash_input "$BB_CMD" | jq -cS . | tr -d '\n' | shasum -a 256 | awk '{print $1}')"
+  : > "$SCREEN"
+  ( unset HERDR_BOUND_BASH; record_bash "$BB_CMD"; printf '%s\t%s\n' "$CALL_ID" "$OCC_KEY" > "$WORK/bb.ids" )
+  CALL=$((CALL + 1))
+  IFS=$'\t' read -r CALL_ID OCC_KEY < "$WORK/bb.ids"
+  BOUND_PAYLOAD_SHA="$(input_sha "${RECORD_TOOL:-bash}" "$(bash_input "$BB_CMD")")"
+}
+bb_refused() {                           # <label> : conductor Approve must be rc 8, no key, no Approve row
+  local before; before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && [ "$(approve_rows)" = "$before" ] \
+    && ok "flag unset at record: $1 is refused" \
+    || bad "flag unset at record: $1 NOT refused: rc=$rc keys=$(keys_pressed); $(tail -2 "$WORK/err.txt")"
+}
+
+bb_record request-bb-exact "git status --short --branch"
+before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$(approve_rows)" = $((before + 1)) ] \
+  && ok "flag unset at record: the exact deferred bash request (git status --short --branch) binds and resolves" \
+  || bad "flag unset at record: exact bash request did not resolve: rc=$rc; $(tail -3 "$WORK/err.txt")"
+bb_refused "a replay of the already-resolved request"
+
+bb_record request-bb-cmd "git status --short --branch"
+BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "git status --short")")"; bb_refused "a changed command (payload sha of a different command)"
+bb_record request-bb-sha "git status --short --branch"
+BOUND_PAYLOAD_SHA="$(printf '0%.0s' $(seq 1 64))"; bb_refused "a changed payload hash"
+bb_record request-bb-digest "git status --short --branch"
+BOUND_DIGEST="sha256:$(printf '1%.0s' $(seq 1 64))"; bb_refused "a changed arguments digest"
+bb_record request-bb-req "git status --short --branch"
+BOUND_REQUEST="request-bb-someone-else"; bb_refused "a changed request id"
+bb_record request-bb-call "git status --short --branch"
+CALL_ID="call-not-this-one"; bb_refused "a changed tool call id"
+RECORD_TOOL=python; bb_record request-bb-tool "git status --short --branch"; unset RECORD_TOOL
+bb_refused "a non-bash/shell/write/edit tool"
+
+bb_record request-bb-stale "git status --short --branch"
+STALE_AT="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+sqlite3 "$DB" "UPDATE events SET occurred_at='$STALE_AT' WHERE json_extract(payload,'\$.occ_key')='$OCC_KEY';"
+bb_refused "a stale (>1h) request"
+
+bb_record request-bb-denied "git status --short --branch"
+reset_keys; conductor_bound_choice 2; rc=$?
+[ "$rc" -eq 0 ] && ok "flag unset at record: a conductor Deny of the exact bash request resolves" \
+  || bad "flag unset at record: Deny did not resolve: rc=$rc; $(tail -2 "$WORK/err.txt")"
+bb_refused "an Approve after the request was already denied"
+
+bb_record request-bb-policy "git push origin main"
+bb_refused "a policy-deny bash command (binding proves identity, never permission)"
+
+printf '== explicit HERDR_BOUND_BASH=0 at record time is still the rollback ==\n'
+BOUND_REQUEST=request-bb-rollback; BOUND_PROTOCOL="omp.tool-approval-binding.v1"; BB_CMD="git status --short --branch"
+BOUND_DIGEST="sha256:$(bash_input "$BB_CMD" | jq -cS . | tr -d '\n' | shasum -a 256 | awk '{print $1}')"
+: > "$SCREEN"
+( export HERDR_BOUND_BASH=0; record_bash "$BB_CMD"; printf '%s\t%s\n' "$CALL_ID" "$OCC_KEY" > "$WORK/bb.ids" )
+CALL=$((CALL + 1)); IFS=$'\t' read -r CALL_ID OCC_KEY < "$WORK/bb.ids"
+BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$BB_CMD")")"
+bb_refused "a bash request recorded with explicit HERDR_BOUND_BASH=0 (no proposal written)"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""; CALL_ID=""
+
+printf '== python reader and config.sh agree on the DEFAULT, not only on an exported value ==\n'
+for bb_val in "<unset>" "" "1" "0" " 1"; do
+  if [ "$bb_val" = "<unset>" ]; then env_args=(-u HERDR_BOUND_BASH); else env_args=("HERDR_BOUND_BASH=$bb_val"); fi
+  py_on="$(env "${env_args[@]}" python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("po", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(int(m.HERDR_BOUND_BASH))' "$here/lib/prompt-occurrence.py")"
+  sh_on="$(env "${env_args[@]}" bash -c '. "$1/config.sh" >/dev/null 2>&1; [ "${HERDR_BOUND_BASH:-}" = 1 ] && echo 1 || echo 0' _ "$here")"
+  [ "$py_on" = "$sh_on" ] && ok "HERDR_BOUND_BASH='$bb_val': shell=$sh_on python=$py_on agree" \
+    || bad "HERDR_BOUND_BASH='$bb_val' split-brain: shell=$sh_on python=$py_on"
 done
 unset HERDR_BOUND_BASH
 

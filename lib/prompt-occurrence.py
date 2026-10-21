@@ -139,13 +139,17 @@ def payload_sha256(tool: str, tool_input: object) -> str:
 # M4 keeps raw tool input out of the shared events table. A file that does not
 # hash to the registry's value is refused, so tampering, truncation or a
 # substituted file cannot be approved. Deleted when the occurrence resolves.
-# Slice (b), bound-bash: default OFF (env var absent). With the flag off,
-# PROPOSAL_TOOLS stays exactly {"write", "edit"} — today's behaviour,
-# byte-for-byte. Binding proves identity only; the canonical bash command
-# still goes through herdr-select.sh's Path A command-policy check.
-# Exact "1" only, no whitespace trimming: must match herdr-select.sh and the
-# TS hook byte-for-byte so a padded value is OFF in all three readers.
-HERDR_BOUND_BASH = os.environ.get("HERDR_BOUND_BASH", "") == "1"
+# Slice (b), bound-bash: default ON, the SAME default config.sh's
+# `: "${HERDR_BOUND_BASH:=1}"` applies (unset or empty -> "1"). Reading the
+# raw env with an OFF default split-brained every process that never sources
+# config.sh: the worker's TS hook and its record-seen/proposal children ran
+# with the flag absent, so no bash proposal was ever written and a deferred
+# bash request could only fall to T. Exact "1" only otherwise, no trimming:
+# an explicit "0" (or a padded value) is the rollback and is OFF in all three
+# readers alike (herdr-select.sh, the TS hook, this file). Binding proves
+# identity only; the canonical bash command still goes through
+# herdr-select.sh's Path A command-policy check.
+HERDR_BOUND_BASH = (os.environ.get("HERDR_BOUND_BASH") or "1") == "1"
 PROPOSAL_TOOLS = {"write", "edit"} | ({"bash", "shell"} if HERDR_BOUND_BASH else set())
 PROPOSAL_VERSION = 1
 # Bounded: raw input never enters the shared events table, only this
