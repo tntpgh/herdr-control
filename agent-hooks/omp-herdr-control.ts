@@ -469,14 +469,17 @@ const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
 const LOAD_HOME = process.env.HOME?.trim() || homedir();
 const LOAD_TMPDIR = process.env.TMPDIR?.trim() ?? "";
 const LOAD_RUN_STATE_DIR = process.env.HERDR_RUN_STATE_DIR?.trim() ?? "";
-// Slice (b), bound-bash: default OFF. With the flag absent, boundTool stays
-// exactly write|edit (today's behaviour, byte-for-byte). Binding here proves
-// IDENTITY only — the canonical command still goes through herdr-select.sh's
-// Path A command-policy check (classify_command/conductor_reserved_reason)
-// before any bash/shell approval resolves; this flag never changes who may
-// approve or which categories are allowed.
-// Exact "1" only, no trim: must match herdr-select.sh and prompt-occurrence.py.
-const HERDR_BOUND_BASH = process.env.HERDR_BOUND_BASH === "1";
+// Slice (b), bound-bash: default ON, the SAME default config.sh applies
+// (`: "${HERDR_BOUND_BASH:=1}"`: unset or empty -> "1"). An OFF default here
+// split-brained a worker whose omp env lacks the stamp: this hook never
+// treated a deferred bash request as bound and wrote no proposal, so the
+// conductor could not answer it. Binding here proves IDENTITY only — the
+// canonical command still goes through herdr-select.sh's Path A command-policy
+// check (classify_command/conductor_reserved_reason) before any bash/shell
+// approval resolves; this flag never changes who may approve or which
+// categories are allowed. Otherwise exact "1" only, no trim: an explicit "0"
+// is the rollback and matches herdr-select.sh and prompt-occurrence.py.
+const HERDR_BOUND_BASH = (process.env.HERDR_BOUND_BASH || "1") === "1";
 // ~/.omp/agent/extensions/notepad.ts writes $NOTEPAD_PATH (absolute, or
 // relative to the session cwd) when set, else <cwd>/.handoffs/notepad.md or
 // the legacy <cwd>/.omc/notepad.md. Its mutating tools are judged on exactly
