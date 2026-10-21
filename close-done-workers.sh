@@ -729,6 +729,17 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
     held=$((held+1))
     printf '  HOLD   %-8s %-46s %s\n' "$pane" "$label" "$reason"
     [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
+    # --apply on a done task that cannot close: record WHY as an explicit
+    # cleanup_blocked event (idempotent per task+reason) so the hub shows a
+    # blocked cleanup instead of a silently-running task. State is untouched:
+    # never `completed`, never a fabricated success.
+    if [ "$apply" = 1 ]; then
+      cb_payload=$(jq -nc --arg reason "$reason" --arg pane "$pane" --arg wt "$wt" \
+        '{reason: $reason, pane: $pane, worktree: $wt}')
+      cb_id="cb_${task_id}_$(printf '%s' "$reason" | shasum -a 256 | cut -c1-12)"
+      append_event "$run_id" "$task_id" cleanup_blocked "$cb_payload" "$cb_id" >/dev/null 2>&1 ||
+        printf '         could not record cleanup_blocked for %s\n' "$task_id"
+    fi
     continue
   fi
   closable=$((closable+1))
@@ -736,6 +747,18 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
   [ "$apply" = 1 ] || continue
 
+  # Archive the task's .handoffs (PROOF/SPEC/events) BEFORE anything is
+  # settled or closed; a copy that cannot be verified identical HOLDs.
+  # The archive is evidence, not a resumable session.
+  if [ -d "$wt/.handoffs" ]; then
+    arch="${HERDR_ARCHIVE_DIR:-$(run_state_root)/../archive}/$task_id"
+    if ! { mkdir -p "$arch" && cp -Rp "$wt/.handoffs" "$arch/" &&
+           diff -rq "$wt/.handoffs" "$arch/.handoffs" >/dev/null 2>&1; }; then
+      refused=$((refused+1))
+      printf '  REFUSED %-8s %-46s archive of .handoffs failed verification — left running, pane not closed\n' "$pane" "$label"
+      continue
+    fi
+  fi
   # Settle the registry FIRST. If the pane close succeeds and this did not
   # run, the task stays `running` forever against a pane that no longer
   # exists — which is precisely the stale state that made the attention view
