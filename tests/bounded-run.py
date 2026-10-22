@@ -57,37 +57,32 @@ def main(argv: list[str]) -> int:
     except subprocess.TimeoutExpired:
         rc = None
     if rc is not None:
-        # Finished in time; descendants it left behind would race the caller's
-        # cleanup, so the same group-gone proof applies.
+        # Finished in time and the leader is already REAPED, so its pid (= our
+        # pgid) may be reused: never signal the group now. Survivors -> 125 and
+        # the caller retains its temp roots. (Zombie members also read as
+        # alive; 125/retention is the safe answer for them too.)
         if group_alive(pgid):
-            os.killpg(pgid, signal.SIGTERM)
-            if not wait_gone(pgid, GRACE_S):
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                if not wait_gone(pgid, GONE_S):
-                    print(f"bounded-run: process group {pgid} still alive after KILL", file=sys.stderr)
-                    return 125
+            print(f"bounded-run: leader exited but group {pgid} still has members; not signalling after reap", file=sys.stderr)
+            return 125
         return rc
+    # Deadline hit. The leader is NOT reaped (wait raised TimeoutExpired), so
+    # its pid, and therefore the pgid, stays reserved, even as a zombie, until
+    # we reap it. Every group signal happens before that reap.
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+    time.sleep(GRACE_S)  # grace with no poll/wait: nothing reaps the leader here
     try:
-        proc.wait(timeout=GRACE_S)
-    except subprocess.TimeoutExpired:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
         pass
-    if group_alive(pgid):
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
     try:
-        proc.wait(timeout=REAP_S)
+        proc.wait(timeout=REAP_S)  # first and only reap of the leader
     except subprocess.TimeoutExpired:
         print(f"bounded-run: leader {pgid} not reaped within {REAP_S}s", file=sys.stderr)
         return 125
+    # Post-reap: signal 0 only. A reused pgid would read as alive -> 125 (safe).
     if not wait_gone(pgid, GONE_S):
         print(f"bounded-run: process group {pgid} not confirmed gone", file=sys.stderr)
         return 125

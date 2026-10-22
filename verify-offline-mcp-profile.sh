@@ -458,6 +458,22 @@ else
 fi
 run_bounded 5 "$bounded_fx/fast" bash -c 'exit 7'
 [ "$?" = 7 ] && ok "fixture: an in-time command's own rc (7) is returned" || bad "fixture: in-time rc not propagated"
+# Leader exits in time but leaves a descendant in its group. The helper must
+# NOT signal after reaping the leader (pgid may be reused): it returns 125 and
+# the descendant is still alive. Called directly, not via run_bounded, because
+# 125 is this fixture's EXPECTED answer. The descendant only sleeps 3 s in its
+# own retained dir (not registered for cleanup) and exits by itself.
+fx_keep="$(mktemp -d "$tmp_root/fxkeep.XXXXXXXXXX")"
+"$bounded_py" "$here/tests/bounded-run.py" 5 "$fx_keep/out" -- bash -c \
+  '( echo $BASHPID > "$1/desc.pid"; exec sleep 3 ) & while [ ! -s "$1/desc.pid" ]; do :; done; exit 0' _ "$fx_keep"
+fx_rc=$?
+fx_desc="$(cat "$fx_keep/desc.pid" 2>/dev/null)"
+[ "$fx_rc" = 125 ] && ok "fixture: leader exited with a surviving descendant -> 125 (retain)" || bad "fixture: expected 125 for a surviving descendant, got $fx_rc"
+if [ -n "$fx_desc" ] && kill -0 "$fx_desc" 2>/dev/null; then
+  ok "fixture: no post-reap signal: descendant $fx_desc still alive after return (left to exit on its own; $fx_keep retained)"
+else
+  bad "fixture: descendant '${fx_desc:-<none>}' gone/unrecorded: a post-reap signal may have been sent"
+fi
 
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
 mk_tmp saved_dir; saved="$saved_dir/overlay.yml"; cp "$ctl_profile_path" "$saved"
