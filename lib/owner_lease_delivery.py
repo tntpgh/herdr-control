@@ -103,11 +103,14 @@ class DeliveryGate:
             # enqueue()'s own fence rejects a caller that is not the live holder.
             res = ol.enqueue(self.conn, label, gen, pane_id, pane_birth, exchange_id, now)
             if not res["authority"]:
-                row = self.conn.execute("SELECT state, detail, generation FROM owner_requests WHERE request_id=?",
+                row = self.conn.execute("SELECT state, detail, generation, label FROM owner_requests WHERE request_id=?",
                                         (exchange_id,)).fetchone()
-                if row and row[2] == gen and row[0] == "queued":
+                # Generations are label-local and request ids global: recovery
+                # needs EXACT (label, generation, state) ownership.
+                owned = bool(row and row[3] == label and row[2] == gen)
+                if owned and row[0] == "queued":
                     return Admission(True, "", gen)  # crash/recovery before typing
-                if not (row and row[2] == gen and row[0] == "blocked" and row[1] == RETRY_APPROVAL):
+                if not (owned and row[0] == "blocked" and row[1] == RETRY_APPROVAL):
                     return Admission(False, f"owner_lease_duplicate:{res['state']}", gen)
                 ol.transition(self.conn, exchange_id, "queued", label, gen, pane_id, pane_birth, "retry", now)
             return Admission(True, "", gen)

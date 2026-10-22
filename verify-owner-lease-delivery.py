@@ -136,6 +136,27 @@ def main():
     case("settle refusal is surfaced as 'unrecorded' (stale generation)",
          g.settle("kb", P2, B2, gen1, "oex_7", "blocked", "x", T0 + TTL + 23) == "unrecorded")
 
+    # --- two labels, equal generation: request ids are global ---
+    tl = scratch(max_open=10)
+    c = ol.connect(tl)
+    ol.register_owner(c, "hc", "tntpgh/herdr-control", max_open=10, now=T0)
+    ga = ol.acquire(c, "kb", P1, B1, TTL, T0)
+    gb = ol.acquire(c, "hc", P2, B2, TTL, T0)
+    c.close()
+    gt = old.DeliveryGate(tl)
+    case("fixture: both labels at the same generation", ga == gb == 1)
+    case("label A queues oex_x", gt.admit("kb", P1, B1, "oex_x", T0 + 1).ok and state(tl, "oex_x")[0] == "queued")
+    bx = gt.admit("hc", P2, B2, "oex_x", T0 + 2)
+    case("SECOND LABEL, equal generation, same id (queued): NOT admitted",
+         not bx.ok and bx.reason == "owner_lease_duplicate:queued")
+    a_r = gt.admit("kb", P1, B1, "oex_r", T0 + 3)
+    gt.begin_notice("kb", P1, B1, a_r.generation, "oex_r", T0 + 3)
+    gt.settle("kb", P1, B1, a_r.generation, "oex_r", "blocked", "owner_at_approval_prompt", T0 + 4)
+    br = gt.admit("hc", P2, B2, "oex_r", T0 + 5)
+    case("SECOND LABEL cannot take label A's approval retry",
+         not br.ok and state(tl, "oex_r")[:3:2] == ("blocked", old.RETRY_APPROVAL))
+    gt.close()
+
     # --- lease lifetime at begin_notice ---
     lt = scratch()
     gl = old.DeliveryGate(lt)
@@ -233,6 +254,21 @@ def main():
     r = pub.deliver_owner(item("oex_p3"), local)
     case("publisher: re-delivery of the same exchange refused (no second notice)",
          r["reason"] == "owner_lease_duplicate:delivering" and delivered() == 3)
+    # publisher: second label, equal generation, same exchange id
+    c = ol.connect(lpath)
+    ol.register_owner(c, "hc", "tntpgh/herdr-control", max_open=10, now=__import__("time").time())
+    ol.acquire(c, "hc", P2, B2, TTL, __import__("time").time())
+    c.close()
+    gq = old.DeliveryGate(lpath)
+    gq.admit("kb", P1, B1, "oex_px", __import__("time").time())
+    gq.close()
+    pub.hub_get = lambda _p: {"panes": [{"pane_id": P1, "birth": B1, "agent": "omp"}, {"pane_id": P2, "birth": B2, "agent": "omp"}]}
+    n0 = delivered()
+    r = pub.deliver_owner({"exchange_id": "oex_px", "owner_label": "hc", "sender": "tnt", "body": "hello"},
+                          {"owners": {**local["owners"], "hc": {"pane_id": P2, "pane_birth": B2}}})
+    case("publisher SECOND LABEL: zero admission, no body file, no notice",
+         r.get("reason") == "owner_lease_duplicate:queued" and delivered() == n0
+         and not (tmp / "inbox" / "hc" / "messages" / "oex_px.md").exists())
     os.environ["FAKE_RC"] = "4"
     r = pub.deliver_owner(item("oex_p4"), local)
     case("publisher: rc 4 recorded blocked, not delivered",
