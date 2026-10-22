@@ -1255,22 +1255,64 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
     gate = owner_lease_gate()
     if gate is None:
         return _send_owner_notice(item, label, pane_id)
-    # Off-by-default owner-lease gate: the registered pane must hold the
-    # label's live lease; the exchange is enqueued/fenced in that generation
-    # BEFORE the body is written or any notice typed.
+    # Off-by-default owner-lease gate. The registered pane must hold the
+    # label's live lease. The exchange is enqueued (QUEUED) in that generation,
+    # the body is written (deduped) while queued and must match the persisted
+    # envelope byte-for-byte, and only then does a fenced begin_notice move it
+    # to `delivering`, immediately before typing, with enough lease left to
+    # cover the full delivery timeout.
     pane_birth = local["owners"][label].get("pane_birth", "")
     adm = gate.admit(label, pane_id, pane_birth, exchange_id)
     if not adm.ok:
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": adm.reason}
-    result = _send_owner_notice(item, label, pane_id)
-    gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, result["outcome"], result.get("reason", ""))
+    sender = clean(str(item.get("sender") or ""))
+    body = str(item.get("body") or "")
+    if not write_inbox_message(label, exchange_id, sender, body):
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}  # stays queued
+    if not persisted_payload_matches(label, exchange_id, sender, body):
+        # Same id, different payload: never inherits the prior authority.
+        gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, "blocked", "owner_payload_mismatch")
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "owner_payload_mismatch"}
+    begun = gate.begin_notice(label, pane_id, pane_birth, adm.generation, exchange_id)
+    if begun == "lease_too_short":
+        log(f"owner message {exchange_id}: lease has < {gate.min_lease_remaining_s}s left; waiting for renewal")
+        return None  # still queued; retried next tick
+    if begun != "delivering":
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": begun}
+    result = _send_owner_notice(item, label, pane_id, write=False)
+    recorded = gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, result["outcome"], result.get("reason", ""))
+    if recorded == "unrecorded":
+        log(f"owner message {exchange_id}: owner-lease could NOT record outcome {result}; lease state disagrees")
+        result = {**result, "reason": f"{result.get('reason', '')}:lease_unrecorded".lstrip(":")}
     return result
 
 
-def _send_owner_notice(item: dict, label: str, pane_id: str) -> dict:
+def persisted_payload_matches(label: str, exchange_id: str, sender: str, body: str) -> bool:
+    """The existing envelope (write_inbox_message's messages/<id>.md) is the
+    payload binding: its From line and its fenced body must equal this
+    delivery's. A replay of the same id with a different payload fails."""
+    path = _resolve_inbox_leaf(label, "messages", exchange_id)
+    if path is None:
+        return False
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = re.search(r"^- From: (.*)$", text, re.M)
+    f = re.search(r"^--BEGIN-UNTRUSTED-BODY-([0-9a-f]{32})--\n", text, re.M)
+    if not m or not f:
+        return False
+    end = f"\n--END-UNTRUSTED-BODY-{f.group(1)}--\n"
+    j = text.find(end, f.end() - 1)
+    if j < 0:
+        return False
+    return m.group(1) == sender and text[f.end():j] == body
+
+
+def _send_owner_notice(item: dict, label: str, pane_id: str, write: bool = True) -> dict:
     exchange_id = item["exchange_id"]
     sender = clean(str(item.get("sender") or ""))
-    if not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
+    if write and not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
     # M7 (REVIEW-219): exchange_id's own fixed format (oex_<compact-iso>Z_<hex>)
     # guarantees a digit at a predictable offset -- made deterministic, not

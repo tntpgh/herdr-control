@@ -15,10 +15,16 @@ reap to close-done-workers.sh — both are later activation work (the latter is
 frozen by #348). Here a delivery is admitted only when the label's CURRENT
 live lease is held by exactly the registered (pane, birth):
 
-  admit()   lease holder == registered pane/birth  -> enqueue(exchange_id)
-            -> queued -> delivering, in the holder's generation.
-            A request id seen before NEVER gets fresh authority, except the
-            one pre-send case (approval prompt) recorded as retryable.
+  admit()   lease holder == registered pane/birth -> enqueue(exchange_id),
+            left QUEUED in the holder's generation. The body file is written
+            (deduped) while queued, so a crash before typing leaves a
+            recoverable queued request: same-generation `queued` is re-admitted.
+            A pre-send approval-prompt block (blocked 'retry:approval') goes
+            back to queued. Every other seen id NEVER regains authority.
+  begin_notice()  immediately before typing: fenced queued -> delivering, only
+            if the live lease has >= DELIVERY_TIMEOUT_S + SAFETY_MARGIN_S left
+            (otherwise stays queued: wait for renewal). Only `delivering` is
+            ambiguous after a crash, and it is never retried.
   settle()  delivered -> stays `delivering` (a typed notice is not a reply);
             approval prompt (pre-send) -> blocked 'retry:approval';
             anything else -> blocked (terminal for delivery; never retyped).
@@ -39,10 +45,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import owner_lease as ol  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+
+def _ts(iso: str) -> float:
+    return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=__import__("datetime").timezone.utc).timestamp()
 
 FLAG = "HERDR_OWNER_LEASE_DELIVERY"
 DB_ENV = "HERDR_OWNER_LEASE_DB"
 RETRY_APPROVAL = "retry:approval"
+DELIVERY_TIMEOUT_S = 120   # publisher's herdr-deliver.sh subprocess timeout
+SAFETY_MARGIN_S = 60       # settle + clock skew allowance after a full timeout
+MIN_LEASE_REMAINING_S = DELIVERY_TIMEOUT_S + SAFETY_MARGIN_S
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,8 @@ class DeliveryGate:
         if not Path(db_path).is_file():
             raise FileNotFoundError(f"owner-lease DB not found: {db_path}")
         self.conn = ol.connect(db_path)
+
+    min_lease_remaining_s = MIN_LEASE_REMAINING_S
 
     def close(self):
         self.conn.close()
@@ -89,10 +105,11 @@ class DeliveryGate:
             if not res["authority"]:
                 row = self.conn.execute("SELECT state, detail, generation FROM owner_requests WHERE request_id=?",
                                         (exchange_id,)).fetchone()
+                if row and row[2] == gen and row[0] == "queued":
+                    return Admission(True, "", gen)  # crash/recovery before typing
                 if not (row and row[2] == gen and row[0] == "blocked" and row[1] == RETRY_APPROVAL):
                     return Admission(False, f"owner_lease_duplicate:{res['state']}", gen)
                 ol.transition(self.conn, exchange_id, "queued", label, gen, pane_id, pane_birth, "retry", now)
-            ol.transition(self.conn, exchange_id, "delivering", label, gen, pane_id, pane_birth, "", now)
             return Admission(True, "", gen)
         except ol.Disabled:
             return Admission(False, "owner_lease_disabled")
@@ -102,6 +119,26 @@ class DeliveryGate:
             return Admission(False, "owner_lease_fenced")
         except (ol.InvalidOwner, ol.InvalidTransition, ValueError, sqlite3.Error) as exc:
             return Admission(False, f"owner_lease_error:{type(exc).__name__}")
+
+    def begin_notice(self, label, pane_id, pane_birth, generation, exchange_id, now: float | None = None) -> str:
+        """'delivering' (type now) | 'lease_too_short' (stay queued; retry after
+        renewal) | 'owner_lease_fenced' | 'owner_lease_disabled' | 'owner_lease_error:*'."""
+        now = time.time() if now is None else now
+        try:
+            if not self._enabled():
+                return "owner_lease_disabled"
+            cur = self._holder(label, now)
+            if not cur or cur[3] != generation:
+                return "owner_lease_fenced"
+            if _ts(cur[5]) - now < MIN_LEASE_REMAINING_S:
+                return "lease_too_short"
+            return ol.transition(self.conn, exchange_id, "delivering", label, generation, pane_id, pane_birth, "", now)
+        except ol.Disabled:
+            return "owner_lease_disabled"
+        except (ol.FencedOut, ol.LeaseConflict):
+            return "owner_lease_fenced"
+        except (ol.InvalidOwner, ol.InvalidTransition, ValueError, sqlite3.Error) as exc:
+            return f"owner_lease_error:{type(exc).__name__}"
 
     def settle(self, label, pane_id, pane_birth, generation, exchange_id, outcome: str, reason: str = "",
                now: float | None = None) -> str:

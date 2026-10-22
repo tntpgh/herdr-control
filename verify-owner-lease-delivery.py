@@ -29,12 +29,12 @@ def case(name, cond):
         FAILS.append(name)
 
 
-def scratch():
+def scratch(max_open=2):
     d = tempfile.mkdtemp()
     path = os.path.join(d, "owner.sqlite3")
     c = ol.connect(path)
     ol.migrate(c)
-    ol.register_owner(c, "kb", "tntpgh/knowledge-base", max_open=2, now=T0)
+    ol.register_owner(c, "kb", "tntpgh/knowledge-base", max_open=max_open, now=T0)
     c.close()
     return path
 
@@ -74,8 +74,14 @@ def main():
          g.admit("kb", P1, B1, "oex_1", T0).reason == "owner_no_lease" and state(path, "oex_1") is None)
     gen1 = holder_acquires(path, P1, B1, T0)
     a = g.admit("kb", P1, B1, "oex_1", T0 + 1)
-    case("holder == registered pane: admitted in its generation, state delivering",
-         a.ok and a.generation == gen1 and state(path, "oex_1")[0] == "delivering")
+    case("holder == registered pane: admitted QUEUED in its generation (not yet delivering)",
+         a.ok and a.generation == gen1 and state(path, "oex_1")[0] == "queued")
+    case("CRASH before typing: same-generation queued request is re-admitted",
+         g.admit("kb", P1, B1, "oex_1", T0 + 1.5).ok and state(path, "oex_1")[0] == "queued")
+    case("begin_notice moves queued -> delivering immediately before typing",
+         g.begin_notice("kb", P1, B1, gen1, "oex_1", T0 + 1.8) == "delivering")
+    case("CRASH after begin_notice: delivering is ambiguous and never re-admitted",
+         g.admit("kb", P1, B1, "oex_1", T0 + 1.9).reason == "owner_lease_duplicate:delivering")
     case("delivered keeps delivering (typed notice is not a reply)",
          g.settle("kb", P1, B1, gen1, "oex_1", "delivered", now=T0 + 2) == "delivering")
     case("reply in the current generation -> replied", g.on_reply("kb", "oex_1", T0 + 3) == "replied")
@@ -101,11 +107,14 @@ def main():
          g.admit("kb", P2, B2, "oex_2", T0 + 7).reason == "owner_lease_fenced" and state(path, "oex_2") is None)
     case("same pane, different birth -> fenced", g.admit("kb", P1, "term_zzz", "oex_2", T0 + 7).reason == "owner_lease_fenced")
     a3 = g.admit("kb", P1, B1, "oex_3", T0 + 8)
+    g.begin_notice("kb", P1, B1, a3.generation, "oex_3", T0 + 8)
     g.settle("kb", P1, B1, a3.generation, "oex_3", "blocked", "owner_at_approval_prompt", T0 + 9)
     case("approval prompt (pre-send) -> blocked retry:approval", state(path, "oex_3")[:3:2] == ("blocked", old.RETRY_APPROVAL))
-    case("retryable pre-send block is re-admitted next tick",
-         g.admit("kb", P1, B1, "oex_3", T0 + 10).ok and state(path, "oex_3")[0] == "delivering")
+    case("retryable pre-send block goes back to QUEUED next tick",
+         g.admit("kb", P1, B1, "oex_3", T0 + 10).ok and state(path, "oex_3")[0] == "queued"
+         and g.begin_notice("kb", P1, B1, a3.generation, "oex_3", T0 + 10) == "delivering")
     a4 = g.admit("kb", P1, B1, "oex_4", T0 + 11)
+    g.begin_notice("kb", P1, B1, a4.generation, "oex_4", T0 + 11)
     g.settle("kb", P1, B1, a4.generation, "oex_4", "blocked", "deliver_failed:4", T0 + 12)
     case("post-type uncertainty -> blocked and NEVER re-admitted (no retype)",
          g.admit("kb", P1, B1, "oex_4", T0 + 13).reason == "owner_lease_duplicate:blocked")
@@ -122,12 +131,42 @@ def main():
     case("settle by the old generation is refused (unrecorded)",
          g.settle("kb", P1, B1, gen1, "oex_3", "blocked", "x", T0 + TTL + 22) == "unrecorded")
     a7 = g.admit("kb", P2, B2, "oex_7", T0 + TTL + 23)
-    case("new holder admitted in the new generation", a7.ok and a7.generation == gen2)
+    case("new holder admitted in the new generation", a7.ok and a7.generation == gen2
+         and g.begin_notice("kb", P2, B2, gen2, "oex_7", T0 + TTL + 23) == "delivering")
+    case("settle refusal is surfaced as 'unrecorded' (stale generation)",
+         g.settle("kb", P2, B2, gen1, "oex_7", "blocked", "x", T0 + TTL + 23) == "unrecorded")
+
+    # --- lease lifetime at begin_notice ---
+    lt = scratch()
+    gl = old.DeliveryGate(lt)
+    c = ol.connect(lt)
+    ol.acquire(c, "kb", P1, B1, old.MIN_LEASE_REMAINING_S + 10, T0)
+    c.close()
+    al = gl.admit("kb", P1, B1, "oex_l", T0)
+    case("lease with >= timeout+margin left: begin_notice delivers",
+         gl.begin_notice("kb", P1, B1, al.generation, "oex_l", T0 + 5) == "delivering")
+    al2 = gl.admit("kb", P1, B1, "oex_l2", T0 + 20)
+    case("LIFETIME: expires>now but < 120s timeout + 60s margin left -> lease_too_short, stays queued",
+         gl.begin_notice("kb", P1, B1, al2.generation, "oex_l2", T0 + 20) == "lease_too_short"
+         and state(lt, "oex_l2")[0] == "queued")
+    c = ol.connect(lt)
+    ol.acquire(c, "kb", P1, B1, 600, T0 + 21)  # holder renews
+    c.close()
+    case("after renewal the queued request proceeds",
+         gl.begin_notice("kb", P1, B1, al2.generation, "oex_l2", T0 + 22) == "delivering")
+    gl.close()
 
     # --- restart ---
     g.close()
     g2 = old.DeliveryGate(path)
     case("RESTART: durable state survives a new gate instance", g2.state("oex_7") == "delivering")
+    a9 = g2.admit("kb", P2, B2, "oex_9", T0 + TTL + 23.5)
+    g2.close()
+    g3 = old.DeliveryGate(path)
+    case("RESTART: queued (never typed) request recovers after restart",
+         g3.admit("kb", P2, B2, "oex_9", T0 + TTL + 23.6).ok and a9.ok and g3.state("oex_9") == "queued")
+    g3.close()
+    g2 = old.DeliveryGate(path)
     case("RESTART: replay of a delivered id gets no authority",
          g2.admit("kb", P2, B2, "oex_7", T0 + TTL + 24).reason == "owner_lease_duplicate:delivering")
     case("RESTART: reply after restart credits once", g2.on_reply("kb", "oex_7", T0 + TTL + 25) == "replied"
@@ -162,7 +201,7 @@ def main():
 
     case("publisher, flag OFF: legacy delivery unchanged, no gate loaded",
          pub.owner_lease_gate() is None and pub.deliver_owner(item("oex_p1"), local)["outcome"] == "delivered" and delivered() == 1)
-    lpath = scratch()
+    lpath = scratch(max_open=10)
     os.environ.update({old.FLAG: "1", old.DB_ENV: lpath})
     pub._OWNER_LEASE_GATE = None
     r = pub.deliver_owner(item("oex_p2"), local)
@@ -173,13 +212,32 @@ def main():
     r = pub.deliver_owner(item("oex_p3"), local)
     case("publisher, flag ON, holder matches: delivered and recorded delivering",
          r["outcome"] == "delivered" and delivered() == 2 and state(lpath, "oex_p3")[0] == "delivering")
+    # crash after body write, before typing: request queued, body on disk
+    gq = old.DeliveryGate(lpath)
+    gq.admit("kb", P1, B1, "oex_pc", __import__("time").time())
+    gq.close()
+    pub.write_inbox_message("kb", "oex_pc", "tnt", "hello")
+    r = pub.deliver_owner(item("oex_pc"), local)
+    case("publisher CRASH RECOVERY: queued + same body -> delivered once",
+         r["outcome"] == "delivered" and delivered() == 3 and state(lpath, "oex_pc")[0] == "delivering")
+    gq = old.DeliveryGate(lpath)
+    gq.admit("kb", P1, B1, "oex_pm", __import__("time").time())
+    gq.close()
+    pub.write_inbox_message("kb", "oex_pm", "tnt", "ORIGINAL body")
+    r = pub.deliver_owner(item("oex_pm"), local)  # replay carries body "hello"
+    case("publisher CHANGED-BODY REPLAY: same id, different payload -> blocked, no notice",
+         r.get("reason") == "owner_payload_mismatch" and delivered() == 3
+         and state(lpath, "oex_pm")[:3:2] == ("blocked", "owner_payload_mismatch"))
+    r = pub.deliver_owner({**item("oex_pm"), "sender": "someone-else", "body": "ORIGINAL body"}, local)
+    case("publisher: changed sender with original body is also refused", r.get("reason", "").startswith("owner_lease_duplicate") and delivered() == 3)
     r = pub.deliver_owner(item("oex_p3"), local)
     case("publisher: re-delivery of the same exchange refused (no second notice)",
-         r["reason"] == "owner_lease_duplicate:delivering" and delivered() == 2)
+         r["reason"] == "owner_lease_duplicate:delivering" and delivered() == 3)
     os.environ["FAKE_RC"] = "4"
     r = pub.deliver_owner(item("oex_p4"), local)
     case("publisher: rc 4 recorded blocked, not delivered",
          r["reason"] == "deliver_failed:4" and state(lpath, "oex_p4")[0] == "blocked")
+    delivered_before_missing = delivered()
     os.environ.pop("FAKE_RC")
     os.environ[old.DB_ENV] = str(tmp / "missing.sqlite3")
     pub._OWNER_LEASE_GATE = None
@@ -187,7 +245,7 @@ def main():
         pub.deliver_owner(item("oex_p5"), local)
         case("publisher, flag ON, missing DB: tick fails, never ungated", False)
     except FileNotFoundError:
-        case("publisher, flag ON, missing DB: tick fails, never ungated", delivered() == 3)
+        case("publisher, flag ON, missing DB: tick fails, never ungated", delivered() == delivered_before_missing)
 
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
