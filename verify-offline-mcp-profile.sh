@@ -49,8 +49,13 @@ unset HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID
 # directly under the mktemp root and named tmp.*; anything else is reported, kept.
 tmp_root=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 tmp_paths=()
+keep_tmp=0  # set when a bounded child's process group could not be confirmed gone
 cleanup() {
   local d
+  if [ "$keep_tmp" = 1 ]; then
+    printf 'cleanup: RETAINING temp roots (a child process group was not confirmed gone): %s\n' "${tmp_paths[*]-}" >&2
+    return 0
+  fi
   for d in ${tmp_paths[@]+"${tmp_paths[@]}"}; do
     case "$d" in
       "$tmp_root"/tmp.*) [ -d "$d" ] && [ "$(dirname "$d")" = "$tmp_root" ] && rm -rf -- "$d" ;;
@@ -423,19 +428,36 @@ neg_py="$(HERDR_HUB_PYTHON_DIRS="$no_py_dir" bash "$resolver" </dev/null 2>/dev/
   && ok "causal: resolver refuses with no python3.11+ on HERDR_HUB_PYTHON_DIRS (the CI cause)" \
   || bad "resolver accepted an empty HERDR_HUB_PYTHON_DIRS (rc=$neg_rc, out='$neg_py')"
 
-# run_bounded <secs> <outfile> <cmd...>: stdin /dev/null, stdout+stderr to
-# <outfile>; returns the command's rc, or 124 after killing it on timeout.
-# ceiling: kills the direct child only, not grandchildren; enough to keep this
-# suite from hanging, and a timeout is itself a FAIL.
+# run_bounded <secs> <outfile> <argv...>: tests/bounded-run.py runs argv (no
+# shell) in its own process group; on deadline it TERMs then KILLs the whole
+# group, reaps the leader and verifies the group is gone -> 124. If the group
+# cannot be confirmed gone it returns 125: we then retain every temp root and
+# FAIL, so no descendant can race our cleanup.
+bounded_py="${res_py:-}"; [ -x "$bounded_py" ] || bounded_py="$(command -v python3)"
 run_bounded() {
-  local secs="$1" outf="$2" pid n=0; shift 2
-  "$@" </dev/null >"$outf" 2>&1 & pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    [ "$n" -ge $((secs * 5)) ] && { kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; }
-    sleep 0.2; n=$((n + 1))
-  done
-  wait "$pid"
+  local secs="$1" outf="$2" brc; shift 2
+  "$bounded_py" "$here/tests/bounded-run.py" "$secs" "$outf" -- "$@"; brc=$?
+  if [ "$brc" = 125 ]; then
+    keep_tmp=1
+    bad "bounded child's process group not confirmed gone; temp roots retained: $*"
+  fi
+  return "$brc"
 }
+
+printf '== bounded runner: causal fixture (TERM-ignoring leader + descendant) ==\n'
+mk_tmp bounded_fx
+run_bounded 1 "$bounded_fx/out" bash -c \
+  'trap "" TERM; ( trap "" TERM; echo $BASHPID > "$1/desc.pid"; sleep 30 ) & sleep 30' _ "$bounded_fx"
+fx_rc=$?
+[ "$fx_rc" = 124 ] && ok "fixture: deadline returns 124" || bad "fixture: expected 124, got $fx_rc"
+fx_desc="$(cat "$bounded_fx/desc.pid" 2>/dev/null)"
+if [ -n "$fx_desc" ] && ! kill -0 "$fx_desc" 2>/dev/null; then
+  ok "fixture: the TERM-ignoring descendant ($fx_desc) is gone after return"
+else
+  bad "fixture: descendant '${fx_desc:-<no pid file>}' still alive or unrecorded"
+fi
+run_bounded 5 "$bounded_fx/fast" bash -c 'exit 7'
+[ "$?" = 7 ] && ok "fixture: an in-time command's own rc (7) is returned" || bad "fixture: in-time rc not propagated"
 
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
 mk_tmp saved_dir; saved="$saved_dir/overlay.yml"; cp "$ctl_profile_path" "$saved"

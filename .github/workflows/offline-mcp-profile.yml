@@ -6,12 +6,12 @@ on:
   pull_request:
     paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
-            "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", ".github/workflows/offline-mcp-profile.yml"]
+            "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
   push:
     branches: [main]
     paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
-            "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", ".github/workflows/offline-mcp-profile.yml"]
+            "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
 
 permissions:
   contents: read
