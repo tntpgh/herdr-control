@@ -41,12 +41,22 @@ Request dispositions
   replied -> evidence
   (any open) -> stale   — only by acquire() on generation change
 
-Migration (design; NOT applied to the live registry by this file)
+Migration / rollback (design; NOT applied to the live registry by this file)
   migrate(conn) is versioned (owner_schema_version) and idempotent; v1 only
   CREATEs owner_* tables/indexes/triggers and alters no existing table.
-  Rollback of v1: DROP the five owner_* tables (their indexes and triggers go
-  with them); nothing else references them. Applying it live is a separate
-  approval with a registry backup first.
+  Rollback is NON-destructive: disable(conn) flips owner_state.enabled=0 so
+  every mutation fails closed while tables and the event log are preserved
+  and readers (observe_stale, check_fence, export_backup) keep working.
+  export_backup() writes a 0600 SQLite copy (new file only, never overwrite);
+  restore is "open the copy", proven by the restore-on-copy test. Nothing
+  here ever drops a table. Applying v1 live is a separate approval with a
+  registry backup first.
+
+Policy
+  An owner's queue bound is its registered max_open (1..MAX_OPEN_LIMIT); a
+  caller can never pass a larger one. Pane ids, births, request ids and TTLs
+  are validated. SQLite foreign keys are ON for every connection: requests
+  reference a registered owner and an existing (label, generation) lease.
 
 ceiling: pane birth is identity, not liveness proof — the caller supplies the
 live pane set (herdr pane list). Clock is the caller's `now` (UTC seconds).
@@ -60,7 +70,12 @@ import uuid
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
-DEFAULT_BOUND = 5
+DEFAULT_MAX_OPEN = 5
+MAX_OPEN_LIMIT = 50
+MAX_TTL_S = 86_400
+PANE_RE = re.compile(r"^w[0-9A-Za-z]{1,16}:p[0-9A-Za-z]{1,16}$")
+BIRTH_RE = re.compile(r"^term_[0-9a-z]{1,40}$")
+REQUEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 _PROJECT_RE = re.compile(
     r"^(?:(?:https://|ssh://git\x40)?github\.com[/:]|git\x40github\.com:)?(tntpgh)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"
@@ -98,6 +113,10 @@ class InvalidTransition(ValueError):
     pass
 
 
+class Disabled(Exception):
+    """Owner leasing is disabled (rolled back); mutations fail closed."""
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -105,12 +124,16 @@ def _iso(ts: float) -> str:
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=10, isolation_level=None)  # explicit BEGINs only
     conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 MIGRATIONS = {
     1: [
-        "CREATE TABLE owner_projects (label TEXT PRIMARY KEY, project TEXT NOT NULL UNIQUE, registered_at TEXT NOT NULL)",
+        "CREATE TABLE owner_state (id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL CHECK (enabled IN (0,1)), changed_at TEXT NOT NULL)",
+        "INSERT INTO owner_state VALUES (1, 1, '1970-01-01T00:00:00.000000Z')",
+        f"""CREATE TABLE owner_projects (label TEXT PRIMARY KEY, project TEXT NOT NULL UNIQUE, registered_at TEXT NOT NULL,
+             max_open INTEGER NOT NULL CHECK (max_open BETWEEN 1 AND {MAX_OPEN_LIMIT}))""",
         """CREATE TABLE owner_leases (
              lease_id TEXT PRIMARY KEY, label TEXT NOT NULL REFERENCES owner_projects(label),
              pane_id TEXT NOT NULL, pane_birth TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -118,13 +141,14 @@ MIGRATIONS = {
              released_at TEXT, release_reason TEXT, UNIQUE(label, generation))""",
         "CREATE UNIQUE INDEX owner_leases_one_live ON owner_leases(label) WHERE released_at IS NULL",
         """CREATE TABLE owner_requests (
-             request_id TEXT PRIMARY KEY, label TEXT NOT NULL, generation INTEGER NOT NULL,
+             request_id TEXT PRIMARY KEY, label TEXT NOT NULL REFERENCES owner_projects(label), generation INTEGER NOT NULL,
              state TEXT NOT NULL CHECK (state IN ('queued','held','blocked','delivering','replied','evidence','timeout','stale','cancelled')),
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+             FOREIGN KEY (label, generation) REFERENCES owner_leases(label, generation))""",
         "CREATE INDEX owner_requests_label_state ON owner_requests(label, state)",
         "CREATE INDEX owner_requests_label_gen ON owner_requests(label, generation)",
         """CREATE TABLE owner_events (
-             seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, label TEXT NOT NULL,
+             seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, label TEXT NOT NULL REFERENCES owner_projects(label),
              kind TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '', generation INTEGER, detail TEXT NOT NULL DEFAULT '')""",
         "CREATE INDEX owner_events_label_seq ON owner_events(label, seq)",
         "CREATE TRIGGER owner_events_no_update BEFORE UPDATE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
@@ -157,9 +181,11 @@ def _event(conn, now, label, kind, ref="", generation=None, detail=""):
                  (_iso(now), label, kind, ref, generation, detail))
 
 
-def _tx(conn, fn):
+def _tx(conn, fn, mutation=True):
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if mutation and conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone() != (1,):
+            raise Disabled("owner leasing is disabled")
         out = fn()
         conn.execute("COMMIT")
         return out
@@ -177,12 +203,25 @@ def canonical_project(value: str) -> str:
     return f"{m.group(1)}/{m.group(2).lower()}"
 
 
-def register_owner(conn, label: str, project: str, now: float | None = None) -> str:
-    """Map label <-> canonical project. Idempotent for the same pair; any other
-    overlap (label to another project, project to another label) is refused."""
+def _check(regex, value, what):
+    if not isinstance(value, str) or not regex.match(value):
+        raise ValueError(f"invalid {what}: {value!r}")
+
+
+def _check_holder(pane_id, pane_birth):
+    _check(PANE_RE, pane_id, "pane id")
+    _check(BIRTH_RE, pane_birth, "pane birth")
+
+
+def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_OPEN, now: float | None = None) -> str:
+    """Map label <-> canonical project with its queue policy. Idempotent for the
+    same pair; any other overlap (label to another project, project to another
+    label) is refused."""
     now = time.time() if now is None else now
-    if not LABEL_RE.match(label or ""):
+    if not isinstance(label, str) or not LABEL_RE.match(label):
         raise InvalidOwner(f"invalid owner label {label!r}")
+    if not isinstance(max_open, int) or isinstance(max_open, bool) or not 1 <= max_open <= MAX_OPEN_LIMIT:
+        raise InvalidOwner(f"max_open must be an int in 1..{MAX_OPEN_LIMIT}")
     proj = canonical_project(project)
 
     def body():
@@ -191,7 +230,7 @@ def register_owner(conn, label: str, project: str, now: float | None = None) -> 
             return proj
         if row:
             raise InvalidOwner(f"{label} -> {proj} conflicts with existing {row}")
-        conn.execute("INSERT INTO owner_projects VALUES (?,?,?)", (label, proj, _iso(now)))
+        conn.execute("INSERT INTO owner_projects VALUES (?,?,?,?)", (label, proj, _iso(now), max_open))
         _event(conn, now, label, "registered", proj)
         return proj
 
@@ -210,6 +249,9 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
     the expired predecessor is released and its open requests disposed `stale`,
     all in the same transaction as the successor's insert."""
     now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= MAX_TTL_S:
+        raise ValueError(f"ttl_s must be an int in 1..{MAX_TTL_S}")
 
     def body():
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
@@ -254,6 +296,7 @@ def _fence(conn, label, generation, pane_id, pane_birth, now):
 
 
 def check_fence(conn, label, generation, pane_id, pane_birth, now=None) -> None:
+    """Read-only: works while disabled too."""
     _fence(conn, label, generation, pane_id, pane_birth, time.time() if now is None else now)
 
 
@@ -271,20 +314,24 @@ def release(conn, label, generation, pane_id, pane_birth, now=None) -> bool:
     return _tx(conn, body)
 
 
-def enqueue(conn, label, generation, pane_id, pane_birth, request_id, bound=DEFAULT_BOUND, now=None) -> dict:
-    """Fenced, bounded, atomic. A new id -> {'state':'queued','authority':True}.
-    An existing id -> its durable prior outcome with authority False (never a
-    fresh delivery grant, whatever generation it was queued under)."""
+def enqueue(conn, label, generation, pane_id, pane_birth, request_id, now=None) -> dict:
+    """Fenced, bounded by the owner's registered max_open, atomic.
+    The caller is authenticated as the current holder FIRST, then:
+    a new id -> {'state':'queued','authority':True}; an existing id -> its
+    durable prior outcome with authority False (never a fresh delivery grant)."""
     now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    _check(REQUEST_RE, request_id, "request id")
 
     def body():
+        _fence(conn, label, generation, pane_id, pane_birth, now)
         row = conn.execute("SELECT label, generation, state FROM owner_requests WHERE request_id=?", (request_id,)).fetchone()
         if row:
             return {"request_id": request_id, "label": row[0], "generation": row[1], "state": row[2], "authority": False}
-        _fence(conn, label, generation, pane_id, pane_birth, now)
+        bound = conn.execute("SELECT max_open FROM owner_projects WHERE label=?", (label,)).fetchone()[0]
         n = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})", (label, *OPEN)).fetchone()[0]
         if n >= bound:
-            raise QueueFull(f"{label}: {n} open >= bound {bound}")
+            raise QueueFull(f"{label}: {n} open >= max_open {bound}")
         conn.execute("INSERT INTO owner_requests(request_id,label,generation,state,created_at,updated_at) VALUES (?,?,?,?,?,?)",
                      (request_id, label, generation, "queued", _iso(now), _iso(now)))
         _event(conn, now, label, "request:queued", request_id, generation)
@@ -297,12 +344,14 @@ def transition(conn, request_id, to, label, generation, pane_id, pane_birth, det
     """Fenced state change. The request must belong to the caller's label AND
     current generation; `stale` is never a caller transition."""
     now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    _check(REQUEST_RE, request_id, "request id")
 
     def body():
+        _fence(conn, label, generation, pane_id, pane_birth, now)
         row = conn.execute("SELECT label, generation, state FROM owner_requests WHERE request_id=?", (request_id,)).fetchone()
         if not row:
             raise InvalidTransition(f"unknown request {request_id}")
-        _fence(conn, label, generation, pane_id, pane_birth, now)
         if row[:2] != (label, generation):
             raise FencedOut(f"{request_id} belongs to {row[0]} gen {row[1]}, caller {label} gen {generation}")
         if to not in TRANSITIONS.get(row[2], set()):
@@ -329,22 +378,64 @@ def observe_stale(conn, live_panes: set, now=None) -> list[dict]:
     return out
 
 
+_OBS_KEYS = ("lease_id", "label", "generation", "pane", "birth", "renewed_at", "expires_at", "reason")
+
+
 def reap(conn, observed: list[dict], now=None, dry_run=True) -> list[dict]:
-    """Release observed stale leases (registry rows only; never a pane) by CAS on
-    (lease_id, renewed_at, expires_at). Dry-run by default."""
+    """Release observed stale leases (registry rows only; never a pane). The
+    release is a CAS on the COMPLETE observed identity: lease_id, label,
+    generation, pane, birth, renewed_at and expires_at must all still match.
+    Event metadata comes from the matched DB row, never from the caller.
+    Dry-run by default."""
     now = time.time() if now is None else now
+    for o in observed:
+        if not isinstance(o, dict) or any(k not in o for k in _OBS_KEYS):
+            raise ValueError(f"observation missing {[k for k in _OBS_KEYS if k not in (o or {})]}")
     if dry_run:
         return [dict(o, released=False, dry_run=True) for o in observed]
 
     def body():
         res = []
         for o in observed:
-            cur = conn.execute("UPDATE owner_leases SET released_at=?, release_reason=? WHERE lease_id=? AND renewed_at=? "
-                               "AND expires_at=? AND released_at IS NULL",
-                               (_iso(now), f"reaped:{o['reason']}", o["lease_id"], o["renewed_at"], o["expires_at"]))
-            ok = cur.rowcount == 1
-            _event(conn, now, o["label"], "reaped" if ok else "reap-skipped", o["lease_id"], o["generation"], o["reason"])
-            res.append(dict(o, released=ok))
+            row = conn.execute(
+                "SELECT lease_id, label, generation FROM owner_leases WHERE lease_id=? AND label=? AND generation=? "
+                "AND pane_id=? AND pane_birth=? AND renewed_at=? AND expires_at=? AND released_at IS NULL",
+                (o["lease_id"], o["label"], o["generation"], o["pane"], o["birth"], o["renewed_at"], o["expires_at"])).fetchone()
+            if row:
+                conn.execute("UPDATE owner_leases SET released_at=?, release_reason=? WHERE lease_id=? AND released_at IS NULL",
+                             (_iso(now), f"reaped:{o['reason']}", row[0]))
+                _event(conn, now, row[1], "reaped", row[0], row[2], o["reason"])
+            else:
+                known = conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (o["label"],)).fetchone()
+                if known:
+                    _event(conn, now, o["label"], "reap-skipped", str(o["lease_id"])[:64], None, "observation no longer matches")
+            res.append(dict(o, released=bool(row)))
         return res
 
     return _tx(conn, body)
+
+
+def disable(conn, now=None) -> None:
+    """Non-destructive rollback: every mutation fails closed afterwards; all
+    tables and events are preserved and readers keep working."""
+    now = time.time() if now is None else now
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("UPDATE owner_state SET enabled=0, changed_at=? WHERE id=1", (_iso(now),))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def export_backup(conn, dest_path: str) -> str:
+    """Consistent SQLite copy to a NEW file created 0600 (refuses to overwrite)."""
+    import os
+    fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    dst = sqlite3.connect(dest_path)
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+    return dest_path
