@@ -380,6 +380,7 @@ def main() -> int:
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
@@ -722,7 +723,61 @@ def cli_cases(base: Path) -> None:
     case("CLI: consumed-but-unsent grant -> exit 4 recovery hold; the new grant is NOT consumed",
          rc == 4 and out == "refused:recovery_needs_operator auth:a_burn=consumed_unsent"
          and c.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_e'").fetchone()[0] == "granted")
+    # operator resolution: wrong key keeps the hold; exact key lifts it for a_burn only; a_burn stays listed by unsent()
+    bad_key = oda.resolve(c, "a_burn", envelope_sha256_hex="0" * 64, operator="terrence", decision_ref="form-x",
+                          outcome="confirmed_not_delivered")
+    rc_wrong = inproc("r_e", "a_e")[0]
+    good = oda.resolve(c, "a_burn", envelope_sha256_hex=oda.envelope_sha256(oda._envelope(c, "a_burn")),
+                       operator="terrence", decision_ref="form-x", outcome="confirmed_not_delivered")
+    rc2, out2 = inproc("r_e", "a_e")
+    case("CLI: resolution with a wrong envelope key keeps exit 4; exact key lifts the hold; evidence still in unsent()",
+         bad_key == "resolve_key_mismatch" and rc_wrong == 4 and good == "resolved" and (rc2, out2) == (0, "dispatched")
+         and oda.unsent(c, str(base / "journal")) == ["a_burn"] and oda.unresolved(c, str(base / "journal")) == [])
     c.close(); lc.close()
+
+
+def operator_cases(base: Path) -> None:
+    """revoke()/resolve()/unresolved() on a disposable store: append-only, exact-key, no regrant."""
+    c = sqlite3.connect(str(base / "op.db"), isolation_level=None)
+    oda.migrate(c); oda.migrate(c)
+    H = ("w93:p2", "term_kb1", SESS[KB], 1)
+    g = lambda aid, **kw: insert_grant(c, aid, label=KB, project="p", holder=H, rid="r_" + aid, sha="a" * 64,
+                                       manifest=["m"], **kw)
+    st = lambda aid: c.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (aid,)).fetchone()[0]
+    con = lambda aid, now=T0: oda.consume(c, aid, label=KB, project="p", holder=H, request_id="r_" + aid,
+                                          body_sha256="a" * 64, manifest=["m"], now=now)
+    rv = lambda aid, now=T0, op="terrence", ref="form-1": oda.revoke(c, aid, operator=op, decision_ref=ref, now=now)
+    g("g1"); g("g2"); g("g3", expires=T0 - 1)
+    case("REVOKE: unexpired grant -> revoked (denied) and later consume holds auth_denied",
+         rv("g1") == "revoked" and st("g1") == "denied" and con("g1") == "auth_denied")
+    case("REVOKE: no operator/decision ref -> invalid, grant untouched", rv("g2", op="") == "revoke_invalid"
+         and rv("g2", ref="") == "revoke_invalid" and st("g2") == "granted")
+    env2 = con("g2")
+    case("REVOKE: after consumption -> too_late_consumed (cancellation cannot undo a started action)",
+         isinstance(env2, dict) and rv("g2") == "revoke_too_late_consumed" and st("g2") == "consumed")
+    case("REVOKE: expired / missing / already revoked -> typed refusal, no record",
+         rv("g3") == "revoke_expired" and rv("nope") == "revoke_missing" and rv("g1") == "revoke_denied"
+         and c.execute("SELECT COUNT(*) FROM owner_dispatch_operator").fetchone()[0] == 1)
+    J = base / "journal"; J.mkdir()
+    key = oda.envelope_sha256(env2)
+    R = lambda aid, k=key, **kw: oda.resolve(c, aid, envelope_sha256_hex=k, operator=kw.get("op", "terrence"),
+                                              decision_ref="form-2", outcome=kw.get("out", "abandoned_uncertain"),
+                                              new_request_id=kw.get("nr"))
+    case("RESOLVE: invalid outcome / not consumed / missing / wrong key -> refused, no record",
+         R("g2", out="ok") == "resolve_invalid" and R("g1") == "resolve_not_consumed" and R("nope") == "resolve_missing"
+         and R("g2", k=key[::-1]) == "resolve_key_mismatch" and oda.unresolved(c, str(J)) == ["g2"])
+    case("RESOLVE: exact key -> resolved; grant unchanged, nothing regranted, duplicate refused",
+         R("g2", nr="r_new") == "resolved" and st("g2") == "consumed" and oda.unresolved(c, str(J)) == []
+         and oda.unsent(c, str(J)) == ["g2"] and R("g2") == "resolve_duplicate"
+         and c.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE request_id='r_new'").fetchone()[0] == 0)
+    # a changed envelope after resolution (row tampered) re-opens the hold
+    c.execute("UPDATE owner_dispatch_auth SET consumed_at='other' WHERE auth_id='g2'")
+    case("RESOLVE: envelope changed after resolution -> hold re-opens (key no longer matches)",
+         oda.unresolved(c, str(J)) == ["g2"])
+    case("OPERATOR LOG: append-only (UPDATE and DELETE abort)",
+         _raises(lambda: c.execute("UPDATE owner_dispatch_operator SET note='x'"))
+         and _raises(lambda: c.execute("DELETE FROM owner_dispatch_operator")))
+    c.close()
 
 
 def publisher_tick_cases(base: Path) -> None:

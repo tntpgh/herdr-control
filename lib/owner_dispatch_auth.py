@@ -31,6 +31,18 @@ bounded regular file, parses and carries exactly that envelope. A missing,
 older, symlinked, malformed or different intent leaves it unsent. Callers
 hold on any such entry: never retried, never regranted.
 
+Operator records (append-only table owner_dispatch_operator, UPDATE/DELETE
+refused by triggers), keyed by auth_id + envelope_sha256 of the grant row:
+  revoke():  granted & unexpired -> denied, BEFORE consumption only. A
+             consumed grant cannot be revoked: cancellation never undoes a
+             started action.
+  resolve(): one operator outcome for a CONSUMED grant, only when the
+             caller names the exact current envelope sha256. It never
+             changes the grant, never regrants and never resends.
+  unresolved(): unsent() minus grants with an exact-key resolution; the
+             dispatch CLI holds on this. unsent() itself is unchanged, so the
+             original evidence stays listed.
+
 This module has NO function that writes a grant. A worker or caller cannot
 authorize itself. Issuing a grant is a separate, unapproved surface; tests
 insert fixture rows directly into a disposable store.
@@ -70,9 +82,33 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS owner_dispatch_auth (
 )"""
 
 
+OPERATOR_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS owner_dispatch_operator (
+  seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+  auth_id         TEXT NOT NULL,
+  kind            TEXT NOT NULL CHECK (kind IN ('revoked','resolved')),
+  envelope_sha256 TEXT NOT NULL,
+  operator        TEXT NOT NULL CHECK (operator <> ''),
+  decision_ref    TEXT NOT NULL CHECK (decision_ref <> ''),
+  outcome         TEXT NOT NULL,
+  note            TEXT NOT NULL,
+  new_request_id  TEXT,
+  recorded_at     TEXT NOT NULL,
+  UNIQUE (auth_id, kind)
+)""",
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_operator_no_update BEFORE UPDATE ON owner_dispatch_operator"
+    " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_operator_no_delete BEFORE DELETE ON owner_dispatch_operator"
+    " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+)
+OUTCOMES = ("confirmed_delivered", "confirmed_not_delivered", "abandoned_uncertain")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Creates the table in a store the CALLER chose (tests: a temp file)."""
+    """Creates the tables in a store the CALLER chose (tests: a temp file)."""
     conn.execute(SCHEMA)
+    for stmt in OPERATOR_SCHEMA:
+        conn.execute(stmt)
 
 
 def manifest_key(manifest) -> str:
@@ -161,6 +197,95 @@ def unsent(conn: sqlite3.Connection, journal_root: str) -> list[str]:
         intent = _read_intent(journal_root, env["owner_label"], env["request_id"])
         if not intent or intent.get("auth") != env or intent.get("rid") != env["request_id"] \
                 or intent.get("label") != env["owner_label"]:
+            out.append(aid)
+    return out
+
+
+def envelope_sha256(env: dict) -> str:
+    return hashlib.sha256(json.dumps(env, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _record(conn, auth_id, kind, env_sha, operator, decision_ref, outcome, note, new_rid):
+    conn.execute("INSERT INTO owner_dispatch_operator (auth_id, kind, envelope_sha256, operator, decision_ref,"
+                 " outcome, note, new_request_id, recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (auth_id, kind, env_sha, operator, decision_ref, outcome, note, new_rid, _now_iso()))
+
+
+def revoke(conn: sqlite3.Connection, auth_id: str, *, operator: str, decision_ref: str, note: str = "",
+           now: float) -> str:
+    """'revoked', or why not: revoke_missing | revoke_denied | revoke_too_late_consumed |
+    revoke_expired | revoke_invalid | revoke_ambiguous:<Error>. Never raises."""
+    if not operator or not decision_ref:
+        return "revoke_invalid"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT status, expires_at FROM owner_dispatch_auth WHERE auth_id=?", (auth_id,)).fetchone()
+            if row is None:
+                return "revoke_missing"
+            st, exp = row
+            if st == "consumed":
+                return "revoke_too_late_consumed"
+            if st == "denied":
+                return "revoke_denied"
+            if not isinstance(exp, (int, float)) or now >= exp:
+                return "revoke_expired"
+            env_sha = envelope_sha256(_envelope(conn, auth_id))
+            if conn.execute("UPDATE owner_dispatch_auth SET status='denied' WHERE auth_id=? AND status='granted'",
+                            (auth_id,)).rowcount != 1:
+                return "revoke_too_late_consumed"
+            _record(conn, auth_id, "revoked", env_sha, operator, decision_ref, "revoked", note, None)
+            conn.execute("COMMIT")
+            return "revoked"
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except sqlite3.Error as exc:
+        return f"revoke_ambiguous:{type(exc).__name__}"
+
+
+def resolve(conn: sqlite3.Connection, auth_id: str, *, envelope_sha256_hex: str, operator: str, decision_ref: str,
+            outcome: str, note: str = "", new_request_id: str | None = None) -> str:
+    """'resolved', or why not: resolve_invalid | resolve_missing | resolve_not_consumed |
+    resolve_key_mismatch | resolve_duplicate | resolve_ambiguous:<Error>. new_request_id is
+    recorded only; it grants nothing. Never raises."""
+    if not operator or not decision_ref or outcome not in OUTCOMES:
+        return "resolve_invalid"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (auth_id,)).fetchone()
+            if row is None:
+                return "resolve_missing"
+            if row[0] != "consumed":
+                return "resolve_not_consumed"
+            if envelope_sha256(_envelope(conn, auth_id)) != envelope_sha256_hex:
+                return "resolve_key_mismatch"
+            try:
+                _record(conn, auth_id, "resolved", envelope_sha256_hex, operator, decision_ref, outcome, note,
+                        new_request_id)
+            except sqlite3.IntegrityError:
+                return "resolve_duplicate"
+            conn.execute("COMMIT")
+            return "resolved"
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except sqlite3.Error as exc:
+        return f"resolve_ambiguous:{type(exc).__name__}"
+
+
+def unresolved(conn: sqlite3.Connection, journal_root: str) -> list[str]:
+    """unsent() minus grants whose resolution names their exact current envelope. Read-only."""
+    out = []
+    for aid in unsent(conn, journal_root):
+        r = conn.execute("SELECT envelope_sha256 FROM owner_dispatch_operator WHERE auth_id=? AND kind='resolved'",
+                         (aid,)).fetchone()
+        if not r or r[0] != envelope_sha256(_envelope(conn, aid)):
             out.append(aid)
     return out
 

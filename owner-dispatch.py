@@ -22,7 +22,8 @@ or acquires, renews, reaps or takes over a lease.
     must equal the live lease tuple. The session digest is a REGISTRY-ATTESTED
     identity, not authentication of the process at the pane.
   - recover() runs first; any mismatch/unrecorded journal entry, or any
-    consumed-but-unsent grant (owner_dispatch_auth.unsent), refuses the run.
+    consumed-but-unsent grant without an exact-key operator resolution
+    (owner_dispatch_auth.unresolved), refuses the run.
 Exit: 0 dispatched; 2 held (typed reason on stdout); 3 ambiguous; 4 config/recovery refusal.
 """
 from __future__ import annotations
@@ -107,7 +108,7 @@ def main(argv=None, send=None, resolve=None) -> int:
     d = od.Dispatcher(gate, avail, send, resolve, authorize=authorize)
     try:
         bad = {k: v for k, v in d.recover().items() if v.startswith(("mismatch", "unrecorded"))}
-        bad.update({f"auth:{aid}": "consumed_unsent" for aid in oda.unsent(store, str(avail.journal_root))})
+        bad.update({f"auth:{aid}": "consumed_unsent" for aid in oda.unresolved(store, str(avail.journal_root))})
         if bad:
             print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad.items())))
             return 4
