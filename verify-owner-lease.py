@@ -9,6 +9,7 @@ panes or network. Prints OK/FAIL per case; exit 1 on any FAIL.
 import multiprocessing as mp
 import os
 import sqlite3
+from datetime import datetime, timezone
 import sys
 import tempfile
 
@@ -76,7 +77,7 @@ def main():
 
     # --- schema / migration ---
     p, c = fresh(label=None)
-    case("migrate is versioned and idempotent", ol.migrate(c) == 1 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 1)
+    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 2 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 2)
     ol.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0)
     case("events: DELETE rejected by trigger", raises(lambda: c.execute("DELETE FROM owner_events"), sqlite3.IntegrityError))
     case("events: UPDATE rejected by trigger", raises(lambda: c.execute("UPDATE owner_events SET kind='x'"), sqlite3.IntegrityError))
@@ -265,6 +266,73 @@ def main():
          all(same(f"SELECT * FROM {t} ORDER BY 1") for t in ("owner_projects", "owner_leases", "owner_requests", "owner_events", "owner_state")))
     rc.close()
     c.close()
+
+    # --- upgrade from a database created at the ORIGINAL v1 schema ---
+    def v1_db(orphan=False):
+        fd, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        d = sqlite3.connect(path, isolation_level=None)
+        d.execute("CREATE TABLE owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
+        for stmt in ol.MIGRATIONS[1]:
+            d.execute(stmt)
+        d.execute("INSERT INTO owner_schema_version VALUES (1, '2026-10-01T00:00:00.000000Z')")
+        d.execute("INSERT INTO owner_projects VALUES ('kb', 'tntpgh/knowledge-base', '2026-10-01T00:00:00.000000Z')")
+        d.execute("INSERT INTO owner_leases VALUES ('L1','kb','w1:p1','term_1',1,'2026-10-01T00:00:00.000000Z','2026-10-01T00:00:00.000000Z','2026-10-01T01:00:00.000000Z','2026-10-01T00:30:00.000000Z','released')")
+        d.execute("INSERT INTO owner_leases VALUES ('L2','kb','w1:p2','term_2',2,'2026-10-01T00:31:00.000000Z','2026-10-01T00:31:00.000000Z','2026-10-01T01:31:00.000000Z',NULL,NULL)")
+        d.execute("INSERT INTO owner_requests VALUES ('r1','kb',1,'stale','2026-10-01T00:10:00.000000Z','2026-10-01T00:31:00.000000Z','')")
+        d.execute("INSERT INTO owner_requests VALUES ('r2','kb',2,'queued','2026-10-01T00:32:00.000000Z','2026-10-01T00:32:00.000000Z','')")
+        if orphan:
+            d.execute("INSERT INTO owner_requests VALUES ('r9','kb',9,'queued','2026-10-01T00:33:00.000000Z','2026-10-01T00:33:00.000000Z','')")
+        for kind, gen in (("acquired", 1), ("released", 1), ("acquired", 2), ("enqueued", 2)):
+            d.execute("INSERT INTO owner_events (at,label,kind,ref,generation) VALUES ('2026-10-01T00:00:00.000000Z','kb',?, '', ?)", (kind, gen))
+        d.close()
+        return path
+
+    path = v1_db()
+    snap = lambda c_, t, cols="*": c_.execute(f"SELECT {cols} FROM {t} ORDER BY 1").fetchall()
+    pre = sqlite3.connect(path)
+    before = {t: snap(pre, t) for t in ("owner_leases", "owner_requests", "owner_events")}
+    pre_projects = snap(pre, "owner_projects")
+    pre.close()
+    u = ol.connect(path)
+    case("v1 -> v2 upgrade applies exactly once", ol.migrate(u) == 2 and ol.migrate(u) == 2
+         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2])
+    case("upgrade preserves leases, requests and events (incl. seq) verbatim",
+         all(snap(u, t) == rows for t, rows in before.items()))
+    case("upgrade preserves projects and backfills max_open default",
+         snap(u, "owner_projects", "label, project, registered_at") == pre_projects
+         and count(u, "SELECT COUNT(*) FROM owner_projects WHERE max_open=?", ol.DEFAULT_MAX_OPEN) == 1)
+    case("upgraded FKs are real (orphan request rejected)",
+         raises(lambda: u.execute("INSERT INTO owner_requests VALUES ('rx','kb',7,'queued','t','t','')"), sqlite3.IntegrityError))
+    case("upgraded events stay append-only and continue the sequence",
+         raises(lambda: u.execute("DELETE FROM owner_events"), sqlite3.IntegrityError)
+         and raises(lambda: u.execute("UPDATE owner_events SET kind='x'"), sqlite3.IntegrityError))
+    seq0 = count(u, "SELECT MAX(seq) FROM owner_events")
+    after_expiry = datetime(2026, 10, 1, 1, 32, tzinfo=timezone.utc).timestamp()  # L2 expired 01:31
+    g3 = ol.acquire(u, "kb", "w1:p3", "term_3", TTL, after_expiry)
+    case("upgraded db is usable: new acquire fences the old generation and appends events",
+         g3 == 3 and count(u, "SELECT MAX(seq) FROM owner_events") > seq0
+         and u.execute("SELECT state FROM owner_requests WHERE request_id='r2'").fetchone()[0] == "stale")
+    n_ev = count(u, "SELECT COUNT(*) FROM owner_events")
+    ol.disable(u, after_expiry + 10)
+    case("upgraded db: disable fails closed, preserves rows",
+         raises(lambda: ol.acquire(u, "kb", "w1:p4", "term_4", TTL, after_expiry + 11), ol.Disabled)
+         and count(u, "SELECT COUNT(*) FROM owner_events") >= n_ev)
+    ub = ol.export_backup(u, os.path.join(tempfile.mkdtemp(), "upgraded-backup.sqlite3"))
+    ur = ol.connect(ub)
+    case("upgraded db: backup copy is identical",
+         all(u.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall() == ur.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()
+             for t in ("owner_projects", "owner_leases", "owner_requests", "owner_events", "owner_state")))
+    ur.close()
+    u.close()
+
+    bad = ol.connect(v1_db(orphan=True))
+    case("upgrade with a pre-existing FK violation aborts and leaves v1 intact",
+         raises(lambda: ol.migrate(bad), sqlite3.IntegrityError)
+         and [r[0] for r in bad.execute("SELECT version FROM owner_schema_version")] == [1]
+         and count(bad, "SELECT COUNT(*) FROM owner_requests") == 3
+         and count(bad, "SELECT COUNT(*) FROM sqlite_master WHERE name='owner_state'") == 0)
+    bad.close()
 
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     sys.exit(1 if FAILS else 0)

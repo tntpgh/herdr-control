@@ -69,7 +69,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
 MAX_TTL_S = 86_400
@@ -129,11 +129,10 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 MIGRATIONS = {
+    # v1 is the ORIGINAL schema exactly as first shipped (031641b). Never edit
+    # it: databases created at v1 exist. Changes go in a new version.
     1: [
-        "CREATE TABLE owner_state (id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL CHECK (enabled IN (0,1)), changed_at TEXT NOT NULL)",
-        "INSERT INTO owner_state VALUES (1, 1, '1970-01-01T00:00:00.000000Z')",
-        f"""CREATE TABLE owner_projects (label TEXT PRIMARY KEY, project TEXT NOT NULL UNIQUE, registered_at TEXT NOT NULL,
-             max_open INTEGER NOT NULL CHECK (max_open BETWEEN 1 AND {MAX_OPEN_LIMIT}))""",
+        "CREATE TABLE owner_projects (label TEXT PRIMARY KEY, project TEXT NOT NULL UNIQUE, registered_at TEXT NOT NULL)",
         """CREATE TABLE owner_leases (
              lease_id TEXT PRIMARY KEY, label TEXT NOT NULL REFERENCES owner_projects(label),
              pane_id TEXT NOT NULL, pane_birth TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -141,15 +140,46 @@ MIGRATIONS = {
              released_at TEXT, release_reason TEXT, UNIQUE(label, generation))""",
         "CREATE UNIQUE INDEX owner_leases_one_live ON owner_leases(label) WHERE released_at IS NULL",
         """CREATE TABLE owner_requests (
+             request_id TEXT PRIMARY KEY, label TEXT NOT NULL, generation INTEGER NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('queued','held','blocked','delivering','replied','evidence','timeout','stale','cancelled')),
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
+        "CREATE INDEX owner_requests_label_state ON owner_requests(label, state)",
+        "CREATE INDEX owner_requests_label_gen ON owner_requests(label, generation)",
+        """CREATE TABLE owner_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, label TEXT NOT NULL,
+             kind TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '', generation INTEGER, detail TEXT NOT NULL DEFAULT '')""",
+        "CREATE INDEX owner_events_label_seq ON owner_events(label, seq)",
+        "CREATE TRIGGER owner_events_no_update BEFORE UPDATE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
+        "CREATE TRIGGER owner_events_no_delete BEFORE DELETE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
+    ],
+    # v2: owner_state (enable/disable), owner_projects.max_open, and real FKs on
+    # requests/events. SQLite cannot add FKs in place, so tables are rebuilt by
+    # copy (rows, seq numbers and append-only triggers preserved). migrate()
+    # runs this with foreign_keys OFF and fails the upgrade on any FK violation.
+    2: [
+        "CREATE TABLE owner_state (id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL CHECK (enabled IN (0,1)), changed_at TEXT NOT NULL)",
+        "INSERT INTO owner_state VALUES (1, 1, '1970-01-01T00:00:00.000000Z')",
+        f"""CREATE TABLE owner_projects_v2 (label TEXT PRIMARY KEY, project TEXT NOT NULL UNIQUE, registered_at TEXT NOT NULL,
+             max_open INTEGER NOT NULL CHECK (max_open BETWEEN 1 AND {MAX_OPEN_LIMIT}))""",
+        f"INSERT INTO owner_projects_v2 SELECT label, project, registered_at, {DEFAULT_MAX_OPEN} FROM owner_projects",
+        "DROP TABLE owner_projects",
+        "ALTER TABLE owner_projects_v2 RENAME TO owner_projects",
+        """CREATE TABLE owner_requests_v2 (
              request_id TEXT PRIMARY KEY, label TEXT NOT NULL REFERENCES owner_projects(label), generation INTEGER NOT NULL,
              state TEXT NOT NULL CHECK (state IN ('queued','held','blocked','delivering','replied','evidence','timeout','stale','cancelled')),
              created_at TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
              FOREIGN KEY (label, generation) REFERENCES owner_leases(label, generation))""",
+        "INSERT INTO owner_requests_v2 SELECT request_id, label, generation, state, created_at, updated_at, detail FROM owner_requests",
+        "DROP TABLE owner_requests",
+        "ALTER TABLE owner_requests_v2 RENAME TO owner_requests",
         "CREATE INDEX owner_requests_label_state ON owner_requests(label, state)",
         "CREATE INDEX owner_requests_label_gen ON owner_requests(label, generation)",
-        """CREATE TABLE owner_events (
+        """CREATE TABLE owner_events_v2 (
              seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, label TEXT NOT NULL REFERENCES owner_projects(label),
              kind TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '', generation INTEGER, detail TEXT NOT NULL DEFAULT '')""",
+        "INSERT INTO owner_events_v2 (seq, at, label, kind, ref, generation, detail) SELECT seq, at, label, kind, ref, generation, detail FROM owner_events",
+        "DROP TABLE owner_events",  # DROP fires no DELETE trigger; rows were copied above
+        "ALTER TABLE owner_events_v2 RENAME TO owner_events",
         "CREATE INDEX owner_events_label_seq ON owner_events(label, seq)",
         "CREATE TRIGGER owner_events_no_update BEFORE UPDATE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
         "CREATE TRIGGER owner_events_no_delete BEFORE DELETE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
@@ -158,7 +188,11 @@ MIGRATIONS = {
 
 
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending versioned migrations atomically. Returns the schema version."""
+    """Apply pending versioned migrations atomically. Returns the schema version.
+
+    FKs are off for the duration (table rebuilds need it; the pragma is a no-op
+    inside a transaction) and every FK is checked before COMMIT."""
+    conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
@@ -169,11 +203,16 @@ def migrate(conn: sqlite3.Connection) -> int:
                     conn.execute(stmt)
                 conn.execute("INSERT INTO owner_schema_version VALUES (?,?)", (v, _iso(time.time())))
                 cur = v
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise sqlite3.IntegrityError(f"migration left {len(bad)} foreign-key violation(s): {bad[:3]}")
         conn.execute("COMMIT")
         return cur
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _event(conn, now, label, kind, ref="", generation=None, detail=""):
