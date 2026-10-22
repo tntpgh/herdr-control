@@ -169,6 +169,22 @@ def _usable_root(r: str, what: str) -> str:
     return r
 
 
+class Held:
+    """A KNOWN-UNSENT refusal from a notice sender: nothing was typed."""
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def __repr__(self):
+        return f"Held({self.reason!r})"
+
+
+def notice_text(rid: str, seen: str, rdir: str) -> str:
+    return (f"RESULT AVAILABLE (UNVERIFIED: artifact observed, not accepted, not done) {rid} "
+            f"manifest {seen[:16]} dir {rdir}")
+
+
 class Availability:
     def __init__(self, db_path: str, label_roots: dict[str, str], journal_root: str):
         if not isinstance(label_roots, dict) or not label_roots:
@@ -347,10 +363,15 @@ class Availability:
         return tuple(r) if r else ("unverified_held", None)
 
     def tick(self, holder: Holder, notify: Notify, now: float | None = None,
-             ready: Callable[[], bool] | None = None) -> dict:
+             ready: Callable[[], bool] | None = None, prepare: Callable[[str, str], object] | None = None) -> dict:
         """ready(): the notifier's own pre-send fence (e.g. a live conductor
         lease). False -> "held:not_dispatched": the row stays staged, nothing
-        is sent, nothing is ambiguous."""
+        is sent, nothing is ambiguous.
+        prepare(rid, text): every pre-send check (admit, body binding, fresh
+        identity, begin_notice) BEFORE the notifying CAS. Held -> row stays
+        staged, never notifying. Otherwise its result is passed as
+        notify(text, prepared); notify returning Held (known unsent at the
+        typing boundary) puts the row back to staged, never ambiguous."""
         now = time.time() if now is None else now
         out: dict[str, str] = {}
         rows = self.conn.execute("SELECT rid, request_dir, request_digest, owner_label, pane_id, pane_birth,"
@@ -390,18 +411,31 @@ class Availability:
                     continue
                 # CAS, committed BEFORE the external side effect: only the one
                 # caller that moves this exact staged observation calls out.
+                text = notice_text(rid, seen, rdir)
+                prepared = None
+                if prepare is not None:
+                    try:
+                        prepared = prepare(rid, text)
+                    except Exception as exc:
+                        prepared = Held(f"prepare_error:{type(exc).__name__}")
+                    if isinstance(prepared, Held):
+                        out[rid] = f"held:not_dispatched:{prepared.reason}"
+                        continue
                 cas = self.conn.execute("UPDATE ra_requests SET state='notifying', updated_at=? WHERE rid=?"
                                         " AND state='staged' AND observed=?", (now, rid, seen))
                 if cas.rowcount != 1:
                     out[rid] = "lost_race"
                     continue
-                text = (f"RESULT AVAILABLE (UNVERIFIED: artifact observed, not accepted, not done) {rid} "
-                        f"manifest {seen[:16]} dir {rdir}")
                 try:
-                    ok = notify(text) is True
+                    res = notify(text) if prepare is None else notify(text, prepared)
                 except Exception:
-                    ok = False
-                out[rid] = self._finish(rid, "notified" if ok else "ambiguous", now)
+                    res = False
+                if isinstance(res, Held):
+                    self.conn.execute("UPDATE ra_requests SET state='staged', updated_at=? WHERE rid=?"
+                                      " AND state='notifying'", (now, rid))
+                    out[rid] = f"held:not_dispatched:{res.reason}"
+                    continue
+                out[rid] = self._finish(rid, "notified" if res is True else "ambiguous", now)
                 if out[rid] == "notified":
                     self._stage(rid, "noticed", seen, now)
                 continue
@@ -416,3 +450,60 @@ class Availability:
                 self._set(rid, "observing", observed=snap, now=now)
                 out[rid] = "observing"
         return out
+
+
+class GatedNotice:
+    """Result-availability notice through the conductor's owner-lease
+    DeliveryGate (the same admit/begin_notice/settle path as every owner
+    delivery). The exchange id is deterministic and binds the body:
+    "ra-notice-" + sha256(text) full hex, so a different body is a different
+    request and a repeated body is the same (never re-admitted once settled).
+      bound(label) -> (pane, birth, session, generation) only while the
+                      registry names that exact lease holder, else None.
+      send(pane, text) -> True only on a confirmed type."""
+
+    def __init__(self, gate, label: str, bound: Callable[[str], tuple | None],
+                 send: Callable[[str, str], bool], clock: Callable[[], float] = time.time):
+        self.gate, self.label, self.bound, self.send, self.clock = gate, label, bound, send, clock
+
+    @staticmethod
+    def exchange_id(text: str) -> str:
+        return "ra-notice-" + hashlib.sha256(text.encode()).hexdigest()
+
+    def prepare(self, rid: str, text: str):
+        cur = self.bound(self.label)
+        if cur is None:
+            return Held("conductor_identity_gone")
+        pane, birth, sess, gen = cur
+        xid, now = self.exchange_id(text), self.clock()
+        adm = self.gate.admit(self.label, pane, birth, xid, now)
+        if not adm.ok:
+            return Held(adm.reason)
+        if adm.generation != gen:
+            self.gate.settle(self.label, pane, birth, adm.generation, xid, "blocked", "admit_generation_changed", now)
+            return Held("admit_generation_changed")
+        began = self.gate.begin_notice(self.label, pane, birth, gen, xid, self.clock())
+        if began != "delivering":
+            if began != "lease_too_short":  # too short stays queued: re-admitted after renewal
+                self.gate.settle(self.label, pane, birth, gen, xid, "blocked", began, self.clock())
+            return Held(began)
+        return {"xid": xid, "digest": hashlib.sha256(text.encode()).hexdigest(), "holder": cur}
+
+    def notify(self, text: str, ctx) -> object:
+        pane, birth, sess, gen = ctx["holder"]
+        if hashlib.sha256(text.encode()).hexdigest() != ctx["digest"]:
+            self.gate.settle(self.label, pane, birth, gen, ctx["xid"], "blocked", "body_changed", self.clock())
+            return Held("body_changed")
+        if self.bound(self.label) != ctx["holder"]:  # fresh registry/lease/session/generation at the boundary
+            self.gate.settle(self.label, pane, birth, gen, ctx["xid"], "blocked", "identity_changed_pre_send", self.clock())
+            return Held("identity_changed_pre_send")
+        try:
+            ok = self.send(pane, text) is True
+        except Exception:
+            ok = False
+        t = self.clock()
+        if ok:
+            self.gate.settle(self.label, pane, birth, gen, ctx["xid"], "delivered", "", t)
+            return True
+        self.gate.settle(self.label, pane, birth, gen, ctx["xid"], "failed", "send_not_confirmed", t)
+        return False

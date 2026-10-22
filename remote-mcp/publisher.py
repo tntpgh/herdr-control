@@ -1243,11 +1243,11 @@ def result_availability_tick() -> dict | None:
     lib/result_availability.py tick():
       holder(label)  the live lease tuple, only while the registry names the
                      same (pane, birth, session); else None -> held:stale_generation.
-      ready()        the conductor's own lease, registry-bound, with the
-                     delivery margin left; missing -> held:not_dispatched
-                     (nothing typed, row stays staged).
-      notify(text)   re-checks the same conductor tuple immediately before
-                     typing it with herdr-deliver.sh (no --force)."""
+      prepare/notify GatedNotice: the conductor's DeliveryGate (admit, body-bound
+                     exchange id, begin_notice with the lease margin) before
+                     the notifying CAS; a fresh registry/lease/session/generation
+                     check immediately before herdr-deliver.sh (no --force);
+                     known-unsent refusals -> held:not_dispatched:<reason>."""
     if os.environ.get("HERDR_RESULT_AVAILABILITY") != "1":
         return None
     gate = owner_lease_gate()
@@ -1265,22 +1265,14 @@ def result_availability_tick() -> dict | None:
         reg = registry_resolver(label)
         return cur if cur and reg and tuple(reg) == cur[:3] else None
 
-    def conductor():
-        cur = bound(RESULT_AVAILABILITY_CONDUCTOR)
-        live = ol._live(gate.conn, RESULT_AVAILABILITY_CONDUCTOR, time.time()) if cur else None
-        ok = live and datetime.strptime(live[5], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-            tzinfo=timezone.utc).timestamp() - time.time() >= gate.min_lease_remaining_s
-        return cur if ok else None
-
-    def notify(text):
-        cur = conductor()
-        if cur is None:
-            return False
-        proc = subprocess.run([DELIVER, cur[0], text], capture_output=True, text=True, timeout=120)
+    def type_notice(pane, text):
+        proc = subprocess.run([DELIVER, pane, text], capture_output=True, text=True, timeout=120)
         return proc.returncode == 0
 
+    notice = ra.GatedNotice(gate, RESULT_AVAILABILITY_CONDUCTOR, bound, type_notice)
+
     try:
-        return avail.tick(bound, notify, ready=lambda: conductor() is not None)
+        return avail.tick(bound, notice.notify, prepare=notice.prepare)
     finally:
         avail.close()
 

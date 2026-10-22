@@ -386,19 +386,82 @@ def publisher_tick_cases(base: Path) -> None:
         (root / "r_tick" / "result.md").write_text("ACK r_tick")
         pub.result_availability_tick(); pub.result_availability_tick()
         out = pub.result_availability_tick()
-        case("TICK no conductor lease: held:not_dispatched, row stays staged, nothing typed",
-             out == {"r_tick": "held:not_dispatched"} and av.state("r_tick")[0] == "staged" and not typed.exists())
+        case("TICK no conductor lease: typed pre-send held, row stays staged, nothing typed, no gate row",
+             out == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and av.state("r_tick")[0] == "staged"
+             and not typed.exists() and lc.execute("SELECT count(*) FROM owner_requests WHERE label='conductor'").fetchone()[0] == 0)
         ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(), session_digest=hashlib.sha256(b"wrong").hexdigest())
         case("TICK conductor lease not matching the registry session: still held, nothing typed",
-             pub.result_availability_tick() == {"r_tick": "held:not_dispatched"} and not typed.exists())
+             pub.result_availability_tick() == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and not typed.exists())
         lc.execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00.000000Z' WHERE label='conductor'")
         ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
                    session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
+        gate = old.DeliveryGate(lease_db)
+        xid = ra.GatedNotice.exchange_id
+
+        def stage(rid):
+            assert d.dispatch(KB, rid, f"REQ {rid}\n".encode(), ["result.md"]) == "dispatched"
+            (root / rid / "result.md").write_text(f"ACK {rid}")
+            pub.result_availability_tick(); pub.result_availability_tick()
+            row = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid=?", (rid,)).fetchone()
+            return ra.notice_text(rid, row[0], row[1])
+
+        # RACE: ready/prepare saw the conductor, identity gone at the typing boundary.
+        real_resolver, calls = pub.registry_resolver, {"n": 0}
+
+        def flaky(label):
+            if label == "conductor":
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    return None
+            return real_resolver(label)
+        pub.registry_resolver = flaky
+        text = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid='r_tick'").fetchone()
+        text = ra.notice_text("r_tick", *text)
+        out = pub.result_availability_tick()
+        pub.registry_resolver = real_resolver
+        case("RACE identity gone at the boundary: typed pre-send held, row staged (never notifying/ambiguous), nothing typed",
+             out == {"r_tick": "held:not_dispatched:identity_changed_pre_send"} and av.state("r_tick")[0] == "staged"
+             and not typed.exists() and gate.record(xid(text))[2:] == ("blocked", "identity_changed_pre_send"))
+        case("RACE: the blocked notice is never re-admitted (no resend grant)",
+             pub.result_availability_tick()["r_tick"] == "held:not_dispatched:owner_lease_duplicate:blocked" and not typed.exists())
+        t2 = stage("r_tick2")
         out = pub.result_availability_tick()
         lines = typed.read_text().splitlines() if typed.exists() else []
-        case("TICK registry-bound conductor lease: notified, exactly one notice to the conductor pane",
-             out == {"r_tick": "notified"} and len(lines) == 1 and lines[0].startswith("w72:p1|RESULT AVAILABLE (UNVERIFIED")
-             and pub.result_availability_tick() == {})
+        case("TICK registry-bound conductor: notified through the gate, exactly one notice, body-bound exchange id delivering",
+             out["r_tick2"] == "notified" and len(lines) == 1 and lines[0] == f"w72:p1|{t2}"
+             and gate.record(xid(t2))[:3] == ("conductor", gate.record(xid(t2))[1], "delivering")
+             and "r_tick2" not in pub.result_availability_tick())
+        t3 = stage("r_tick3")
+        bad = base / "fail-deliver.sh"
+        bad.write_text("#!/bin/sh\nexit 1\n"); bad.chmod(0o700)
+        pub.DELIVER = str(bad)
+        out = pub.result_availability_tick()
+        pub.DELIVER = str(fake)
+        case("POST-SEND failure: ambiguous, gate blocked send_not_confirmed (not retryable)",
+             out["r_tick3"] == "ambiguous" and gate.record(xid(t3))[2:] == ("blocked", "send_not_confirmed"))
+        t4 = stage("r_tick4")
+
+        class Crash(BaseException):
+            pass
+        real_prepare = ra.GatedNotice.prepare
+
+        def crash_after_prepare(self, rid, text):
+            r = real_prepare(self, rid, text)
+            if rid != "r_tick4":
+                return r
+            raise Crash()  # killed after begin_notice, before the notifying CAS
+        ra.GatedNotice.prepare = crash_after_prepare
+        try:
+            pub.result_availability_tick()
+        except Crash:
+            pass
+        finally:
+            ra.GatedNotice.prepare = real_prepare
+        out = pub.result_availability_tick()
+        case("CRASH after begin_notice, before CAS: row staged, gate delivering, next tick held duplicate, never typed",
+             out["r_tick4"] == "held:not_dispatched:owner_lease_duplicate:delivering" and av.state("r_tick4")[0] == "staged"
+             and gate.record(xid(t4))[2] == "delivering" and len(typed.read_text().splitlines()) == 1)
+        gate.close()
         av.close()
     finally:
         for k, v in saved.items():
