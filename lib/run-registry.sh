@@ -864,7 +864,15 @@ _migrate_legacy_files() {
 }
 
 gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand>"
-  printf '%s_%s_%s_%s\n' "$1" "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"
+  # $$ is the PARENT shell's pid inside a ( ... ) subshell and $RANDOM is 15
+  # bits, so concurrent subshell writers in one second collided, and
+  # append_event's INSERT OR IGNORE then dropped an event silently (CI run
+  # 39751690043: 19 of 20 landed). 64 random bits from /dev/urandom; the
+  # pid field is kept for log readability ($BASHPID where bash has it).
+  local rnd
+  rnd="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ -n "$rnd" ] || rnd="${RANDOM}${RANDOM}${RANDOM}"
+  printf '%s_%s_%s_%s\n' "$1" "$(date -u +%Y%m%dT%H%M%SZ)" "${BASHPID:-$$}" "$rnd"
 }
 
 # ---- task records -----------------------------------------------------------

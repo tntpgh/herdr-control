@@ -439,16 +439,24 @@ plugin_pin() {
 # nonzero — a failed provision means the find/git gate fails CLOSED (every
 # shaped command escalates, logged once) rather than taking install.sh or a
 # deploy down.
+# The interpreter is the caller's RESOLVED ABSOLUTE path (deploy_app's pinned
+# deploy_py / install.sh's resolve_hub_python), never the bare name `python3`,
+# which uv resolves by its own discovery order (managed-first) independent of
+# the hub's pin. No absolute executable given -> skip (gate fails closed).
 provision_bashlex_venv() {
-  local app_dir="$1" venv reqs
+  local app_dir="$1" py="${2:-}" venv reqs
   venv="$app_dir/.venv-bashlex"
   reqs="$app_dir/lib/bashlex-requirements.txt"
   if [ ! -f "$reqs" ]; then
     echo "  bashlex: no $reqs in this revision — skipping (pre-#264 checkout?)"
     return 0
   fi
+  case "$py" in /*) ;; *) echo "  bashlex: no resolved absolute interpreter given — skipping (parser gate fails closed)" >&2; return 0 ;; esac
+  if [ ! -x "$py" ]; then
+    echo "  bashlex: interpreter '$py' is not executable — skipping (parser gate fails closed)" >&2; return 0
+  fi
   if [ ! -x "$venv/bin/python3" ]; then
-    uv venv --python python3 "$venv" >/dev/null 2>&1
+    uv venv --python "$py" "$venv" >/dev/null 2>&1
   fi
   if ! "$venv/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
     uv pip install --python "$venv/bin/python3" -r "$reqs" --require-hashes >/dev/null 2>&1
@@ -611,7 +619,7 @@ deploy_app() {
     return 1
   fi
   find "$HERDR_APP_DIR" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
-  command -v uv >/dev/null 2>&1 && provision_bashlex_venv "$HERDR_APP_DIR"
+  command -v uv >/dev/null 2>&1 && provision_bashlex_venv "$HERDR_APP_DIR" "$deploy_py"
   echo "  deployed $(app_rev) $(git -C "$HERDR_APP_DIR" log -1 --format=%s | cut -c1-56)${fetched}"
 }
 

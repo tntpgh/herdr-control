@@ -1194,6 +1194,89 @@ def deliver(item: dict, local: dict) -> dict:
     return {"message_id": mid, "outcome": outcome, "detail": detail}
 
 
+_OWNER_LEASE_GATE = None
+
+
+def owner_lease_gate():
+    """lib/owner_lease_delivery.py gate, or None (the default: legacy path).
+    Loaded only when HERDR_OWNER_LEASE_DELIVERY=1 and HERDR_OWNER_LEASE_DB are
+    both set; a gate that cannot open its DB raises, so a misconfigured
+    activation fails the tick instead of silently delivering ungated."""
+    global _OWNER_LEASE_GATE
+    if os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
+        return None
+    if _OWNER_LEASE_GATE is None:
+        path = Path(__file__).resolve().parent.parent / "lib" / "owner_lease_delivery.py"
+        spec = importlib.util.spec_from_file_location("owner_lease_delivery", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        gate = mod.from_env()
+        if gate is None:
+            raise RuntimeError("HERDR_OWNER_LEASE_DELIVERY=1 but HERDR_OWNER_LEASE_DB is unset")
+        _OWNER_LEASE_GATE = gate
+    return _OWNER_LEASE_GATE
+
+
+def owner_session_digest(label: str, owner_row: dict) -> str:
+    """Full sha256 of (label, agent_session): the owner_lease v3 session_digest
+    a lease holder must carry. '' when the registry row has no session."""
+    raw = owner_row.get("agent_session") or ""
+    return hashlib.sha256(f"{label}:{raw}".encode()).hexdigest() if raw else ""
+
+
+def registry_resolver(label: str):
+    """Read-only (pane_id, pane_birth, session_digest) from the existing owner
+    registry, or None (unregistered / no session)."""
+    row = registry_owners().get(label)
+    if not row or not row["pane_id"] or not row["pane_birth"]:
+        return None
+    digest = owner_session_digest(label, row)
+    return (row["pane_id"], row["pane_birth"], digest) if digest else None
+
+
+RESULT_AVAILABILITY_CONDUCTOR = "conductor"
+
+
+def result_availability_tick() -> dict | None:
+    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. Requires the
+    owner-lease gate too (HERDR_OWNER_LEASE_DELIVERY=1). One pass of
+    lib/result_availability.py tick():
+      holder(label)  the live lease tuple, only while the registry names the
+                     same (pane, birth, session); else None -> held:stale_generation.
+      prepare/notify GatedNotice: the conductor's DeliveryGate (admit, body-bound
+                     exchange id, begin_notice with the lease margin) before
+                     the notifying CAS; a fresh registry/lease/session/generation
+                     check immediately before herdr-deliver.sh (no --force);
+                     known-unsent refusals -> held:not_dispatched:<reason>."""
+    if os.environ.get("HERDR_RESULT_AVAILABILITY") != "1":
+        return None
+    gate = owner_lease_gate()
+    if gate is None:
+        raise RuntimeError("HERDR_RESULT_AVAILABILITY=1 needs the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1)")
+    lib = Path(__file__).resolve().parent.parent / "lib"
+    if str(lib) not in sys.path:
+        sys.path.insert(0, str(lib))
+    import owner_lease as ol  # noqa: E402
+    import result_availability as ra  # noqa: E402
+    avail = ra.from_env()
+
+    def bound(label):
+        cur = ol.holder_tuple(gate.conn, label, time.time())
+        reg = registry_resolver(label)
+        return cur if cur and reg and tuple(reg) == cur[:3] else None
+
+    def type_notice(pane, text):
+        proc = subprocess.run([DELIVER, pane, text], capture_output=True, text=True, timeout=120)
+        return proc.returncode == 0
+
+    notice = ra.GatedNotice(gate, RESULT_AVAILABILITY_CONDUCTOR, bound, type_notice)
+
+    try:
+        return avail.tick(bound, notice.notify, prepare=notice.prepare)
+    finally:
+        avail.close()
+
+
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
     only the fixed notice pointing at it. Pre-send exit 5 keeps its
@@ -1229,8 +1312,67 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
                    "changed": "owner_identity_changed"}[status]
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": reason}
     pane_id = local["owners"][label]["pane_id"]
+    gate = owner_lease_gate()
+    if gate is None:
+        return _send_owner_notice(item, label, pane_id)
+    # Off-by-default owner-lease gate. The registered pane must hold the
+    # label's live lease. The exchange is enqueued (QUEUED) in that generation,
+    # the body is written (deduped) while queued and must match the persisted
+    # envelope byte-for-byte, and only then does a fenced begin_notice move it
+    # to `delivering`, immediately before typing, with enough lease left to
+    # cover the full delivery timeout.
+    pane_birth = local["owners"][label].get("pane_birth", "")
+    adm = gate.admit(label, pane_id, pane_birth, exchange_id)
+    if not adm.ok:
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": adm.reason}
     sender = clean(str(item.get("sender") or ""))
-    if not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
+    body = str(item.get("body") or "")
+    if not write_inbox_message(label, exchange_id, sender, body):
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}  # stays queued
+    if not persisted_payload_matches(label, exchange_id, sender, body):
+        # Same id, different payload: never inherits the prior authority.
+        gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, "blocked", "owner_payload_mismatch")
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "owner_payload_mismatch"}
+    begun = gate.begin_notice(label, pane_id, pane_birth, adm.generation, exchange_id)
+    if begun == "lease_too_short":
+        log(f"owner message {exchange_id}: lease has < {gate.min_lease_remaining_s}s left; waiting for renewal")
+        return None  # still queued; retried next tick
+    if begun != "delivering":
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": begun}
+    result = _send_owner_notice(item, label, pane_id, write=False)
+    recorded = gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, result["outcome"], result.get("reason", ""))
+    if recorded == "unrecorded":
+        log(f"owner message {exchange_id}: owner-lease could NOT record outcome {result}; lease state disagrees")
+        result = {**result, "reason": f"{result.get('reason', '')}:lease_unrecorded".lstrip(":")}
+    return result
+
+
+def persisted_payload_matches(label: str, exchange_id: str, sender: str, body: str) -> bool:
+    """The existing envelope (write_inbox_message's messages/<id>.md) is the
+    payload binding: its From line and its fenced body must equal this
+    delivery's. A replay of the same id with a different payload fails."""
+    path = _resolve_inbox_leaf(label, "messages", exchange_id)
+    if path is None:
+        return False
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = re.search(r"^- From: (.*)$", text, re.M)
+    f = re.search(r"^--BEGIN-UNTRUSTED-BODY-([0-9a-f]{32})--\n", text, re.M)
+    if not m or not f:
+        return False
+    end = f"\n--END-UNTRUSTED-BODY-{f.group(1)}--\n"
+    j = text.find(end, f.end() - 1)
+    if j < 0:
+        return False
+    return m.group(1) == sender and text[f.end():j] == body
+
+
+def _send_owner_notice(item: dict, label: str, pane_id: str, write: bool = True) -> dict:
+    exchange_id = item["exchange_id"]
+    sender = clean(str(item.get("sender") or ""))
+    if write and not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
     # M7 (REVIEW-219): exchange_id's own fixed format (oex_<compact-iso>Z_<hex>)
     # guarantees a digit at a predictable offset -- made deterministic, not
@@ -1657,8 +1799,16 @@ def main(argv: list[str]) -> int:
             for r in owner_replies_raw:
                 label, eid = r["owner_label"], r["exchange_id"]
                 original = identities.get(f"{label}/{eid}")
-                if (original and original == owners_now.get(label)
-                        and owner_pane_status(label, owners_now, reply_panes) == "ok"):
+                identity_ok = bool(original and original == owners_now.get(label)
+                                   and owner_pane_status(label, owners_now, reply_panes) == "ok")
+                gate = owner_lease_gate() if identity_ok else None
+                if gate is not None:
+                    # Credit only a reply to the CURRENT generation's delivery.
+                    credited = gate.on_reply(label, eid)
+                    if credited != "replied" and gate.state(eid) not in ("replied", "evidence"):
+                        log(f"owner reply {label}/{eid}: owner-lease {credited}; left local")
+                        identity_ok = False
+                if identity_ok:
                     verified.append(r)
                 else:
                     log(f"owner reply {label}/{eid}: registration/pane identity unverifiable or changed; left local")
@@ -1840,6 +1990,13 @@ def main(argv: list[str]) -> int:
         new_command_acks.append(ack)
         st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks
         save_state(st)
+
+    try:
+        ra_out = result_availability_tick()
+        if ra_out:
+            log(f"result availability: {ra_out}")
+    except Exception as exc:  # noqa: BLE001 - never blocks the publisher tick
+        log(f"result availability tick failed (held, nothing typed): {type(exc).__name__}: {exc}")
 
     try:  # second sync: report outcomes now rather than next tick
         reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks, "command_acks": new_command_acks,

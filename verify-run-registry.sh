@@ -391,6 +391,15 @@ append_event run1 task1 retry_test '{"n":1}' stable-id-1
 after=$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")
 check "3 identical appends -> 1 row" "$(( after - before ))" "1"
 
+printf '== gen_id is unique across concurrent subshells (silent INSERT OR IGNORE drop) ==\n'
+ids_file="$(mktemp)"
+# RANDOM=1 pins bash's 15-bit generator identically in every subshell: an id
+# that relies on $$ / $RANDOM collides here deterministically, on any bash.
+for i in $(seq 1 300); do ( RANDOM=1; gen_id ev >> "$ids_file" ) & done
+wait
+check "300 concurrent subshell ids are all distinct" "$(sort -u "$ids_file" | wc -l | tr -d ' ')" "300"
+rm -f "$ids_file"
+
 printf '== monotonic sequence under CONCURRENT writers (the count-then-append bug) ==\n'
 # The old implementation computed `sequence` as `grep -c` of the file plus one.
 # Twenty writers racing that produce colliding sequences and nobody notices.
