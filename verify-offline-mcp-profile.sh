@@ -44,12 +44,27 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/agent-profiles.sh"
 unset HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID
 
+# Temp dirs are created and registered in THIS shell (never inside $(...), whose
+# array append would be lost). cleanup removes only paths that are directories
+# directly under the mktemp root and named tmp.*; anything else is reported, kept.
+tmp_root=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 tmp_paths=()
-cleanup() { [ "${#tmp_paths[@]}" -gt 0 ] && rm -rf "${tmp_paths[@]}"; }
+cleanup() {
+  local d
+  for d in ${tmp_paths[@]+"${tmp_paths[@]}"}; do
+    case "$d" in
+      "$tmp_root"/tmp.*) [ -d "$d" ] && [ "$(dirname "$d")" = "$tmp_root" ] && rm -rf -- "$d" ;;
+      *) echo "cleanup: refusing unexpected path $d" >&2 ;;
+    esac
+  done
+}
 trap cleanup EXIT
-tmp_dir() { local d; d=$(mktemp -d) || exit 2; tmp_paths+=("$d"); printf '%s' "$d"; }
+mk_tmp() {  # mk_tmp <varname>: mktemp -d under $tmp_root, registered in this shell
+  local d; d=$(mktemp -d "$tmp_root/tmp.XXXXXXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 2; }
+  tmp_paths+=("$d"); printf -v "$1" '%s' "$d"
+}
 
-stub_dir=$(tmp_dir); stub_log="$stub_dir/calls.log"; : > "$stub_log"
+mk_tmp stub_dir; stub_log="$stub_dir/calls.log"; : > "$stub_log"
 for b in omp op npx claude codex; do
   printf '#!/bin/bash\nprintf "VIOLATION %s %%s\\n" "$*" >> %q\nexit 97\n' "$b" "$stub_log" > "$stub_dir/$b"
 done
@@ -62,7 +77,16 @@ case "\$1 \$2" in
 esac
 EOF
 chmod 700 "$stub_dir"/*
+# Child environment, exported ONCE so every child inherits it:
+# - config.sh prepends $HERDR_EXTRA_PATH to PATH, so the stub dir must lead it;
+# - state/cache go to temp dirs; OP_ENV_FILE is an empty temp file (names only,
+#   never the real service-account file); HERDR_CANONICAL_RULES is unset.
+mk_tmp child_state; mk_tmp child_cache
+op_env_tmp="$child_state/op-env-empty"; : > "$op_env_tmp"
+export HERDR_EXTRA_PATH="$stub_dir:/opt/homebrew/bin:/usr/local/bin"
 export PATH="$stub_dir:$PATH"
+export HERDR_STATE_DIR="$child_state" XDG_CACHE_HOME="$child_cache" OP_ENV_FILE="$op_env_tmp"
+unset HERDR_CANONICAL_RULES
 for b in herdr omp op npx claude codex; do
   [ "$(command -v "$b")" = "$stub_dir/$b" ] || { echo "FATAL: subprocess boundary not in effect for $b; refusing to run" >&2; exit 2; }
 done
@@ -94,8 +118,8 @@ grep -q 'enableProjectConfig: *false' "$profile_path" \
   || bad "overlay does not disable project MCP config: $(cat "$profile_path" 2>&1)"
 
 # ---- isolated spawn-task.sh --dry-run ($ctl copy only) against a temp repo ---
-probe_repo=$(tmp_dir); git -C "$probe_repo" init -q 2>/dev/null
-wt_dir=$(tmp_dir); state_dir=$(tmp_dir)
+mk_tmp probe_repo; git -C "$probe_repo" init -q 2>/dev/null
+mk_tmp wt_dir; mk_tmp state_dir
 
 # ---- K3 (2026-10-18): --approval hook needs a launcher whose own
 # --herdr-bound-check matches $here's content; no HERDR_OMP_EXTENSION env
@@ -103,7 +127,7 @@ wt_dir=$(tmp_dir); state_dir=$(tmp_dir)
 # fixture launcher that reports pins computed from that copy's own
 # content, pinned into that copy's OWN config.sh (production config.sh is
 # never touched). Every hook-mode call below runs against $ctl, not $here.
-ctl_work=$(tmp_dir)
+mk_tmp ctl_work
 ctl="$ctl_work/ctl"; mkdir -p "$ctl"; cp -R "$here/." "$ctl/"
 rm -rf "$ctl/.git"; find "$ctl" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
 ctl_lib_tree_sha() {
@@ -131,6 +155,12 @@ ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"
 ctl_cfg="${ctl_cfg//$ctl_old_sha/HERDR_OMP_LAUNCHER_SHA256=\"$ctl_fx_sha\"}"
 printf '%s\n' "$ctl_cfg" > "$ctl/config.sh"
 ctl_profile_path="$ctl/lib/offline-mcp-profile.yml"
+child_check="$(bash -c '. "$1/config.sh" >/dev/null 2>&1
+  for b in herdr omp op npx claude codex; do printf "%s=%s\n" "$b" "$(command -v "$b")"; done
+  printf "HERDR_STATE_DIR=%s\nXDG_CACHE_HOME=%s\nOP_ENV_FILE=%s\nCANON=%s\n" "$HERDR_STATE_DIR" "$XDG_CACHE_HOME" "$OP_ENV_FILE" "${HERDR_CANONICAL_RULES:-}"' _ "$ctl")"
+want_check="$(for b in herdr omp op npx claude codex; do printf '%s=%s\n' "$b" "$stub_dir/$b"; done
+  printf 'HERDR_STATE_DIR=%s\nXDG_CACHE_HOME=%s\nOP_ENV_FILE=%s\nCANON=\n' "$child_state" "$child_cache" "$op_env_tmp")"
+[ "$child_check" = "$want_check" ] || { printf 'FATAL: boundary not in effect inside a config-sourced child:\n%s\n' "$child_check" >&2; exit 2; }
 ctl_wt_overlay="$ctl/agent-hooks/omp-worker-overlay.yml"
 
 dry_launch() {  # <job-class> [extra spawn-task.sh args...] -> the "launch :" line
@@ -313,9 +343,9 @@ case "$sa_src" in
 esac
 
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
-saved="$(tmp_dir)/overlay.yml"; cp "$ctl_profile_path" "$saved"
+mk_tmp saved_dir; saved="$saved_dir/overlay.yml"; cp "$ctl_profile_path" "$saved"
 rm -f "$ctl_profile_path"
-miss_state_dir=$(tmp_dir)
+mk_tmp miss_state_dir
 out=$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$miss_state_dir" \
   bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-missing-$$" review omp 2>&1)
 rc=$?
