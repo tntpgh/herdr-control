@@ -13,18 +13,88 @@
 # mcp.enableProjectConfig:false) before omp ever starts a server process, for
 # review/debug/explore job classes and any secrets-withheld spawn.
 #
-# Drives the real spawn-task.sh/spawn-agent.sh via --dry-run (same technique
-# as verify-posture.sh's canonical-rules section): --dry-run exits well
-# before the unrelated local-caller-ancestry authorization gate
-# (spawn-task.sh:805, requires a real herdr pane process tree — not this
-# plain-shell test harness) but AFTER the offline-MCP decision and its
-# preflight, so the composed launch line and the preflight refusal are both
-# observable without stubbing herdr's RPC surface.
+# NO-SPAWN CONTRACT (2026-10-22: run from inside a herdr pane, the old
+# spawn-agent.sh probe created a REAL workspace + omp pane, twice). This script
+# never executes spawn-agent.sh, the real bound launcher, or any spawn script
+# in $here. Every subprocess and write path, exhaustively:
+#   - sourced pure functions: $here/lib/agent-profiles.sh (unit section) and
+#     $ctl/lib/run-registry.sh (final read of a TEMP registry);
+#   - mktemp dirs under $TMPDIR (stub dir, probe repo, worktree dir, state
+#     dirs, isolated copy $ctl): all removed by the EXIT trap;
+#   - git init / rev-parse ONLY inside the temp probe repo;
+#   - cp -R $here -> $ctl (reads $here, writes temp); $ctl/config.sh is
+#     rewritten to point at a FAKE launcher in temp; the missing-overlay case
+#     deletes the overlay in $ctl, never in $here;
+#   - `bash $ctl/spawn-task.sh --dry-run ...` only (the isolated copy). It reads
+#     git/config, writes run-registry events to a temp HERDR_RUN_STATE_DIR and,
+#     in hook mode, runs the FAKE launcher;
+#   - read-only grep/awk/sed/shasum of $here files, incl. the real launcher's
+#     SOURCE text (read, never executed) and spawn-agent.sh's source (static
+#     assertion, never executed).
+# Subprocess boundary: a stub dir is FIRST on PATH for herdr, omp, op, npx,
+# claude and codex; the script refuses to run unless each resolves to its stub.
+# `herdr pane list` / `herdr workspace list` return EMPTY JSON (the real herdr
+# is never called); every other stub call is a VIOLATION (exit 97). Any
+# VIOLATION fails the run, so any spawn attempt is a test failure.
+# HERDR_PANE_ID / _WORKSPACE_ID / _TAB_ID are unset first.
 #
 #   bash verify-offline-mcp-profile.sh
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/agent-profiles.sh"
+unset HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID
+
+# Temp dirs are created and registered in THIS shell (never inside $(...), whose
+# array append would be lost). cleanup removes only paths that are directories
+# directly under the mktemp root and named tmp.*; anything else is reported, kept.
+tmp_root=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+tmp_paths=()
+keep_tmp=0  # set when a bounded child's process group could not be confirmed gone
+cleanup() {
+  local d
+  if [ "$keep_tmp" = 1 ]; then
+    printf 'cleanup: RETAINING temp roots (a child process group was not confirmed gone): %s\n' "${tmp_paths[*]-}" >&2
+    return 0
+  fi
+  for d in ${tmp_paths[@]+"${tmp_paths[@]}"}; do
+    case "$d" in
+      "$tmp_root"/tmp.*) [ -d "$d" ] && [ "$(dirname "$d")" = "$tmp_root" ] && rm -rf -- "$d" ;;
+      *) echo "cleanup: refusing unexpected path $d" >&2 ;;
+    esac
+  done
+}
+trap cleanup EXIT
+mk_tmp() {  # mk_tmp <varname>: mktemp -d under $tmp_root, registered in this shell
+  local d; d=$(mktemp -d "$tmp_root/tmp.XXXXXXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 2; }
+  tmp_paths+=("$d"); printf -v "$1" '%s' "$d"
+}
+
+mk_tmp stub_dir; stub_log="$stub_dir/calls.log"; : > "$stub_log"
+for b in omp op npx claude codex; do
+  printf '#!/bin/bash\nprintf "VIOLATION %s %%s\\n" "$*" >> %q\nexit 97\n' "$b" "$stub_log" > "$stub_dir/$b"
+done
+cat > "$stub_dir/herdr" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "pane list") printf 'herdr %s\\n' "\$*" >> "$stub_log"; echo '{"result":{"panes":[]}}' ;;
+  "workspace list") printf 'herdr %s\\n' "\$*" >> "$stub_log"; echo '{"result":{"workspaces":[]}}' ;;
+  *) printf 'VIOLATION herdr %s\\n' "\$*" >> "$stub_log"; exit 97 ;;
+esac
+EOF
+chmod 700 "$stub_dir"/*
+# Child environment, exported ONCE so every child inherits it:
+# - config.sh prepends $HERDR_EXTRA_PATH to PATH, so the stub dir must lead it;
+# - state/cache go to temp dirs; OP_ENV_FILE is an empty temp file (names only,
+#   never the real service-account file); HERDR_CANONICAL_RULES is unset.
+mk_tmp child_state; mk_tmp child_cache
+op_env_tmp="$child_state/op-env-empty"; : > "$op_env_tmp"
+export HERDR_EXTRA_PATH="$stub_dir:/opt/homebrew/bin:/usr/local/bin"
+export PATH="$stub_dir:$PATH"
+export HERDR_STATE_DIR="$child_state" XDG_CACHE_HOME="$child_cache" OP_ENV_FILE="$op_env_tmp"
+unset HERDR_CANONICAL_RULES
+for b in herdr omp op npx claude codex; do
+  [ "$(command -v "$b")" = "$stub_dir/$b" ] || { echo "FATAL: subprocess boundary not in effect for $b; refusing to run" >&2; exit 2; }
+done
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
@@ -52,9 +122,9 @@ grep -q 'enableProjectConfig: *false' "$profile_path" \
   && ok "overlay sets mcp.enableProjectConfig: false" \
   || bad "overlay does not disable project MCP config: $(cat "$profile_path" 2>&1)"
 
-# ---- real spawn-task.sh --dry-run against a throwaway repo -----------------
-probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
-wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
+# ---- isolated spawn-task.sh --dry-run ($ctl copy only) against a temp repo ---
+mk_tmp probe_repo; git -C "$probe_repo" init -q 2>/dev/null
+mk_tmp wt_dir; mk_tmp state_dir
 
 # ---- K3 (2026-10-18): --approval hook needs a launcher whose own
 # --herdr-bound-check matches $here's content; no HERDR_OMP_EXTENSION env
@@ -62,7 +132,7 @@ wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
 # fixture launcher that reports pins computed from that copy's own
 # content, pinned into that copy's OWN config.sh (production config.sh is
 # never touched). Every hook-mode call below runs against $ctl, not $here.
-ctl_work=$(mktemp -d); trap 'rm -rf "$ctl_work"' EXIT
+mk_tmp ctl_work
 ctl="$ctl_work/ctl"; mkdir -p "$ctl"; cp -R "$here/." "$ctl/"
 rm -rf "$ctl/.git"; find "$ctl" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
 ctl_lib_tree_sha() {
@@ -90,12 +160,18 @@ ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"
 ctl_cfg="${ctl_cfg//$ctl_old_sha/HERDR_OMP_LAUNCHER_SHA256=\"$ctl_fx_sha\"}"
 printf '%s\n' "$ctl_cfg" > "$ctl/config.sh"
 ctl_profile_path="$ctl/lib/offline-mcp-profile.yml"
+child_check="$(bash -c '. "$1/config.sh" >/dev/null 2>&1
+  for b in herdr omp op npx claude codex; do printf "%s=%s\n" "$b" "$(command -v "$b")"; done
+  printf "HERDR_STATE_DIR=%s\nXDG_CACHE_HOME=%s\nOP_ENV_FILE=%s\nCANON=%s\n" "$HERDR_STATE_DIR" "$XDG_CACHE_HOME" "$OP_ENV_FILE" "${HERDR_CANONICAL_RULES:-}"' _ "$ctl")"
+want_check="$(for b in herdr omp op npx claude codex; do printf '%s=%s\n' "$b" "$stub_dir/$b"; done
+  printf 'HERDR_STATE_DIR=%s\nXDG_CACHE_HOME=%s\nOP_ENV_FILE=%s\nCANON=\n' "$child_state" "$child_cache" "$op_env_tmp")"
+[ "$child_check" = "$want_check" ] || { printf 'FATAL: boundary not in effect inside a config-sourced child:\n%s\n' "$child_check" >&2; exit 2; }
 ctl_wt_overlay="$ctl/agent-hooks/omp-worker-overlay.yml"
 
 dry_launch() {  # <job-class> [extra spawn-task.sh args...] -> the "launch :" line
   local job="$1"; shift
   HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-    bash "$here/spawn-task.sh" --dry-run "$@" "$probe_repo" "offline-mcp-$job-$$" "$job" omp 2>&1 \
+    bash "$ctl/spawn-task.sh" --dry-run "$@" "$probe_repo" "offline-mcp-$job-$$" "$job" omp 2>&1 \
     | grep '^  launch'
 }
 
@@ -103,7 +179,7 @@ printf '== spawn-task.sh --dry-run: review/debug/explore get the offline overlay
 for j in review debug explore; do
   launch_line="$(dry_launch "$j")"
   case "$launch_line" in
-    *"--config $profile_path"*) ok "job class '$j': --config $profile_path is in the launch line" ;;
+    *"--config $ctl_profile_path"*) ok "job class '$j': --config $ctl_profile_path is in the launch line" ;;
     *) bad "job class '$j': overlay missing from launch line: $launch_line" ;;
   esac
 done
@@ -139,10 +215,9 @@ for j in $KNOWN_JOB_CLASSES; do
         secret_env=(env -u HERDR_SECRETS_WITHHELD)
         secret_flag=(--secrets)
       fi
-      target="$here"; want_profile_path="$profile_path"
+      want_profile_path="$ctl_profile_path"
       if [ "$appr" = hook ]; then
         extra=(--approval hook ${secret_flag[@]+"${secret_flag[@]}"})
-        target="$ctl"; want_profile_path="$ctl_profile_path"
       else
         extra=(${secret_flag[@]+"${secret_flag[@]}"})
       fi
@@ -152,7 +227,7 @@ for j in $KNOWN_JOB_CLASSES; do
       # aborted the command with "unbound variable" and left $out empty.
       # Found by live review: "every */menu/* matrix row ... EMPTY output".
       out="$("${secret_env[@]}" HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-        bash "$target/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-mx-$j-$appr-$sec-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1)"
+        bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-mx-$j-$appr-$sec-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1)"
       row="$j/$appr/$sec"
       case "$out" in
         *"could not find the write-floor approval flag"*)
@@ -184,31 +259,95 @@ printf '== bound launcher argv allowlist: every composed launch line would be AC
 # patched managed spawn exit 78 ("only the bound Herdr worker overlay is
 # allowed") before any pane output, and --dry-run tests never invoke the
 # launcher at all, so nothing caught it. v19 allowlists both.
-launcher_bin_line="$(grep -n '^HERDR_OMP_BIN=' "$here/config.sh")"
-eval "${launcher_bin_line#*:}"
-[ -x "$HERDR_OMP_BIN" ] && ok "the configured bound launcher exists and is executable: $HERDR_OMP_BIN" \
-  || bad "configured HERDR_OMP_BIN is missing/not executable: $HERDR_OMP_BIN"
-guard_src="$(awk '/^args=\("\$@"\)$/,/^done$/' "$HERDR_OMP_BIN" 2>/dev/null)"
-case "$guard_src" in
-  *'"$overlay"|"$offline_overlay"'*) ok "launcher's argv-scan shape (the \$overlay|\$offline_overlay case arm) still matches what this extraction assumes" ;;
-  *) bad "launcher's argv-scan shape changed or the marker lines are gone — extraction found: ${guard_src:-<empty>}" ;;
+# Guard source, two modes (OFFLINE_MCP_GUARD_SOURCE):
+#   installed (default, Mac): extract from the configured bound launcher AND
+#     require it to equal the checked-in fixture (drift = FAIL).
+#   fixture (CI only): use tests/fixtures/launcher-argv-guard.v26d.sh, pinned by
+#     digest. Proves the CONTRACT only; it says nothing about the installed wrapper.
+# Every load fails closed: missing/empty/shape-wrong/digest-mismatch = no guard.
+guard_fixture="$here/tests/fixtures/launcher-argv-guard.v26d.sh"
+guard_fixture_sha=fe11df1da5b9daae025256c10b12bc68ab2b1a2c41b89d889e3ba1ac3eacabbd
+guard_block_of() {  # <file>: the argv-scan block (fixture header lines dropped)
+  [ -f "$1" ] || return 1
+  awk '/^args=\("\$@"\)$/,/^done$/' "$1" 2>/dev/null
+}
+guard_shape_ok() {  # <block>
+  case "$1" in
+    'args=("$@")'*'"$overlay"|"$offline_overlay"'*done) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+guard_digest() { printf '%s\n' "$1" | shasum -a256 | cut -c1-64; }
+load_fixture_guard() {  # <file> <pinned-sha>: prints block, nonzero on any defect
+  local b; b="$(guard_block_of "$1")" || return 1
+  [ -n "$b" ] && guard_shape_ok "$b" && [ "$(guard_digest "$b")" = "$2" ] || return 1
+  printf '%s' "$b"
+}
+guard_src=""
+fixture_src="$(load_fixture_guard "$guard_fixture" "$guard_fixture_sha")" \
+  && ok "guard fixture present, shape ok, digest pinned ($guard_fixture_sha)" \
+  || bad "guard fixture missing/empty/wrong shape/digest mismatch: $guard_fixture"
+case "${OFFLINE_MCP_GUARD_SOURCE:-installed}" in
+  fixture)
+    printf '  note  FIXTURE MODE (CI): the installed launcher is NOT checked; contract only\n'
+    guard_src="$fixture_src" ;;
+  installed)
+    launcher_bin_line="$(grep -n '^HERDR_OMP_BIN=' "$here/config.sh")"
+    eval "${launcher_bin_line#*:}"
+    [ -x "$HERDR_OMP_BIN" ] && ok "the configured bound launcher exists and is executable: $HERDR_OMP_BIN" \
+      || bad "configured HERDR_OMP_BIN is missing/not executable: $HERDR_OMP_BIN"
+    inst_src="$(guard_block_of "$HERDR_OMP_BIN")" || inst_src=""
+    if [ -n "$inst_src" ] && guard_shape_ok "$inst_src"; then
+      ok "launcher's argv-scan shape (the \$overlay|\$offline_overlay case arm) still matches what this extraction assumes"
+      guard_src="$inst_src"
+      [ "$inst_src" = "$fixture_src" ] && ok "installed launcher argv-scan == checked-in fixture" \
+        || bad "installed launcher argv-scan differs from the fixture (refresh the fixture from a reviewed release)"
+    else
+      bad "launcher's argv-scan shape changed or the marker lines are gone — extraction found: ${inst_src:-<empty>}"
+    fi ;;
+  *) bad "unknown OFFLINE_MCP_GUARD_SOURCE=${OFFLINE_MCP_GUARD_SOURCE}" ;;
 esac
 launcher_allows_argv() {  # <overlay-path> <offline-overlay-path> -- <rest of the launch argv>
-  local overlay="$1" offline_overlay="$2"; shift 2
-  local _guard_fail=""
-  die() { _guard_fail="$*"; }
-  eval "$guard_src"
-  [ -z "$_guard_fail" ]
+  # Evaluated in a subshell where die EXITS, as in the launcher; any error
+  # (incl. set -u on a missing --config value) is a denial: fail closed.
+  _guard_fail=""
+  [ -n "$guard_src" ] || { _guard_fail="no guard source loaded (fail closed)"; return 1; }
+  _guard_fail="$( overlay="$1" offline_overlay="$2"; shift 2
+    die() { printf '%s' "$*"; exit 78; }
+    eval "$guard_src" 2>/dev/null; exit 0 )" && return 0
+  _guard_fail="${_guard_fail:-guard evaluation error}"; return 1
 }
+
+printf '== guard contract: deny/allow cases (pure; no launcher invoked) ==\n'
+gov=/x/overlay.yml; goff=/x/offline.yml
+launcher_allows_argv "$gov" "$goff" --config "$gov" -p hi && ok "allow: --config <worker overlay>" || bad "deny of a valid --config <worker overlay>: $_guard_fail"
+launcher_allows_argv "$gov" "$goff" --config "$goff" && ok "allow: --config <offline overlay>" || bad "deny of a valid --config <offline overlay>: $_guard_fail"
+for neg in "--config /x/other.yml" "--config" "--config=/x/overlay.yml" "--profile p" "--profile=p" "--no-extensions" \
+           "-e x" "-ex" "--extension x" "--extension=x" "--hook h" "--hook=h" "--plugin-dir d" "--plugin-dir=d" "--plugin-url u" "--plugin-url=u"; do
+  # shellcheck disable=SC2086
+  launcher_allows_argv "$gov" "$goff" $neg && bad "guard ALLOWED forbidden argv: $neg" || ok "deny: $neg"
+done
+saved_guard="$guard_src"; guard_src=""
+launcher_allows_argv "$gov" "$goff" --config "$gov" && bad "empty guard allowed argv (must fail closed)" || ok "empty guard fails closed"
+guard_src="$saved_guard"
+mk_tmp guard_neg
+load_fixture_guard "$guard_neg/absent.sh" "$guard_fixture_sha" >/dev/null && bad "missing fixture loaded" || ok "missing fixture fails closed"
+: > "$guard_neg/empty.sh"
+load_fixture_guard "$guard_neg/empty.sh" "$guard_fixture_sha" >/dev/null && bad "empty fixture loaded" || ok "empty fixture fails closed"
+printf '%s\n' "$fixture_src" | awk '{ sub(/only the bound/, "only THE bound"); print }' > "$guard_neg/tampered.sh"
+load_fixture_guard "$guard_neg/tampered.sh" "$guard_fixture_sha" >/dev/null && bad "tampered fixture loaded" || ok "tampered fixture: digest mismatch fails closed"
+load_fixture_guard "$guard_fixture" 0000000000000000000000000000000000000000000000000000000000000000 >/dev/null && bad "wrong pin accepted" || ok "wrong pinned digest fails closed"
+printf 'args=("$@")\nfor x in; do :\ndone\n' > "$guard_neg/shape.sh"
+load_fixture_guard "$guard_neg/shape.sh" "$(guard_digest "$(guard_block_of "$guard_neg/shape.sh")")" >/dev/null && bad "wrong-shape guard loaded" || ok "wrong-shape guard fails closed even with a matching digest"
 wt_overlay="$here/agent-hooks/omp-worker-overlay.yml"
 for j in review debug explore; do
   for appr in menu hook; do
-    extra=(); target="$here"; use_wt_overlay="$wt_overlay"; use_profile_path="$profile_path"
+    extra=(); use_wt_overlay="$ctl_wt_overlay"; use_profile_path="$ctl_profile_path"
     if [ "$appr" = hook ]; then
-      extra=(--approval hook); target="$ctl"; use_wt_overlay="$ctl_wt_overlay"; use_profile_path="$ctl_profile_path"
+      extra=(--approval hook)
     fi
     cli_tail="$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-      bash "$target/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-launcher-$j-$appr-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1 \
+      bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-launcher-$j-$appr-$$" "$j" omp ${extra[@]+"${extra[@]}"} 2>&1 \
       | sed -n 's/^  launch    : //p')"
     [ -n "$cli_tail" ] || { bad "$j/$appr: no launch line to test the launcher against"; continue; }
     eval "argv=($cli_tail)"
@@ -221,60 +360,138 @@ for j in review debug explore; do
     fi
   done
 done
-if "$HERDR_OMP_BIN" --herdr-bound-check >/dev/null 2>&1; then
-  ok "the live installed app is already pinned to this launcher (--herdr-bound-check passed)"
-else
-  echo "  info  --herdr-bound-check failed against the LIVE install — expected: installing lib/offline-mcp-profile.yml into ~/.local/share/herdr-control/app is the separate owner-approved release step SPEC.md forbids this task from doing; the argv-scan checks above prove the composed line is correct independent of whether that install has happened yet"
-fi
+# The real launcher is never EXECUTED here (no --herdr-bound-check): its pins are
+# a release-time check (verify-launcher-release.sh), not part of this suite.
 
 printf '== spawn-task.sh --dry-run: implement (no withholding) gets NO offline overlay ==\n'
 launch_line="$(env -u HERDR_SECRETS_WITHHELD HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-  bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-implement-$$" implement omp 2>&1 | grep '^  launch')"
+  bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-implement-$$" implement omp 2>&1 | grep '^  launch')"
 case "$launch_line" in
-  *"--config $profile_path"*) bad "implement (unwithheld) unexpectedly got the offline overlay: $launch_line" ;;
+  *"--config $ctl_profile_path"*) bad "implement (unwithheld) unexpectedly got the offline overlay: $launch_line" ;;
   *) ok "implement (unwithheld): no --config overlay in the launch line" ;;
 esac
 
 printf '== spawn-task.sh --dry-run: --no-secrets forces the overlay even for a non-offline job class ==\n'
 launch_line="$(env -u HERDR_SECRETS_WITHHELD HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-  bash "$here/spawn-task.sh" --dry-run --no-secrets "$probe_repo" "offline-mcp-ns-$$" implement omp 2>&1 | grep '^  launch')"
+  bash "$ctl/spawn-task.sh" --dry-run --no-secrets "$probe_repo" "offline-mcp-ns-$$" implement omp 2>&1 | grep '^  launch')"
 case "$launch_line" in
-  *"--config $profile_path"*) ok "implement + --no-secrets: overlay present (withheld secrets, same prompt-risk)" ;;
+  *"--config $ctl_profile_path"*) ok "implement + --no-secrets: overlay present (withheld secrets, same prompt-risk)" ;;
   *) bad "implement + --no-secrets: overlay missing: $launch_line" ;;
 esac
 
 printf '== spawn-task.sh --dry-run: --secrets on review does NOT lift the job-class overlay ==\n'
 launch_line="$(env -u HERDR_SECRETS_WITHHELD HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-  bash "$here/spawn-task.sh" --dry-run --secrets "$probe_repo" "offline-mcp-sec-$$" review omp 2>&1 | grep '^  launch')"
+  bash "$ctl/spawn-task.sh" --dry-run --secrets "$probe_repo" "offline-mcp-sec-$$" review omp 2>&1 | grep '^  launch')"
 case "$launch_line" in
-  *"--config $profile_path"*) ok "review + --secrets: overlay still present (job class is the trigger, not just withholding)" ;;
+  *"--config $ctl_profile_path"*) ok "review + --secrets: overlay still present (job class is the trigger, not just withholding)" ;;
   *) bad "review + --secrets: overlay was dropped: $launch_line" ;;
 esac
 
-printf '== spawn-agent.sh --job review: same overlay, same trigger ==\n'
-launch_line="$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
-  bash "$here/spawn-agent.sh" --job review "$probe_repo" offline-mcp-agent-test omp 2>&1)"
-case "$launch_line" in
-  *"--config $profile_path"*) ok "spawn-agent.sh --job review: overlay present" ;;
-  *"authorization hold"*|*"unavailable or outside Herdr"*)
-    # spawn-agent.sh has no --dry-run; it reaches the real pane-create call,
-    # which this plain-shell harness cannot satisfy (same local-ancestry gate
-    # spawn-task.sh's --dry-run sidesteps above). The overlay decision itself
-    # already ran (lib/agent-profiles.sh unit tests above cover it); this
-    # section only confirms spawn-agent.sh does not error out BEFORE that
-    # decision in a way unrelated to the fix.
-    ok "spawn-agent.sh: reached the real pane-create step (same code path proven via spawn-task.sh's --dry-run above; no separate --dry-run exists here)" ;;
-  *) bad "spawn-agent.sh --job review: unexpected output: $launch_line" ;;
+printf '== spawn-agent.sh --job review: same overlay rule (STATIC source assertion; spawn-agent.sh is never executed) ==\n'
+# spawn-agent.sh has no --dry-run: executing it reaches real workspace/pane
+# creation. Assert instead, from its source text, that its launch composition
+# applies the SAME selector (offline_mcp_profile_for_job / withheld secrets)
+# and appends the SAME overlay path as spawn-task.sh, and that it refuses when
+# the overlay is unreadable.
+sa_src="$(cat "$here/spawn-agent.sh")"
+case "$sa_src" in
+  *'. "$here/lib/agent-profiles.sh"'*) ok "spawn-agent.sh sources lib/agent-profiles.sh (same selector functions)" ;;
+  *) bad "spawn-agent.sh no longer sources lib/agent-profiles.sh" ;;
+esac
+case "$sa_src" in
+  *'"$(offline_mcp_profile_for_job "$job_class")" = 1 ] || [ "$op_mode" = withhold ]'*) ok "spawn-agent.sh gates the overlay on offline_mcp_profile_for_job OR withheld secrets" ;;
+  *) bad "spawn-agent.sh overlay condition changed (static assertion found no job-class/withhold gate)" ;;
+esac
+case "$sa_src" in
+  *'offline_mcp_cfg="$(offline_mcp_profile_path)"'*'cli="$cli --config $(printf '"'"'%q'"'"' "$offline_mcp_cfg")"'*) ok "spawn-agent.sh appends --config <offline_mcp_profile_path> to the launch line" ;;
+  *) bad "spawn-agent.sh no longer appends the offline overlay via offline_mcp_profile_path" ;;
+esac
+case "$sa_src" in
+  *"requires the offline MCP launch profile, but it is missing or unreadable"*) ok "spawn-agent.sh refuses when the overlay is missing/unreadable" ;;
+  *) bad "spawn-agent.sh missing-overlay refusal text not found" ;;
 esac
 
+printf '== run registry interpreter: canonical resolver, positive and negative (no registry is opened) ==\n'
+# Cause of the 2026-10-22 CI red (run 39797211751): lib/run-registry.sh pins
+# python3.11+ via launchd/resolve-hub-python.sh, which searches only
+# ${HERDR_HUB_PYTHON_DIRS:-/opt/homebrew/bin:/usr/local/bin}; with none found,
+# registry_init refuses and spawn-task swallows append_event's error, so the
+# event never lands. Name that cause here instead of as a missing event.
+resolver="$ctl/launchd/resolve-hub-python.sh"
+res_py="$(bash "$resolver" </dev/null 2>/dev/null)"; res_rc=$?
+[ "$res_rc" = 0 ] && [ -n "$res_py" ] && [ -x "$res_py" ] \
+  && ok "resolver emits an executable python3.11+: $res_py" \
+  || bad "resolver found no python3.11+ (rc=$res_rc, out='${res_py}'); registry events cannot be recorded (set HERDR_HUB_PYTHON_DIRS)"
+mk_tmp no_py_dir
+neg_py="$(HERDR_HUB_PYTHON_DIRS="$no_py_dir" bash "$resolver" </dev/null 2>/dev/null)"; neg_rc=$?
+[ "$neg_rc" != 0 ] && [ -z "$neg_py" ] \
+  && ok "causal: resolver refuses with no python3.11+ on HERDR_HUB_PYTHON_DIRS (the CI cause)" \
+  || bad "resolver accepted an empty HERDR_HUB_PYTHON_DIRS (rc=$neg_rc, out='$neg_py')"
+
+# run_bounded <secs> <outfile> <argv...>: tests/bounded-run.py runs argv (no
+# shell) in its own process group; on deadline it TERMs then KILLs the whole
+# group, reaps the leader and verifies the group is gone -> 124. If the group
+# cannot be confirmed gone it returns 125: we then retain every temp root and
+# FAIL, so no descendant can race our cleanup.
+bounded_py="${res_py:-}"; [ -x "$bounded_py" ] || bounded_py="$(command -v python3)"
+run_bounded() {
+  local secs="$1" outf="$2" brc; shift 2
+  "$bounded_py" "$here/tests/bounded-run.py" "$secs" "$outf" -- "$@"; brc=$?
+  if [ "$brc" = 125 ]; then
+    keep_tmp=1
+    bad "bounded child's process group not confirmed gone; temp roots retained: $*"
+  fi
+  return "$brc"
+}
+
+printf '== bounded runner: causal fixture (TERM-ignoring leader + descendant) ==\n'
+mk_tmp bounded_fx
+# The descendant records its OWN pid via `exec sh -c 'echo $$'` ($BASHPID does
+# not exist in macOS /bin/bash 3.2; it wrote an empty line in the bd5b9753 run).
+# An ignored TERM disposition survives exec.
+run_bounded 1 "$bounded_fx/out" bash -c \
+  'trap "" TERM; ( trap "" TERM; exec sh -c '"'"'echo $$ > "$1/desc.pid"; exec sleep 30'"'"' _ "$1" ) & sleep 30' _ "$bounded_fx"
+fx_rc=$?
+[ "$fx_rc" = 124 ] && ok "fixture: deadline returns 124" || bad "fixture: expected 124, got $fx_rc"
+fx_desc="$(cat "$bounded_fx/desc.pid" 2>/dev/null)"
+if [ -n "$fx_desc" ] && ! kill -0 "$fx_desc" 2>/dev/null; then
+  ok "fixture: the TERM-ignoring descendant ($fx_desc) is gone after return"
+else
+  bad "fixture: descendant '${fx_desc:-<no pid file>}' still alive or unrecorded"
+fi
+run_bounded 5 "$bounded_fx/fast" bash -c 'exit 7'
+[ "$?" = 7 ] && ok "fixture: an in-time command's own rc (7) is returned" || bad "fixture: in-time rc not propagated"
+# Leader exits in time but leaves a descendant in its group. The helper must
+# NOT signal after reaping the leader (pgid may be reused): it returns 125 and
+# the descendant is still alive. Called directly, not via run_bounded, because
+# 125 is this fixture's EXPECTED answer. The descendant only sleeps 3 s in its
+# own retained dir (not registered for cleanup) and exits by itself.
+fx_keep="$(mktemp -d "$tmp_root/fxkeep.XXXXXXXXXX")"
+"$bounded_py" "$here/tests/bounded-run.py" 5 "$fx_keep/out" -- bash -c \
+  '( exec sh -c '"'"'echo $$ > "$1/desc.pid"; exec sleep 3'"'"' _ "$1" ) & while [ ! -s "$1/desc.pid" ]; do :; done; exit 0' _ "$fx_keep"
+fx_rc=$?
+fx_desc="$(cat "$fx_keep/desc.pid" 2>/dev/null)"
+[ "$fx_rc" = 125 ] && ok "fixture: leader exited with a surviving descendant -> 125 (retain)" || bad "fixture: expected 125 for a surviving descendant, got $fx_rc"
+if [ -n "$fx_desc" ] && kill -0 "$fx_desc" 2>/dev/null; then
+  ok "fixture: no post-reap signal: descendant $fx_desc still alive after return (left to exit on its own; $fx_keep retained)"
+else
+  bad "fixture: descendant '${fx_desc:-<none>}' gone/unrecorded: a post-reap signal may have been sent"
+fi
+
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
-saved="$(mktemp)"; cp "$profile_path" "$saved"
-rm -f "$profile_path"
-miss_state_dir=$(mktemp -d)
-out=$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$miss_state_dir" \
-  bash "$here/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-missing-$$" review omp 2>&1)
+mk_tmp saved_dir; saved="$saved_dir/overlay.yml"; cp "$ctl_profile_path" "$saved"
+rm -f "$ctl_profile_path"
+mk_tmp miss_state_dir
+mk_tmp miss_io
+[ -z "$(ls -A "$miss_state_dir")" ] && [ -n "$(find "$miss_state_dir" -maxdepth 0 -perm 700)" ] \
+  && ok "registry root is an exact empty private (0700) temp dir: $miss_state_dir" \
+  || bad "registry root not empty/0700 before the dry-run: $miss_state_dir"
+run_bounded 60 "$miss_io/spawn.out" env HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$miss_state_dir" \
+  bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-missing-$$" review omp
 rc=$?
-cp "$saved" "$profile_path"; rm -f "$saved"
+out="$(cat "$miss_io/spawn.out")"
+cp "$saved" "$ctl_profile_path"
+[ "$rc" = 124 ] && bad "stage spawn-task: dry-run did not finish in 60s (killed); output so far: $out"
 [ "$rc" = 1 ] && ok "refused (rc=1) instead of launching unprotected" || bad "unexpected rc=$rc: $out"
 case "$out" in
   *"spawn-task (dry-run):"*) bad "dry-run summary printed despite the missing overlay — preflight did not actually refuse: $out" ;;
@@ -284,12 +501,25 @@ case "$out" in
   *"offline MCP launch profile"*) ok "refusal names the missing offline MCP profile" ;;
   *) bad "refusal message does not explain itself: $out" ;;
 esac
-. "$here/lib/run-registry.sh"
-export HERDR_RUN_STATE_DIR="$miss_state_dir"
-missing_row="$(_sql "SELECT count(*) FROM events WHERE type='offline_mcp_profile_missing';" 2>/dev/null)"
-[ "${missing_row:-0}" -gt 0 ] 2>/dev/null \
-  && ok "a registry event records the preflight refusal" \
-  || bad "no offline_mcp_profile_missing event found in the registry"
+if [ -f "$miss_state_dir/registry.sqlite3" ]; then
+  run_bounded 20 "$miss_io/event.out" env HERDR_RUN_STATE_DIR="$miss_state_dir" bash -c \
+    '. "$1/lib/run-registry.sh" && _sql "SELECT count(*) FROM events WHERE type='"'"'offline_mcp_profile_missing'"'"';"' _ "$ctl"
+  erc=$?; missing_row="$(cat "$miss_io/event.out")"
+  if [ "$erc" = 124 ]; then bad "stage event-read: registry query did not finish in 20s (killed)"
+  elif [ "$erc" != 0 ]; then bad "stage event-read: query failed rc=$erc: $missing_row"
+  elif [ "${missing_row:-0}" -gt 0 ] 2>/dev/null; then ok "a registry event records the preflight refusal"
+  else bad "stage event-write: registry exists but has no offline_mcp_profile_missing event (got '$missing_row')"
+  fi
+else
+  bad "stage registry-init: spawn-task created no registry at $miss_state_dir (append_event failed silently; see the resolver check above)"
+fi
+
+printf '== subprocess boundary: no spawn/launcher/provider call was attempted ==\n'
+if grep -q '^VIOLATION' "$stub_log"; then
+  bad "stubbed command(s) were called: $(grep '^VIOLATION' "$stub_log" | sort | uniq -c | tr '\n' ';')"
+else
+  ok "0 VIOLATION calls; herdr read stubs answered $(grep -c '^herdr ' "$stub_log") list call(s) with empty JSON"
+fi
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then echo PASS; exit 0; else echo FAIL; exit 1; fi
