@@ -3,9 +3,13 @@
 dispatch(label, rid, request_text, manifest) is the only way a request becomes
 trackable by lib/result_availability.py:
 
-  1. PRE-SEND PREFLIGHT. The label must have its own configured handoff root;
+  1. PRE-SEND PREFLIGHT. The label must have its own configured handoff root
+     and an owner_projects mapping (never created here);
      the live lease tuple (owner_lease.holder_tuple) must EQUAL the read-only
      registry resolver's (pane, birth, session); and the publisher's real
+     a one-time owner-dispatch-auth/1 grant for exactly (label, rid, body
+     sha256, sorted manifest) must be consumed (lib/owner_dispatch_auth.py);
+     and the publisher's real
      DeliveryGate.admit() (owner_lease.enqueue: bounded max_open queue,
      duplicate and approval-retry fences) must grant it. Otherwise nothing is
      written and nothing is sent: "held:not_dispatched:<reason>".
@@ -95,6 +99,9 @@ def _record(**fields) -> bytes:
 
 
 Resolve = Callable[[str], "tuple[str, str, str] | None"]  # label -> registry (pane_id, pane_birth, session_digest)
+# (label, rid, body sha256, manifest) -> "ok" only when THIS call consumed a
+# one-time grant (lib/owner_dispatch_auth.consume); else the hold reason.
+Authorize = Callable[[str, str, str, list], str]
 
 
 class Dispatcher:
@@ -104,8 +111,9 @@ class Dispatcher:
     registry. clock: read fresh immediately before the send."""
 
     def __init__(self, gate, avail: ra.Availability, send: Send, resolve: Resolve,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, authorize: Authorize | None = None):
         self.gate, self.avail, self.send, self.resolve, self.clock = gate, avail, send, resolve, clock
+        self.authorize = authorize  # None: every dispatch holds (auth_missing)
 
     def _bound(self, label, now):
         """The lease holder, only when the registry names exactly that
@@ -137,10 +145,24 @@ class Dispatcher:
                 or len(set(manifest)) != len(manifest) or ra.REQUEST_FILE in manifest \
                 or not all(isinstance(n, str) and ra.NAME_RE.match(n) for n in manifest):
             raise NotDispatched("bad_manifest")
+        # An owner_projects mapping is required and never created here: the
+        # registry row does not imply one.
+        if not self.gate.conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise NotDispatched("owner_project_unmapped")
         holder = self._bound(label, now)
         if holder is None:
             raise NotDispatched("registry_lease_mismatch")
         pane, birth, sess, gen = holder
+        # One-time authorization, consumed BEFORE admission or any file write.
+        # A refusal after this point leaves the grant consumed: fail closed.
+        if self.authorize is None:
+            raise NotDispatched("auth_missing")
+        try:
+            verdict = self.authorize(label, rid, hashlib.sha256(request_text).hexdigest(), sorted(manifest))
+        except Exception as exc:
+            verdict = f"auth_ambiguous:{type(exc).__name__}"
+        if verdict != "ok":
+            raise NotDispatched(verdict)
         adm = self.gate.admit(label, pane, birth, rid, now)
         if not adm.ok or adm.generation != gen:
             raise NotDispatched(adm.reason or "admit_generation_changed")
