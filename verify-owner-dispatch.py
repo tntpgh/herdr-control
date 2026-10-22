@@ -365,6 +365,7 @@ def main() -> int:
     av.close()
 
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
@@ -469,6 +470,53 @@ def auth_contract_cases(base: Path) -> None:
     case("READ: non-canonical parent refused", rerr(str(rq) + "/../rq", "req.txt") == "parent_not_canonical")
     case("READ: path traversal name refused", rerr(str(rq), "../rq/req.txt") == "bad_name")
     store.close(); gate.close(); av.close(); lc.close()
+
+
+def lease_writer_cases(base: Path) -> None:
+    """owner-lease-claim.py: registry-row identity only, one-shot, no renew."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("olc", HERE / "owner-lease-claim.py")
+    olc = importlib.util.module_from_spec(spec); spec.loader.exec_module(olc)
+    lc, av, roots, lease_db = env(base)
+    reg = {KB: (*PANE[KB], SESS[KB])}
+
+    def run(label, flags=True, resolve=reg.get):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DELIVERY="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = olc.main(["--label", label, "--ttl", str(TTL)], resolve=resolve)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    live = lambda lab: lc.execute("SELECT count(*) FROM owner_leases WHERE label=? AND released_at IS NULL", (lab,)).fetchone()[0]
+    case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and live(KB) == 0)
+    case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and live(DOTS) == 0)
+    rc, out = run(KB)
+    ht = ol.holder_tuple(lc, KB)
+    case("WRITER: acquires with EXACTLY the registry (pane, birth, session digest)",
+         rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB])
+    exp = lc.execute("SELECT expires_at FROM owner_leases WHERE label=? AND released_at IS NULL", (KB,)).fetchone()[0]
+    case("WRITER: a second run never renews (same holder) -> lease_exists, expiry unchanged",
+         run(KB) == (2, "refused:lease_exists")
+         and lc.execute("SELECT expires_at FROM owner_leases WHERE label=? AND released_at IS NULL", (KB,)).fetchone()[0] == exp)
+    case("WRITER: a different registry identity never takes over -> lease_exists",
+         run(KB, resolve={KB: ("w9:p9", "term_x", SESS[KB])}.get) == (2, "refused:lease_exists") and ol.holder_tuple(lc, KB) == ht)
+    lc.execute("PRAGMA foreign_keys=OFF")
+    lc.execute("DELETE FROM owner_projects WHERE label=?", (DOTS,))
+    case("WRITER: no owner_projects mapping -> refused, mapping not created",
+         run(DOTS, resolve={DOTS: (*PANE[DOTS], SESS[DOTS])}.get) == (2, "refused:owner_project_unmapped")
+         and lc.execute("SELECT count(*) FROM owner_projects WHERE label=?", (DOTS,)).fetchone()[0] == 0)
+    av.close(); lc.close()
 
 
 def publisher_tick_cases(base: Path) -> None:

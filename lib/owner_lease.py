@@ -293,8 +293,9 @@ def _live(conn, label, now):
 
 
 def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: float | None = None,
-            session_digest: str = "") -> int:
-    """Acquire or renew. Returns the holder's generation. On a generation change,
+            session_digest: str = "", allow_renew: bool = True) -> int:
+    """Acquire or renew (allow_renew=False: a live lease of ANY holder is a
+    LeaseConflict, decided inside the same transaction). Returns the holder's generation. On a generation change,
     the expired predecessor is released and its open requests disposed `stale`,
     all in the same transaction as the successor's insert. session_digest is ''
     or a full sha256 hex; a renewal must present the SAME digest (a session
@@ -312,6 +313,8 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
         cur = _live(conn, label, now)
         if cur:
             lease_id, pane, birth, gen, _r, _e, sess = cur
+            if not allow_renew:
+                raise LeaseConflict(f"{label} already leased (gen {gen}); not renewing")
             if (pane, birth, sess) != (pane_id, pane_birth, session_digest):
                 raise LeaseConflict(f"{label} held by {pane}@{birth} gen {gen}")
             conn.execute("UPDATE owner_leases SET renewed_at=?, expires_at=? WHERE lease_id=?",
