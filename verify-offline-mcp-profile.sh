@@ -446,8 +446,11 @@ run_bounded() {
 
 printf '== bounded runner: causal fixture (TERM-ignoring leader + descendant) ==\n'
 mk_tmp bounded_fx
+# The descendant records its OWN pid via `exec sh -c 'echo $$'` ($BASHPID does
+# not exist in macOS /bin/bash 3.2; it wrote an empty line in the bd5b9753 run).
+# An ignored TERM disposition survives exec.
 run_bounded 1 "$bounded_fx/out" bash -c \
-  'trap "" TERM; ( trap "" TERM; echo $BASHPID > "$1/desc.pid"; sleep 30 ) & sleep 30' _ "$bounded_fx"
+  'trap "" TERM; ( trap "" TERM; exec sh -c '"'"'echo $$ > "$1/desc.pid"; exec sleep 30'"'"' _ "$1" ) & sleep 30' _ "$bounded_fx"
 fx_rc=$?
 [ "$fx_rc" = 124 ] && ok "fixture: deadline returns 124" || bad "fixture: expected 124, got $fx_rc"
 fx_desc="$(cat "$bounded_fx/desc.pid" 2>/dev/null)"
@@ -465,7 +468,7 @@ run_bounded 5 "$bounded_fx/fast" bash -c 'exit 7'
 # own retained dir (not registered for cleanup) and exits by itself.
 fx_keep="$(mktemp -d "$tmp_root/fxkeep.XXXXXXXXXX")"
 "$bounded_py" "$here/tests/bounded-run.py" 5 "$fx_keep/out" -- bash -c \
-  '( echo $BASHPID > "$1/desc.pid"; exec sleep 3 ) & while [ ! -s "$1/desc.pid" ]; do :; done; exit 0' _ "$fx_keep"
+  '( exec sh -c '"'"'echo $$ > "$1/desc.pid"; exec sleep 3'"'"' _ "$1" ) & while [ ! -s "$1/desc.pid" ]; do :; done; exit 0' _ "$fx_keep"
 fx_rc=$?
 fx_desc="$(cat "$fx_keep/desc.pid" 2>/dev/null)"
 [ "$fx_rc" = 125 ] && ok "fixture: leader exited with a surviving descendant -> 125 (retain)" || bad "fixture: expected 125 for a surviving descendant, got $fx_rc"
