@@ -875,7 +875,11 @@ class OwnerInboxRetention(unittest.TestCase):
             # #225 review round 3 N1: keyed by "label/exchange_id", not
             # bare exchange_id -- the same id in two labels' sent/ dirs
             # must never share one accepted record.
-            owner_replies_accepted = {f"{label}/oex_old_sent": old_s}
+            owner_replies_accepted = {f"{label}/oex_old_sent": old_s,
+                                      # the delivered messages' replies are durably accepted (their
+                                      # sent files are fresh, so only the messages age out here)
+                                      f"{label}/oex_old_delivered": old_s, f"{label}/oex_recent_delivered": old_s,
+                                      f"{label}/oex_old_undelivered": old_s}
             pruned_messages, pruned_sent = pub.prune_inbox(owner_message_delivered, owner_replies_accepted, time.time())
 
             self.assertEqual(pruned_messages, {"oex_old_delivered"})
@@ -926,7 +930,8 @@ class OwnerInboxRetention(unittest.TestCase):
                 (label_dir / "replies" / "sent" / f"{x}.md").write_text("reply")
 
             owner_message_delivered = {"oex_at_cutoff": cutoff, "oex_past_cutoff": cutoff - 1}
-            pruned_messages, _ = pub.prune_inbox(owner_message_delivered, {}, now_s)
+            accepted = {f"{label}/oex_at_cutoff": cutoff, f"{label}/oex_past_cutoff": cutoff}
+            pruned_messages, _ = pub.prune_inbox(owner_message_delivered, accepted, now_s)
             self.assertEqual(pruned_messages, {"oex_past_cutoff"})
             self.assertTrue(at_cutoff.exists())
             self.assertFalse(past_cutoff.exists())
@@ -986,7 +991,7 @@ class OwnerInboxRetention(unittest.TestCase):
 
             pub.append_audit = failing_append
             try:
-                pruned_messages, pruned_sent = pub.prune_inbox({"oex_auditfail1": old_s}, {}, time.time())
+                pruned_messages, pruned_sent = pub.prune_inbox({"oex_auditfail1": old_s}, {f"{label}/oex_auditfail1": old_s}, time.time())
             finally:
                 pub.append_audit = real_append
             self.assertEqual(pruned_messages, set())
@@ -1249,6 +1254,51 @@ class PruneOwnerWorkProtectionTests(unittest.TestCase):
         self.assertEqual(msgs, set())  # subject AND ref targets all retained
         for x in (a, b, c):
             self.assertTrue((self.d / "messages" / f"{x}.md").exists())
+
+    def test_unaccepted_sent_file_does_not_close_a_message(self):
+        x = "oex_20260901T000000Z_eeeeeeee"
+        a = self.msg(x, replied=True)  # regular sent file, but NO accepted record
+        self.assertEqual(self.prune(accepted=[]), (set(), set()))
+        self.assertTrue(a.exists())
+
+    def test_readable_malformed_ledger_inhibits_label(self):
+        x = "oex_20260901T000000Z_ffffffff"
+        a = self.msg(x, replied=True)
+        for bad in (b"only\ttwo\n", f"{x}\theld\t-\tno-newline".encode(),
+                    f"{x}\tbogus_class\t-\tn\n".encode(),
+                    f"{x}\theld\t-\ta\n{x}\ttriaged_historic\t-\tb\n".encode()):
+            (self.d / "handled.tsv").write_bytes(bad)
+            self.assertEqual(self.prune(accepted=[x]), (set(), set()), bad)
+            self.assertTrue(a.exists())
+
+    def test_nonregular_inbox_entries_inhibit_label(self):
+        x, y = "oex_20260901T000000Z_aaaaaaaa", "oex_20260902T000000Z_bbbbbbbb"
+        a = self.msg(x, replied=True)
+        (self.d / "messages" / f"{y}.md").mkdir()  # dir named like a message
+        self.assertEqual(self.prune(accepted=[x]), (set(), set()))
+        self.assertTrue(a.exists())
+        (self.d / "messages" / f"{y}.md").rmdir()
+        os.symlink(a, self.d / "replies" / f"{y}.md")  # symlinked reply
+        self.assertEqual(self.prune(accepted=[x]), (set(), set()))
+        self.assertTrue(a.exists())
+
+    def test_prune_waits_for_an_in_flight_mark_and_sees_its_line(self):
+        import fcntl, threading
+        x, y = "oex_20260901T000000Z_aaaaaaaa", "oex_20260902T000000Z_bbbbbbbb"
+        self.msg(x, replied=True); self.msg(y)
+        led = self.d / "handled.tsv"
+        led.write_text(f"{y}\ttriaged_historic\t-\tseed\n")
+        fd = os.open(led, os.O_RDWR | os.O_APPEND)
+        fcntl.flock(fd, fcntl.LOCK_EX)              # a --mark is mid-append...
+        os.write(fd, f"{x}\theld".encode())         # ...partial line on disk
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", self.prune(accepted=[x])))
+        t.start(); time.sleep(0.3)
+        self.assertTrue(t.is_alive())               # pruner blocked on LOCK_SH, not reading the partial line
+        os.write(fd, b"\t-\tawaiting T\n"); os.fsync(fd); fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+        t.join(5)
+        self.assertEqual(out["r"], (set(), set()))  # x now held -> retained
+        self.assertTrue((self.d / "messages" / f"{x}.md").exists())
 
     def test_unreadable_ledger_prunes_nothing_under_that_label(self):
         x = "oex_20260901T000000Z_dddddddd"

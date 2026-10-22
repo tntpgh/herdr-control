@@ -129,6 +129,39 @@ def parse_handled(raw: bytes, messages: set[str]) -> dict[str, tuple[str, str]]:
     return out
 
 
+def protected_ids(d: Path) -> set[str]:
+    """Canonical retention contract for publisher.prune_inbox: every id the
+    ledger names (subject or ref) under label dir d. Same strict parser as the
+    helper's own reads, read under LOCK_SH so it can never observe a partial
+    --mark append (which holds LOCK_EX). Raises Refused on ANY inconsistency
+    (non-regular messages/replies entries, symlinked/unreadable/malformed/
+    truncated/conflicting ledger); the caller must then prune nothing there."""
+    msgs = _ids(d / "messages")
+    _ids(d / "replies")
+    _ids(d / "replies" / "sent")
+    f = d / "handled.tsv"
+    if not os.path.lexists(f):
+        return set()
+    try:
+        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Refused(f"handled.tsv unreadable: {e}")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+    except OSError as e:
+        raise Refused(f"handled.tsv unreadable: {e}")
+    finally:
+        os.close(fd)
+    disp = parse_handled(b"".join(chunks), msgs)
+    return set(disp) | {ref for _cls, ref in disp.values() if ref != "-"}
+
+
 def _validate(xid: str, cls: str, ref: str, messages: set[str], where: str) -> None:
     if not ID_RE.match(xid) or xid not in messages:
         raise Refused(f"{where}: no such message {xid!r}")

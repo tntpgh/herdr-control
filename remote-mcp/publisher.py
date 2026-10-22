@@ -25,6 +25,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import importlib.util
 import os
 import re
 import secrets
@@ -1386,30 +1387,34 @@ def _prune_one(path: Path, exchange_id: str, label: str, tree: str, mtime: float
     return outcome
 
 
-def _retention_protected(label_dir: Path) -> set | None:
-    """Exchange ids in <label>/handled.tsv (owner-inbox-pending.py's
-    disposition ledger), as the subject OR the ref of any line. Those
-    records must outlive age-based pruning until durable tombstone/archive
-    semantics exist: deleting one would make the ledger reference a missing
-    message, which the helper (rightly) refuses to parse. None = the ledger
-    is present but unreadable (symlink, I/O, non-UTF-8): the caller prunes
-    NOTHING under that label this tick (fail closed)."""
-    f = label_dir / "handled.tsv"
-    if not os.path.lexists(f):
-        return set()
+def _load_inbox_helper():
+    """owner-inbox-pending.py owns the ONE ledger parser (writer, reader and
+    this pruner share it, so the schema cannot drift). Loaded from this file's
+    own directory; None if unavailable, which disables message pruning."""
     try:
-        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as fh:
-            text = fh.read().decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+        spec = importlib.util.spec_from_file_location(
+            "owner_inbox_pending", Path(__file__).with_name("owner-inbox-pending.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001 -- any load failure must only ever mean "prune nothing"
         return None
-    out: set = set()
-    for line in text.splitlines():
-        parts = line.split("\t")
-        out.add(parts[0])
-        if len(parts) > 2:
-            out.add(parts[2])
-    return out
+
+
+def _retention_protected(label_dir: Path) -> set | None:
+    """Exchange ids <label>/handled.tsv names (subject or ref), via the
+    helper's canonical strict parser under LOCK_SH. Those records outlive
+    age-based pruning until durable tombstone/archive semantics exist.
+    None = helper unavailable, or ANY inconsistency (non-regular inbox
+    entries, symlinked/unreadable/malformed/truncated/conflicting ledger):
+    the caller prunes NOTHING under that label this tick (fail closed)."""
+    helper = _load_inbox_helper()
+    if helper is None:
+        return None
+    try:
+        return helper.protected_ids(label_dir)
+    except Exception:  # noqa: BLE001 -- Refused or OSError: inhibit the whole label
+        return None
 
 
 def _is_regular(p: Path) -> bool:
@@ -1436,8 +1441,9 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
         into sent/, bypassing that path, has no such key and is never
         pruned, however old) AND older than OWNER_INBOX_RETENTION_DAYS.
     Owner-work protection (2026-10-22): age alone NEVER deletes owner work.
-    A message is pruned only once it is closed by an accepted reply (a
-    regular replies/sent/<id>.md exists) AND it is not named, as subject
+    A message is pruned only once it is closed by an accepted reply (BOTH
+    the durable owner_replies_accepted["<label>/<id>"] record AND a regular
+    replies/sent/<id>.md) AND it is not named, as subject
     or ref, in <label>/handled.tsv -- so an unanswered or held item, and
     every record a disposition points at, is retained however old. A sent
     reply is pruned only after its message is gone, so pruning can never
@@ -1472,8 +1478,9 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
                 continue  # never delivered (or not provably so): never touched
             if exchange_id in protected:
                 continue  # held / dispositioned / referenced: retained until tombstones exist
-            if not _is_regular(label_dir / "replies" / "sent" / f"{exchange_id}.md"):
-                continue  # no accepted reply: still owner work (pending), never age-pruned
+            if (f"{label}/{exchange_id}" not in owner_replies_accepted
+                    or not _is_regular(label_dir / "replies" / "sent" / f"{exchange_id}.md")):
+                continue  # no durably ACCEPTED reply (record AND regular file): still owner work
             path = _resolve_inbox_leaf(label, "messages", exchange_id)
             if path is None:
                 continue
