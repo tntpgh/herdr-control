@@ -99,9 +99,10 @@ def _record(**fields) -> bytes:
 
 
 Resolve = Callable[[str], "tuple[str, str, str] | None"]  # label -> registry (pane_id, pane_birth, session_digest)
-# (label, rid, body sha256, manifest) -> "ok" only when THIS call consumed a
-# one-time grant (lib/owner_dispatch_auth.consume); else the hold reason.
-Authorize = Callable[[str, str, str, list], str]
+# (label, project, holder (pane, birth, session, generation), rid, body sha256,
+# manifest, now) -> "ok" only when THIS call consumed a one-time grant bound to
+# all of them (lib/owner_dispatch_auth.consume); else the hold reason.
+Authorize = Callable[[str, str, tuple, str, str, list, float], str]
 
 
 class Dispatcher:
@@ -147,18 +148,21 @@ class Dispatcher:
             raise NotDispatched("bad_manifest")
         # An owner_projects mapping is required and never created here: the
         # registry row does not imply one.
-        if not self.gate.conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+        mapped = self.gate.conn.execute("SELECT project FROM owner_projects WHERE label=?", (label,)).fetchone()
+        if not mapped:
             raise NotDispatched("owner_project_unmapped")
         holder = self._bound(label, now)
         if holder is None:
             raise NotDispatched("registry_lease_mismatch")
         pane, birth, sess, gen = holder
         # One-time authorization, consumed BEFORE admission or any file write.
-        # A refusal after this point leaves the grant consumed: fail closed.
+        # A refusal or crash after this point leaves the grant consumed with no
+        # intent.json: owner_dispatch_auth.unsent() surfaces it for an operator.
         if self.authorize is None:
             raise NotDispatched("auth_missing")
         try:
-            verdict = self.authorize(label, rid, hashlib.sha256(request_text).hexdigest(), sorted(manifest))
+            verdict = self.authorize(label, mapped[0], tuple(holder), rid, hashlib.sha256(request_text).hexdigest(),
+                                     sorted(manifest), now)
         except Exception as exc:
             verdict = f"auth_ambiguous:{type(exc).__name__}"
         if verdict != "ok":

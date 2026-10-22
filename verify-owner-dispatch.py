@@ -26,18 +26,30 @@ import sqlite3  # noqa: E402
 import uuid  # noqa: E402
 
 
+def insert_grant(conn, aid, *, label, project, holder, rid, sha, manifest, status="granted",
+                 prompt="fixture-prompt", approval="fixture-approval", expires=None, proto=None):
+    """TEST-ONLY issuer into a disposable store (production has none)."""
+    pane, birth, sess, gen = holder
+    conn.execute("INSERT INTO owner_dispatch_auth(auth_id,protocol,owner_label,project,pane_id,pane_birth,session_digest,"
+                 "lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,status,decided_at,expires_at)"
+                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'2026-10-22T00:00:00Z',?)",
+                 (aid, proto or oda.PROTOCOL, label, project, pane, birth, sess, gen, rid, sha,
+                  oda.manifest_key(manifest), prompt, approval, status, T0 + 3600 if expires is None else expires))
+
+
 def auto_auth(path):
     """TEST FIXTURE for cases about something else: issues a grant for exactly
     the call's arguments into a disposable store, then consumes it through the
-    REAL oda.consume(). Never a production path (production has no issuer)."""
+    REAL oda.consume()."""
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=10)
     oda.migrate(conn)
 
-    def authorize(label, rid, sha, manifest):
+    def authorize(label, project, holder, rid, sha, manifest, now):
         aid = uuid.uuid4().hex
-        conn.execute("INSERT INTO owner_dispatch_auth VALUES (?,?,?,?,?,?,?,?,'granted','2026-10-22T00:00:00Z',NULL)",
-                     (aid, oda.PROTOCOL, label, rid, sha, oda.manifest_key(manifest), "fixture-prompt", "fixture-approval"))
-        return oda.consume(conn, aid, label=label, request_id=rid, body_sha256=sha, manifest=manifest)
+        insert_grant(conn, aid, label=label, project=project, holder=holder, rid=rid, sha=sha, manifest=manifest,
+                     expires=now + 3600)
+        return oda.consume(conn, aid, label=label, project=project, holder=holder, request_id=rid,
+                           body_sha256=sha, manifest=manifest, now=now)
     return authorize
 
 FAILS: list[str] = []
@@ -324,9 +336,9 @@ def main() -> int:
         "now=float(sys.argv[8]);reg=json.loads(sys.argv[9])\n"
         "import sqlite3,uuid,owner_dispatch_auth as oda\n"
         "ac=sqlite3.connect(sys.argv[3]+'.auth',isolation_level=None,timeout=30);oda.migrate(ac)\n"
-        "def auth(l,r,h,m):\n"
-        " a=uuid.uuid4().hex;ac.execute(\"INSERT INTO owner_dispatch_auth VALUES (?,?,?,?,?,?,'p','a','granted','t',NULL)\",(a,oda.PROTOCOL,l,r,h,oda.manifest_key(m)))\n"
-        " return oda.consume(ac,a,label=l,request_id=r,body_sha256=h,manifest=m)\n"
+        "def auth(l,pj,hd,r,h,m,n):\n"
+        " a=uuid.uuid4().hex;ac.execute(\"INSERT INTO owner_dispatch_auth(auth_id,protocol,owner_label,project,pane_id,pane_birth,session_digest,lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,status,decided_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'p','a','granted','t',?)\",(a,oda.PROTOCOL,l,pj,*hd,r,h,oda.manifest_key(m),n+3600))\n"
+        " return oda.consume(ac,a,label=l,project=pj,holder=hd,request_id=r,body_sha256=h,manifest=m,now=n)\n"
         "d=od.Dispatcher(old.DeliveryGate(sys.argv[2]),av,lambda l,h,t:sent.append(l) or True,lambda l:tuple(reg[l]),lambda:now,authorize=auth)\n"
         "res=[d.dispatch(label,f'{label}_q{i}',f'REQ {i}'.encode(),['result.md'],now) for i in range(12)]\n"
         "res.append(d.dispatch(label,f'{label}_q0',b'REQ 0',['result.md'],now))\n"
@@ -366,34 +378,44 @@ def main() -> int:
 
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
 
 def auth_contract_cases(base: Path) -> None:
-    """owner-dispatch-auth/1 through the REAL store and Dispatcher: every hold
+    """owner-dispatch-auth/2 through the REAL store and Dispatcher: every hold
     happens before admission and before any journal/handoff write."""
     lc, av, roots, lease_db = env(base)
     J = base / "journal"
     acquire(lc, KB, T0, session=SESS[KB])
     gate = old.DeliveryGate(lease_db)
     reg = {KB: (*PANE[KB], SESS[KB])}.get
+    HOLDER = ol.holder_tuple(lc, KB, T0)
+    PROJ = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
     store = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
     oda.migrate(store)
     body, man = b"REQ auth\n", ["result.md"]
     sha = hashlib.sha256(body).hexdigest()
 
-    def grant(aid, rid="r_a", status="granted", label=KB, s=sha, m=man, prompt="prompt-1", approval="appr-1", proto=oda.PROTOCOL):
-        store.execute("INSERT INTO owner_dispatch_auth VALUES (?,?,?,?,?,?,?,?,?,'2026-10-22T00:00:00Z',NULL)",
-                      (aid, proto, label, rid, s, oda.manifest_key(m), prompt, approval, status))
+    def grant(aid, rid="r_a", label=KB, project=None, holder=None, s=sha, m=man, **kw):
+        insert_grant(store, aid, label=label, project=PROJ if project is None else project,
+                     holder=HOLDER if holder is None else holder, rid=rid, sha=s, manifest=m, **kw)
 
-    def mkd(aid):
-        return od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, reg, lambda: T0,
-                             authorize=lambda l, r, h, m: oda.consume(store, aid, label=l, request_id=r, body_sha256=h, manifest=m))
+    def consumer(aid, conn=None):
+        c = conn or store
+        return lambda l, pj, hd, r, h, m, n: oda.consume(c, aid, label=l, project=pj, holder=hd, request_id=r,
+                                                         body_sha256=h, manifest=m, now=n)
+
+    def mkd(aid, clock=T0):
+        return od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, reg, lambda: clock, authorize=consumer(aid))
 
     def nothing(rid):
         return files(J / KB / rid) is None and files(roots[KB] / rid) is None and gate.state(rid) is None
+
+    def status(aid):
+        return store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (aid,)).fetchone()[0]
 
     sent = []
     nod = od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, reg, lambda: T0)
@@ -404,24 +426,41 @@ def auth_contract_cases(base: Path) -> None:
     grant("a_den", status="denied")
     case("AUTH: denied grant -> held auth_denied", mkd("a_den").dispatch(KB, "r_a", body, man, T0)
          == "held:not_dispatched:auth_denied" and nothing("r_a"))
+    p, b_, sd, g = HOLDER
     for aid, kw, what in [("a_body", {"s": "0" * 64}, "body sha"), ("a_rid", {"rid": "r_other"}, "request id"),
                           ("a_lab", {"label": DOTS}, "owner label"), ("a_man", {"m": ["other.md"]}, "manifest"),
-                          ("a_proto", {"proto": "owner-dispatch-auth/0"}, "protocol"), ("a_noprompt", {"prompt": ""}, "prompt identity")]:
+                          ("a_proto", {"proto": "owner-dispatch-auth/1"}, "protocol"), ("a_noprompt", {"prompt": ""}, "prompt identity"),
+                          ("a_proj", {"project": "tntpgh/other"}, "project"),
+                          ("a_pane", {"holder": ("w9:p9", b_, sd, g)}, "pane"),
+                          ("a_birth", {"holder": (p, "term_other", sd, g)}, "pane birth"),
+                          ("a_sess", {"holder": (p, b_, "f" * 64, g)}, "session digest"),
+                          ("a_gen", {"holder": (p, b_, sd, g + 1)}, "lease generation")]:
         grant(aid, **kw)
         case(f"AUTH: grant bound to a different {what} -> held auth_mismatch, still granted",
              mkd(aid).dispatch(KB, "r_a", body, man, T0) == "held:not_dispatched:auth_mismatch" and nothing("r_a")
-             and store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (aid,)).fetchone()[0] == "granted")
+             and status(aid) == "granted")
+    grant("a_exp", expires=T0)
+    case("AUTH: grant at/after expires_at -> held auth_expired, still granted, nothing written",
+         mkd("a_exp").dispatch(KB, "r_a", body, man, T0) == "held:not_dispatched:auth_expired" and nothing("r_a")
+         and status("a_exp") == "granted")
     grant("a_ok")
     case("AUTH: exact grant -> dispatched with the identical bytes; grant consumed",
-         mkd("a_ok").dispatch(KB, "r_a", body, man, T0) == "dispatched" and sent == [body]
-         and store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_ok'").fetchone()[0] == "consumed")
-    case("AUTH: a consumed grant never authorizes again (new rid, same grant) -> held auth_mismatch/consumed",
+         mkd("a_ok").dispatch(KB, "r_a", body, man, T0) == "dispatched" and sent == [body] and status("a_ok") == "consumed")
+    case("AUTH: a consumed grant never authorizes again",
          mkd("a_ok").dispatch(KB, "r_a", body, man, T0).startswith("held:not_dispatched:auth_consumed") and len(sent) == 1)
+    case("UNSENT: a dispatched grant is not reported unsent", oda.unsent(store, str(J)) == [])
+    # consumed, then refused at admission (queue full): burned with no journal -> surfaced
+    lc.execute("UPDATE owner_projects SET max_open=1 WHERE label=?", (KB,))
+    grant("a_q", rid="r_q")
+    rq_res = mkd("a_q").dispatch(KB, "r_q", body, man, T0)
+    case("UNSENT: consumed then refused at admission -> held, no journal, listed by unsent(); never regranted",
+         rq_res.startswith("held:not_dispatched:") and status("a_q") == "consumed" and files(J / KB / "r_q") is None
+         and oda.unsent(store, str(J)) == ["a_q"])
+    lc.execute("UPDATE owner_projects SET max_open=? WHERE label=?", (ol.DEFAULT_MAX_OPEN, KB))
     grant("a_amb", rid="r_amb")
     broken = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
     broken.close()
-    amb = od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, reg, lambda: T0,
-                        authorize=lambda l, r, h, m: oda.consume(broken, "a_amb", label=l, request_id=r, body_sha256=h, manifest=m))
+    amb = od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, reg, lambda: T0, authorize=consumer("a_amb", broken))
     case("AUTH: store error -> held auth_ambiguous, nothing written",
          amb.dispatch(KB, "r_amb", body, man, T0).startswith("held:not_dispatched:auth_ambiguous") and nothing("r_amb"))
     raising = od.Dispatcher(gate, av, lambda l, h, t: True, reg, lambda: T0, authorize=lambda *a: 1 / 0)
@@ -430,29 +469,49 @@ def auth_contract_cases(base: Path) -> None:
     case("AUTH: an authorizer returning anything but 'ok' never authorizes (self-attestation)",
          od.Dispatcher(gate, av, lambda l, h, t: True, reg, lambda: T0, authorize=lambda *a: True).dispatch(
              KB, "r_amb", body, man, T0) == "held:not_dispatched:True" and nothing("r_amb"))
-    # one-shot under concurrency: N parallel consumers of one grant -> exactly one ok
     grant("a_race", rid="r_race")
     import threading
     res = []
     def worker():
         c = sqlite3.connect(str(base / "auth.db"), isolation_level=None, timeout=10)
-        res.append(oda.consume(c, "a_race", label=KB, request_id="r_race", body_sha256=sha, manifest=man))
+        res.append(oda.consume(c, "a_race", label=KB, project=PROJ, holder=HOLDER, request_id="r_race",
+                               body_sha256=sha, manifest=man, now=T0))
         c.close()
     ts = [threading.Thread(target=worker) for _ in range(8)]
     [t.start() for t in ts]; [t.join() for t in ts]
     case("AUTH: 8 concurrent consumers of one grant -> exactly one ok, rest auth_consumed",
          res.count("ok") == 1 and res.count("auth_consumed") == 7)
-    # owner_projects mapping absent -> hold before admission, no implicit register
     lc.execute("PRAGMA foreign_keys=OFF")  # disposable DB: model a label with no mapping row
     lc.execute("DELETE FROM owner_projects WHERE label=?", (DOTS,))
     grant("a_unm", rid="r_unm", label=DOTS)
     unm = od.Dispatcher(gate, av, lambda l, h, t: True, {DOTS: (*PANE[DOTS], SESS[DOTS])}.get, lambda: T0,
-                        authorize=lambda l, r, h, m: oda.consume(store, "a_unm", label=l, request_id=r, body_sha256=h, manifest=m))
+                        authorize=consumer("a_unm"))
     case("MAPPING: no owner_projects row -> held owner_project_unmapped; grant untouched; nothing registered",
          unm.dispatch(DOTS, "r_unm", body, man, T0) == "held:not_dispatched:owner_project_unmapped"
-         and store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_unm'").fetchone()[0] == "granted"
+         and status("a_unm") == "granted"
          and lc.execute("SELECT count(*) FROM owner_projects WHERE label=?", (DOTS,)).fetchone()[0] == 0)
-    # bounded single read through O_NOFOLLOW under the exact canonical parent
+    # store opening
+    sd_ = base / "store"; sd_.mkdir(mode=0o700)
+    good = sd_ / "auth.db"
+    c = sqlite3.connect(str(good)); oda.migrate(c); c.close(); os.chmod(good, 0o600)
+    def oerr(path):
+        try:
+            oda.open_store(str(path)).close(); return "open"
+        except ValueError as e:
+            return str(e)
+    case("STORE: canonical private migrated store opens", oerr(good) == "open")
+    (sd_ / "link.db").symlink_to(good)
+    case("STORE: symlink path refused", oerr(sd_ / "link.db") == "store_path_not_canonical")
+    case("STORE: missing store refused, not created", oerr(sd_ / "none.db") == "store_missing" and not (sd_ / "none.db").exists())
+    os.chmod(good, 0o644); r1 = oerr(good); os.chmod(good, 0o600)
+    case("STORE: group/other-readable store refused", r1 == "store_not_private_regular")
+    os.chmod(sd_, 0o777); r2 = oerr(good); os.chmod(sd_, 0o700)
+    case("STORE: world-writable parent refused", r2 == "store_parent_unprotected")
+    (sd_ / "auth.db-wal").symlink_to(base / "elsewhere")
+    case("STORE: symlinked -wal sidecar refused", oerr(good) == "store_sidecar_unsafe")
+    os.unlink(sd_ / "auth.db-wal")
+    e = sd_ / "empty.db"; sqlite3.connect(str(e)).close(); os.chmod(e, 0o600)
+    case("STORE: unmigrated store refused", oerr(e) == "store_not_migrated")
     rq = base / "rq"; rq.mkdir()
     (rq / "req.txt").write_bytes(body)
     (rq / "link.txt").symlink_to(rq / "req.txt")
@@ -517,6 +576,86 @@ def lease_writer_cases(base: Path) -> None:
          run(DOTS, resolve={DOTS: (*PANE[DOTS], SESS[DOTS])}.get) == (2, "refused:owner_project_unmapped")
          and lc.execute("SELECT count(*) FROM owner_projects WHERE label=?", (DOTS,)).fetchone()[0] == 0)
     av.close(); lc.close()
+
+
+def cli_cases(base: Path) -> None:
+    """owner-dispatch.py as the caller: subprocess for flag/store refusals,
+    main() for the full path with the REAL delivery adapter (make_send) aimed
+    at a recording stand-in for herdr-deliver."""
+    import importlib.util
+    import io
+    import contextlib
+    import time as _t
+    cli = HERE / "owner-dispatch.py"
+    spec = importlib.util.spec_from_file_location("odcli", cli)
+    odc = importlib.util.module_from_spec(spec); spec.loader.exec_module(odc)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    now = _t.time()
+    acquire(lc, KB, now, session=SESS[KB])
+    holder = ol.holder_tuple(lc, KB, now)
+    proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+    sd = base / "authstore"; sd.mkdir(mode=0o700)
+    adb = sd / "auth.db"
+    c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); os.chmod(adb, 0o600)
+    rq = base / "req"; rq.mkdir()
+    body = "REQ cli \u00e9\n".encode()
+    (rq / "r.txt").write_bytes(body)
+    sha = hashlib.sha256(body).hexdigest()
+    rec = base / "deliver.log"
+    fake = base / "fake-deliver.sh"
+    fake.write_text(f"#!/bin/sh\nprintf '%s\\n--\\n%s' \"$1\" \"$2\" > {rec}\nexit 0\n"); os.chmod(fake, 0o700)
+    E = {"HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": lease_db,
+         "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb), "HERDR_RESULT_AVAILABILITY": "1",
+         "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"), "HERDR_RESULT_AVAILABILITY_JOURNAL": str(base / "journal"),
+         "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={roots[KB]}{os.pathsep}{DOTS}={roots[DOTS]}"}
+    ARGS = lambda rid, aid: ["--label", KB, "--rid", rid, "--request-dir", str(rq), "--request-name", "r.txt",
+                             "--auth-id", aid, "--manifest", "result.md"]
+
+    def sub(env_over, rid="r_c", aid="a_c"):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        e.update(env_over)
+        r = subprocess.run([sys.executable, str(cli), *ARGS(rid, aid)], capture_output=True, text=True, env=e, timeout=60)
+        return r.returncode, r.stdout.strip()
+
+    def inproc(rid, aid, resolve={KB: (*PANE[KB], SESS[KB])}.get):
+        saved = {k: os.environ.get(k) for k in E}
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odc.main(ARGS(rid, aid), send=odc.make_send(str(fake)), resolve=resolve)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    case("CLI: flags off (subprocess) -> exit 4 refused:flags_off", sub({}) == (4, "refused:flags_off"))
+    (sd / "link.db").symlink_to(adb)
+    case("CLI: symlinked auth store (subprocess) -> exit 4, refused before any read",
+         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "link.db")}) == (4, "refused:store_path_not_canonical"))
+    case("CLI: missing auth store (subprocess) -> exit 4, not created",
+         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "x.db")}) == (4, "refused:store_missing")
+         and not (sd / "x.db").exists())
+    case("CLI: no grant -> exit 2 held auth_missing, adapter never called",
+         inproc("r_c", "nope") == (2, "held:not_dispatched:auth_missing") and not rec.exists())
+    insert_grant(c, "a_c", label=KB, project=proj, holder=holder, rid="r_c", sha=sha, manifest=["result.md"], expires=now + 600)
+    rc, out = inproc("r_c", "a_c")
+    delivered = rec.read_bytes() if rec.exists() else b""
+    case("CLI: exact grant -> exit 0 dispatched; adapter got pane + the captured bytes (grant sha binds them)",
+         (rc, out) == (0, "dispatched") and delivered == PANE[KB][0].encode() + b"\n--\n" + body
+         and (roots[KB] / "r_c" / ra.REQUEST_FILE).read_bytes() == body)
+    insert_grant(c, "a_d", label=KB, project=proj, holder=holder, rid="r_d", sha="0" * 64, manifest=["result.md"], expires=now + 600)
+    case("CLI: grant for other bytes -> exit 2 auth_mismatch", inproc("r_d", "a_d") == (2, "held:not_dispatched:auth_mismatch"))
+    # consumed-but-unsent grant present -> every later run refuses (recovery hold)
+    insert_grant(c, "a_burn", label=KB, project=proj, holder=holder, rid="r_burn", sha=sha, manifest=["result.md"], expires=now + 600)
+    c.execute("UPDATE owner_dispatch_auth SET status='consumed' WHERE auth_id='a_burn'")
+    insert_grant(c, "a_e", label=KB, project=proj, holder=holder, rid="r_e", sha=sha, manifest=["result.md"], expires=now + 600)
+    rc, out = inproc("r_e", "a_e")
+    case("CLI: consumed-but-unsent grant -> exit 4 recovery hold; the new grant is NOT consumed",
+         rc == 4 and out == "refused:recovery_needs_operator auth:a_burn=consumed_unsent"
+         and c.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_e'").fetchone()[0] == "granted")
+    c.close(); lc.close()
 
 
 def publisher_tick_cases(base: Path) -> None:
