@@ -3,13 +3,16 @@
 One-shot writer for ONE approved owner-dispatch pilot (OFF BY DEFAULT, INERT).
 
 TRUST ROOT: the answered formserve decision record, not a caller-supplied
-file or digest. The writer reads, from the canonical forms directory
-($HERDR_STATE_ROOT/forms, default ~/.local/state/herdr/forms):
+file or digest. The writer reads, from the PINNED forms directory
+~/.local/state/herdr/forms (opened per component with O_NOFOLLOW; own-UID,
+no group/world write; HERDR_STATE_ROOT is ignored):
   <ID>.json   the registry row formserve/hub write claim-once on submit
               (status "answered", answered_at, answers), and
   <ID>.html   the exact page that was served to Terrence.
-The page embeds the approval record as <script type="application/json"
-id="owner-dispatch-approval">. The answers must say decision="approve" AND
+The page must be byte-identical to render_form(record) (built offline by
+`owner-dispatch-issue.py build-form`, which binds the holder resolved fresh from
+the registry and the request sha256); it embeds the record's canonical bytes as
+<script type="application/json" id="owner-dispatch-approval">. The answers must say decision="approve" AND
 echo approval_sha256 = sha256 of exactly those embedded bytes, so an
 approval binds the record that was on screen. decided_at is the record's
 answered_at. grant expiry = answered_at + approval.grant_window_s (<= 3600).
@@ -75,22 +78,83 @@ class Refused(Exception):
     pass
 
 
-def forms_dir() -> str:
-    return os.path.join(os.environ.get("HERDR_STATE_ROOT", os.path.expanduser("~/.local/state/herdr")), "forms")
+# PINNED canonical state root. Deliberately NOT read from HERDR_STATE_ROOT or
+# any argument: the caller cannot choose where the "answered" record lives.
+# (Tests rebind this module attribute; no runtime path does.)
+STATE_ROOT = os.path.join(os.path.expanduser("~"), ".local", "state", "herdr")
 
 
-def _read_nofollow(path: str) -> bytes:
+def _safe_dir_fd(path: str) -> int:
+    """Open `path` one component at a time from '/', O_NOFOLLOW|O_DIRECTORY on
+    every component (no symlink anywhere in the chain). Every ancestor must be
+    owned by root or this user and not group/world-writable (unless sticky);
+    the final forms directory must be owned by this user with no g/o write."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise Refused("forms_dir_not_canonical")
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        for i, name in enumerate(parts):
+            try:
+                nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise Refused("forms_dir_unsafe_path") from None
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if i == len(parts) - 1:
+                if st.st_uid != os.getuid() or st.st_mode & 0o022:
+                    raise Refused("forms_dir_not_private")
+            elif st.st_uid not in (0, os.getuid()) or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+                raise Refused("forms_dir_unsafe_ancestor")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_at(dfd: int, name: str) -> bytes:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
     except OSError:
         raise Refused("form_unreadable") from None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES or st.st_uid != os.getuid():
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES or st.st_uid != os.getuid() or st.st_mode & 0o022:
             raise Refused("form_file_not_private_regular")
         return os.read(fd, MAX_FILE_BYTES + 1)
     finally:
         os.close(fd)
+
+
+def approval_bytes(rec: dict) -> bytes:
+    """The ONE canonical serialization of an approval record."""
+    return json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def render_form(rec: dict) -> bytes:
+    """Deterministic decision page for one approval record. read_decision()
+    accepts ONLY a stored page byte-identical to this rendering, so what was on
+    screen is exactly the record (including holder, request sha and window)."""
+    emb = approval_bytes(rec)
+    sha = hashlib.sha256(emb).hexdigest()
+    h = rec["expected_holder"]
+    rows = [("Owner", rec["owner_label"]), ("Project", rec["project"]), ("Holder pane", h["pane_id"]),
+            ("Holder birth", h["pane_birth"]), ("Holder session sha256", h["session_digest"]),
+            ("Request", f'{rec["request_id"]} / {rec["request_name"]}'), ("Request sha256", rec["request_sha256"]),
+            ("Manifest", ", ".join(rec["manifest"])), ("Grant id", rec["auth_id"]),
+            ("Lease", f'generation {rec["expected_generation"]}, ttl {rec["lease_ttl_s"]} s, max_open {rec["max_open"]}'),
+            ("Approval valid for", f'{rec["grant_window_s"]} s after you answer'), ("Approval record sha256", sha)]
+    esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    table = "".join(f"<tr><th>{esc(k)}</th><td><code>{esc(v)}</code></td></tr>" for k, v in rows)
+    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Approve ONE KB owner-dispatch pilot request</title></head><body>"
+            "<h1>Approve ONE read-only KB pilot request?</h1>"
+            "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
+            f"<table>{table}</table>"
+            f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
+            f'<button onclick="window.submitAnswers({{decision:\'approve\',approval_sha256:\'{sha}\'}})">Approve</button> '
+            "<button onclick=\"window.submitAnswers({decision:'decline'})\">Decline</button>"
+            "</body></html>").encode()
 
 
 def validate_approval(rec) -> dict:
@@ -127,11 +191,12 @@ def read_decision(form_id: str) -> dict:
     """The answered formserve record + served HTML -> the approved record and its provenance."""
     if not isinstance(form_id, str) or not FORM_ID.match(form_id):
         raise Refused("form_id_malformed")
-    d = forms_dir()
-    if os.path.realpath(d) != d:
-        raise Refused("forms_dir_not_canonical")
-    row_bytes = _read_nofollow(os.path.join(d, form_id + ".json"))
-    html = _read_nofollow(os.path.join(d, form_id + ".html"))
+    dfd = _safe_dir_fd(os.path.join(STATE_ROOT, "forms"))
+    try:
+        row_bytes = _read_at(dfd, form_id + ".json")
+        html = _read_at(dfd, form_id + ".html")
+    finally:
+        os.close(dfd)
     try:
         row = json.loads(row_bytes)
     except ValueError:
@@ -155,7 +220,10 @@ def read_decision(form_id: str) -> dict:
         rec = json.loads(embedded)
     except ValueError:
         raise Refused("approval_not_json") from None
-    return {"rec": validate_approval(rec), "approval_bytes": embedded, "approval_sha256": sha, "form_id": form_id,
+    rec = validate_approval(rec)
+    if approval_bytes(rec) != embedded or render_form(rec) != html:
+        raise Refused("form_html_not_canonical_rendering")
+    return {"rec": rec, "approval_bytes": embedded, "approval_sha256": sha, "form_id": form_id,
             "answered_at": at / 1000.0, "form_record_sha256": hashlib.sha256(row_bytes).hexdigest(),
             "form_html_sha256": hashlib.sha256(html).hexdigest()}
 
@@ -176,53 +244,110 @@ def same_identity(resolve, rec) -> None:
         raise Refused("identity_mismatch")
 
 
+GRANT_COLS = ("auth_id", "protocol", "owner_label", "project", "pane_id", "pane_birth", "session_digest", "lease_generation",
+              "request_id", "body_sha256", "manifest", "prompt_id", "approval_id", "status", "decided_at", "expires_at")
+ISSUANCE_COLS = ("auth_id", "approval_sha256", "approval_bytes", "form_id", "form_record_sha256", "form_html_sha256", "answered_at")
+
+
+def expected_rows(dec, exp: float) -> tuple[tuple, tuple]:
+    """The complete grant tuple and issuance tuple (minus issued_at) this approval produces."""
+    rec, h = dec["rec"], dec["rec"]["expected_holder"]
+    decided_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec["answered_at"]))
+    grant = (rec["auth_id"], oda.PROTOCOL, rec["owner_label"], rec["project"], h["pane_id"], h["pane_birth"], h["session_digest"],
+             1, rec["request_id"], rec["request_sha256"], oda.manifest_key(rec["manifest"]), dec["form_id"], dec["form_id"],
+             "granted", decided_iso, exp)
+    issuance = (rec["auth_id"], dec["approval_sha256"], dec["approval_bytes"], dec["form_id"], dec["form_record_sha256"],
+                dec["form_html_sha256"], dec["answered_at"])
+    return grant, issuance
+
+
 def insert_grant(store, dec, exp: float) -> None:
     """The only grant writer: fixed columns; grant row + immutable issuance
     record in ONE transaction; refuses any prior use of auth_id/approval_id."""
-    rec, h = dec["rec"], dec["rec"]["expected_holder"]
-    decided_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec["answered_at"]))
+    rec = dec["rec"]
+    grant, issuance = expected_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
         if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
                          (rec["auth_id"], dec["form_id"])).fetchone():
             raise Refused("approval_already_used")
-        store.execute(
-            "INSERT INTO owner_dispatch_auth(auth_id,protocol,owner_label,project,pane_id,pane_birth,session_digest,"
-            "lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,status,decided_at,expires_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'granted',?,?)",
-            (rec["auth_id"], oda.PROTOCOL, rec["owner_label"], rec["project"], h["pane_id"], h["pane_birth"],
-             h["session_digest"], 1, rec["request_id"], rec["request_sha256"], oda.manifest_key(rec["manifest"]),
-             dec["form_id"], dec["form_id"], decided_iso, exp))
-        store.execute(
-            "INSERT INTO owner_dispatch_issuance(auth_id,approval_sha256,approval_bytes,form_id,form_record_sha256,"
-            "form_html_sha256,answered_at,issued_at) VALUES (?,?,?,?,?,?,?,?)",
-            (rec["auth_id"], dec["approval_sha256"], dec["approval_bytes"], dec["form_id"], dec["form_record_sha256"],
-             dec["form_html_sha256"], dec["answered_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        store.execute(f"INSERT INTO owner_dispatch_auth({','.join(GRANT_COLS)}) VALUES ({','.join('?' * len(GRANT_COLS))})", grant)
+        store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
+                      (*issuance, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
         store.execute("COMMIT")
     finally:
         if store.in_transaction:
             store.execute("ROLLBACK")
 
 
-def grant_state(auth_db: str, dec) -> str:
-    """After an error: 'present' (grant + matching issuance found), 'absent', or 'unknown'."""
+def grant_state(auth_db: str, dec, exp: float) -> str:
+    """After an error: 'present' only when the COMPLETE expected grant tuple and
+    issuance tuple are both stored; 'absent' when neither the auth_id nor the
+    form id is used anywhere; otherwise 'unknown'."""
+    want_g, want_i = expected_rows(dec, exp)
     try:
         c = oda.open_store(auth_db)
         try:
-            g = c.execute("SELECT approval_id FROM owner_dispatch_auth WHERE auth_id=?", (dec["rec"]["auth_id"],)).fetchone()
-            i = c.execute("SELECT approval_sha256 FROM owner_dispatch_issuance WHERE auth_id=?", (dec["rec"]["auth_id"],)).fetchone()
+            g = c.execute(f"SELECT {','.join(GRANT_COLS)} FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
+                          (dec["rec"]["auth_id"], dec["form_id"])).fetchall()
+            i = c.execute(f"SELECT {','.join(ISSUANCE_COLS)} FROM owner_dispatch_issuance WHERE auth_id=? OR form_id=?",
+                          (dec["rec"]["auth_id"], dec["form_id"])).fetchall()
         finally:
             c.close()
     except Exception:  # noqa: BLE001
         return "unknown"
-    if g is None and i is None:
+    if not g and not i:
         return "absent"
-    if g and i and g[0] == dec["form_id"] and i[0] == dec["approval_sha256"]:
+    if [tuple(r) for r in g] == [want_g] and [tuple(r) for r in i] == [want_i]:
         return "present"
     return "unknown"
 
 
+def build_main(argv, resolve=None) -> int:
+    """OFFLINE: write the deterministic decision page for ONE request, binding the
+    holder identity resolved fresh from the registry NOW and the request bytes'
+    sha256. Serves nothing and records nothing."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
+    for a in ("--label", "--project", "--request-dir", "--request-name", "--request-id", "--auth-id", "--out"):
+        ap.add_argument(a, required=True)
+    ap.add_argument("--manifest", action="append", required=True)
+    ap.add_argument("--lease-ttl-s", type=int, default=1800)
+    ap.add_argument("--grant-window-s", type=int, default=1800)
+    a = ap.parse_args(argv)
+    if resolve is None:
+        import publisher  # noqa: E402
+        resolve = publisher.registry_resolver
+    ident = resolve(a.label)
+    if not ident:
+        print("refused:identity_unresolved")
+        return 2
+    try:
+        data = oda.read_request_once(a.request_dir, a.request_name)
+    except (ValueError, OSError):
+        print("refused:request_unreadable")
+        return 2
+    rec = {"protocol": PROTOCOL, "owner_label": a.label, "project": a.project, "max_open": 1,
+           "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
+           "expected_generation": 1, "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id, "request_name": a.request_name,
+           "request_sha256": oda.body_sha256(data), "manifest": a.manifest, "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
+    try:
+        validate_approval(rec)
+    except Refused as exc:
+        print(f"refused:{exc}")
+        return 2
+    os.umask(0o077)
+    html = render_form(rec)
+    fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(html)
+    print(f"built:{a.out}:html_sha256={hashlib.sha256(html).hexdigest()}:approval_sha256={hashlib.sha256(approval_bytes(rec)).hexdigest()}")
+    return 0
+
+
 def main(argv=None, resolve=None, now=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["build-form"]:
+        return build_main(argv[1:], resolve=resolve)
     ap = argparse.ArgumentParser()
     ap.add_argument("--form-id", required=True)
     ap.add_argument("--request-dir", required=True)
@@ -296,7 +421,7 @@ def main(argv=None, resolve=None, now=None) -> int:
             insert_grant(store, dec, exp)
         except BaseException as exc:  # noqa: BLE001  after the claim: classify by what the store says
             reason = str(exc) if isinstance(exc, Refused) else f"error_{type(exc).__name__}"
-            st = grant_state(auth_db, dec)
+            st = grant_state(auth_db, dec, exp)
             if st == "present":
                 print(f"issued:{rec['auth_id']}:gen1 (after {reason}; verified in store)")
                 return 0

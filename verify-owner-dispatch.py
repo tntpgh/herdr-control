@@ -955,9 +955,9 @@ def issue_cases(base: Path) -> None:
                "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"], "auth_id": f"auth-{n[0]}",
                "grant_window_s": 1800}
         rec.update(over or {})
-        emb = json.dumps(rec, sort_keys=True, indent=1).encode()
+        emb = odi.approval_bytes(rec)
         fid = f"20261022T1200{n[0] % 100:02d}-86{n[0] % 100:02d}"
-        html = b"<html><body><h1>KB pilot</h1><script type=\"application/json\" id=\"owner-dispatch-approval\">" + emb + b"</script>" + html_extra + b"</body></html>"
+        html = odi.render_form(rec) + html_extra
         ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
         row = {"id": fid, "status": status, "answers": ans, "answered_at": int((now - 60) * 1000) if answered_at is None else answered_at}
         (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
@@ -965,12 +965,13 @@ def issue_cases(base: Path) -> None:
         return fid, rec, hashlib.sha256(emb).hexdigest()
 
     KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
-                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB", "HERDR_STATE_ROOT")
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+    real_root = odi.STATE_ROOT
 
     def run(d, lease_db, adb, rq, fid, resolve=reg_ok, flags=True, t=None):
         E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
              "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
-        E["HERDR_STATE_ROOT"] = str(d / "state")
+        odi.STATE_ROOT = os.path.realpath(d / "state")   # the pinned root, rebound for the test only
         saved = {k: os.environ.get(k) for k in KEYS_ENV}
         for k in saved: os.environ.pop(k, None)
         os.environ.update(E)
@@ -979,6 +980,7 @@ def issue_cases(base: Path) -> None:
             with contextlib.redirect_stdout(buf):
                 rc = odi.main(["--form-id", fid, "--request-dir", str(rq)], resolve=resolve, now=now if t is None else t)
         finally:
+            odi.STATE_ROOT = real_root
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         return rc, buf.getvalue().strip()
@@ -1060,6 +1062,61 @@ def issue_cases(base: Path) -> None:
     case("ISSUE: path-like form id and a symlinked record are refused",
          run(d, ldb, adb, rq, "../x")[0] == 2 and run(d, ldb, adb, rq, fid) == (2, "refused:form_unreadable") and lease_rows(lc) == 0)
     lc.close()
+    # pinned root: HERDR_STATE_ROOT pointing at another valid answered form is ignored
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    other_root = d / "other"; (other_root / "forms").mkdir(parents=True)
+    for ext in (".json", ".html"):
+        (other_root / "forms" / f"{fid}{ext}").write_bytes((d / "state" / "forms" / f"{fid}{ext}").read_bytes())
+        (d / "state" / "forms" / f"{fid}{ext}").unlink()
+    os.environ["HERDR_STATE_ROOT"] = str(other_root)
+    try:
+        got = run(d, ldb, adb, rq, fid)
+    finally:
+        os.environ.pop("HERDR_STATE_ROOT", None)
+    case("ISSUE: the forms root is pinned; HERDR_STATE_ROOT at another answered form is ignored", got == (2, "refused:form_unreadable") and lease_rows(lc) == 0)
+    lc.close()
+    import shutil
+    def symlink_forms(d):
+        real = d / "state" / "real"; real.mkdir()
+        for f in (d / "state" / "forms").iterdir():
+            (real / f.name).write_bytes(f.read_bytes())
+        shutil.rmtree(d / "state" / "forms"); (d / "state" / "forms").symlink_to(real)
+    for name, mutate, want in [
+        ("symlinked forms dir", symlink_forms, "refused:forms_dir_unsafe_path"),
+        ("group-writable forms dir", lambda d: os.chmod(d / "state" / "forms", 0o775), "refused:forms_dir_not_private"),
+        ("world-writable ancestor", lambda d: os.chmod(d / "state", 0o777), "refused:forms_dir_unsafe_ancestor"),
+        ("group-writable record file", lambda d: [os.chmod(f, 0o664) for f in (d / "state" / "forms").glob("*.json")], "refused:form_file_not_private_regular"),
+        ("served page differs from the canonical rendering",
+         lambda d: [f.write_bytes(f.read_bytes().replace(b"Approve ONE", b"Approve one")) for f in (d / "state" / "forms").glob("*.html")],
+         "refused:form_html_not_canonical_rendering"),
+    ]:
+        d, lc, ldb, adb, rq, roots, proj = setup()
+        fid, rec, asha = decision(d, proj)
+        mutate(d)
+        got = run(d, ldb, adb, rq, fid)
+        case(f"ISSUE refused before any write: {name}", got == (2, want) and lease_rows(lc) == 0
+             and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+        lc.close()
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    out = d / "built.html"
+    with contextlib.redirect_stdout(io.StringIO()):
+        rcb = odi.main(["build-form", "--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                        "--request-id", "kbpilot-b", "--auth-id", "auth-b", "--manifest", "result.md", "--out", str(out)], resolve=reg_ok)
+    emb = odi.EMBED.findall(out.read_bytes())[0]
+    brec = json.loads(emb)
+    fidb = "20261022T120099-8699"
+    (d / "state" / "forms" / f"{fidb}.html").write_bytes(out.read_bytes())
+    (d / "state" / "forms" / f"{fidb}.json").write_text(json.dumps({"id": fidb, "status": "answered", "answered_at": int((now - 60) * 1000),
+        "answers": {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()}}))
+    case("BUILD-FORM: offline page binds fresh registry holder + request sha (0600), and the issuer accepts exactly it",
+         rcb == 0 and (out.stat().st_mode & 0o777) == 0o600 and brec["expected_holder"] == HOLD
+         and brec["request_sha256"] == hashlib.sha256(body).hexdigest() and run(d, ldb, adb, rq, fidb) == (0, "issued:auth-b:gen1"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        rcn = odi.main(["build-form", "--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                        "--request-id", "x", "--auth-id", "y", "--manifest", "result.md", "--out", str(d / "n.html")], resolve=lambda l: None)
+    case("BUILD-FORM: unresolved registry identity -> refused, no page", rcn == 2 and not (d / "n.html").exists())
+    lc.close()
     # unexpected error BEFORE the claim -> refused, nothing written
     d, lc, ldb, adb, rq, roots, proj = setup()
     fid, rec, asha = decision(d, proj)
@@ -1115,13 +1172,26 @@ def issue_cases(base: Path) -> None:
          got[0] == 0 and got[1].startswith(f"issued:{rec['auth_id']}:gen1 (after error_OperationalError")
          and q(adb, "SELECT COUNT(*) FROM owner_dispatch_issuance") == [(1,)])
     lc.close()
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    def insert_wrong_then_fail(store, dec, exp):
+        real_insert(store, dec, exp + 1)
+        raise sqlite3.OperationalError("disk I/O error after commit")
+    odi.insert_grant = insert_wrong_then_fail
+    try:
+        got = run(d, ldb, adb, rq, fid)
+    finally:
+        odi.insert_grant = real_insert
+    case("ISSUE: a stored grant that differs from the complete expected tuple -> issue_uncertain store_unknown, never issued",
+         got == (6, "issue_uncertain:error_OperationalError:store_unknown"))
+    lc.close()
     # error where the store cannot be read back -> issue_uncertain store_unknown
     d, lc, ldb, adb, rq, roots, proj = setup()
     fid, rec, asha = decision(d, proj)
     real_gs = odi.grant_state
     def fail_insert(store, dec, exp):
         raise sqlite3.OperationalError("database is locked")
-    odi.insert_grant, odi.grant_state = fail_insert, (lambda db, dec: "unknown")
+    odi.insert_grant, odi.grant_state = fail_insert, (lambda db, dec, exp: "unknown")
     try:
         got = run(d, ldb, adb, rq, fid)
     finally:
