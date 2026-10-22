@@ -162,15 +162,60 @@ def main() -> int:
          and files(J / KB / "r_err") == ["intent.json", "uncertain.json"] and av.state("r_err")[0] == "unverified_held")
     case("send returns non-True: ambiguous", mk(Sender("yes")).dispatch(
         KB, "r_truthy", b"REQ\n", ["result.md"], T0) == "ambiguous")
-    crash = J / KB / "r_crash"
-    crash.mkdir()
-    (crash / "intent.json").write_text("{}\n")
+    # --- (A) crash fixtures through the REAL gate: a BaseException escapes dispatch
+    # exactly where a process kill would, leaving intent.json with no outcome ---
+    class Crash(BaseException):
+        pass
+
+    def crash_sender(label, holder, text):
+        raise Crash()  # killed mid-send: may or may not have been typed
+
+    try:
+        mk(crash_sender).dispatch(KB, "r_crash_post", b"REQ\n", ["result.md"], T0)
+    except Crash:
+        pass
+
+    class CrashBeforeNotice:
+        def __init__(self, gate):
+            self.g = gate
+
+        def __getattr__(self, n):
+            return getattr(self.g, n)
+
+        def begin_notice(self, *a, **k):
+            raise Crash()  # killed after admit + journal, before anything could be typed
     s2 = Sender()
+    try:
+        od.Dispatcher(CrashBeforeNotice(G["gate"]), av, s2, REG.get, lambda: T0).dispatch(
+            KB, "r_crash_pre", b"REQ\n", ["result.md"], T0)
+    except Crash:
+        pass
+    case("CRASH fixtures: both left intent.json and no outcome; gate delivering vs queued",
+         files(J / KB / "r_crash_post") == ["intent.json"] and files(J / KB / "r_crash_pre") == ["intent.json"]
+         and G["gate"].state("r_crash_post") == "delivering" and G["gate"].state("r_crash_pre") == "queued")
     out = mk(s2).recover(T0)
-    case("CRASH (intent, no outcome): recover marks uncertain, no resend, no registration",
-         out == {f"{KB}/r_crash": "ambiguous"} and files(crash) == ["intent.json", "uncertain.json"]
-         and not s2.calls and av.state("r_crash")[0] == "unverified_held")
-    case("recover is idempotent and never rewrites an outcome", mk(s2).recover(T0 + 1) == {})
+    case("RECOVER post-send crash: ambiguous (uncertain.json), gate untouched, never resent or registered",
+         out[f"{KB}/r_crash_post"] == "ambiguous" and files(J / KB / "r_crash_post") == ["intent.json", "uncertain.json"]
+         and G["gate"].state("r_crash_post") == "delivering" and not s2.calls and av.state("r_crash_post")[0] == "unverified_held")
+    case("RECOVER pre-send crash: gate settled queued->blocked, refused.json, never sent",
+         out[f"{KB}/r_crash_pre"] == "refused_recovered" and files(J / KB / "r_crash_pre") == ["intent.json", "refused.json"]
+         and G["gate"].record("r_crash_pre")[2:] == ("blocked", "crash_recovered_pre_send") and not s2.calls)
+    case("RECOVER pre-send crash: the blocked request is never re-admitted (no resend grant)",
+         mk(s2).dispatch(KB, "r_crash_pre", b"REQ\n", ["result.md"], T0).startswith("held:not_dispatched:owner_lease_duplicate")
+         and not s2.calls)
+    case("RECOVER reconciles every durable outcome: refused / ambiguous entries report as such",
+         out[f"{KB}/r_pre"] == "refused" and out[f"{KB}/r_err"] == "ambiguous" and out[f"{KB}/r_kb1"] == "dispatched")
+    again = mk(s2).recover(T0 + 1)
+    case("recover is idempotent: no outcome rewritten, crash entries now steady-state",
+         again[f"{KB}/r_crash_post"] == "ambiguous" and again[f"{KB}/r_crash_pre"] == "refused"
+         and files(J / KB / "r_crash_post") == ["intent.json", "uncertain.json"] and not s2.calls)
+    G["gate"].conn.execute("UPDATE owner_requests SET state='replied' WHERE request_id='r_pre'")
+    G["gate"].conn.execute("DELETE FROM owner_requests WHERE request_id='r_err'")
+    out = mk(s2).recover(T0 + 2)
+    case("RECOVER surfaces journal/gate MISMATCH and UNRECORDED explicitly, writes nothing",
+         out[f"{KB}/r_pre"] == "mismatch:refused:replied" and out[f"{KB}/r_err"] == "unrecorded:uncertain.json"
+         and files(J / KB / "r_err") == ["intent.json", "uncertain.json"] and not s2.calls)
+    G["gate"].conn.execute("UPDATE owner_requests SET state='blocked' WHERE request_id='r_pre'")
 
     # --- fence moved between preflight and send ---
     calls = {"n": 0}
@@ -220,14 +265,14 @@ def main() -> int:
     case("dispatch r_rec", mk(s5).dispatch(KB, "r_rec", b"REQ rec\n", ["result.md"], T0) == "dispatched")
     av.conn.execute("DELETE FROM ra_requests WHERE rid='r_rec'")  # crash between settled.json and register
     case("RECOVER: settled-but-unregistered is registered exactly once, no resend",
-         mk(s5).recover(T0) == {f"{KB}/r_rec": "dispatched"} and av.state("r_rec")[0] == "pending"
-         and len(s5.calls) == 1 and mk(s5).recover(T0 + 1) == {})
+         mk(s5).recover(T0)[f"{KB}/r_rec"] == "registered" and av.state("r_rec")[0] == "pending"
+         and len(s5.calls) == 1 and mk(s5).recover(T0 + 1)[f"{KB}/r_rec"] == "dispatched")
     av.conn.execute("DELETE FROM ra_requests WHERE rid='r_rec'")
     sp = J / KB / "r_rec" / "settled.json"
     raw = json.loads(sp.read_text()); raw["generation"] = 99
     sp.unlink(); sp.write_text(json.dumps(raw))
     case("RECOVER: a settled.json not matching its intent is never registered",
-         mk(s5).recover(T0) == {f"{KB}/r_rec": "dispatched:unregistered"} and av.state("r_rec")[0] == "unverified_held"
+         mk(s5).recover(T0)[f"{KB}/r_rec"] == "dispatched:unregistered" and av.state("r_rec")[0] == "unverified_held"
          and len(s5.calls) == 1)
 
     # --- availability bound to the settled dispatch; lease change after dispatch ---

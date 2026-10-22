@@ -175,6 +175,12 @@ class DeliveryGate:
         except ol.FencedOut:
             return "stale"
 
+    def record(self, exchange_id: str):
+        """(label, generation, state, detail) of the owner request, or None. Read-only."""
+        row = self.conn.execute("SELECT label, generation, state, detail FROM owner_requests WHERE request_id=?",
+                                (exchange_id,)).fetchone()
+        return tuple(row) if row else None
+
     def state(self, exchange_id: str) -> str | None:
         row = self.conn.execute("SELECT state FROM owner_requests WHERE request_id=?", (exchange_id,)).fetchone()
         return row[0] if row else None

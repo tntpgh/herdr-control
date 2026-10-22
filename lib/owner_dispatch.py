@@ -45,6 +45,8 @@ import result_availability as ra
 
 Send = Callable[[str, tuple, bytes], bool]  # (label, holder tuple, request bytes) -> delivered?
 OUTCOMES = ("refused.json", "settled.json", "uncertain.json")
+POST_SEND_DETAIL = "send_not_confirmed"   # gate detail that marks a send that may have happened
+SETTLED_GATE_STATES = ("delivering", "replied", "evidence")
 RID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,100}$")
 
 
@@ -157,14 +159,19 @@ class Dispatcher:
         finally:
             os.close(lfd)
         try:
+            # The gate identity is part of the intent: recovery reconciles the
+            # journal against exactly this owner_requests row.
             _write_excl(jfd, "intent.json", _record(rid=rid, label=label, request_digest=digest, pane_id=pane,
                                                      pane_birth=birth, session_id=sess, generation=gen,
-                                                     manifest=sorted(manifest), at=now))
+                                                     manifest=sorted(manifest), gate_request_id=rid,
+                                                     gate_generation=adm.generation, gate_state="queued", at=now))
 
             def refuse(reason, t):
-                _write_excl(jfd, "refused.json", _record(reason=reason, at=t))
-                self.gate.settle(label, pane, birth, gen, rid, "blocked", reason, t)
-                raise NotDispatched(reason)
+                # PRE-SEND only. Settle the gate FIRST, then make the journal
+                # outcome durable with what the gate actually recorded.
+                st = self.gate.settle(label, pane, birth, gen, rid, "blocked", reason, t)
+                _write_excl(jfd, "refused.json", _record(reason=reason, gate_state=st, at=t))
+                raise NotDispatched(reason if st == "blocked" else f"{reason}:gate_{st}")
 
             rfd = ra._open_dir(root)
             try:
@@ -190,9 +197,11 @@ class Dispatcher:
                 ok = False
             t = self.clock()
             if not ok:
-                _write_excl(jfd, "uncertain.json", _record(reason="send_not_confirmed", at=t))
-                self.gate.settle(label, pane, birth, gen, rid, "failed", "send_not_confirmed", t)
-                return "ambiguous"
+                # POST-SEND: may have been typed. Terminal and non-retryable in
+                # the gate (blocked, not retry:approval) and in the journal.
+                st = self.gate.settle(label, pane, birth, gen, rid, "failed", POST_SEND_DETAIL, t)
+                _write_excl(jfd, "uncertain.json", _record(reason=POST_SEND_DETAIL, gate_state=st, at=t))
+                return "ambiguous" if st == "blocked" else f"ambiguous:gate_{st}"
             self.gate.settle(label, pane, birth, gen, rid, "delivered", "", t)
             _write_excl(jfd, ra.SETTLED_FILE, ra.settled_record(rid, digest, label, pane, birth, sess, gen, manifest))
         finally:
@@ -218,8 +227,16 @@ class Dispatcher:
         return "dispatched"
 
     def recover(self, now: float | None = None) -> dict[str, str]:
-        """Intent with no outcome -> uncertain (crashed around the send).
-        settled.json present -> idempotently registered. Never resends."""
+        """Reconcile EVERY journal entry with its owner_requests row. Never
+        resends, never grants a resend. Status per <label>/<rid>:
+          dispatched                             settled.json, already registered
+          registered / dispatched:unregistered   settled.json registered now / refused (intent mismatch)
+          refused                                durable pre-send refusal, gate blocked
+          refused_recovered[:gate_*]             crashed pre-send: gate settled now (queued
+                                                 -> blocked) and refused.json written
+          ambiguous                              post-send uncertainty (never retried)
+          mismatch:<outcome>:<gate state>        journal and gate disagree: surfaced, untouched
+          unrecorded:<outcome>                   gate has no row for a durable outcome"""
         now = self.clock() if now is None else now
         out: dict[str, str] = {}
         jroot = ra._open_dir(self.avail.journal_root)
@@ -238,15 +255,8 @@ class Dispatcher:
                         except OSError:
                             continue
                         try:
-                            if not _exists(jfd, "intent.json"):
-                                continue
-                            if _exists(jfd, ra.SETTLED_FILE):
-                                if self.avail.conn.execute("SELECT 1 FROM ra_requests WHERE rid=?", (rid,)).fetchone():
-                                    continue
-                                out[f"{label}/{rid}"] = self._register(label, rid, now)
-                            elif not any(_exists(jfd, o) for o in OUTCOMES):
-                                _write_excl(jfd, "uncertain.json", _record(reason="crash_recovered", at=now))
-                                out[f"{label}/{rid}"] = "ambiguous"
+                            if _exists(jfd, "intent.json"):
+                                out[f"{label}/{rid}"] = self._reconcile(jfd, label, rid, now)
                         finally:
                             os.close(jfd)
                 finally:
@@ -255,6 +265,34 @@ class Dispatcher:
             os.close(jroot)
         return out
 
+    def _reconcile(self, jfd, label, rid, now) -> str:
+        rec = self.gate.record(rid)
+        gstate, gdetail = (rec[2], rec[3]) if rec and rec[0] == label else (None, None)
+        post_send = gstate == "delivering" or (gstate == "blocked" and gdetail == POST_SEND_DETAIL)
+        outcome = next((o for o in OUTCOMES if _exists(jfd, o)), None)
+        if outcome is None:  # crashed between intent and a durable outcome
+            if gstate is None or gstate == "queued" or (gstate == "blocked" and not post_send):
+                st = gstate or "unrecorded"
+                if gstate == "queued":
+                    intent = json.loads(_read_small(Path(self.avail.journal_root) / label / rid, "intent.json"))
+                    st = self.gate.settle(label, intent["pane_id"], intent["pane_birth"], intent["generation"], rid,
+                                          "blocked", "crash_recovered_pre_send", now)
+                _write_excl(jfd, "refused.json", _record(reason="crash_recovered_pre_send", gate_state=st, at=now))
+                return "refused_recovered" if st == "blocked" else f"refused_recovered:gate_{st}"
+            _write_excl(jfd, "uncertain.json", _record(reason="crash_recovered_post_send", gate_state=gstate, at=now))
+            return "ambiguous"
+        if gstate is None:
+            return f"unrecorded:{outcome}"
+        if outcome == ra.SETTLED_FILE:
+            if gstate not in SETTLED_GATE_STATES:
+                return f"mismatch:settled:{gstate}"
+            if self.avail.conn.execute("SELECT 1 FROM ra_requests WHERE rid=?", (rid,)).fetchone():
+                return "dispatched"
+            r = self._register(label, rid, now)
+            return "registered" if r == "dispatched" else r
+        if outcome == "refused.json":
+            return "refused" if gstate == "blocked" and not post_send else f"mismatch:refused:{gstate}"
+        return "ambiguous" if post_send else f"mismatch:uncertain:{gstate}"
 
 def _read_small(d: Path, name: str) -> bytes:
     """Bytes of a regular file directly in d, opened without following any symlink."""
