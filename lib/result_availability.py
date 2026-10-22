@@ -235,42 +235,59 @@ class Availability:
     def stages(self, rid) -> dict[str, str]:
         return dict(self.conn.execute("SELECT stage, evidence FROM ra_stages WHERE rid=?", (rid,)).fetchall())
 
-    def _stage(self, rid, stage, evidence, now):
+    def _stage(self, rid, stage, evidence, now) -> bool:
+        """Write-once. A repeat is accepted only with byte-identical evidence;
+        conflicting evidence raises Refused. Any other DB error propagates."""
         try:
             self.conn.execute("INSERT INTO ra_stages VALUES (?,?,?,?)", (rid, stage, now, evidence))
+            return True
         except sqlite3.IntegrityError:
-            pass  # already recorded: stages are write-once
+            prior = self.conn.execute("SELECT evidence FROM ra_stages WHERE rid=? AND stage=?", (rid, stage)).fetchone()
+            if prior is None:
+                raise
+            if prior[0] != evidence:
+                raise Refused(f"{rid}: {stage} already recorded with different evidence") from None
+            return True
 
     def record_reply_authenticated(self, rid: str, auth_ref: str, now: float | None = None) -> bool:
         """auth_ref names the AUTHENTICATED channel record (e.g. a verified
         inbox exchange id) checked by the caller. Never derived from the result."""
         if not auth_ref or "observed" not in self.stages(rid):
             return False
-        self._stage(rid, "reply_authenticated", auth_ref, time.time() if now is None else now)
-        return True
+        return self._stage(rid, "reply_authenticated", auth_ref, time.time() if now is None else now)
 
     def verify_pinned(self, rid: str, pins: dict[str, str], now: float | None = None) -> bool:
         """pins: {manifest name: sha256} supplied by the CALLER (the request's own
-        expectations), covering the manifest exactly. Re-reads the files now."""
-        row = self.conn.execute("SELECT request_dir, manifest, state FROM ra_requests WHERE rid=?", (rid,)).fetchone()
-        if not row or row[2].startswith("held:") or "observed" not in self.stages(rid):
+        expectations), covering the manifest exactly. Bound to ONE durable
+        occurrence: the request must be `notified`, its observed and noticed
+        stages must name the same snapshot, the files re-read now must still be
+        that snapshot, and every pin must match it."""
+        row = self.conn.execute("SELECT request_dir, manifest, state, observed FROM ra_requests WHERE rid=?",
+                                (rid,)).fetchone()
+        if not row or row[2] != "notified":
+            return False
+        st = self.stages(rid)
+        occ = st.get("observed")
+        if not occ or st.get("noticed") != occ or row[3] != occ:
             return False
         manifest = json.loads(row[1])
         if sorted(pins) != manifest or not all(re.fullmatch(r"[0-9a-f]{64}", v or "") for v in pins.values()):
+            return False
+        if self._snapshot(Path(row[0]), manifest) != occ:
             return False
         for name in manifest:
             got = self._read(Path(row[0]), name)
             if got is None or got[0] != pins[name]:
                 return False
-        self._stage(rid, "verified", _sha(json.dumps(pins, sort_keys=True).encode()), time.time() if now is None else now)
-        return True
+        evidence = json.dumps({"occurrence": occ, "pins": _sha(json.dumps(pins, sort_keys=True).encode())},
+                              sort_keys=True)
+        return self._stage(rid, "verified", evidence, time.time() if now is None else now)
 
     def accept(self, rid: str, by: str, now: float | None = None) -> bool:
         st = self.stages(rid)
         if not by or "verified" not in st or "reply_authenticated" not in st:
             return False
-        self._stage(rid, "accepted", by, time.time() if now is None else now)
-        return True
+        return self._stage(rid, "accepted", by, time.time() if now is None else now)
 
     # --- observation ---
     @staticmethod

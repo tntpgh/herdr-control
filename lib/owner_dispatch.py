@@ -33,6 +33,7 @@ import os
 import re
 import stat
 import time
+from pathlib import Path
 from typing import Callable
 
 import owner_lease as ol
@@ -87,13 +88,34 @@ def _record(**fields) -> bytes:
     return (json.dumps(fields, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+Resolve = Callable[[str], "tuple[str, str, str] | None"]  # label -> registry (pane_id, pane_birth, session_digest)
+
+
 class Dispatcher:
-    def __init__(self, lease_conn, avail: ra.Availability, send: Send):
-        self.lease_conn, self.avail, self.send = lease_conn, avail, send
+    """gate: the publisher's lib/owner_lease_delivery.DeliveryGate (its queue,
+    max_open, approval/retry fences and lease-remaining margin are the ONLY
+    admission path). resolve: a read-only lookup of the EXISTING owner
+    registry. clock: read fresh immediately before the send."""
+
+    def __init__(self, gate, avail: ra.Availability, send: Send, resolve: Resolve,
+                 clock: Callable[[], float] = time.time):
+        self.gate, self.avail, self.send, self.resolve, self.clock = gate, avail, send, resolve, clock
+
+    def _bound(self, label, now):
+        """The lease holder, only when the registry names exactly that
+        (pane, birth, session); else None."""
+        holder = ol.holder_tuple(self.gate.conn, label, now)
+        try:
+            reg = self.resolve(label)
+        except Exception:
+            reg = None
+        if holder is None or reg is None or tuple(reg) != holder[:3]:
+            return None
+        return holder
 
     def dispatch(self, label: str, rid: str, request_text: bytes, manifest: list[str],
                  now: float | None = None) -> str:
-        now = time.time() if now is None else now
+        now = self.clock() if now is None else now
         try:
             return self._dispatch(label, rid, request_text, manifest, now)
         except NotDispatched as exc:
@@ -105,16 +127,18 @@ class Dispatcher:
             raise NotDispatched("label_has_no_root")
         if not RID_RE.match(rid) or not isinstance(request_text, bytes) or not request_text:
             raise NotDispatched("bad_request")
-        holder = ol.holder_tuple(self.lease_conn, label, now)
-        if holder is None:
-            raise NotDispatched("no_live_session_lease")
-        pane, birth, sess, gen = holder
-        digest = hashlib.sha256(request_text).hexdigest()
-        # the same manifest rule register() applies, checked before anything is written
         if not isinstance(manifest, list) or not manifest or len(manifest) > ra.MAX_MANIFEST \
                 or len(set(manifest)) != len(manifest) or ra.REQUEST_FILE in manifest \
                 or not all(isinstance(n, str) and ra.NAME_RE.match(n) for n in manifest):
             raise NotDispatched("bad_manifest")
+        holder = self._bound(label, now)
+        if holder is None:
+            raise NotDispatched("registry_lease_mismatch")
+        pane, birth, sess, gen = holder
+        adm = self.gate.admit(label, pane, birth, rid, now)
+        if not adm.ok or adm.generation != gen:
+            raise NotDispatched(adm.reason or "admit_generation_changed")
+        digest = hashlib.sha256(request_text).hexdigest()
 
         jroot = ra._open_dir(self.avail.journal_root)
         try:
@@ -132,47 +156,73 @@ class Dispatcher:
             _write_excl(jfd, "intent.json", _record(rid=rid, label=label, request_digest=digest, pane_id=pane,
                                                      pane_birth=birth, session_id=sess, generation=gen,
                                                      manifest=sorted(manifest), at=now))
+
+            def refuse(reason, t):
+                _write_excl(jfd, "refused.json", _record(reason=reason, at=t))
+                self.gate.settle(label, pane, birth, gen, rid, "blocked", reason, t)
+                raise NotDispatched(reason)
+
             rfd = ra._open_dir(root)
             try:
                 try:
                     hfd = _mkdir_at(rfd, rid, exclusive=True)
                 except FileExistsError:
-                    _write_excl(jfd, "refused.json", _record(reason="handoff_dir_exists", at=now))
-                    raise NotDispatched("handoff_dir_exists") from None
+                    refuse("handoff_dir_exists", now)
             finally:
                 os.close(rfd)
             try:
                 _write_excl(hfd, ra.REQUEST_FILE, request_text)
             finally:
                 os.close(hfd)
-            if ol.holder_tuple(self.lease_conn, label, now) != holder:  # fence, immediately before the send
-                _write_excl(jfd, "refused.json", _record(reason="fenced_before_send", at=now))
-                raise NotDispatched("fenced_before_send")
+            t = self.clock()  # fresh: the journal/file writes took real time
+            if self._bound(label, t) != holder:
+                refuse("fenced_before_send", t)
+            began = self.gate.begin_notice(label, pane, birth, gen, rid, t)  # enforces MIN_LEASE_REMAINING_S
+            if began != "delivering":
+                refuse(began, t)
             try:
                 ok = self.send(label, holder, request_text) is True
             except Exception:
                 ok = False
+            t = self.clock()
             if not ok:
-                _write_excl(jfd, "uncertain.json", _record(reason="send_not_confirmed", at=now))
+                _write_excl(jfd, "uncertain.json", _record(reason="send_not_confirmed", at=t))
+                self.gate.settle(label, pane, birth, gen, rid, "failed", "send_not_confirmed", t)
                 return "ambiguous"
+            self.gate.settle(label, pane, birth, gen, rid, "delivered", "", t)
             _write_excl(jfd, ra.SETTLED_FILE, ra.settled_record(rid, digest, label, pane, birth, sess, gen, manifest))
         finally:
             os.close(jfd)
+        return self._register(label, rid, now)
+
+    def _register(self, label, rid, now) -> str:
+        """Bind availability to the exact durable settled.json + intent; idempotent."""
+        d = Path(self.avail.journal_root) / label / rid
         try:
-            self.avail.register(rid, os.path.join(root, rid), request_text, label, pane, birth, sess, gen,
-                                manifest, now)
-        except ra.Refused:
-            return "dispatched:unregistered"  # settled, but the handoff changed before binding: never tracked
+            intent = json.loads(_read_small(d, "intent.json"))
+            settled = _read_small(d, ra.SETTLED_FILE)
+            want = ra.settled_record(rid, intent["request_digest"], label, intent["pane_id"], intent["pane_birth"],
+                                     intent["session_id"], intent["generation"], intent["manifest"])
+            if intent.get("rid") != rid or intent.get("label") != label or settled != want:
+                return "dispatched:unregistered"
+            root = self.avail.roots[label]
+            text = _read_small(Path(root) / rid, ra.REQUEST_FILE)
+            self.avail.register(rid, os.path.join(root, rid), text, label, intent["pane_id"], intent["pane_birth"],
+                                intent["session_id"], intent["generation"], intent["manifest"], now)
+        except (OSError, ValueError, KeyError, TypeError):
+            return "dispatched:unregistered"  # settled, but not exactly bindable: never tracked
         return "dispatched"
 
     def recover(self, now: float | None = None) -> dict[str, str]:
-        """An intent with no outcome crashed somewhere around the send: mark it
-        uncertain. Never resends, never registers."""
-        now = time.time() if now is None else now
+        """Intent with no outcome -> uncertain (crashed around the send).
+        settled.json present -> idempotently registered. Never resends."""
+        now = self.clock() if now is None else now
         out: dict[str, str] = {}
         jroot = ra._open_dir(self.avail.journal_root)
         try:
             for label in sorted(os.listdir(jroot)):
+                if label not in self.avail.roots:
+                    continue
                 try:
                     lfd = os.open(label, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=jroot)
                 except OSError:
@@ -184,7 +234,13 @@ class Dispatcher:
                         except OSError:
                             continue
                         try:
-                            if _exists(jfd, "intent.json") and not any(_exists(jfd, o) for o in OUTCOMES):
+                            if not _exists(jfd, "intent.json"):
+                                continue
+                            if _exists(jfd, ra.SETTLED_FILE):
+                                if self.avail.conn.execute("SELECT 1 FROM ra_requests WHERE rid=?", (rid,)).fetchone():
+                                    continue
+                                out[f"{label}/{rid}"] = self._register(label, rid, now)
+                            elif not any(_exists(jfd, o) for o in OUTCOMES):
                                 _write_excl(jfd, "uncertain.json", _record(reason="crash_recovered", at=now))
                                 out[f"{label}/{rid}"] = "ambiguous"
                         finally:
@@ -194,3 +250,19 @@ class Dispatcher:
         finally:
             os.close(jroot)
         return out
+
+
+def _read_small(d: Path, name: str) -> bytes:
+    """Bytes of a regular file directly in d, opened without following any symlink."""
+    dfd = ra._open_dir(str(d))
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > ra.MAX_FILE_BYTES:
+            raise ValueError("not a small regular file")
+        return os.read(fd, st.st_size + 1)
+    finally:
+        os.close(fd)

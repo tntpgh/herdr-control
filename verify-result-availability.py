@@ -228,14 +228,30 @@ def main() -> int:
          not a.verify_pinned("kbreq_stage", {"result.md": "0" * 64}, T0) and "verified" not in a.stages("kbreq_stage"))
     case("verify with pins not covering the manifest exactly: refused",
          not a.verify_pinned("kbreq_stage", {**pin, "extra.md": "0" * 64}, T0))
-    case("verify with the caller's correct pins: verified", a.verify_pinned("kbreq_stage", pin, T0))
-    case("verified alone does not allow accept (no authenticated reply)", not a.accept("kbreq_stage", "conductor", T0))
+    case("verify before the occurrence was noticed: refused (not bound to a notice)",
+         not a.verify_pinned("kbreq_stage", pin, T0) and "verified" not in a.stages("kbreq_stage"))
     case("authenticated reply needs a reference", not a.record_reply_authenticated("kbreq_stage", "", T0)
          and a.record_reply_authenticated("kbreq_stage", "oex_auth_ref", T0))
+    case("duplicate stage with byte-identical evidence: accepted, no new row",
+         a.record_reply_authenticated("kbreq_stage", "oex_auth_ref", T0 + 1)
+         and a.conn.execute("SELECT COUNT(*) FROM ra_stages WHERE rid='kbreq_stage'").fetchone()[0] == 2)
+    case("duplicate stage with conflicting evidence: rejected, original kept",
+         raises(lambda: a.record_reply_authenticated("kbreq_stage", "oex_OTHER", T0 + 1))
+         and a.stages("kbreq_stage")["reply_authenticated"] == "oex_auth_ref")
     a.tick(holder, Notices(), T0 + 14.6)
-    case("notice is its own stage; accept is a separate conductor act",
+    case("noticed names the same occurrence as observed",
+         a.stages("kbreq_stage").get("noticed") == a.stages("kbreq_stage")["observed"])
+    case("accept still refused before verify; then verify with correct pins on the noticed occurrence",
+         not a.accept("kbreq_stage", "conductor", T0) and a.verify_pinned("kbreq_stage", pin, T0))
+    case("accept is a separate conductor act after verify + authenticated reply",
          set(a.stages("kbreq_stage")) == {"observed", "noticed", "reply_authenticated", "verified"}
          and a.accept("kbreq_stage", "conductor", T0) and "accepted" in a.stages("kbreq_stage"))
+    staged("kbreq_postnotice")
+    a.tick(holder, Notices(), T0 + 14.7)
+    (root / "kbreq_postnotice" / "result.md").write_text("r2")
+    case("artifact replaced after the notice: verify refused even with pins of the new bytes",
+         not a.verify_pinned("kbreq_postnotice", {"result.md": ra._sha(b"r2")}, T0)
+         and "verified" not in a.stages("kbreq_postnotice"))
     case("stages are append-only", raises_db(lambda: a.conn.execute("DELETE FROM ra_stages"))
          and raises_db(lambda: a.conn.execute("UPDATE ra_stages SET evidence='x'")))
 
