@@ -60,4 +60,15 @@ _deploy_launcher_preflight "$repo" HEAD 2>/dev/null && ok "candidate + matching 
 printf '# tampered\n' >> "$WORK/new/omp"
 _deploy_launcher_preflight "$repo" HEAD 2>/dev/null && bad "tampered launcher accepted" || ok "tampered launcher refused (digest)"
 
+# provision_bashlex_venv must hand uv the RESOLVED ABSOLUTE interpreter, never the bare
+# name python3 (uv's own discovery would pick a different interpreter than the hub pin).
+stub="$WORK/stub"; mkdir -p "$stub" "$WORK/app/lib"; : > "$WORK/app/lib/bashlex-requirements.txt"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/uv.calls"\nexit 1\n' "$WORK" > "$stub/uv"
+PATH="$stub:$PATH" bash -c '. "$1"; chmod +x "$2/uv" 2>/dev/null; provision_bashlex_venv "$3" python3' _ "$here/launchd/agent-lib.sh" "$stub" "$WORK/app" 2>/dev/null
+[ ! -s "$WORK/uv.calls" ] && ok "bare 'python3' refused: uv not invoked" || bad "bare python3 reached uv: $(cat "$WORK/uv.calls")"
+fake_py="$WORK/py/bin/python3.14"; mkdir -p "$(dirname "$fake_py")"; printf '#!/bin/sh\nexit 1\n' > "$fake_py"
+PATH="$stub:$PATH" bash -c '. "$1"; chmod +x "$2/uv" "$4" 2>/dev/null; provision_bashlex_venv "$3" "$4"' _ "$here/launchd/agent-lib.sh" "$stub" "$WORK/app" "$fake_py" 2>/dev/null
+grep -qx "venv --python $fake_py $WORK/app/.venv-bashlex" "$WORK/uv.calls" 2>/dev/null \
+  && ok "absolute interpreter passed to uv venv --python verbatim" || bad "uv venv args: $(cat "$WORK/uv.calls" 2>/dev/null)"
+
 [ $fails -eq 0 ] && { echo "PASS: 0 failing"; exit 0; } || { echo "FAIL: $fails failing"; exit 1; }

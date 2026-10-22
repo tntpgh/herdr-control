@@ -110,7 +110,7 @@ echo "deps ok: jq python3 herdr curl uv"
 # git-shaped command until the venv exists and imports cleanly, logged
 # once to ~/.herdr/command-policy-bashlex.log.
 if [ "$APPLY" = 1 ]; then
-  provision_bashlex_venv "$here"
+  provision_bashlex_venv "$here" "$(resolve_hub_python 2>/dev/null)"
 else
   if [ -x "$here/.venv-bashlex/bin/python3" ] && "$here/.venv-bashlex/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
     echo "bashlex venv ok: $here/.venv-bashlex (dry run, unchanged)"
