@@ -660,8 +660,8 @@ EOF
 pin_ctl() {  # <ctl-dir> <fixture-path> -- repoints that copy's OWN config.sh (never production's)
   local d="$1" fx="$2" fx_sha
   fx_sha="$(shasum -a 256 "$fx" | cut -d' ' -f1)"
-  local old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-21-boundbash-v26c/omp"'
-  local old_sha='HERDR_OMP_LAUNCHER_SHA256="7aa7a7fd3964d588d50978b67faafe89c0b11f8e2fee6a05b046fa3505450972"'
+  local old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-22-ownerdispatch-v26d/omp"'
+  local old_sha='HERDR_OMP_LAUNCHER_SHA256="780cacbbd56524bb8be81f971b705bbc5e3d7353e838db25c3cfb7e763b579ce"'
   local content; content="$(cat "$d/config.sh")"
   case "$content" in *"$old_bin"*) ;; *) echo "pin_ctl: HERDR_OMP_BIN pin not found in $d/config.sh" >&2; return 1 ;; esac
   content="${content//$old_bin/HERDR_OMP_BIN=\"$fx\"}"

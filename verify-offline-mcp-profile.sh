@@ -82,8 +82,8 @@ printf 'hook=%s\nlib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' \
 EOF
 chmod +x "$ctl_fx"
 ctl_fx_sha="$(shasum -a 256 "$ctl_fx" | cut -d' ' -f1)"
-ctl_old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-21-boundbash-v26c/omp"'
-ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="7aa7a7fd3964d588d50978b67faafe89c0b11f8e2fee6a05b046fa3505450972"'
+ctl_old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-22-ownerdispatch-v26d/omp"'
+ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="780cacbbd56524bb8be81f971b705bbc5e3d7353e838db25c3cfb7e763b579ce"'
 ctl_cfg="$(cat "$ctl/config.sh")"
 case "$ctl_cfg" in *"$ctl_old_bin"*) ;; *) echo "FATAL: HERDR_OMP_BIN pin not found in $ctl/config.sh" >&2; exit 1 ;; esac
 ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"

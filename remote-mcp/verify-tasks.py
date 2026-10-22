@@ -33,8 +33,8 @@ HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
 # Must equal config.sh's pinned release exactly; the exact-count assert in
 # _isolated_control fails loudly when config.sh moves without this.
-BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-21-boundbash-v26c/omp")
-BOUND_LAUNCHER_SHA256 = "7aa7a7fd3964d588d50978b67faafe89c0b11f8e2fee6a05b046fa3505450972"
+BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-22-ownerdispatch-v26d/omp")
+BOUND_LAUNCHER_SHA256 = "780cacbbd56524bb8be81f971b705bbc5e3d7353e838db25c3cfb7e763b579ce"
 
 
 def _lib_tree_sha(control: Path) -> str:
