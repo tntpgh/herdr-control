@@ -346,7 +346,11 @@ class Availability:
         r = self.conn.execute("SELECT state, observed FROM ra_requests WHERE rid=?", (rid,)).fetchone()
         return tuple(r) if r else ("unverified_held", None)
 
-    def tick(self, holder: Holder, notify: Notify, now: float | None = None) -> dict:
+    def tick(self, holder: Holder, notify: Notify, now: float | None = None,
+             ready: Callable[[], bool] | None = None) -> dict:
+        """ready(): the notifier's own pre-send fence (e.g. a live conductor
+        lease). False -> "held:not_dispatched": the row stays staged, nothing
+        is sent, nothing is ambiguous."""
         now = time.time() if now is None else now
         out: dict[str, str] = {}
         rows = self.conn.execute("SELECT rid, request_dir, request_digest, owner_label, pane_id, pane_birth,"
@@ -380,6 +384,9 @@ class Availability:
                 if snap != seen:
                     self._set(rid, "held:changed", now=now)
                     out[rid] = "held:changed"
+                    continue
+                if ready is not None and not ready():
+                    out[rid] = "held:not_dispatched"
                     continue
                 # CAS, committed BEFORE the external side effect: only the one
                 # caller that moves this exact staged observation calls out.

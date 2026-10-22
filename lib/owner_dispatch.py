@@ -3,27 +3,31 @@
 dispatch(label, rid, request_text, manifest) is the only way a request becomes
 trackable by lib/result_availability.py:
 
-  1. PRE-SEND PREFLIGHT. The label must have its own configured handoff root
-     and a live owner lease carrying a session digest
-     (owner_lease.holder_tuple). Otherwise nothing is written and nothing is
-     sent: "held:not_dispatched:<reason>". That is a typed refusal, never
-     "ambiguous": no send was attempted.
+  1. PRE-SEND PREFLIGHT. The label must have its own configured handoff root;
+     the live lease tuple (owner_lease.holder_tuple) must EQUAL the read-only
+     registry resolver's (pane, birth, session); and the publisher's real
+     DeliveryGate.admit() (owner_lease.enqueue: bounded max_open queue,
+     duplicate and approval-retry fences) must grant it. Otherwise nothing is
+     written and nothing is sent: "held:not_dispatched:<reason>".
   2. IMMUTABLE JOURNAL in a conductor-private root outside every owner
      handoff root: <journal>/<label>/<rid>/ created exclusively (an existing
      rid is a duplicate and is refused). Every journal file is written
      O_CREAT|O_EXCL|O_NOFOLLOW under a dir fd and fsynced, then the directory
      is fsynced. Order: intent.json -> request.txt in the handoff dir ->
-     fence re-check -> send -> exactly one outcome file:
+     FRESH clock read -> registry+lease re-check -> DeliveryGate.begin_notice
+     (lease must outlive DELIVERY_TIMEOUT_S + SAFETY_MARGIN_S) -> send ->
+     DeliveryGate.settle -> exactly one outcome file:
        refused.json   fence moved before the send (nothing sent),
        settled.json   the sender returned True (result_availability.settled_record),
        uncertain.json the sender raised/returned anything else, or recover()
                       found an intent with no outcome (crash across the send).
      An outcome is never rewritten and a send is never retried.
   3. Only after settled.json is durable is the request registered for
-     availability, bound to that exact settled record.
+     availability, bound to that exact settled record. recover() registers a
+     settled-but-unregistered dispatch idempotently and never resends.
 
-The sender is injected. This module never calls herdr, never acquires,
-renews, reaps or takes over a lease, and never redispatches.
+The sender and registry resolver are injected. This module never calls
+herdr, never acquires, renews, reaps or takes over a lease, never redispatches.
 """
 from __future__ import annotations
 

@@ -295,8 +295,73 @@ def main() -> int:
          and not any(p.name.startswith(KB) for p in roots[DOTS].iterdir()))
     av.close()
 
+    publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
+
+
+def publisher_tick_cases(base: Path) -> None:
+    """(7) remote-mcp/publisher.py result_availability_tick: default off; a
+    conductor without a registry-bound lease -> held:not_dispatched, nothing
+    typed; with one -> exactly one notice typed to the conductor pane."""
+    import importlib.util
+    import time as _t
+    root, J = base / "kb_root", base / "journal"
+    root.mkdir(); J.mkdir()
+    lease_db = str(base / "lease.db")
+    lc = ol.connect(lease_db); ol.migrate(lc)
+    ol.register_owner(lc, KB, "tntpgh/knowledge-base", now=_t.time())
+    ol.register_owner(lc, "conductor", "tntpgh/thurber-os", now=_t.time())
+    typed = base / "typed.log"
+    fake = base / "fake-deliver.sh"
+    fake.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$1" "$2" >> {typed}\n')
+    fake.chmod(0o700)
+    env = {"HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": lease_db,
+           "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
+           "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={root}", "HERDR_RESULT_AVAILABILITY_JOURNAL": str(J)}
+    saved = {k: os.environ.get(k) for k in [*env, "HERDR_RESULT_AVAILABILITY", "HERDR_DELIVER"]}
+    os.environ.update(env); os.environ["HERDR_DELIVER"] = str(fake)
+    try:
+        sys.path.insert(0, str(HERE / "remote-mcp"))
+        spec = importlib.util.spec_from_file_location("publisher_under_test", HERE / "remote-mcp" / "publisher.py")
+        pub = importlib.util.module_from_spec(spec); spec.loader.exec_module(pub)
+        pub.DELIVER = str(fake)
+        rows = {KB: {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "agent_session": "kb-sess"},
+                "conductor": {"pane_id": "w72:p1", "pane_birth": "term_cond", "agent_session": "cond-sess"}}
+        pub.registry_owners = lambda: {k: dict(v, workspace="", registered_at="", updated_at="") for k, v in rows.items()}
+        kb_digest = pub.owner_session_digest(KB, rows[KB])
+        ol.acquire(lc, KB, *PANE[KB], TTL, _t.time(), session_digest=kb_digest)
+        os.environ.pop("HERDR_RESULT_AVAILABILITY", None)
+        case("TICK default off: no flag -> None, nothing typed", pub.result_availability_tick() is None and not typed.exists())
+        os.environ["HERDR_RESULT_AVAILABILITY"] = "1"
+        av = ra.Availability(env["HERDR_RESULT_AVAILABILITY_DB"], {KB: str(root)}, str(J))
+        d = od.Dispatcher(old.DeliveryGate(lease_db), av, lambda l, h, t: True, pub.registry_resolver)
+        case("TICK fixture: dispatched through the publisher's own registry resolver",
+             d.dispatch(KB, "r_tick", b"REQ tick\n", ["result.md"]) == "dispatched")
+        (root / "r_tick" / "result.md").write_text("ACK r_tick")
+        pub.result_availability_tick(); pub.result_availability_tick()
+        out = pub.result_availability_tick()
+        case("TICK no conductor lease: held:not_dispatched, row stays staged, nothing typed",
+             out == {"r_tick": "held:not_dispatched"} and av.state("r_tick")[0] == "staged" and not typed.exists())
+        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(), session_digest=hashlib.sha256(b"wrong").hexdigest())
+        case("TICK conductor lease not matching the registry session: still held, nothing typed",
+             pub.result_availability_tick() == {"r_tick": "held:not_dispatched"} and not typed.exists())
+        lc.execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00.000000Z' WHERE label='conductor'")
+        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
+                   session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
+        out = pub.result_availability_tick()
+        lines = typed.read_text().splitlines() if typed.exists() else []
+        case("TICK registry-bound conductor lease: notified, exactly one notice to the conductor pane",
+             out == {"r_tick": "notified"} and len(lines) == 1 and lines[0].startswith("w72:p1|RESULT AVAILABLE (UNVERIFIED")
+             and pub.result_availability_tick() == {})
+        av.close()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        lc.close()
 
 
 def _raises(fn):

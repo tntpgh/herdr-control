@@ -1217,6 +1217,74 @@ def owner_lease_gate():
     return _OWNER_LEASE_GATE
 
 
+def owner_session_digest(label: str, owner_row: dict) -> str:
+    """Full sha256 of (label, agent_session): the owner_lease v3 session_digest
+    a lease holder must carry. '' when the registry row has no session."""
+    raw = owner_row.get("agent_session") or ""
+    return hashlib.sha256(f"{label}:{raw}".encode()).hexdigest() if raw else ""
+
+
+def registry_resolver(label: str):
+    """Read-only (pane_id, pane_birth, session_digest) from the existing owner
+    registry, or None (unregistered / no session)."""
+    row = registry_owners().get(label)
+    if not row or not row["pane_id"] or not row["pane_birth"]:
+        return None
+    digest = owner_session_digest(label, row)
+    return (row["pane_id"], row["pane_birth"], digest) if digest else None
+
+
+RESULT_AVAILABILITY_CONDUCTOR = "conductor"
+
+
+def result_availability_tick() -> dict | None:
+    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. Requires the
+    owner-lease gate too (HERDR_OWNER_LEASE_DELIVERY=1). One pass of
+    lib/result_availability.py tick():
+      holder(label)  the live lease tuple, only while the registry names the
+                     same (pane, birth, session); else None -> held:stale_generation.
+      ready()        the conductor's own lease, registry-bound, with the
+                     delivery margin left; missing -> held:not_dispatched
+                     (nothing typed, row stays staged).
+      notify(text)   re-checks the same conductor tuple immediately before
+                     typing it with herdr-deliver.sh (no --force)."""
+    if os.environ.get("HERDR_RESULT_AVAILABILITY") != "1":
+        return None
+    gate = owner_lease_gate()
+    if gate is None:
+        raise RuntimeError("HERDR_RESULT_AVAILABILITY=1 needs the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1)")
+    lib = Path(__file__).resolve().parent.parent / "lib"
+    if str(lib) not in sys.path:
+        sys.path.insert(0, str(lib))
+    import owner_lease as ol  # noqa: E402
+    import result_availability as ra  # noqa: E402
+    avail = ra.from_env()
+
+    def bound(label):
+        cur = ol.holder_tuple(gate.conn, label, time.time())
+        reg = registry_resolver(label)
+        return cur if cur and reg and tuple(reg) == cur[:3] else None
+
+    def conductor():
+        cur = bound(RESULT_AVAILABILITY_CONDUCTOR)
+        live = ol._live(gate.conn, RESULT_AVAILABILITY_CONDUCTOR, time.time()) if cur else None
+        ok = live and datetime.strptime(live[5], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc).timestamp() - time.time() >= gate.min_lease_remaining_s
+        return cur if ok else None
+
+    def notify(text):
+        cur = conductor()
+        if cur is None:
+            return False
+        proc = subprocess.run([DELIVER, cur[0], text], capture_output=True, text=True, timeout=120)
+        return proc.returncode == 0
+
+    try:
+        return avail.tick(bound, notify, ready=lambda: conductor() is not None)
+    finally:
+        avail.close()
+
+
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
     only the fixed notice pointing at it. Pre-send exit 5 keeps its
@@ -1930,6 +1998,13 @@ def main(argv: list[str]) -> int:
         new_command_acks.append(ack)
         st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks
         save_state(st)
+
+    try:
+        ra_out = result_availability_tick()
+        if ra_out:
+            log(f"result availability: {ra_out}")
+    except Exception as exc:  # noqa: BLE001 - never blocks the publisher tick
+        log(f"result availability tick failed (held, nothing typed): {type(exc).__name__}: {exc}")
 
     try:  # second sync: report outcomes now rather than next tick
         reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks, "command_acks": new_command_acks,
