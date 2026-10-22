@@ -8,7 +8,9 @@ migrated here). The (pane_id, pane_birth, session digest) come ONLY from the
 registry row (remote-mcp/publisher.registry_resolver); the digest is a
 registry-attested identity, not authentication of the process at the pane.
 Requires an existing owner_projects mapping (never registers one). Acquires
-only when NO live lease exists: never renews, reaps, or takes over.
+only as an INITIAL claim (owner_lease.claim_initial): generation 1 for a label
+with no lease or request history at all. Never renews, releases, reaps,
+stales or takes over. The lease DB is opened via lib/private_sqlite.
 Exit: 0 acquired (prints generation); 2 refused (typed reason); 4 config.
 Rollback: unset the flags; the lease expires on its own TTL.
 """
@@ -24,6 +26,7 @@ sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
+import private_sqlite  # noqa: E402
 
 
 def main(argv=None, resolve=None) -> int:
@@ -34,27 +37,30 @@ def main(argv=None, resolve=None) -> int:
     if os.environ.get("HERDR_OWNER_LEASE_WRITER") != "1" or os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
         print("refused:flags_off")
         return 4
+    os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
-    if not db or not Path(db).is_file():
-        print("refused:lease_db_missing")
+    try:
+        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_leases")
+    except ValueError as exc:
+        print(f"refused:lease_{exc}")
         return 4
     if resolve is None:
         import publisher  # noqa: E402
         resolve = publisher.registry_resolver
     reg = resolve(a.label)
     if not reg:
+        conn.close()
         print("refused:not_registered_or_no_session")
         return 2
     pane, birth, digest = reg
-    conn = ol.connect(db)
     try:
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (a.label,)).fetchone():
             print("refused:owner_project_unmapped")
             return 2
         try:
-            gen = ol.acquire(conn, a.label, pane, birth, a.ttl, session_digest=digest, allow_renew=False)
+            gen = ol.claim_initial(conn, a.label, pane, birth, a.ttl, digest)
         except ol.LeaseConflict:
-            print("refused:lease_exists")
+            print("refused:not_initial")
             return 2
         except (ol.Disabled, ol.InvalidOwner, ValueError) as exc:
             print(f"refused:{type(exc).__name__}")

@@ -23,9 +23,13 @@ turns `granted` into `consumed`. Everything else is a typed hold:
 
 Consumed-but-unsent: consumption happens before admission and before any
 journal write, so a crash or a queue refusal after it burns the grant with no
-journal entry. The grant row (durable in the consuming transaction) names
-(label, request_id); unsent() lists every consumed grant whose journal has no
-intent.json. Callers hold on any such entry: never retried, never regranted.
+journal entry. consume() returns the complete consumed ENVELOPE (auth_id,
+binding, consumed_at); the Dispatcher writes it into the immutable
+intent.json. unsent() accepts a consumed grant as accounted for ONLY when
+<journal>/<label>/<rid>/intent.json, read through no-follow descriptors as a
+bounded regular file, parses and carries exactly that envelope. A missing,
+older, symlinked, malformed or different intent leaves it unsent. Callers
+hold on any such entry: never retried, never regranted.
 
 This module has NO function that writes a grant. A worker or caller cannot
 authorize itself. Issuing a grant is a separate, unapproved surface; tests
@@ -39,6 +43,8 @@ import os
 import sqlite3
 import stat
 import time
+
+import private_sqlite
 
 PROTOCOL = "owner-dispatch-auth/2"
 MAX_REQUEST_BYTES = 64 * 1024
@@ -73,9 +79,19 @@ def manifest_key(manifest) -> str:
     return json.dumps(sorted(manifest), separators=(",", ":"))
 
 
+ENVELOPE_COLS = ("auth_id", "protocol", "owner_label", "project", "pane_id", "pane_birth", "session_digest",
+                 "lease_generation", "request_id", "body_sha256", "manifest", "prompt_id", "approval_id", "consumed_at")
+
+
+def _envelope(conn, auth_id) -> dict:
+    row = conn.execute(f"SELECT {','.join(ENVELOPE_COLS)} FROM owner_dispatch_auth WHERE auth_id=?", (auth_id,)).fetchone()
+    return dict(zip(ENVELOPE_COLS, row)) if row else {}
+
+
 def consume(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str, holder, request_id: str,
-            body_sha256: str, manifest, now: float) -> str:
-    """'ok' (this call consumed the grant) or a hold reason. Never raises.
+            body_sha256: str, manifest, now: float):
+    """The consumed envelope (dict) when THIS call consumed the grant, else a
+    hold reason (str). Never raises.
     holder = the resolved (pane_id, pane_birth, session_digest, generation)."""
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -101,8 +117,9 @@ def consume(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str,
                                    (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), auth_id)).rowcount
             if changed != 1:
                 return "auth_consumed"
+            env = _envelope(conn, auth_id)
             conn.execute("COMMIT")
-            return "ok"
+            return env
         finally:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -110,54 +127,50 @@ def consume(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str,
         return f"auth_ambiguous:{type(exc).__name__}"
 
 
+def _read_intent(journal_root: str, label: str, rid: str) -> dict | None:
+    """intent.json via O_NOFOLLOW directory/file descriptors, regular file,
+    bounded; None on any irregularity."""
+    fds = []
+    try:
+        fds.append(os.open(journal_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        for part in (label, rid):
+            if not part or "/" in part or part in (".", ".."):
+                return None
+            fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
+        fd = os.open("intent.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds[-1])
+        fds.append(fd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_REQUEST_BYTES:
+            return None
+        data = os.read(fd, MAX_REQUEST_BYTES + 1)
+        obj = json.loads(data)
+        return obj if isinstance(obj, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        for f in fds:
+            os.close(f)
+
+
 def unsent(conn: sqlite3.Connection, journal_root: str) -> list[str]:
-    """auth_ids of consumed grants with no <journal>/<label>/<rid>/intent.json:
-    consumed but known unsent. Read-only; the caller must hold on any."""
+    """auth_ids of consumed grants NOT accounted for by an intent.json that
+    carries exactly their consumed envelope. Read-only."""
     out = []
-    for aid, label, rid in conn.execute("SELECT auth_id, owner_label, request_id FROM owner_dispatch_auth"
-                                        " WHERE status='consumed' ORDER BY auth_id"):
-        try:
-            os.stat(os.path.join(journal_root, label, rid, "intent.json"), follow_symlinks=False)
-        except FileNotFoundError:
+    for (aid,) in conn.execute("SELECT auth_id FROM owner_dispatch_auth WHERE status='consumed' ORDER BY auth_id").fetchall():
+        env = _envelope(conn, aid)
+        intent = _read_intent(journal_root, env["owner_label"], env["request_id"])
+        if not intent or intent.get("auth") != env or intent.get("rid") != env["request_id"] \
+                or intent.get("label") != env["owner_label"]:
             out.append(aid)
     return out
 
 
-def _private_regular(st, uid) -> bool:
-    return stat.S_ISREG(st.st_mode) and st.st_uid == uid and st.st_mode & 0o077 == 0
-
-
 def open_store(path: str, uid: int | None = None) -> sqlite3.Connection:
-    """Open an EXISTING auth store at exactly this canonical path. Raises
-    ValueError: the path must be absolute and canonical (no symlink anywhere),
-    the file a regular non-symlink owned by uid with no group/other bits, its
-    parent a directory owned by uid and not group/other writable, and any
-    SQLite sidecar (-wal, -shm, -journal) likewise private regular files.
-    Never creates a store."""
-    uid = os.getuid() if uid is None else uid
-    if not os.path.isabs(path) or os.path.realpath(path) != path:
-        raise ValueError("store_path_not_canonical")
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        raise ValueError("store_missing") from None
-    if not _private_regular(st, uid):
-        raise ValueError("store_not_private_regular")
-    pst = os.lstat(os.path.dirname(path))
-    if not stat.S_ISDIR(pst.st_mode) or pst.st_uid != uid or pst.st_mode & 0o022:
-        raise ValueError("store_parent_unprotected")
-    for sfx in ("-wal", "-shm", "-journal"):
-        try:
-            sst = os.lstat(path + sfx)
-        except FileNotFoundError:
-            continue
-        if not _private_regular(sst, uid):
-            raise ValueError("store_sidecar_unsafe")
-    conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, isolation_level=None, timeout=10)
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_dispatch_auth'").fetchone() is None:
-        conn.close()
-        raise ValueError("store_not_migrated")
-    return conn
+    """The EXISTING auth store, via lib/private_sqlite.open_private (canonical
+    path, private file/parents/sidecars, post-open inode check). Never creates."""
+    return private_sqlite.open_private(
+        path, lambda p: sqlite3.connect(f"file:{p}?mode=rw", uri=True, isolation_level=None, timeout=10),
+        uid, require_table="owner_dispatch_auth")
 
 
 def read_request_once(parent: str, name: str, max_bytes: int = MAX_REQUEST_BYTES) -> bytes:

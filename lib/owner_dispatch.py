@@ -100,9 +100,10 @@ def _record(**fields) -> bytes:
 
 Resolve = Callable[[str], "tuple[str, str, str] | None"]  # label -> registry (pane_id, pane_birth, session_digest)
 # (label, project, holder (pane, birth, session, generation), rid, body sha256,
-# manifest, now) -> "ok" only when THIS call consumed a one-time grant bound to
-# all of them (lib/owner_dispatch_auth.consume); else the hold reason.
-Authorize = Callable[[str, str, tuple, str, str, list, float], str]
+# manifest, now) -> the consumed envelope (dict, lib/owner_dispatch_auth.consume)
+# when THIS call consumed a one-time grant bound to all of them; else a hold
+# reason. The envelope must restate exactly this call's binding.
+Authorize = Callable[[str, str, tuple, str, str, list, float], "dict | str"]
 
 
 class Dispatcher:
@@ -160,13 +161,19 @@ class Dispatcher:
         # intent.json: owner_dispatch_auth.unsent() surfaces it for an operator.
         if self.authorize is None:
             raise NotDispatched("auth_missing")
+        body_sha = hashlib.sha256(request_text).hexdigest()
         try:
-            verdict = self.authorize(label, mapped[0], tuple(holder), rid, hashlib.sha256(request_text).hexdigest(),
-                                     sorted(manifest), now)
+            verdict = self.authorize(label, mapped[0], tuple(holder), rid, body_sha, sorted(manifest), now)
         except Exception as exc:
             verdict = f"auth_ambiguous:{type(exc).__name__}"
-        if verdict != "ok":
-            raise NotDispatched(verdict)
+        if not isinstance(verdict, dict):
+            raise NotDispatched(verdict if isinstance(verdict, str) else "auth_not_envelope")
+        want = {"owner_label": label, "project": mapped[0], "pane_id": pane, "pane_birth": birth,
+                "session_digest": sess, "lease_generation": gen, "request_id": rid, "body_sha256": body_sha,
+                "manifest": json.dumps(sorted(manifest), separators=(",", ":"))}
+        if any(verdict.get(k) != v for k, v in want.items()) or not verdict.get("auth_id"):
+            raise NotDispatched("auth_envelope_mismatch")
+        auth_envelope = verdict
         adm = self.gate.admit(label, pane, birth, rid, now)
         if not adm.ok or adm.generation != gen:
             raise NotDispatched(adm.reason or "admit_generation_changed")
@@ -190,7 +197,8 @@ class Dispatcher:
             _write_excl(jfd, "intent.json", _record(rid=rid, label=label, request_digest=digest, pane_id=pane,
                                                      pane_birth=birth, session_id=sess, generation=gen,
                                                      manifest=sorted(manifest), gate_request_id=rid,
-                                                     gate_generation=adm.generation, gate_state="queued", at=now))
+                                                     gate_generation=adm.generation, gate_state="queued", at=now,
+                                                     auth=auth_envelope))
 
             def refuse(reason, t):
                 # PRE-SEND only. Settle the gate FIRST, then make the journal

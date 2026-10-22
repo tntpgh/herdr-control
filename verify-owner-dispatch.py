@@ -448,7 +448,30 @@ def auth_contract_cases(base: Path) -> None:
          mkd("a_ok").dispatch(KB, "r_a", body, man, T0) == "dispatched" and sent == [body] and status("a_ok") == "consumed")
     case("AUTH: a consumed grant never authorizes again",
          mkd("a_ok").dispatch(KB, "r_a", body, man, T0).startswith("held:not_dispatched:auth_consumed") and len(sent) == 1)
-    case("UNSENT: a dispatched grant is not reported unsent", oda.unsent(store, str(J)) == [])
+    case("UNSENT: a dispatched grant is accounted for by its own envelope in intent.json",
+         oda.unsent(store, str(J)) == [] and json.loads((J / KB / "r_a" / "intent.json").read_text())["auth"]["auth_id"] == "a_ok")
+    # Forged/stale accounting: a consumed grant whose rid dir holds an intent
+    # that is old (no/other auth), symlinked, or malformed stays UNSENT.
+    for aid, rid, make in [
+            ("a_old", "r_old", lambda d: (d / "intent.json").write_text(json.dumps({"rid": "r_old", "label": KB}))),
+            ("a_oth", "r_oth", lambda d: (d / "intent.json").write_text(json.dumps({"rid": "r_oth", "label": KB, "auth": {"auth_id": "a_ok"}}))),
+            ("a_sym", "r_sym", lambda d: (d / "intent.json").symlink_to(base / "forged-intent.json")),
+            ("a_bad", "r_bad", lambda d: (d / "intent.json").write_bytes(b"{not json"))]:
+        grant(aid, rid=rid, status="consumed")
+        store.execute("UPDATE owner_dispatch_auth SET consumed_at='t' WHERE auth_id=?", (aid,))
+        if aid == "a_sym":  # symlink target carries the EXACT envelope: only O_NOFOLLOW rejects it
+            (base / "forged-intent.json").write_text(json.dumps({"rid": rid, "label": KB, "auth": oda._envelope(store, aid)}))
+        (J / KB / rid).mkdir(parents=True)
+        make(J / KB / rid)
+    lst = oda.unsent(store, str(J))
+    case("UNSENT: old / other-envelope / symlinked / malformed intent never accounts for a consumed grant",
+         all(a in lst for a in ("a_old", "a_oth", "a_sym", "a_bad")) and "a_ok" not in lst)
+    for aid in ("a_old", "a_oth", "a_sym", "a_bad"):
+        store.execute("DELETE FROM owner_dispatch_auth WHERE auth_id=?", (aid,))
+    forged = {"auth_id": "x", "owner_label": KB, "project": "tntpgh/other"}
+    case("AUTH: an envelope that does not restate this call's binding -> auth_envelope_mismatch",
+         od.Dispatcher(gate, av, lambda l, h, t: True, reg, lambda: T0, authorize=lambda *a: forged).dispatch(
+             KB, "r_env", body, man, T0) == "held:not_dispatched:auth_envelope_mismatch" and nothing("r_env"))
     # consumed, then refused at admission (queue full): burned with no journal -> surfaced
     lc.execute("UPDATE owner_projects SET max_open=1 WHERE label=?", (KB,))
     grant("a_q", rid="r_q")
@@ -468,7 +491,7 @@ def auth_contract_cases(base: Path) -> None:
          == "held:not_dispatched:auth_ambiguous:ZeroDivisionError" and nothing("r_amb"))
     case("AUTH: an authorizer returning anything but 'ok' never authorizes (self-attestation)",
          od.Dispatcher(gate, av, lambda l, h, t: True, reg, lambda: T0, authorize=lambda *a: True).dispatch(
-             KB, "r_amb", body, man, T0) == "held:not_dispatched:True" and nothing("r_amb"))
+             KB, "r_amb", body, man, T0) == "held:not_dispatched:auth_not_envelope" and nothing("r_amb"))
     grant("a_race", rid="r_race")
     import threading
     res = []
@@ -480,7 +503,7 @@ def auth_contract_cases(base: Path) -> None:
     ts = [threading.Thread(target=worker) for _ in range(8)]
     [t.start() for t in ts]; [t.join() for t in ts]
     case("AUTH: 8 concurrent consumers of one grant -> exactly one ok, rest auth_consumed",
-         res.count("ok") == 1 and res.count("auth_consumed") == 7)
+         sum(isinstance(r, dict) for r in res) == 1 and res.count("auth_consumed") == 7)
     lc.execute("PRAGMA foreign_keys=OFF")  # disposable DB: model a label with no mapping row
     lc.execute("DELETE FROM owner_projects WHERE label=?", (DOTS,))
     grant("a_unm", rid="r_unm", label=DOTS)
@@ -501,17 +524,29 @@ def auth_contract_cases(base: Path) -> None:
             return str(e)
     case("STORE: canonical private migrated store opens", oerr(good) == "open")
     (sd_ / "link.db").symlink_to(good)
-    case("STORE: symlink path refused", oerr(sd_ / "link.db") == "store_path_not_canonical")
-    case("STORE: missing store refused, not created", oerr(sd_ / "none.db") == "store_missing" and not (sd_ / "none.db").exists())
+    case("STORE: symlink path refused", oerr(sd_ / "link.db") == "db_path_not_canonical")
+    case("STORE: missing store refused, not created", oerr(sd_ / "none.db") == "db_missing" and not (sd_ / "none.db").exists())
     os.chmod(good, 0o644); r1 = oerr(good); os.chmod(good, 0o600)
-    case("STORE: group/other-readable store refused", r1 == "store_not_private_regular")
+    case("STORE: group/other-readable store refused", r1 == "db_not_private_regular")
     os.chmod(sd_, 0o777); r2 = oerr(good); os.chmod(sd_, 0o700)
-    case("STORE: world-writable parent refused", r2 == "store_parent_unprotected")
+    case("STORE: world-writable parent refused", r2 == "db_parent_unprotected")
     (sd_ / "auth.db-wal").symlink_to(base / "elsewhere")
-    case("STORE: symlinked -wal sidecar refused", oerr(good) == "store_sidecar_unsafe")
+    case("STORE: symlinked -wal sidecar refused", oerr(good) == "db_sidecar_unsafe")
     os.unlink(sd_ / "auth.db-wal")
+    import private_sqlite as ps
+    other = sd_ / "other.db"
+    c2 = sqlite3.connect(str(other)); oda.migrate(c2); c2.close(); os.chmod(other, 0o600)
+    def swapping_connect(pth):
+        os.rename(pth, str(sd_ / "orig.db")); os.rename(str(other), pth)  # same-UID swap during open
+        return sqlite3.connect(pth)
+    try:
+        ps.open_private(str(good), swapping_connect, require_table="owner_dispatch_auth"); sw = "open"
+    except ValueError as ex:
+        sw = str(ex)
+    case("STORE: file swapped while SQLite opens it -> db_swapped_after_open (connection closed)", sw == "db_swapped_after_open")
+    os.rename(str(sd_ / "orig.db"), str(good))
     e = sd_ / "empty.db"; sqlite3.connect(str(e)).close(); os.chmod(e, 0o600)
-    case("STORE: unmigrated store refused", oerr(e) == "store_not_migrated")
+    case("STORE: unmigrated store refused", oerr(e) == "db_not_migrated")
     rq = base / "rq"; rq.mkdir()
     (rq / "req.txt").write_bytes(body)
     (rq / "link.txt").symlink_to(rq / "req.txt")
@@ -557,24 +592,40 @@ def lease_writer_cases(base: Path) -> None:
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         return rc, buf.getvalue().strip()
 
-    live = lambda lab: lc.execute("SELECT count(*) FROM owner_leases WHERE label=? AND released_at IS NULL", (lab,)).fetchone()[0]
-    case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and live(KB) == 0)
-    case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and live(DOTS) == 0)
+    os.chmod(lease_db, 0o600)
+    leases = lambda lab: lc.execute("SELECT generation, released_at, expires_at FROM owner_leases WHERE label=? ORDER BY generation", (lab,)).fetchall()
+    events = lambda: lc.execute("SELECT count(*) FROM owner_events").fetchone()[0]
+    case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and leases(KB) == [])
+    case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and leases(DOTS) == [])
     rc, out = run(KB)
     ht = ol.holder_tuple(lc, KB)
-    case("WRITER: acquires with EXACTLY the registry (pane, birth, session digest)",
-         rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB])
-    exp = lc.execute("SELECT expires_at FROM owner_leases WHERE label=? AND released_at IS NULL", (KB,)).fetchone()[0]
-    case("WRITER: a second run never renews (same holder) -> lease_exists, expiry unchanged",
-         run(KB) == (2, "refused:lease_exists")
-         and lc.execute("SELECT expires_at FROM owner_leases WHERE label=? AND released_at IS NULL", (KB,)).fetchone()[0] == exp)
-    case("WRITER: a different registry identity never takes over -> lease_exists",
-         run(KB, resolve={KB: ("w9:p9", "term_x", SESS[KB])}.get) == (2, "refused:lease_exists") and ol.holder_tuple(lc, KB) == ht)
+    case("WRITER: initial claim = generation 1 with EXACTLY the registry (pane, birth, session digest)",
+         rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB] and ht[3] == 1)
+    before, ev = leases(KB), events()
+    case("WRITER: a second run (same holder, live lease) -> not_initial; nothing renewed or written",
+         run(KB) == (2, "refused:not_initial") and leases(KB) == before and events() == ev)
+    case("WRITER: a different registry identity never takes over -> not_initial",
+         run(KB, resolve={KB: ("w9:p9", "term_x", SESS[KB])}.get) == (2, "refused:not_initial") and leases(KB) == before)
+    # EXPIRED predecessor: acquire() would release it, stale its requests and
+    # take gen 2. The initial claim must touch nothing.
+    lc.execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00.000000Z' WHERE label=?", (KB,))
+    expired, ev = leases(KB), events()
+    case("WRITER: EXPIRED unreleased predecessor -> not_initial; not released, no gen 2, no events",
+         run(KB) == (2, "refused:not_initial") and leases(KB) == expired and events() == ev
+         and all(r[1] is None for r in expired) and len(expired) == 1)
+    # request/recovery history without any lease row -> refused
     lc.execute("PRAGMA foreign_keys=OFF")
+    lc.execute("INSERT INTO owner_requests(request_id,label,generation,state,created_at,updated_at) VALUES ('old_r',?,1,'stale','t','t')", (DOTS,))
+    case("WRITER: request/recovery history, no lease -> not_initial",
+         run(DOTS, resolve={DOTS: (*PANE[DOTS], SESS[DOTS])}.get) == (2, "refused:not_initial") and leases(DOTS) == [])
+    lc.execute("DELETE FROM owner_requests WHERE request_id='old_r'")
     lc.execute("DELETE FROM owner_projects WHERE label=?", (DOTS,))
     case("WRITER: no owner_projects mapping -> refused, mapping not created",
          run(DOTS, resolve={DOTS: (*PANE[DOTS], SESS[DOTS])}.get) == (2, "refused:owner_project_unmapped")
          and lc.execute("SELECT count(*) FROM owner_projects WHERE label=?", (DOTS,)).fetchone()[0] == 0)
+    os.chmod(lease_db, 0o644)
+    case("WRITER: group/other-readable lease DB -> refused before any claim", run(KB)[1] == "refused:lease_db_not_private_regular")
+    os.chmod(lease_db, 0o600)
     av.close(); lc.close()
 
 
@@ -598,6 +649,7 @@ def cli_cases(base: Path) -> None:
     sd = base / "authstore"; sd.mkdir(mode=0o700)
     adb = sd / "auth.db"
     c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); os.chmod(adb, 0o600)
+    os.chmod(lease_db, 0o600)
     rq = base / "req"; rq.mkdir()
     body = "REQ cli \u00e9\n".encode()
     (rq / "r.txt").write_bytes(body)
@@ -618,6 +670,18 @@ def cli_cases(base: Path) -> None:
         r = subprocess.run([sys.executable, str(cli), *ARGS(rid, aid)], capture_output=True, text=True, env=e, timeout=60)
         return r.returncode, r.stdout.strip()
 
+    def inproc_env(over, rid, aid):
+        saved = {k: os.environ.get(k) for k in E}
+        os.environ.update({**E, **over})
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odc.main(ARGS(rid, aid), send=odc.make_send(str(fake)), resolve={KB: (*PANE[KB], SESS[KB])}.get)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
     def inproc(rid, aid, resolve={KB: (*PANE[KB], SESS[KB])}.get):
         saved = {k: os.environ.get(k) for k in E}
         os.environ.update(E)
@@ -633,10 +697,13 @@ def cli_cases(base: Path) -> None:
     case("CLI: flags off (subprocess) -> exit 4 refused:flags_off", sub({}) == (4, "refused:flags_off"))
     (sd / "link.db").symlink_to(adb)
     case("CLI: symlinked auth store (subprocess) -> exit 4, refused before any read",
-         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "link.db")}) == (4, "refused:store_path_not_canonical"))
+         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "link.db")}) == (4, "refused:db_path_not_canonical"))
     case("CLI: missing auth store (subprocess) -> exit 4, not created",
-         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "x.db")}) == (4, "refused:store_missing")
+         sub({**E, "HERDR_OWNER_DISPATCH_AUTH_DB": str(sd / "x.db")}) == (4, "refused:db_missing")
          and not (sd / "x.db").exists())
+    (base / "lease-link.db").symlink_to(lease_db)
+    case("CLI: symlinked LEASE DB -> exit 4 refused before dispatch",
+         inproc_env({"HERDR_OWNER_LEASE_DB": str(base / "lease-link.db")}, "r_c", "nope") == (4, "refused:lease_db_path_not_canonical"))
     case("CLI: no grant -> exit 2 held auth_missing, adapter never called",
          inproc("r_c", "nope") == (2, "held:not_dispatched:auth_missing") and not rec.exists())
     insert_grant(c, "a_c", label=KB, project=proj, holder=holder, rid="r_c", sha=sha, manifest=["result.md"], expires=now + 600)

@@ -39,7 +39,9 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_dispatch as od  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
+import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
+import private_sqlite  # noqa: E402
 import result_availability as ra  # noqa: E402
 
 
@@ -63,6 +65,7 @@ def main(argv=None, send=None, resolve=None) -> int:
     if os.environ.get("HERDR_OWNER_DISPATCH") != "1" or os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
         print("refused:flags_off")
         return 4
+    os.umask(0o077)  # any SQLite sidecar created from here on is private
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     if not lease_db or not auth_db:
         print("refused:store_not_configured")
@@ -88,7 +91,14 @@ def main(argv=None, send=None, resolve=None) -> int:
         import publisher  # noqa: E402  (read-only registry resolver + DELIVER path)
         send = send or make_send(publisher.DELIVER)
         resolve = resolve or publisher.registry_resolver
-    gate = old.DeliveryGate(lease_db)
+    try:
+        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+    except ValueError as exc:
+        store.close()
+        avail.close()
+        print(f"refused:lease_{exc}")
+        return 4
+    gate = old.DeliveryGate(lease_db, conn=lconn)
 
     def authorize(label, project, holder, rid, sha, manifest, now):
         return oda.consume(store, a.auth_id, label=label, project=project, holder=holder, request_id=rid,

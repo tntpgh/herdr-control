@@ -293,9 +293,8 @@ def _live(conn, label, now):
 
 
 def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: float | None = None,
-            session_digest: str = "", allow_renew: bool = True) -> int:
-    """Acquire or renew (allow_renew=False: a live lease of ANY holder is a
-    LeaseConflict, decided inside the same transaction). Returns the holder's generation. On a generation change,
+            session_digest: str = "") -> int:
+    """Acquire or renew. Returns the holder's generation. On a generation change,
     the expired predecessor is released and its open requests disposed `stale`,
     all in the same transaction as the successor's insert. session_digest is ''
     or a full sha256 hex; a renewal must present the SAME digest (a session
@@ -313,8 +312,6 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
         cur = _live(conn, label, now)
         if cur:
             lease_id, pane, birth, gen, _r, _e, sess = cur
-            if not allow_renew:
-                raise LeaseConflict(f"{label} already leased (gen {gen}); not renewing")
             if (pane, birth, sess) != (pane_id, pane_birth, session_digest):
                 raise LeaseConflict(f"{label} held by {pane}@{birth} gen {gen}")
             conn.execute("UPDATE owner_leases SET renewed_at=?, expires_at=? WHERE lease_id=?",
@@ -338,6 +335,37 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
             conn.execute("UPDATE owner_requests SET state='stale', updated_at=? WHERE request_id=?", (_iso(now), rid))
             _event(conn, now, label, "request:stale", rid, rgen, f"superseded by gen {gen}")
         return gen
+
+    return _tx(conn, body)
+
+
+def claim_initial(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, session_digest: str,
+                  now: float | None = None) -> int:
+    """INITIAL-ONLY claim: generation 1 for a label that has NEVER had a lease
+    and has no owner_requests at all. Refuses (LeaseConflict) on any prior
+    lease row, released or not, expired or not, and on any request row. It
+    never releases, reaps, stales or renews anything, and never takes a later
+    generation: those are acquire()'s successor branch, not reachable here."""
+    now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    if not SESSION_DIGEST_RE.match(session_digest or ""):
+        raise ValueError("session_digest must be 64 lowercase hex")
+    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= MAX_TTL_S:
+        raise ValueError(f"ttl_s must be an int in 1..{MAX_TTL_S}")
+
+    def body():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        if conn.execute("SELECT 1 FROM owner_leases WHERE label=? LIMIT 1", (label,)).fetchone():
+            raise LeaseConflict(f"{label} has prior lease history; initial claim only")
+        if conn.execute("SELECT 1 FROM owner_requests WHERE label=? LIMIT 1", (label,)).fetchone():
+            raise LeaseConflict(f"{label} has request/recovery history; initial claim only")
+        lease_id = f"ol_{uuid.uuid4().hex}"
+        conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
+                     "session_digest) VALUES (?,?,?,?,1,?,?,?,?)",
+                     (lease_id, label, pane_id, pane_birth, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
+        _event(conn, now, label, "acquired", lease_id, 1, f"{pane_id}@{pane_birth} initial")
+        return 1
 
     return _tx(conn, body)
 

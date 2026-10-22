@@ -73,8 +73,12 @@ def from_env(environ=os.environ) -> "DeliveryGate | None":
 
 
 class DeliveryGate:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, conn=None):
         # Never creates or migrates: a missing/unmigrated DB fails closed.
+        # conn: an already-verified connection (lib/private_sqlite.open_private).
+        if conn is not None:
+            self.conn = conn
+            return
         if not Path(db_path).is_file():
             raise FileNotFoundError(f"owner-lease DB not found: {db_path}")
         self.conn = ol.connect(db_path)
