@@ -1,0 +1,29 @@
+name: offline-mcp-profile
+# Runs verify-offline-mcp-profile.sh: isolated, stub-bounded spawn-task.sh --dry-run
+# composition checks. It never executes spawn-agent.sh or a real launcher.
+# No install step: bash, git, jq, sqlite3, python3 and shasum ship on ubuntu-latest.
+on:
+  pull_request:
+    paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
+            "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
+            ".github/workflows/offline-mcp-profile.yml"]
+  push:
+    branches: [main]
+    paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
+            "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
+            ".github/workflows/offline-mcp-profile.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: required tools present (no install)
+        run: for t in bash git jq sqlite3 python3 shasum mktemp; do command -v "$t" || { echo "missing $t"; exit 1; }; done
+      - run: bash verify-offline-mcp-profile.sh
