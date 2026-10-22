@@ -173,17 +173,27 @@ describe("blocked states reported by the publisher's own ack", () => {
       { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
     const id = sent.data.exchange_id;
 
-    // 9 lease+approval-prompt-ack round trips: each must requeue, not finalize.
-    for (let i = 0; i < 9; i++) {
-      const outbox = (await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot() })))).owner_outbox;
-      expect(outbox.map((m) => m.exchange_id)).toEqual([id]);
-      await signedSync(syncBody({ snapshot: ownerSnapshot(), lease: false, owner_acks: [{ exchange_id: id, outcome: "blocked", reason: "owner_at_approval_prompt" }] }));
-      const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
-      expect(status.data.owner_message.status).toBe("queued");
-    }
-    // The 10th attempt exhausts APPROVAL_RETRY_CAP: stays blocked.
-    await signedSync(syncBody({ snapshot: ownerSnapshot() })); // lease, attempts -> 10
-    await signedSync(syncBody({ snapshot: ownerSnapshot(), lease: false, owner_acks: [{ exchange_id: id, outcome: "blocked", reason: "owner_at_approval_prompt" }] }));
+    // All ten lease + approval-prompt-ack transitions run inside ONE synchronous
+    // durable-object callback, so no part of this test's body can outlive a
+    // timeout and run into the next test after reset(). The sender's grant is
+    // live (enqueued over OAuth above), so the owner gate is the unrevoked one.
+    const live = { revoked: [], hold: false };
+    const statuses = await runInDurableObject(fleet(), (o: HerdrState) => {
+      const seen: { outbox: string[]; status: string | undefined }[] = [];
+      let t = Date.now();
+      for (let i = 0; i < 10; i++) {
+        const lease = o.sync(++t, crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot() })), live, live, live);
+        if (!lease.ok) throw new Error(lease.reason);
+        const ack = o.sync(++t, crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot(), lease: false,
+          owner_acks: [{ exchange_id: id, outcome: "blocked", reason: "owner_at_approval_prompt" }] })), live, live, live);
+        if (!ack.ok) throw new Error(ack.reason);
+        seen.push({ outbox: lease.response.owner_outbox.map((m) => m.exchange_id), status: o.ownerMessageStatus(id, "tnt@teamthurber.com")?.status });
+      }
+      return seen;
+    });
+    // 9 round trips each requeue; the 10th exhausts APPROVAL_RETRY_CAP.
+    expect(statuses.map((x) => x.outbox)).toEqual(Array(10).fill([id]));
+    expect(statuses.map((x) => x.status)).toEqual([...Array(9).fill("queued"), "blocked:owner_at_approval_prompt"]);
     const final = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
     expect(final.data.owner_message.status).toBe("blocked:owner_at_approval_prompt");
   });
@@ -192,22 +202,27 @@ describe("blocked states reported by the publisher's own ack", () => {
 describe("unconfirmed owner notices", () => {
   const actor = "tnt@teamthurber.com";
   const gate = { revoked: [], hold: false };
+  // Each test owns a fresh durable object, captured once and used for queue/tick/
+  // status/reply alike. It is never the canonical HTTP "fleet", so no request from
+  // another test (even one orphaned by a timeout) can sweep or lease these rows.
+  let owned: DurableObjectStub<HerdrState>;
+  beforeEach(() => { owned = e.HERDR_STATE.get(e.HERDR_STATE.idFromName(`owner-notices-${crypto.randomUUID()}`)) as DurableObjectStub<HerdrState>; });
   async function tick(now: number, over: Parameters<typeof syncBody>[0] = {},
       revoked: { actor: string; client_id: string }[] = [], hold = false) {
-    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
+    const out = await runInDurableObject(owned, (o: HerdrState) =>
       o.sync(now, crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot(), ...over })),
         gate, gate, { revoked, hold }));
     if (!out.ok) throw new Error(out.reason);
     return out.response;
   }
   const status = (id: string) =>
-    runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, actor));
+    runInDurableObject(owned, (o: HerdrState) => o.ownerMessageStatus(id, actor));
   const busy = (id: string) => ({ exchange_id: id, outcome: "blocked" as const, reason: "deliver_failed:4" });
   const prompt = (id: string) => ({ exchange_id: id, outcome: "blocked" as const, reason: "owner_at_approval_prompt" });
   const reply = (id: string) => ({ exchange_id: id, owner_label: "conductor", body: "owner answer",
     responded_at: new Date().toISOString(), artifact_revision: "r1", session: "opaque-session" });
   async function queued() {
-    return runInDurableObject(fleet(), (_o: HerdrState, state) => queueRawOwner(state.storage));
+    return runInDurableObject(owned, (_o: HerdrState, state) => queueRawOwner(state.storage));
   }
 
   it("never re-leases an already-typed rc4 notice and blocks with rc4 at expiry", async () => {
@@ -242,7 +257,7 @@ describe("unconfirmed owner notices", () => {
     const out = await tick(now + 720_000, { owner_replies: [reply(id)] });
     expect(out.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "accepted" }]);
     expect(out.owner_outbox).toEqual([]);
-    expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor)))
+    expect(await runInDurableObject(owned, (o: HerdrState) => o.ownerReply(id, actor)))
       .toMatchObject({ body: "owner answer" });
     expect((await status(id))).toMatchObject({ status: "replied", delivered_at: null });
     expect((await tick(now + 720_001, { owner_replies: [reply(id)] })).owner_reply_results)
@@ -256,7 +271,7 @@ describe("unconfirmed owner notices", () => {
     await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
     // A lease issued by the previous implementation can still report rc5
     // after cutover. Model that existing delivering row, not a new lease.
-    await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+    await runInDurableObject(owned, (_o: HerdrState, state) =>
       state.storage.sql.exec("UPDATE owner_messages SET status='delivering', attempts=2 WHERE exchange_id=?", id).toArray());
     await tick(now + 30_000, { lease: false, owner_acks: [prompt(id)] });
     const out = await tick(now + 30_001, { owner_replies: [reply(id)] });
@@ -287,14 +302,14 @@ describe("unconfirmed owner notices", () => {
       const now = Date.now();
       await tick(now);
       await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
-      await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      await runInDurableObject(owned, (_o: HerdrState, state) =>
         state.storage.sql.exec("UPDATE owner_messages SET expires_at=? WHERE exchange_id=?", now + 100_000, id).toArray());
       const out = await tick(now + 100_000 + offset, {
         owner_replies: [{ ...reply(id), responded_at: new Date(now + 90_000).toISOString() }],
       });
       expect(out.owner_reply_results[0]?.outcome).toBe("ignored:queued");
       expect((await status(id))?.status).toBe("blocked:deliver_failed:4");
-      expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
+      expect(await runInDurableObject(owned, (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
     });
   }
 
@@ -320,7 +335,7 @@ describe("unconfirmed owner notices", () => {
     const revoked = await tick(now + 3, { owner_replies: [reply(id)] }, [{ actor, client_id: "c" }]);
     expect(revoked.owner_reply_results[0]?.outcome).not.toBe("accepted");
     expect((await status(id))?.status).toBe("blocked:sender_revoked");
-    expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
+    expect(await runInDurableObject(owned, (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
   });
 
   it("holds confirmed-delivery replies transiently and refuses them after sender revocation", async () => {
@@ -332,7 +347,7 @@ describe("unconfirmed owner notices", () => {
     expect(held.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "retry:grant_lookup_hold" }]);
     const revoked = await tick(now + 3, { owner_replies: [reply(id)] }, [{ actor, client_id: "c" }]);
     expect(revoked.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:blocked:sender_revoked" }]);
-    expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
+    expect(await runInDurableObject(owned, (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
   });
 
   for (const delivery of ["unconfirmed", "confirmed"] as const) {
@@ -360,8 +375,10 @@ describe("unconfirmed owner notices", () => {
         }
         const out = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [reply(id)] })));
         expect(out.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:blocked:sender_revoked" }]);
+        // This case runs over the real HTTP path, so its rows live in the canonical fleet object.
         expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
-        expect((await status(id))?.status).toBe(delivery === "unconfirmed" ? "blocked:sender_revoked" : "delivered");
+        expect((await runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, actor)))?.status)
+          .toBe(delivery === "unconfirmed" ? "blocked:sender_revoked" : "delivered");
       });
     }
   }
@@ -373,7 +390,7 @@ describe("unconfirmed owner notices", () => {
       await tick(now);
       await tick(now + 1, { lease: false,
         owner_acks: [delivery === "unconfirmed" ? busy(id) : { exchange_id: id, outcome: "delivered" }] });
-      const out = await runInDurableObject(fleet(), (o: HerdrState) => {
+      const out = await runInDurableObject(owned, (o: HerdrState) => {
         const original = Reflect.get(o, "env") as Env;
         Reflect.set(o, "env", { ...original, OWNER_INBOX_ENABLED: "false" });
         try {
@@ -386,7 +403,7 @@ describe("unconfirmed owner notices", () => {
       });
       expect(out.ok && out.response.owner_reply_results)
         .toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:blocked:owner_inbox_disabled" }]);
-      expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
+      expect(await runInDurableObject(owned, (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
     });
   }
 });
