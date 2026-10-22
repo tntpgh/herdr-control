@@ -70,8 +70,41 @@ with tempfile.TemporaryDirectory() as t:
     check("unknown class refused", err(run(root, "--mark", D, "done_lol", "-", "x")), (3, "ERROR"))
     check("mark of nonexistent message refused",
           err(run(root, "--mark", "oex_20990101T000000Z_deadbeef", "held", "-", "x")), (3, "ERROR"))
-    check("--since filters backlog without marking it", run(root, "--since", "20261022T014430")[1],
-          ["PENDING 1", D, "HELD 0"])
+    check("--since is a view: authoritative count kept, older counted not hidden",
+          run(root, "--since", "20261022T014432")[1],
+          ["PENDING 1", "VIEW since=20261022T014432 shown=0 older_unanswered_not_shown=1", "HELD 1", A])
+    check("bad --since (not a real UTC time) refused", err(run(root, "--since", "20261399T999999")), (3, "ERROR"))
+    check("unknown flag -> usage exit 2", run(root, "--snice", "x")[0], 2)
+    check("--mark missing note -> usage exit 2", run(root, "--mark", D, "held", "-")[0], 2)
+    check("extra args after --since -> usage exit 2", run(root, "--since", "20261022T014430", "x")[0], 2)
+
+    # restart with prior unanswered: a fresh process, no session state, still sees D
+    msg_new = "oex_20261023T090000Z_cccccccc"; msg(msg_new)
+    check("restart with prior unanswered: old D still pending next day", run(root)[1],
+          ["PENDING 2", D, msg_new, "HELD 1", A])
+    (d / "messages" / f"{msg_new}.md").unlink()
+
+    # legitimate closure of a hold: a later reply resolves it, no conflict
+    (d / "replies" / f"{A}.md").write_text("approved")
+    check("held item later replied: closed (neither pending nor held)", run(root)[1], ["PENDING 1", D, "HELD 0"])
+    check("closure did not need a conflicting mark; ledger still valid", run(root, "--mark", A, "held", "-", "same")[0], 0)
+    (d / "replies" / f"{A}.md").unlink()
+
+    # concurrency: two different marks for one id racing -> exactly one wins
+    import concurrent.futures as cf
+    E = "oex_20261022T014433Z_eeeeeeee"; msg(E)
+    ok = 0
+    for _ in range(8):
+        H.write_bytes(H.read_bytes())  # unchanged
+        with cf.ThreadPoolExecutor(2) as ex:
+            r = list(ex.map(lambda c: run(root, "--mark", E, c[0], c[1], "race")[0],
+                            [("held", "-"), ("superseded", D)]))
+        rc_ok = sorted(r)
+        lines = [l for l in H.read_text().splitlines() if l.startswith(E)]
+        ok += rc_ok == [0, 3] and len({tuple(l.split("\t")[1:3]) for l in lines}) == 1
+        H.write_text("".join(l + "\n" for l in H.read_text().splitlines() if not l.startswith(E)))
+    check("concurrent different marks: exactly one succeeds, ledger unpoisoned (8 rounds)", ok, 8)
+    (d / "messages" / f"{E}.md").unlink()
 
     good = H.read_bytes()
     H.write_bytes(good + f"{A}\ttriaged_historic\t-\tconflict\n".encode())
@@ -105,7 +138,13 @@ with tempfile.TemporaryDirectory() as t:
     check("ref must exist in the SAME label",
           err(run(root, "--mark", B, "answered_elsewhere", A, "x", label="other")), (3, "ERROR"))
     os.symlink(outside / "messages" / f"{A}.md", o2 / "messages" / f"{C}.md")
-    check("symlinked message file ignored", run(root, label="other")[1], ["PENDING 1", B, "HELD 0"])
+    check("symlinked message file -> ERROR (not silently skipped)", err(run(root, label="other")), (3, "ERROR"))
+    (o2 / "messages" / f"{C}.md").unlink()
+    os.symlink(outside / "messages" / f"{A}.md", o2 / "replies" / f"{B}.md")
+    check("symlinked reply file -> ERROR (cannot fake a reply)", err(run(root, label="other")), (3, "ERROR"))
+    (o2 / "replies" / f"{B}.md").unlink()
+    (o2 / "replies" / "sent" / f"{B}.md").mkdir()
+    check("directory named like a sent reply -> ERROR", err(run(root, label="other")), (3, "ERROR"))
 
 print(f"{'ALL PASS' if not fails else f'{fails} FAILED'}")
 sys.exit(1 if fails else 0)
