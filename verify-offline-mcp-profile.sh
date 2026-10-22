@@ -56,6 +56,39 @@ grep -q 'enableProjectConfig: *false' "$profile_path" \
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
 wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
 
+# ---- FAKE herdr backend (2026-10-21): this suite used to reach the REAL
+# herdr through spawn-agent.sh below and leaked one `tmp.XXXXXXXX`
+# workspace with an "offline-mcp-agent-test" tab per run (five found live).
+# Every herdr call in this suite now hits a recorder on PATH that returns
+# empty JSON and creates nothing; the end of the suite asserts no call
+# escaped to a real backend and no workspace was created.
+fake_bin=$(mktemp -d); herdr_calls="$fake_bin/herdr.calls"; : > "$herdr_calls"
+python3 - "$fake_bin" "$herdr_calls" <<'PY'
+import os, shlex, sys
+d, log = sys.argv[1], sys.argv[2]
+p = os.path.join(d, "herdr")
+script = r'''#!/bin/sh
+printf "%%s\n" "$*" >> %s
+case "$1 $2" in
+  "workspace list") echo '{"result":{"workspaces":[]}}' ;;
+  "pane list") echo '{"result":{"panes":[]}}' ;;
+  "tab list") echo '{"result":{"tabs":[]}}' ;;
+  "workspace create") echo '{"result":{"workspace":{"workspace_id":"wFAKE","active_tab_id":"wFAKE:t1"}}}' ;;
+  "tab create") echo '{"result":{"tab":{"tab_id":"wFAKE:t2"},"root_pane":{"pane_id":"wFAKE:p2","terminal_id":"fake-birth"}}}' ;;
+  *) echo '{}' ;;
+esac
+''' % shlex.quote(log)
+open(p, "w").write(script)
+os.chmod(p, 0o755)
+PY
+export PATH="$fake_bin:$PATH"
+# config.sh PREPENDS HERDR_EXTRA_PATH (homebrew, ~/.local/bin) to PATH, which
+# put the real herdr back in front for spawn-agent.sh (measured: a live
+# tmp.* workspace leaked with the fake on PATH alone). Pin the fake first.
+export HERDR_EXTRA_PATH="$fake_bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
+unset HERDR_PANE_ID
+[ "$(command -v herdr)" = "$fake_bin/herdr" ] && ok "fake herdr backend shadows the real one" || bad "real herdr still first on PATH: $(command -v herdr)"
+
 # ---- K3 (2026-10-18): --approval hook needs a launcher whose own
 # --herdr-bound-check matches $here's content; no HERDR_OMP_EXTENSION env
 # seam exists anymore. Build ONE isolated copy of this checkout with a
@@ -290,6 +323,12 @@ missing_row="$(_sql "SELECT count(*) FROM events WHERE type='offline_mcp_profile
 [ "${missing_row:-0}" -gt 0 ] 2>/dev/null \
   && ok "a registry event records the preflight refusal" \
   || bad "no offline_mcp_profile_missing event found in the registry"
+
+printf '== fake backend: nothing escaped to a real herdr ==\n'
+# The spawn-agent.sh section must have reached `tab create` on the FAKE.
+grep -q '^tab create' "$herdr_calls" \
+  && ok "spawn-agent.sh's tab create hit the recorder, not a real herdr" \
+  || bad "no tab create recorded — the spawn either escaped to a real herdr or never got there: $(tr '\n' ';' < "$herdr_calls")"
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then echo PASS; exit 0; else echo FAIL; exit 1; fi
