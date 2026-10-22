@@ -920,7 +920,8 @@ def _raises(fn):
 
 
 def issue_cases(base: Path) -> None:
-    """owner-dispatch-issue.py: one approval record -> expected gen-1 claim + one grant; every mismatch aborts."""
+    """owner-dispatch-issue.py: trust root = the answered formserve record + served HTML;
+    one approval -> expected gen-1 claim + one grant + immutable issuance record."""
     import importlib.util
     import io
     import contextlib
@@ -930,65 +931,80 @@ def issue_cases(base: Path) -> None:
     spec2 = importlib.util.spec_from_file_location("odcli2", HERE / "owner-dispatch.py")
     odc = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(odc)
     now = float(int(_t.time()))
-    iso = lambda t: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
     HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
     reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
     body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
     n = [0]
 
-    def setup():
+    def setup(max_open=1):
         n[0] += 1
         d = base / f"c{n[0]}"; d.mkdir(mode=0o700)
         lc, av, roots, lease_db = env(d); av.close()
+        lc.execute("UPDATE owner_projects SET max_open=? WHERE label=?", (max_open, KB))
         os.chmod(lease_db, 0o600)
         adb = d / "auth.db"
         c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); c.close(); os.chmod(adb, 0o600)
         rq = d / "req"; rq.mkdir(); (rq / "req.txt").write_bytes(body)
+        (d / "state" / "forms").mkdir(parents=True)
         proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
         return d, lc, lease_db, adb, rq, roots, proj
 
-    def approval(d, proj, **over):
-        rec = {"protocol": odi.PROTOCOL, "approval_id": f"appr-{n[0]}", "prompt_id": "form-20261022-kb-pilot",
-               "decided_at": iso(now - 60), "owner_label": KB, "project": proj, "expected_holder": dict(HOLD),
+    def decision(d, proj, over=None, answers=None, status="answered", answered_at=None, html_extra=b""):
+        rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1, "expected_holder": dict(HOLD),
                "expected_generation": 1, "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}", "request_name": "req.txt",
                "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"], "auth_id": f"auth-{n[0]}",
-               "grant_expires_at": iso(now + 1800)}
-        rec.update(over)
-        data = json.dumps(rec, sort_keys=True).encode()
-        f = d / "approval.json"; f.write_bytes(data)
-        return f, hashlib.sha256(data).hexdigest(), rec
+               "grant_window_s": 1800}
+        rec.update(over or {})
+        emb = json.dumps(rec, sort_keys=True, indent=1).encode()
+        fid = f"20261022T1200{n[0] % 100:02d}-86{n[0] % 100:02d}"
+        html = b"<html><body><h1>KB pilot</h1><script type=\"application/json\" id=\"owner-dispatch-approval\">" + emb + b"</script>" + html_extra + b"</body></html>"
+        ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
+        row = {"id": fid, "status": status, "answers": ans, "answered_at": int((now - 60) * 1000) if answered_at is None else answered_at}
+        (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
+        (d / "state" / "forms" / f"{fid}.json").write_text(json.dumps(row))
+        return fid, rec, hashlib.sha256(emb).hexdigest()
 
-    def run(d, lease_db, adb, rq, f, sha, resolve=reg_ok, flags=True, t=None):
+    KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB", "HERDR_STATE_ROOT")
+
+    def run(d, lease_db, adb, rq, fid, resolve=reg_ok, flags=True, t=None):
         E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
              "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
-        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
-                                                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")}
+        E["HERDR_STATE_ROOT"] = str(d / "state")
+        saved = {k: os.environ.get(k) for k in KEYS_ENV}
         for k in saved: os.environ.pop(k, None)
         os.environ.update(E)
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                rc = odi.main(["--approval", str(f), "--approval-sha256", sha, "--request-dir", str(rq)], resolve=resolve,
-                              now=now if t is None else t)
+                rc = odi.main(["--form-id", fid, "--request-dir", str(rq)], resolve=resolve, now=now if t is None else t)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         return rc, buf.getvalue().strip()
 
-    def grants(adb):
-        c = sqlite3.connect(str(adb)); r = c.execute("SELECT COUNT(*) FROM owner_dispatch_auth").fetchone()[0]; c.close(); return r
+    def q(adb, sql):
+        c = sqlite3.connect(str(adb)); r = c.execute(sql).fetchall(); c.close(); return r
 
     def lease_rows(lc):
         return lc.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0]
 
-    # happy path, then the SAME record again, then dispatch through the real CLI
+    # happy path: grant + immutable issuance record in one transaction; replay refused; dispatch works
     d, lc, ldb, adb, rq, roots, proj = setup()
-    f, sha, rec = approval(d, proj)
-    first = run(d, ldb, adb, rq, f, sha)
-    again = run(d, ldb, adb, rq, f, sha)
-    case("ISSUE: exact approval -> gen-1 claim + exactly one grant; replaying the record refuses (approval_already_used), still one grant",
-         first == (0, f"issued:{rec['auth_id']}:gen1") and again == (2, "refused:approval_already_used") and grants(adb) == 1
-         and ol.holder_tuple(lc, KB, now) == (*PANE[KB], SESS[KB], 1))
+    fid, rec, asha = decision(d, proj)
+    first = run(d, ldb, adb, rq, fid)
+    again = run(d, ldb, adb, rq, fid)
+    iss = q(adb, "SELECT auth_id, approval_sha256, form_id, length(approval_bytes) FROM owner_dispatch_issuance")
+    g = q(adb, "SELECT approval_id, prompt_id, expires_at FROM owner_dispatch_auth")
+    case("ISSUE: answered form record -> gen-1 claim, one grant + issuance record (approval sha + bytes + form id); replay refused",
+         first == (0, f"issued:{rec['auth_id']}:gen1") and again == (2, "refused:approval_already_used")
+         and iss == [(rec["auth_id"], asha, fid, iss[0][3])] and iss[0][3] > 100
+         and g == [(fid, fid, now - 60 + 1800)] and ol.holder_tuple(lc, KB, now) == (*PANE[KB], SESS[KB], 1))
+    ac = sqlite3.connect(str(adb), isolation_level=None)
+    case("ISSUE: issuance record is append-only",
+         _raises(lambda: ac.execute("UPDATE owner_dispatch_issuance SET approval_sha256=?", ("f" * 64,)))
+         and _raises(lambda: ac.execute("DELETE FROM owner_dispatch_issuance")))
+    ac.close()
     sent = []
     E = {"HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": ldb,
          "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb), "HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(d / "ra.db"),
@@ -1009,57 +1025,109 @@ def issue_cases(base: Path) -> None:
          (rc, buf.getvalue().strip()) == (0, "dispatched") and (roots[KB] / rec["request_id"] / ra.REQUEST_FILE).read_bytes() == body)
     lc.close()
 
-    # every pre-claim mismatch: refused, NOTHING written (no lease row, no grant)
-    other_sess = hashlib.sha256(b"other").hexdigest()
-    for name, over, kw, want in [
-        ("flags off", {}, {"flags": False}, (4, "refused:flags_off")),
-        ("approval bytes changed after sha", {}, {"tamper": True}, (2, "refused:approval_sha_mismatch")),
-        ("request bytes differ", {"request_sha256": "0" * 64}, {}, (2, "refused:request_sha_mismatch")),
-        ("window over 60 min", {"grant_expires_at": iso(now - 60 + 3601)}, {}, (2, "refused:approval_window_over_60min")),
-        ("expired", {"decided_at": iso(now - 1000), "grant_expires_at": iso(now - 10)}, {}, (2, "refused:approval_expired")),
-        ("non-canonical timestamp", {"grant_expires_at": iso(now + 600).replace("Z", "+00:00")}, {}, (2, "refused:bad_timestamp")),
-        ("generation != 1", {"expected_generation": 2}, {}, (2, "refused:approval_generation_not_initial")),
-        ("extra field", {"note": "x"}, {}, (2, "refused:approval_schema")),
-        ("holder digest differs from registry", {"expected_holder": {**HOLD, "session_digest": other_sess}}, {}, (2, "refused:identity_mismatch")),
-        ("dead/other owner label", {"owner_label": DOTS}, {}, (2, "refused:identity_mismatch")),
-        ("project differs", {"project": "tntpgh/other"}, {}, (2, "refused:owner_project_mismatch")),
-        ("registry has no session", {}, {"resolve": lambda l: None}, (2, "refused:identity_mismatch")),
+    other = hashlib.sha256(b"other").hexdigest()
+    for name, kw, want in [
+        ("flags off", {"flags": False}, (4, "refused:flags_off")),
+        ("form still open", {"status": "open"}, (2, "refused:form_not_answered")),
+        ("form expired (unanswered, never a decline)", {"status": "expired"}, (2, "refused:form_not_answered")),
+        ("answer declines", {"answers": {"decision": "decline"}}, (2, "refused:form_not_approved")),
+        ("answer echoes a different record sha", {"answers": {"decision": "approve", "approval_sha256": other}}, (2, "refused:form_answer_not_bound_to_displayed_record")),
+        ("page carries two embedded records", {"html_extra": b'<script type="application/json" id="owner-dispatch-approval">{}</script>'}, (2, "refused:form_html_no_single_embedded_approval")),
+        ("approval older than its window", {"answered_at": int((now - 1801) * 1000)}, (2, "refused:approval_expired")),
+        ("window over 60 min", {"over": {"grant_window_s": 3601}}, (2, "refused:approval_field_grant_window_s")),
+        ("max_open not 1 in record", {"over": {"max_open": 2}}, (2, "refused:approval_max_open_not_1")),
+        ("request bytes differ", {"over": {"request_sha256": "0" * 64}}, (2, "refused:request_sha_mismatch")),
+        ("generation != 1", {"over": {"expected_generation": 2}}, (2, "refused:approval_generation_not_initial")),
+        ("extra field", {"over": {"note": "x"}}, (2, "refused:approval_schema")),
+        ("holder digest differs", {"over": {"expected_holder": {**HOLD, "session_digest": other}}}, (2, "refused:identity_mismatch")),
+        ("dead/other owner label", {"over": {"owner_label": DOTS}}, (2, "refused:identity_mismatch")),
+        ("project differs", {"over": {"project": "tntpgh/other"}}, (2, "refused:owner_project_mismatch")),
+        ("live mapping max_open != 1", {"max_open": 5}, (2, "refused:owner_project_mismatch")),
+        ("registry has no session", {"resolve": lambda l: None}, (2, "refused:identity_mismatch")),
     ]:
-        d, lc, ldb, adb, rq, roots, proj = setup()
-        f, sha, rec = approval(d, proj, **over)
-        if kw.get("tamper"):
-            f.write_bytes(f.read_bytes().replace(b"result.md", b"result.mx"))
-        got = run(d, ldb, adb, rq, f, sha, resolve=kw.get("resolve", reg_ok), flags=kw.get("flags", True))
-        case(f"ISSUE refused before any write: {name}", got == want and grants(adb) == 0 and lease_rows(lc) == 0)
+        d, lc, ldb, adb, rq, roots, proj = setup(max_open=kw.get("max_open", 1))
+        fid, rec, asha = decision(d, proj, over=kw.get("over"), answers=kw.get("answers"), status=kw.get("status", "answered"),
+                                  answered_at=kw.get("answered_at"), html_extra=kw.get("html_extra", b""))
+        got = run(d, ldb, adb, rq, fid, resolve=kw.get("resolve", reg_ok), flags=kw.get("flags", True))
+        case(f"ISSUE refused before any write: {name}", got == want and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+             and lease_rows(lc) == 0)
         lc.close()
-
-    # an existing lease is never adopted: refused, the existing lease untouched, no grant
+    # caller cannot point at an arbitrary file: only a form id in the canonical forms dir; symlinked record refused
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    fj = d / "state" / "forms" / f"{fid}.json"
+    (d / "elsewhere.json").write_bytes(fj.read_bytes()); fj.unlink(); fj.symlink_to(d / "elsewhere.json")
+    case("ISSUE: path-like form id and a symlinked record are refused",
+         run(d, ldb, adb, rq, "../x")[0] == 2 and run(d, ldb, adb, rq, fid) == (2, "refused:form_unreadable") and lease_rows(lc) == 0)
+    lc.close()
+    # unexpected error BEFORE the claim -> refused, nothing written
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    def raise_first(label):
+        raise RuntimeError("registry read failed")
+    case("ISSUE: unexpected error before the claim -> refused exit 2, no lease, no grant",
+         run(d, ldb, adb, rq, fid, resolve=raise_first) == (2, "refused:error_RuntimeError") and lease_rows(lc) == 0
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+    # existing lease never adopted
     d, lc, ldb, adb, rq, roots, proj = setup()
     acquire(lc, KB, now, session=SESS[KB])
-    f, sha, rec = approval(d, proj)
-    case("ISSUE: an existing lease is never adopted (not_initial), no grant", run(d, ldb, adb, rq, f, sha) == (2, "refused:not_initial")
-         and grants(adb) == 0 and lease_rows(lc) == 1)
+    fid, rec, asha = decision(d, proj)
+    case("ISSUE: an existing lease is never adopted (not_initial), no grant", run(d, ldb, adb, rq, fid) == (2, "refused:not_initial")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)] and lease_rows(lc) == 1)
     lc.close()
-    # identity moves between claim and issue -> claimed_not_issued (exit 5), no grant, no retry
+    # identity moves after claim -> claimed_not_issued (grant verified absent)
     d, lc, ldb, adb, rq, roots, proj = setup()
-    f, sha, rec = approval(d, proj)
+    fid, rec, asha = decision(d, proj)
     calls = [0]
     def moving(label):
         calls[0] += 1
         return reg_ok(label) if calls[0] == 1 else (PANE[KB][0], "term_new", SESS[KB])
-    case("ISSUE: identity changes after the claim -> claimed_not_issued exit 5, lease held, NO grant",
-         run(d, ldb, adb, rq, f, sha, resolve=moving) == (5, "claimed_not_issued:identity_mismatch") and grants(adb) == 0
-         and lease_rows(lc) == 1)
+    case("ISSUE: identity changes after the claim -> claimed_not_issued exit 5 (grant verified absent), lease held",
+         run(d, ldb, adb, rq, fid, resolve=moving) == (5, "claimed_not_issued:identity_mismatch")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)] and lease_rows(lc) == 1)
     lc.close()
-    # auth_id / approval_id reuse: refused before the claim
+    # resolver raises after claim -> unexpected error classified by the store: absent but not a Refused -> issue_uncertain
     d, lc, ldb, adb, rq, roots, proj = setup()
-    f, sha, rec = approval(d, proj)
-    c = sqlite3.connect(str(adb), isolation_level=None)
-    insert_grant(c, "other", label=KB, project=proj, holder=(*PANE[KB], SESS[KB], 1), rid="x", sha="a" * 64, manifest=["m"],
-                 approval=rec["approval_id"])
-    c.close()
-    case("ISSUE: approval_id already used -> refused before claim, nothing new written",
-         run(d, ldb, adb, rq, f, sha) == (2, "refused:approval_already_used") and grants(adb) == 1 and lease_rows(lc) == 0)
+    fid, rec, asha = decision(d, proj)
+    calls2 = [0]
+    def boom(label):
+        calls2[0] += 1
+        if calls2[0] == 1:
+            return reg_ok(label)
+        raise RuntimeError("registry read failed")
+    case("ISSUE: unexpected error after the claim -> issue_uncertain exit 6, never 'unissued', no grant, lease held",
+         run(d, ldb, adb, rq, fid, resolve=boom) == (6, "issue_uncertain:error_RuntimeError:store_absent") and lease_rows(lc) == 1)
+    lc.close()
+    # commit raises but the row landed -> reported issued (verified), not unissued
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    real_insert = odi.insert_grant
+    def insert_then_fail(store, dec, exp):
+        real_insert(store, dec, exp)
+        raise sqlite3.OperationalError("disk I/O error after commit")
+    odi.insert_grant = insert_then_fail
+    try:
+        got = run(d, ldb, adb, rq, fid)
+    finally:
+        odi.insert_grant = real_insert
+    case("ISSUE: error after a commit that landed -> verified 'issued' (exit 0), never reported unissued",
+         got[0] == 0 and got[1].startswith(f"issued:{rec['auth_id']}:gen1 (after error_OperationalError")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_issuance") == [(1,)])
+    lc.close()
+    # error where the store cannot be read back -> issue_uncertain store_unknown
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    real_gs = odi.grant_state
+    def fail_insert(store, dec, exp):
+        raise sqlite3.OperationalError("database is locked")
+    odi.insert_grant, odi.grant_state = fail_insert, (lambda db, dec: "unknown")
+    try:
+        got = run(d, ldb, adb, rq, fid)
+    finally:
+        odi.insert_grant, odi.grant_state = real_insert, real_gs
+    case("ISSUE: failed issue with unreadable store -> issue_uncertain exit 6 store_unknown",
+         got == (6, "issue_uncertain:error_OperationalError:store_unknown"))
     lc.close()
 
 

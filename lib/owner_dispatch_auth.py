@@ -101,13 +101,29 @@ OPERATOR_SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS owner_dispatch_operator_no_delete BEFORE DELETE ON owner_dispatch_operator"
     " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
 )
+ISSUANCE_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS owner_dispatch_issuance (
+  auth_id            TEXT PRIMARY KEY,
+  approval_sha256    TEXT NOT NULL CHECK (length(approval_sha256) = 64),
+  approval_bytes     BLOB NOT NULL,
+  form_id            TEXT NOT NULL UNIQUE,
+  form_record_sha256 TEXT NOT NULL,
+  form_html_sha256   TEXT NOT NULL,
+  answered_at        REAL NOT NULL,
+  issued_at          TEXT NOT NULL
+)""",
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_issuance_no_update BEFORE UPDATE ON owner_dispatch_issuance"
+    " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_issuance_no_delete BEFORE DELETE ON owner_dispatch_issuance"
+    " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+)
 OUTCOMES = ("confirmed_delivered", "confirmed_not_delivered", "abandoned_uncertain")
 
 
 def migrate(conn: sqlite3.Connection) -> None:
     """Creates the tables in a store the CALLER chose (tests: a temp file)."""
     conn.execute(SCHEMA)
-    for stmt in OPERATOR_SCHEMA:
+    for stmt in OPERATOR_SCHEMA + ISSUANCE_SCHEMA:
         conn.execute(stmt)
 
 
