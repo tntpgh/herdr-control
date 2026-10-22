@@ -69,7 +69,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
 MAX_TTL_S = 86_400
@@ -184,6 +184,12 @@ MIGRATIONS = {
         "CREATE TRIGGER owner_events_no_update BEFORE UPDATE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
         "CREATE TRIGGER owner_events_no_delete BEFORE DELETE ON owner_events BEGIN SELECT RAISE(ABORT, 'owner_events is append-only'); END",
     ],
+    # v3: the holder's agent-session digest (full sha256 hex) is part of lease
+    # authority: (label, pane_id, pane_birth, session_digest, generation).
+    # Pre-v3 leases carry '' and therefore never satisfy holder_tuple().
+    3: [
+        "ALTER TABLE owner_leases ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''",
+    ],
 }
 
 
@@ -276,19 +282,27 @@ def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_O
     return _tx(conn, body)
 
 
+SESSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def _live(conn, label, now):
     """Current live lease (unreleased, unexpired) or None."""
     return conn.execute(
-        "SELECT lease_id, pane_id, pane_birth, generation, renewed_at, expires_at FROM owner_leases "
+        "SELECT lease_id, pane_id, pane_birth, generation, renewed_at, expires_at, session_digest FROM owner_leases "
         "WHERE label=? AND released_at IS NULL AND expires_at > ?", (label, _iso(now))).fetchone()
 
 
-def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: float | None = None) -> int:
+def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: float | None = None,
+            session_digest: str = "") -> int:
     """Acquire or renew. Returns the holder's generation. On a generation change,
     the expired predecessor is released and its open requests disposed `stale`,
-    all in the same transaction as the successor's insert."""
+    all in the same transaction as the successor's insert. session_digest is ''
+    or a full sha256 hex; a renewal must present the SAME digest (a session
+    change is a different holder and waits for expiry)."""
     now = time.time() if now is None else now
     _check_holder(pane_id, pane_birth)
+    if session_digest and not SESSION_DIGEST_RE.match(session_digest):
+        raise ValueError("session_digest must be '' or 64 lowercase hex")
     if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= MAX_TTL_S:
         raise ValueError(f"ttl_s must be an int in 1..{MAX_TTL_S}")
 
@@ -297,8 +311,8 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
             raise InvalidOwner(f"{label} is not a registered owner")
         cur = _live(conn, label, now)
         if cur:
-            lease_id, pane, birth, gen, _r, _e = cur
-            if (pane, birth) != (pane_id, pane_birth):
+            lease_id, pane, birth, gen, _r, _e, sess = cur
+            if (pane, birth, sess) != (pane_id, pane_birth, session_digest):
                 raise LeaseConflict(f"{label} held by {pane}@{birth} gen {gen}")
             conn.execute("UPDATE owner_leases SET renewed_at=?, expires_at=? WHERE lease_id=?",
                          (_iso(now), _iso(now + ttl_s), lease_id))
@@ -310,8 +324,9 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
             _event(conn, now, label, "released", old_id, old_gen, "expired")
         gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
         lease_id = f"ol_{uuid.uuid4().hex}"
-        conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at) "
-                     "VALUES (?,?,?,?,?,?,?,?)", (lease_id, label, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s)))
+        conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
+                     "session_digest) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (lease_id, label, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
         _event(conn, now, label, "acquired", lease_id, gen, f"{pane_id}@{pane_birth}")
         stale = conn.execute(
             f"SELECT request_id, generation FROM owner_requests WHERE label=? AND generation<? AND state IN ({_q(OPEN)})",
@@ -322,6 +337,15 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
         return gen
 
     return _tx(conn, body)
+
+
+def holder_tuple(conn, label, now=None):
+    """(pane_id, pane_birth, session_digest, generation) of the live lease, or
+    None when there is none or it carries no session digest. Read-only."""
+    cur = _live(conn, label, time.time() if now is None else now)
+    if not cur or not SESSION_DIGEST_RE.match(cur[6] or ""):
+        return None
+    return (cur[1], cur[2], cur[6], cur[3])
 
 
 def _q(items):

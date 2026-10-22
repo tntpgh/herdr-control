@@ -77,7 +77,7 @@ def main():
 
     # --- schema / migration ---
     p, c = fresh(label=None)
-    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 2 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 2)
+    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 3 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 3)
     ol.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0)
     case("events: DELETE rejected by trigger", raises(lambda: c.execute("DELETE FROM owner_events"), sqlite3.IntegrityError))
     case("events: UPDATE rejected by trigger", raises(lambda: c.execute("UPDATE owner_events SET kind='x'"), sqlite3.IntegrityError))
@@ -295,10 +295,15 @@ def main():
     pre_projects = snap(pre, "owner_projects")
     pre.close()
     u = ol.connect(path)
-    case("v1 -> v2 upgrade applies exactly once", ol.migrate(u) == 2 and ol.migrate(u) == 2
-         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2])
+    case("v1 -> v3 upgrade applies each version exactly once", ol.migrate(u) == 3 and ol.migrate(u) == 3
+         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2, 3])
+    v1_lease_cols = "lease_id, label, pane_id, pane_birth, generation, acquired_at, renewed_at, expires_at, released_at, release_reason"
     case("upgrade preserves leases, requests and events (incl. seq) verbatim",
-         all(snap(u, t) == rows for t, rows in before.items()))
+         snap(u, "owner_leases", v1_lease_cols) == before["owner_leases"]
+         and all(snap(u, t) == before[t] for t in ("owner_requests", "owner_events")))
+    case("pre-v3 leases get an empty session digest and so never satisfy holder_tuple()",
+         count(u, "SELECT COUNT(*) FROM owner_leases WHERE session_digest <> ''") == 0
+         and ol.holder_tuple(u, "kb", datetime(2026, 10, 1, 1, 0, tzinfo=timezone.utc).timestamp()) is None)
     case("upgrade preserves projects and backfills max_open default",
          snap(u, "owner_projects", "label, project, registered_at") == pre_projects
          and count(u, "SELECT COUNT(*) FROM owner_projects WHERE max_open=?", ol.DEFAULT_MAX_OPEN) == 1)
