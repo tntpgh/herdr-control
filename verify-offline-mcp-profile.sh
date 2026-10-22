@@ -52,6 +52,29 @@ grep -q 'enableProjectConfig: *false' "$profile_path" \
   && ok "overlay sets mcp.enableProjectConfig: false" \
   || bad "overlay does not disable project MCP config: $(cat "$profile_path" 2>&1)"
 
+# ---- NO-SPAWN BOUNDARY (2026-10-22 incident: run from inside a herdr pane, the
+# spawn-agent.sh probe below created a REAL workspace + omp pane). Every `herdr`
+# call in this script and its children resolves to a stub FIRST on PATH: read-only
+# verbs are forwarded to the real CLI, every other verb (tab/workspace/pane create,
+# split, run, send, close, report-agent, ...) is refused (exit 97) and logged.
+# No absolute herdr path is used by spawn-task.sh/spawn-agent.sh/ensure-workspace.sh/lib.
+# Fail closed: if `herdr` does not resolve to the stub, the script aborts before any probe.
+nospawn_dir=$(mktemp -d); nospawn_log="$nospawn_dir/calls.log"; : > "$nospawn_log"
+real_herdr=$(command -v herdr 2>/dev/null || true)
+cat > "$nospawn_dir/herdr" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$nospawn_log"
+case "\$1 \$2" in
+  "pane list"|"workspace list"|"tab list"|"pane get"|"pane read"|"workspace get"|"tab get")
+    [ -n "$real_herdr" ] && exec "$real_herdr" "\$@"; exit 97 ;;
+esac
+echo "verify-offline-mcp-profile: herdr \$1 \$2 REFUSED by no-spawn boundary" >&2
+exit 97
+EOF
+chmod 700 "$nospawn_dir/herdr"
+export PATH="$nospawn_dir:$PATH"
+[ "$(command -v herdr)" = "$nospawn_dir/herdr" ] || { echo "FATAL: no-spawn boundary not in effect; refusing to run" >&2; exit 2; }
+
 # ---- real spawn-task.sh --dry-run against a throwaway repo -----------------
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
 wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
@@ -62,7 +85,7 @@ wt_dir=$(mktemp -d); state_dir=$(mktemp -d)
 # fixture launcher that reports pins computed from that copy's own
 # content, pinned into that copy's OWN config.sh (production config.sh is
 # never touched). Every hook-mode call below runs against $ctl, not $here.
-ctl_work=$(mktemp -d); trap 'rm -rf "$ctl_work"' EXIT
+ctl_work=$(mktemp -d); trap 'rm -rf "$ctl_work" "$nospawn_dir"' EXIT
 ctl="$ctl_work/ctl"; mkdir -p "$ctl"; cp -R "$here/." "$ctl/"
 rm -rf "$ctl/.git"; find "$ctl" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
 ctl_lib_tree_sha() {
@@ -254,17 +277,16 @@ esac
 printf '== spawn-agent.sh --job review: same overlay, same trigger ==\n'
 launch_line="$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$state_dir" \
   bash "$here/spawn-agent.sh" --job review "$probe_repo" offline-mcp-agent-test omp 2>&1)"
+# spawn-agent.sh has no --dry-run. Under the no-spawn boundary every mutating
+# herdr call it makes (workspace/tab create, pane run, ...) is refused, so no
+# pane can exist in ANY environment. Its stderr may be silenced, so the verdict
+# comes from the stub's call log, not the text. The overlay decision itself is
+# covered by lib/agent-profiles.sh unit tests and spawn-task.sh --dry-run above.
+refused=$(grep -cvE '^(pane|workspace|tab) (list|get|read)( |$)' "$nospawn_log" || true)
 case "$launch_line" in
-  *"--config $profile_path"*) ok "spawn-agent.sh --job review: overlay present" ;;
-  *"authorization hold"*|*"unavailable or outside Herdr"*)
-    # spawn-agent.sh has no --dry-run; it reaches the real pane-create call,
-    # which this plain-shell harness cannot satisfy (same local-ancestry gate
-    # spawn-task.sh's --dry-run sidesteps above). The overlay decision itself
-    # already ran (lib/agent-profiles.sh unit tests above cover it); this
-    # section only confirms spawn-agent.sh does not error out BEFORE that
-    # decision in a way unrelated to the fix.
-    ok "spawn-agent.sh: reached the real pane-create step (same code path proven via spawn-task.sh's --dry-run above; no separate --dry-run exists here)" ;;
-  *) bad "spawn-agent.sh --job review: unexpected output: $launch_line" ;;
+  *"--config $profile_path"*) bad "spawn-agent.sh printed a launch line: the no-spawn boundary did not hold" ;;
+  *) if [ "${refused:-0}" -ge 1 ]; then ok "spawn-agent.sh: stopped at the herdr boundary ($refused mutating call(s) refused; no real workspace/tab/pane)"
+     else bad "spawn-agent.sh made no mutating herdr call; unexpected output: $launch_line"; fi ;;
 esac
 
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
