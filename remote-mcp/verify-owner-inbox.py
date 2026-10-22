@@ -846,6 +846,10 @@ class OwnerInboxRetention(unittest.TestCase):
             os.utime(old_undelivered, (old_s, old_s))
 
             (label_dir / "replies" / "sent").mkdir(parents=True)
+            # Closed exchanges: the delivered messages have an accepted reply
+            # (owner-work protection prunes only replied messages).
+            for x in ("oex_old_delivered", "oex_recent_delivered", "oex_old_undelivered"):
+                (label_dir / "replies" / "sent" / f"{x}.md").write_text("reply")
             old_sent = label_dir / "replies" / "sent" / "oex_old_sent.md"
             old_sent.write_text("acked reply")
             os.utime(old_sent, (old_s, old_s))
@@ -917,6 +921,9 @@ class OwnerInboxRetention(unittest.TestCase):
             past_cutoff = label_dir / "messages" / "oex_past_cutoff.md"
             past_cutoff.write_text("one second older than the boundary")
             os.utime(past_cutoff, (cutoff - 1, cutoff - 1))
+            (label_dir / "replies" / "sent").mkdir(parents=True)
+            for x in ("oex_at_cutoff", "oex_past_cutoff"):
+                (label_dir / "replies" / "sent" / f"{x}.md").write_text("reply")
 
             owner_message_delivered = {"oex_at_cutoff": cutoff, "oex_past_cutoff": cutoff - 1}
             pruned_messages, _ = pub.prune_inbox(owner_message_delivered, {}, now_s)
@@ -969,6 +976,8 @@ class OwnerInboxRetention(unittest.TestCase):
             victim = label_dir / "messages" / "oex_auditfail1.md"
             victim.write_text("must survive an audit-write failure")
             os.utime(victim, (old_s, old_s))
+            (label_dir / "replies" / "sent").mkdir(parents=True)
+            (label_dir / "replies" / "sent" / "oex_auditfail1.md").write_text("reply")  # else skipped before audit
 
             real_append = pub.append_audit
 
@@ -1153,6 +1162,100 @@ class DeliverIdentityFreshness(unittest.TestCase):
             pub.HUB = old_hub
         self.assertIsNone(out)  # transient: no ack this tick, retried next tick -- never a raised exception either
 
+
+
+class PruneOwnerWorkProtectionTests(unittest.TestCase):
+    """2026-10-22: age alone must never delete owner work. Unanswered and
+    held items, and anything handled.tsv references, survive retention;
+    a replied exchange may be pruned without poisoning the ledger."""
+
+    def setUp(self):
+        self.label = "prunework"
+        self.d = pub.INBOX_ROOT / self.label
+        shutil.rmtree(self.d, ignore_errors=True)
+        (self.d / "messages").mkdir(parents=True)
+        (self.d / "replies" / "sent").mkdir(parents=True)
+        self.old = time.time() - (pub.OWNER_INBOX_RETENTION_DAYS + 5) * 86_400
+        self.delivered = {}
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def msg(self, x, replied=False):
+        f = self.d / "messages" / f"{x}.md"
+        f.write_text("m"); os.utime(f, (self.old, self.old)); self.delivered[x] = self.old
+        if replied:
+            r = self.d / "replies" / "sent" / f"{x}.md"
+            r.write_text("r"); os.utime(r, (self.old, self.old))
+        return f
+
+    def ledger(self, *lines):
+        (self.d / "handled.tsv").write_text("".join(l + "\n" for l in lines))
+
+    def prune(self, accepted=()):
+        return pub.prune_inbox(self.delivered, {f"{self.label}/{x}": self.old for x in accepted}, time.time())
+
+    def test_old_unanswered_is_retained(self):
+        f = self.msg("oex_20260901T000000Z_aaaaaaaa")
+        self.assertEqual(self.prune()[0], set())
+        self.assertTrue(f.exists())
+
+    def test_old_held_is_retained_even_if_some_reply_exists_elsewhere(self):
+        a = self.msg("oex_20260901T000000Z_aaaaaaaa")
+        self.ledger("oex_20260901T000000Z_aaaaaaaa\theld\t-\tawaiting T")
+        self.assertEqual(self.prune()[0], set())
+        self.assertTrue(a.exists())
+
+    def test_replied_held_is_retained_while_ledger_names_it_and_ledger_stays_parseable(self):
+        x = "oex_20260901T000000Z_aaaaaaaa"
+        a = self.msg(x, replied=True)
+        self.ledger(f"{x}\theld\t-\tlater approved by reply")
+        self.assertEqual(self.prune(accepted=[x]), (set(), set()))
+        self.assertTrue(a.exists())
+        self.assertTrue((self.d / "replies" / "sent" / f"{x}.md").exists())
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("oip", Path(__file__).with_name("owner-inbox-pending.py"))
+        oip = importlib.util.module_from_spec(spec); spec.loader.exec_module(oip)
+        os.environ["HERDR_INBOX_ROOT"] = str(pub.INBOX_ROOT)
+        try:
+            self.assertEqual(oip.report(self.label)[0].split()[:2], ["PENDING", "0"])  # parses, closed
+        finally:
+            os.environ.pop("HERDR_INBOX_ROOT", None)
+
+    def test_replied_unreferenced_exchange_prunes_message_then_reply_never_resurrects(self):
+        x = "oex_20260901T000000Z_bbbbbbbb"
+        a = self.msg(x, replied=True)
+        msgs, sent = self.prune(accepted=[x])
+        # message first, then (same tick, message now gone) its reply: no
+        # window where a reply-less message exists and reads as "pending"
+        self.assertEqual((msgs, sent), ({x}, {f"{self.label}/{x}"}))
+        self.assertFalse(a.exists())
+
+    def test_sent_reply_kept_while_its_message_is_still_present(self):
+        x = "oex_20260901T000000Z_cccccccc"
+        self.msg(x, replied=True)
+        self.ledger(f"{x}\ttriaged_historic\t-\tkeep")  # message protected
+        msgs, sent = self.prune(accepted=[x])
+        self.assertEqual((msgs, sent), (set(), set()))
+        self.assertTrue((self.d / "replies" / "sent" / f"{x}.md").exists())
+
+    def test_superseded_and_answered_elsewhere_reference_closure(self):
+        a, b, c = ("oex_20260901T000000Z_aaaaaaaa", "oex_20260902T000000Z_bbbbbbbb",
+                   "oex_20260903T000000Z_cccccccc")
+        for x in (a, b, c):
+            self.msg(x, replied=(x != a))
+        self.ledger(f"{a}\tsuperseded\t{b}\tB restates A", f"{c}\tanswered_elsewhere\t{b}\tsee B")
+        msgs, _ = self.prune(accepted=[b, c])
+        self.assertEqual(msgs, set())  # subject AND ref targets all retained
+        for x in (a, b, c):
+            self.assertTrue((self.d / "messages" / f"{x}.md").exists())
+
+    def test_unreadable_ledger_prunes_nothing_under_that_label(self):
+        x = "oex_20260901T000000Z_dddddddd"
+        a = self.msg(x, replied=True)
+        (self.d / "handled.tsv").write_bytes(b"\xff\xfe not utf-8\n")
+        self.assertEqual(self.prune(accepted=[x]), (set(), set()))
+        self.assertTrue(a.exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

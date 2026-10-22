@@ -1386,6 +1386,39 @@ def _prune_one(path: Path, exchange_id: str, label: str, tree: str, mtime: float
     return outcome
 
 
+def _retention_protected(label_dir: Path) -> set | None:
+    """Exchange ids in <label>/handled.tsv (owner-inbox-pending.py's
+    disposition ledger), as the subject OR the ref of any line. Those
+    records must outlive age-based pruning until durable tombstone/archive
+    semantics exist: deleting one would make the ledger reference a missing
+    message, which the helper (rightly) refuses to parse. None = the ledger
+    is present but unreadable (symlink, I/O, non-UTF-8): the caller prunes
+    NOTHING under that label this tick (fail closed)."""
+    f = label_dir / "handled.tsv"
+    if not os.path.lexists(f):
+        return set()
+    try:
+        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            text = fh.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    out: set = set()
+    for line in text.splitlines():
+        parts = line.split("\t")
+        out.add(parts[0])
+        if len(parts) > 2:
+            out.add(parts[2])
+    return out
+
+
+def _is_regular(p: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
 def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now_s: float) -> tuple[set, set]:
     """Bounded retention for the owner inbox tree (#225 item 3), matching
     the Worker's own 30-day owner_messages retention (state.ts ~1314) so
@@ -1402,6 +1435,14 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
         "accepted"/"duplicate" -- a file someone hand-placed directly
         into sent/, bypassing that path, has no such key and is never
         pruned, however old) AND older than OWNER_INBOX_RETENTION_DAYS.
+    Owner-work protection (2026-10-22): age alone NEVER deletes owner work.
+    A message is pruned only once it is closed by an accepted reply (a
+    regular replies/sent/<id>.md exists) AND it is not named, as subject
+    or ref, in <label>/handled.tsv -- so an unanswered or held item, and
+    every record a disposition points at, is retained however old. A sent
+    reply is pruned only after its message is gone, so pruning can never
+    turn a closed exchange back into "pending". An unreadable ledger
+    prunes nothing under that label.
     A message never confirmed delivered, a reply still sitting in
     replies/ (unacked), or anything under replies/rejected/ (#225 review
     H1 -- a reply the Worker durably refused, kept for a human) is NEVER
@@ -1421,10 +1462,18 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
         if not label_dir.is_dir() or not OWNER_LABEL_RE.match(label_dir.name):
             continue
         label = label_dir.name
+        protected = _retention_protected(label_dir)
+        if protected is None:
+            log(f"owner inbox prune skipped for {label}: handled.tsv unreadable (fail closed)")
+            continue
         for f in sorted((label_dir / "messages").glob("*.md")) if (label_dir / "messages").is_dir() else []:
             exchange_id = f.stem
             if exchange_id not in owner_message_delivered or not EXCHANGE_ID_RE.match(exchange_id):
                 continue  # never delivered (or not provably so): never touched
+            if exchange_id in protected:
+                continue  # held / dispositioned / referenced: retained until tombstones exist
+            if not _is_regular(label_dir / "replies" / "sent" / f"{exchange_id}.md"):
+                continue  # no accepted reply: still owner work (pending), never age-pruned
             path = _resolve_inbox_leaf(label, "messages", exchange_id)
             if path is None:
                 continue
@@ -1448,6 +1497,8 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
             # sent/ directories must never share one accepted-record.
             if accepted_key not in owner_replies_accepted or not EXCHANGE_ID_RE.match(exchange_id):
                 continue  # never provably Worker-accepted under THIS label: never touched
+            if exchange_id in protected or os.path.lexists(label_dir / "messages" / f"{exchange_id}.md"):
+                continue  # message still present (or referenced): keep the reply that closes it
             path = _resolve_inbox_leaf(label, "replies/sent", exchange_id)
             if path is None:
                 continue
