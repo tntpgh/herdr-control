@@ -1083,11 +1083,14 @@ without Docker.
 - `push_wake` persists a verified worker's `blocked`/`input_required` BEFORE
   checking conductor reachability, rejects stale/terminal hooks before
   mutating state, and records every wake attempt individually.
-- `stage2-diagnose.sh` no longer emits `succeeded` at dispatch or on weekly
-  skips. The scheduled monthly pass FAILS CLOSED with an `isolation-required`
-  ledger row until it is moved onto the isolated worker path;
-  `--record-completion` verifies the doc commit on the branch before
-  completing the task.
+- `stage2-diagnose.sh` no longer emits `succeeded` at dispatch. The
+  scheduled monthly pass runs inside an isolated worker (no host pane, no
+  herdr socket, no credentials) and accepts its returned patch only when
+  the sole change is the tracking doc — anything else is refused, with a
+  doc-only hunk extracted as a PROPOSAL for human review (2026-10-21); a
+  first-Friday no-op reports `skipped`, not `succeeded`, since scheduler
+  liveness is not a diagnosis outcome. `--record-completion` verifies the
+  doc commit on the branch before completing the task.
 
 See `SKILL.md`'s "The safety model" for the full list of what refuses and why.
 
