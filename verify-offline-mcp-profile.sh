@@ -254,22 +254,86 @@ printf '== bound launcher argv allowlist: every composed launch line would be AC
 # patched managed spawn exit 78 ("only the bound Herdr worker overlay is
 # allowed") before any pane output, and --dry-run tests never invoke the
 # launcher at all, so nothing caught it. v19 allowlists both.
-launcher_bin_line="$(grep -n '^HERDR_OMP_BIN=' "$here/config.sh")"
-eval "${launcher_bin_line#*:}"
-[ -x "$HERDR_OMP_BIN" ] && ok "the configured bound launcher exists and is executable: $HERDR_OMP_BIN" \
-  || bad "configured HERDR_OMP_BIN is missing/not executable: $HERDR_OMP_BIN"
-guard_src="$(awk '/^args=\("\$@"\)$/,/^done$/' "$HERDR_OMP_BIN" 2>/dev/null)"
-case "$guard_src" in
-  *'"$overlay"|"$offline_overlay"'*) ok "launcher's argv-scan shape (the \$overlay|\$offline_overlay case arm) still matches what this extraction assumes" ;;
-  *) bad "launcher's argv-scan shape changed or the marker lines are gone — extraction found: ${guard_src:-<empty>}" ;;
+# Guard source, two modes (OFFLINE_MCP_GUARD_SOURCE):
+#   installed (default, Mac): extract from the configured bound launcher AND
+#     require it to equal the checked-in fixture (drift = FAIL).
+#   fixture (CI only): use tests/fixtures/launcher-argv-guard.v26d.sh, pinned by
+#     digest. Proves the CONTRACT only; it says nothing about the installed wrapper.
+# Every load fails closed: missing/empty/shape-wrong/digest-mismatch = no guard.
+guard_fixture="$here/tests/fixtures/launcher-argv-guard.v26d.sh"
+guard_fixture_sha=fe11df1da5b9daae025256c10b12bc68ab2b1a2c41b89d889e3ba1ac3eacabbd
+guard_block_of() {  # <file>: the argv-scan block (fixture header lines dropped)
+  [ -f "$1" ] || return 1
+  awk '/^args=\("\$@"\)$/,/^done$/' "$1" 2>/dev/null
+}
+guard_shape_ok() {  # <block>
+  case "$1" in
+    'args=("$@")'*'"$overlay"|"$offline_overlay"'*done) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+guard_digest() { printf '%s\n' "$1" | shasum -a256 | cut -c1-64; }
+load_fixture_guard() {  # <file> <pinned-sha>: prints block, nonzero on any defect
+  local b; b="$(guard_block_of "$1")" || return 1
+  [ -n "$b" ] && guard_shape_ok "$b" && [ "$(guard_digest "$b")" = "$2" ] || return 1
+  printf '%s' "$b"
+}
+guard_src=""
+fixture_src="$(load_fixture_guard "$guard_fixture" "$guard_fixture_sha")" \
+  && ok "guard fixture present, shape ok, digest pinned ($guard_fixture_sha)" \
+  || bad "guard fixture missing/empty/wrong shape/digest mismatch: $guard_fixture"
+case "${OFFLINE_MCP_GUARD_SOURCE:-installed}" in
+  fixture)
+    printf '  note  FIXTURE MODE (CI): the installed launcher is NOT checked; contract only\n'
+    guard_src="$fixture_src" ;;
+  installed)
+    launcher_bin_line="$(grep -n '^HERDR_OMP_BIN=' "$here/config.sh")"
+    eval "${launcher_bin_line#*:}"
+    [ -x "$HERDR_OMP_BIN" ] && ok "the configured bound launcher exists and is executable: $HERDR_OMP_BIN" \
+      || bad "configured HERDR_OMP_BIN is missing/not executable: $HERDR_OMP_BIN"
+    inst_src="$(guard_block_of "$HERDR_OMP_BIN")" || inst_src=""
+    if [ -n "$inst_src" ] && guard_shape_ok "$inst_src"; then
+      ok "launcher's argv-scan shape (the \$overlay|\$offline_overlay case arm) still matches what this extraction assumes"
+      guard_src="$inst_src"
+      [ "$inst_src" = "$fixture_src" ] && ok "installed launcher argv-scan == checked-in fixture" \
+        || bad "installed launcher argv-scan differs from the fixture (refresh the fixture from a reviewed release)"
+    else
+      bad "launcher's argv-scan shape changed or the marker lines are gone — extraction found: ${inst_src:-<empty>}"
+    fi ;;
+  *) bad "unknown OFFLINE_MCP_GUARD_SOURCE=${OFFLINE_MCP_GUARD_SOURCE}" ;;
 esac
 launcher_allows_argv() {  # <overlay-path> <offline-overlay-path> -- <rest of the launch argv>
-  local overlay="$1" offline_overlay="$2"; shift 2
-  local _guard_fail=""
-  die() { _guard_fail="$*"; }
-  eval "$guard_src"
-  [ -z "$_guard_fail" ]
+  # Evaluated in a subshell where die EXITS, as in the launcher; any error
+  # (incl. set -u on a missing --config value) is a denial: fail closed.
+  _guard_fail=""
+  [ -n "$guard_src" ] || { _guard_fail="no guard source loaded (fail closed)"; return 1; }
+  _guard_fail="$( overlay="$1" offline_overlay="$2"; shift 2
+    die() { printf '%s' "$*"; exit 78; }
+    eval "$guard_src" 2>/dev/null; exit 0 )" && return 0
+  _guard_fail="${_guard_fail:-guard evaluation error}"; return 1
 }
+
+printf '== guard contract: deny/allow cases (pure; no launcher invoked) ==\n'
+gov=/x/overlay.yml; goff=/x/offline.yml
+launcher_allows_argv "$gov" "$goff" --config "$gov" -p hi && ok "allow: --config <worker overlay>" || bad "deny of a valid --config <worker overlay>: $_guard_fail"
+launcher_allows_argv "$gov" "$goff" --config "$goff" && ok "allow: --config <offline overlay>" || bad "deny of a valid --config <offline overlay>: $_guard_fail"
+for neg in "--config /x/other.yml" "--config" "--config=/x/overlay.yml" "--profile p" "--profile=p" "--no-extensions" \
+           "-e x" "-ex" "--extension x" "--extension=x" "--hook h" "--hook=h" "--plugin-dir d" "--plugin-dir=d" "--plugin-url u" "--plugin-url=u"; do
+  # shellcheck disable=SC2086
+  launcher_allows_argv "$gov" "$goff" $neg && bad "guard ALLOWED forbidden argv: $neg" || ok "deny: $neg"
+done
+saved_guard="$guard_src"; guard_src=""
+launcher_allows_argv "$gov" "$goff" --config "$gov" && bad "empty guard allowed argv (must fail closed)" || ok "empty guard fails closed"
+guard_src="$saved_guard"
+mk_tmp guard_neg
+load_fixture_guard "$guard_neg/absent.sh" "$guard_fixture_sha" >/dev/null && bad "missing fixture loaded" || ok "missing fixture fails closed"
+: > "$guard_neg/empty.sh"
+load_fixture_guard "$guard_neg/empty.sh" "$guard_fixture_sha" >/dev/null && bad "empty fixture loaded" || ok "empty fixture fails closed"
+printf '%s\n' "$fixture_src" | awk '{ sub(/only the bound/, "only THE bound"); print }' > "$guard_neg/tampered.sh"
+load_fixture_guard "$guard_neg/tampered.sh" "$guard_fixture_sha" >/dev/null && bad "tampered fixture loaded" || ok "tampered fixture: digest mismatch fails closed"
+load_fixture_guard "$guard_fixture" 0000000000000000000000000000000000000000000000000000000000000000 >/dev/null && bad "wrong pin accepted" || ok "wrong pinned digest fails closed"
+printf 'args=("$@")\nfor x in; do :\ndone\n' > "$guard_neg/shape.sh"
+load_fixture_guard "$guard_neg/shape.sh" "$(guard_digest "$(guard_block_of "$guard_neg/shape.sh")")" >/dev/null && bad "wrong-shape guard loaded" || ok "wrong-shape guard fails closed even with a matching digest"
 wt_overlay="$here/agent-hooks/omp-worker-overlay.yml"
 for j in review debug explore; do
   for appr in menu hook; do
