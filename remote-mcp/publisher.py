@@ -1194,6 +1194,29 @@ def deliver(item: dict, local: dict) -> dict:
     return {"message_id": mid, "outcome": outcome, "detail": detail}
 
 
+_OWNER_LEASE_GATE = None
+
+
+def owner_lease_gate():
+    """lib/owner_lease_delivery.py gate, or None (the default: legacy path).
+    Loaded only when HERDR_OWNER_LEASE_DELIVERY=1 and HERDR_OWNER_LEASE_DB are
+    both set; a gate that cannot open its DB raises, so a misconfigured
+    activation fails the tick instead of silently delivering ungated."""
+    global _OWNER_LEASE_GATE
+    if os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
+        return None
+    if _OWNER_LEASE_GATE is None:
+        path = Path(__file__).resolve().parent.parent / "lib" / "owner_lease_delivery.py"
+        spec = importlib.util.spec_from_file_location("owner_lease_delivery", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        gate = mod.from_env()
+        if gate is None:
+            raise RuntimeError("HERDR_OWNER_LEASE_DELIVERY=1 but HERDR_OWNER_LEASE_DB is unset")
+        _OWNER_LEASE_GATE = gate
+    return _OWNER_LEASE_GATE
+
+
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
     only the fixed notice pointing at it. Pre-send exit 5 keeps its
@@ -1229,6 +1252,23 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
                    "changed": "owner_identity_changed"}[status]
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": reason}
     pane_id = local["owners"][label]["pane_id"]
+    gate = owner_lease_gate()
+    if gate is None:
+        return _send_owner_notice(item, label, pane_id)
+    # Off-by-default owner-lease gate: the registered pane must hold the
+    # label's live lease; the exchange is enqueued/fenced in that generation
+    # BEFORE the body is written or any notice typed.
+    pane_birth = local["owners"][label].get("pane_birth", "")
+    adm = gate.admit(label, pane_id, pane_birth, exchange_id)
+    if not adm.ok:
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": adm.reason}
+    result = _send_owner_notice(item, label, pane_id)
+    gate.settle(label, pane_id, pane_birth, adm.generation, exchange_id, result["outcome"], result.get("reason", ""))
+    return result
+
+
+def _send_owner_notice(item: dict, label: str, pane_id: str) -> dict:
+    exchange_id = item["exchange_id"]
     sender = clean(str(item.get("sender") or ""))
     if not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
@@ -1657,8 +1697,16 @@ def main(argv: list[str]) -> int:
             for r in owner_replies_raw:
                 label, eid = r["owner_label"], r["exchange_id"]
                 original = identities.get(f"{label}/{eid}")
-                if (original and original == owners_now.get(label)
-                        and owner_pane_status(label, owners_now, reply_panes) == "ok"):
+                identity_ok = bool(original and original == owners_now.get(label)
+                                   and owner_pane_status(label, owners_now, reply_panes) == "ok")
+                gate = owner_lease_gate() if identity_ok else None
+                if gate is not None:
+                    # Credit only a reply to the CURRENT generation's delivery.
+                    credited = gate.on_reply(label, eid)
+                    if credited != "replied" and gate.state(eid) not in ("replied", "evidence"):
+                        log(f"owner reply {label}/{eid}: owner-lease {credited}; left local")
+                        identity_ok = False
+                if identity_ok:
                     verified.append(r)
                 else:
                     log(f"owner reply {label}/{eid}: registration/pane identity unverifiable or changed; left local")
