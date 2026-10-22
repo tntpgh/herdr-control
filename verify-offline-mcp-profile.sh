@@ -406,14 +406,51 @@ case "$sa_src" in
   *) bad "spawn-agent.sh missing-overlay refusal text not found" ;;
 esac
 
+printf '== run registry interpreter: canonical resolver, positive and negative (no registry is opened) ==\n'
+# Cause of the 2026-10-22 CI red (run 39797211751): lib/run-registry.sh pins
+# python3.11+ via launchd/resolve-hub-python.sh, which searches only
+# ${HERDR_HUB_PYTHON_DIRS:-/opt/homebrew/bin:/usr/local/bin}; with none found,
+# registry_init refuses and spawn-task swallows append_event's error, so the
+# event never lands. Name that cause here instead of as a missing event.
+resolver="$ctl/launchd/resolve-hub-python.sh"
+res_py="$(bash "$resolver" </dev/null 2>/dev/null)"; res_rc=$?
+[ "$res_rc" = 0 ] && [ -n "$res_py" ] && [ -x "$res_py" ] \
+  && ok "resolver emits an executable python3.11+: $res_py" \
+  || bad "resolver found no python3.11+ (rc=$res_rc, out='${res_py}'); registry events cannot be recorded (set HERDR_HUB_PYTHON_DIRS)"
+mk_tmp no_py_dir
+neg_py="$(HERDR_HUB_PYTHON_DIRS="$no_py_dir" bash "$resolver" </dev/null 2>/dev/null)"; neg_rc=$?
+[ "$neg_rc" != 0 ] && [ -z "$neg_py" ] \
+  && ok "causal: resolver refuses with no python3.11+ on HERDR_HUB_PYTHON_DIRS (the CI cause)" \
+  || bad "resolver accepted an empty HERDR_HUB_PYTHON_DIRS (rc=$neg_rc, out='$neg_py')"
+
+# run_bounded <secs> <outfile> <cmd...>: stdin /dev/null, stdout+stderr to
+# <outfile>; returns the command's rc, or 124 after killing it on timeout.
+# ceiling: kills the direct child only, not grandchildren; enough to keep this
+# suite from hanging, and a timeout is itself a FAIL.
+run_bounded() {
+  local secs="$1" outf="$2" pid n=0; shift 2
+  "$@" </dev/null >"$outf" 2>&1 & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$n" -ge $((secs * 5)) ] && { kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; }
+    sleep 0.2; n=$((n + 1))
+  done
+  wait "$pid"
+}
+
 printf '== spawn-task.sh --dry-run: missing overlay file refuses the whole spawn, non-interactively, with a registry event ==\n'
 mk_tmp saved_dir; saved="$saved_dir/overlay.yml"; cp "$ctl_profile_path" "$saved"
 rm -f "$ctl_profile_path"
 mk_tmp miss_state_dir
-out=$(HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$miss_state_dir" \
-  bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-missing-$$" review omp 2>&1)
+mk_tmp miss_io
+[ -z "$(ls -A "$miss_state_dir")" ] && [ -n "$(find "$miss_state_dir" -maxdepth 0 -perm 700)" ] \
+  && ok "registry root is an exact empty private (0700) temp dir: $miss_state_dir" \
+  || bad "registry root not empty/0700 before the dry-run: $miss_state_dir"
+run_bounded 60 "$miss_io/spawn.out" env HERDR_WT_DIR="$wt_dir" HERDR_RUN_STATE_DIR="$miss_state_dir" \
+  bash "$ctl/spawn-task.sh" --dry-run "$probe_repo" "offline-mcp-missing-$$" review omp
 rc=$?
+out="$(cat "$miss_io/spawn.out")"
 cp "$saved" "$ctl_profile_path"
+[ "$rc" = 124 ] && bad "stage spawn-task: dry-run did not finish in 60s (killed); output so far: $out"
 [ "$rc" = 1 ] && ok "refused (rc=1) instead of launching unprotected" || bad "unexpected rc=$rc: $out"
 case "$out" in
   *"spawn-task (dry-run):"*) bad "dry-run summary printed despite the missing overlay — preflight did not actually refuse: $out" ;;
@@ -423,12 +460,18 @@ case "$out" in
   *"offline MCP launch profile"*) ok "refusal names the missing offline MCP profile" ;;
   *) bad "refusal message does not explain itself: $out" ;;
 esac
-. "$ctl/lib/run-registry.sh"
-export HERDR_RUN_STATE_DIR="$miss_state_dir"
-missing_row="$(_sql "SELECT count(*) FROM events WHERE type='offline_mcp_profile_missing';" 2>/dev/null)"
-[ "${missing_row:-0}" -gt 0 ] 2>/dev/null \
-  && ok "a registry event records the preflight refusal" \
-  || bad "no offline_mcp_profile_missing event found in the registry"
+if [ -f "$miss_state_dir/registry.sqlite3" ]; then
+  run_bounded 20 "$miss_io/event.out" env HERDR_RUN_STATE_DIR="$miss_state_dir" bash -c \
+    '. "$1/lib/run-registry.sh" && _sql "SELECT count(*) FROM events WHERE type='"'"'offline_mcp_profile_missing'"'"';"' _ "$ctl"
+  erc=$?; missing_row="$(cat "$miss_io/event.out")"
+  if [ "$erc" = 124 ]; then bad "stage event-read: registry query did not finish in 20s (killed)"
+  elif [ "$erc" != 0 ]; then bad "stage event-read: query failed rc=$erc: $missing_row"
+  elif [ "${missing_row:-0}" -gt 0 ] 2>/dev/null; then ok "a registry event records the preflight refusal"
+  else bad "stage event-write: registry exists but has no offline_mcp_profile_missing event (got '$missing_row')"
+  fi
+else
+  bad "stage registry-init: spawn-task created no registry at $miss_state_dir (append_event failed silently; see the resolver check above)"
+fi
 
 printf '== subprocess boundary: no spawn/launcher/provider call was attempted ==\n'
 if grep -q '^VIOLATION' "$stub_log"; then
