@@ -9,9 +9,23 @@ observes and announces. It never authenticates, accepts, forwards or acts.
   the evidence is accepted, or the work is done. Result text is never read
   for meaning, forwarded, or used as authority for anything.
 
-Off unless HERDR_RESULT_AVAILABILITY=1, HERDR_RESULT_AVAILABILITY_DB and
-HERDR_RESULT_AVAILABILITY_ROOTS (os.pathsep-separated absolute roots) are all
-set. Off means no scan, no DB open, no notice.
+Off unless HERDR_RESULT_AVAILABILITY=1, HERDR_RESULT_AVAILABILITY_DB,
+HERDR_RESULT_AVAILABILITY_ROOTS (os.pathsep-separated `label=/abs/root`
+pairs: each registered owner label maps to EXACTLY one handoff root) and
+HERDR_RESULT_AVAILABILITY_JOURNAL (the conductor-private dispatch journal
+root, see lib/owner_dispatch.py) are all set. Off means no scan, no DB open,
+no notice.
+
+A request is registered only against a SETTLED dispatch: the journal must hold
+<journal>/<label>/<rid>/settled.json byte-identical to settled_record() of the
+binding being registered. The journal lives outside every owner-writable
+handoff root, so an owner cannot forge one. tick() re-hashes it every pass.
+
+Stages are separate, append-only, durable facts (ra_stages), never inferred
+from one another: observed -> noticed (the notice), reply_authenticated
+(caller-supplied reference from an authenticated channel), verified (artifact
+hashes match pins the CALLER supplies, never read from the result body), and
+accepted (conductor; requires verified AND reply_authenticated).
 
 Binding (register): the dispatcher records, at dispatch time, the request id,
 its exact request directory, the sha256 of the request text it sent, the
@@ -64,14 +78,23 @@ REQUEST_FILE = "request.txt"
 # older means that call crashed or hung past the deliver timeout -> ambiguous.
 NOTIFY_TIMEOUT_S = 180
 TERMINAL = ("notified", "ambiguous", "held:request_changed", "held:stale_generation", "held:changed",
-            "held:invalid")
+            "held:invalid", "held:dispatch_changed")
+STAGES = ("observed", "noticed", "reply_authenticated", "verified", "accepted")
+SETTLED_FILE = "settled.json"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ra_requests (
   rid TEXT PRIMARY KEY, request_dir TEXT NOT NULL, request_digest TEXT NOT NULL,
   owner_label TEXT NOT NULL, pane_id TEXT NOT NULL, pane_birth TEXT NOT NULL,
   session_id TEXT NOT NULL, generation INTEGER NOT NULL, manifest TEXT NOT NULL,
-  state TEXT NOT NULL, observed TEXT, updated_at REAL NOT NULL);
+  state TEXT NOT NULL, observed TEXT, updated_at REAL NOT NULL, settled_digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ra_stages (
+  rid TEXT NOT NULL REFERENCES ra_requests(rid), stage TEXT NOT NULL, at REAL NOT NULL,
+  evidence TEXT NOT NULL, PRIMARY KEY (rid, stage));
+CREATE TRIGGER IF NOT EXISTS ra_stages_no_update BEFORE UPDATE ON ra_stages
+  BEGIN SELECT RAISE(ABORT, 'ra_stages is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ra_stages_no_delete BEFORE DELETE ON ra_stages
+  BEGIN SELECT RAISE(ABORT, 'ra_stages is append-only'); END;
 """
 
 Holder = Callable[[str], "tuple[str, str, str, int] | None"]  # label -> (pane_id, pane_birth, session_id, generation)
@@ -86,10 +109,26 @@ def from_env(environ=os.environ) -> "Availability | None":
     if environ.get("HERDR_RESULT_AVAILABILITY") != "1":
         return None
     db = environ.get("HERDR_RESULT_AVAILABILITY_DB")
-    roots = [r for r in environ.get("HERDR_RESULT_AVAILABILITY_ROOTS", "").split(os.pathsep) if r]
-    if not db or not roots:
-        raise Refused("HERDR_RESULT_AVAILABILITY=1 needs HERDR_RESULT_AVAILABILITY_DB and _ROOTS")
-    return Availability(db, roots)
+    journal = environ.get("HERDR_RESULT_AVAILABILITY_JOURNAL")
+    pairs = [r for r in environ.get("HERDR_RESULT_AVAILABILITY_ROOTS", "").split(os.pathsep) if r]
+    if not db or not pairs or not journal:
+        raise Refused("HERDR_RESULT_AVAILABILITY=1 needs HERDR_RESULT_AVAILABILITY_DB, _ROOTS and _JOURNAL")
+    roots: dict[str, str] = {}
+    for pair in pairs:
+        label, sep, root = pair.partition("=")
+        if not sep or label in roots:
+            raise Refused(f"_ROOTS entries must be unique label=/abs/root: {pair!r}")
+        roots[label] = root
+    return Availability(db, roots, journal)
+
+
+def settled_record(rid: str, request_digest: str, label: str, pane_id: str, pane_birth: str, session_id: str,
+                   generation: int, manifest: list[str]) -> bytes:
+    """Canonical bytes of a settled dispatch: the one exact form register() accepts."""
+    return (json.dumps({"rid": rid, "request_digest": request_digest, "label": label, "pane_id": pane_id,
+                        "pane_birth": pane_birth, "session_id": session_id, "generation": generation,
+                        "manifest": sorted(manifest), "outcome": "settled"},
+                       sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _sha(b: bytes) -> str:
@@ -120,20 +159,33 @@ def _open_dir(path: str) -> int:
         raise
 
 
+def _usable_root(r: str, what: str) -> str:
+    if not isinstance(r, str) or not os.path.isabs(r) or os.path.normpath(r) != r:
+        raise Refused(f"{what} must be absolute and normalized: {r!r}")
+    try:
+        os.close(_open_dir(r))  # exists, symlink-free at every component
+    except OSError as exc:
+        raise Refused(f"{what} unusable (missing or symlinked): {r!r}") from exc
+    return r
+
+
 class Availability:
-    def __init__(self, db_path: str, allowed_roots: list[str]):
-        roots = []
-        for r in allowed_roots:
-            if not os.path.isabs(r) or os.path.normpath(r) != r:
-                raise Refused(f"allowed root must be absolute and normalized: {r!r}")
-            try:
-                os.close(_open_dir(r))  # exists, symlink-free at every component
-            except OSError as exc:
-                raise Refused(f"allowed root unusable (missing or symlinked): {r!r}") from exc
-            roots.append(r)
-        if not roots:
-            raise Refused("no allowed roots")
-        self.roots = tuple(roots)
+    def __init__(self, db_path: str, label_roots: dict[str, str], journal_root: str):
+        if not isinstance(label_roots, dict) or not label_roots:
+            raise Refused("no label roots")
+        roots = {}
+        for label, r in label_roots.items():
+            if not isinstance(label, str) or not NAME_RE.match(label):
+                raise Refused(f"bad owner label {label!r}")
+            roots[label] = _usable_root(r, "allowed root")
+        if len(set(roots.values())) != len(roots):
+            raise Refused("each label needs its own handoff root (no shared roots)")
+        self.journal_root = _usable_root(journal_root, "journal root")
+        for r in roots.values():
+            if r == self.journal_root or r.startswith(self.journal_root + os.sep) \
+                    or self.journal_root.startswith(r + os.sep):
+                raise Refused("journal root must not overlap an owner handoff root")
+        self.roots = roots
         self.conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
         self.conn.executescript(SCHEMA)
 
@@ -148,8 +200,8 @@ class Availability:
         if not RID_RE.match(rid):
             raise Refused("bad rid")
         d = Path(request_dir)
-        if d.name != rid or str(d.parent) not in self.roots or os.path.normpath(request_dir) != request_dir:
-            raise Refused("request_dir must be <allowed root>/<rid>")
+        if d.name != rid or self.roots.get(owner_label) != str(d.parent) or os.path.normpath(request_dir) != request_dir:
+            raise Refused("request_dir must be <the owner label's own root>/<rid>")
         if not manifest or len(manifest) > MAX_MANIFEST or len(set(manifest)) != len(manifest) \
                 or not all(NAME_RE.match(n) for n in manifest) or REQUEST_FILE in manifest:
             raise Refused("manifest must be 1..8 distinct plain file names, excluding request.txt")
@@ -159,15 +211,66 @@ class Availability:
         digest = _sha(request_text)
         if self._read(d, REQUEST_FILE) != (digest, len(request_text)):
             raise Refused("request.txt on disk does not match the dispatched request")
-        row = (str(d), digest, owner_label, pane_id, pane_birth, session_id, generation, json.dumps(sorted(manifest)))
+        settled = _sha(settled_record(rid, digest, owner_label, pane_id, pane_birth, session_id, generation, manifest))
+        if self._journal(owner_label, rid) != settled:
+            raise Refused("no settled dispatch in the journal for exactly this binding")
+        row = (str(d), digest, owner_label, pane_id, pane_birth, session_id, generation, json.dumps(sorted(manifest)),
+               settled)
         old = self.conn.execute("SELECT request_dir, request_digest, owner_label, pane_id, pane_birth, session_id,"
-                                " generation, manifest FROM ra_requests WHERE rid=?", (rid,)).fetchone()
+                                " generation, manifest, settled_digest FROM ra_requests WHERE rid=?", (rid,)).fetchone()
         if old is not None:
             if tuple(old) != row:
                 raise Refused("rid already registered with a different binding")
             return "already_registered"
-        self.conn.execute("INSERT INTO ra_requests VALUES (?,?,?,?,?,?,?,?,?,'pending',NULL,?)", (rid, *row, now))
+        self.conn.execute("INSERT INTO ra_requests (rid, request_dir, request_digest, owner_label, pane_id, pane_birth,"
+                          " session_id, generation, manifest, settled_digest, state, observed, updated_at)"
+                          " VALUES (?,?,?,?,?,?,?,?,?,?,'pending',NULL,?)", (rid, *row, now))
         return "registered"
+
+    def _journal(self, label: str, rid: str) -> str | None:
+        r = self._read(Path(self.journal_root) / label / rid, SETTLED_FILE)
+        return r[0] if r else None
+
+    # --- stages (separate durable facts; none implies another) ---
+    def stages(self, rid) -> dict[str, str]:
+        return dict(self.conn.execute("SELECT stage, evidence FROM ra_stages WHERE rid=?", (rid,)).fetchall())
+
+    def _stage(self, rid, stage, evidence, now):
+        try:
+            self.conn.execute("INSERT INTO ra_stages VALUES (?,?,?,?)", (rid, stage, now, evidence))
+        except sqlite3.IntegrityError:
+            pass  # already recorded: stages are write-once
+
+    def record_reply_authenticated(self, rid: str, auth_ref: str, now: float | None = None) -> bool:
+        """auth_ref names the AUTHENTICATED channel record (e.g. a verified
+        inbox exchange id) checked by the caller. Never derived from the result."""
+        if not auth_ref or "observed" not in self.stages(rid):
+            return False
+        self._stage(rid, "reply_authenticated", auth_ref, time.time() if now is None else now)
+        return True
+
+    def verify_pinned(self, rid: str, pins: dict[str, str], now: float | None = None) -> bool:
+        """pins: {manifest name: sha256} supplied by the CALLER (the request's own
+        expectations), covering the manifest exactly. Re-reads the files now."""
+        row = self.conn.execute("SELECT request_dir, manifest, state FROM ra_requests WHERE rid=?", (rid,)).fetchone()
+        if not row or row[2].startswith("held:") or "observed" not in self.stages(rid):
+            return False
+        manifest = json.loads(row[1])
+        if sorted(pins) != manifest or not all(re.fullmatch(r"[0-9a-f]{64}", v or "") for v in pins.values()):
+            return False
+        for name in manifest:
+            got = self._read(Path(row[0]), name)
+            if got is None or got[0] != pins[name]:
+                return False
+        self._stage(rid, "verified", _sha(json.dumps(pins, sort_keys=True).encode()), time.time() if now is None else now)
+        return True
+
+    def accept(self, rid: str, by: str, now: float | None = None) -> bool:
+        st = self.stages(rid)
+        if not by or "verified" not in st or "reply_authenticated" not in st:
+            return False
+        self._stage(rid, "accepted", by, time.time() if now is None else now)
+        return True
 
     # --- observation ---
     @staticmethod
@@ -230,9 +333,10 @@ class Availability:
         now = time.time() if now is None else now
         out: dict[str, str] = {}
         rows = self.conn.execute("SELECT rid, request_dir, request_digest, owner_label, pane_id, pane_birth,"
-                                 " session_id, generation, manifest, state, observed, updated_at FROM ra_requests WHERE state NOT IN"
+                                 " session_id, generation, manifest, state, observed, updated_at, settled_digest"
+                                 " FROM ra_requests WHERE state NOT IN"
                                  f" ({','.join('?' * len(TERMINAL))}) ORDER BY rid", TERMINAL).fetchall()
-        for rid, rdir, rdig, label, pane, birth, sess, gen, man, st, seen, upd in rows:
+        for rid, rdir, rdig, label, pane, birth, sess, gen, man, st, seen, upd, sdig in rows:
             d, manifest = Path(rdir), json.loads(man)
             if st == "notifying":
                 if now - upd < NOTIFY_TIMEOUT_S:
@@ -240,6 +344,10 @@ class Availability:
                     continue
                 self._finish(rid, "ambiguous", now)  # crashed across the notice boundary
                 out[rid] = "ambiguous"
+                continue
+            if self._journal(label, rid) != sdig:
+                self._set(rid, "held:dispatch_changed", now=now)
+                out[rid] = "held:dispatch_changed"
                 continue
             req = self._read(d, REQUEST_FILE)
             if req is None or req[0] != rdig:
@@ -270,12 +378,15 @@ class Availability:
                 except Exception:
                     ok = False
                 out[rid] = self._finish(rid, "notified" if ok else "ambiguous", now)
+                if out[rid] == "notified":
+                    self._stage(rid, "noticed", seen, now)
                 continue
             if snap is None:  # interruption: the next observation starts over
                 self._set(rid, "pending", observed=None, now=now)
                 out[rid] = "pending"
             elif snap == seen:
                 self._set(rid, "staged", now=now)
+                self._stage(rid, "observed", snap, now)
                 out[rid] = "staged"
             else:
                 self._set(rid, "observing", observed=snap, now=now)

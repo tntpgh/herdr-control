@@ -24,6 +24,14 @@ def case(name, ok):
         FAILS.append(name)
 
 
+def raises_db(fn):
+    try:
+        fn()
+    except sqlite3.DatabaseError:
+        return True
+    return False
+
+
 def raises(fn):
     try:
         fn()
@@ -50,10 +58,22 @@ def setup(root: Path, rid: str, req=b"REQ do the thing\n"):
     return d, req
 
 
+def reg(av, rid, d, req, label, pane, birth, sess, gen, manifest, now):
+    """A settled dispatch for exactly this binding (first write wins), then register."""
+    j = Path(av.journal_root) / label / rid
+    j.mkdir(parents=True, exist_ok=True)
+    if not (j / ra.SETTLED_FILE).exists():
+        (j / ra.SETTLED_FILE).write_bytes(ra.settled_record(rid, ra._sha(req), label, pane, birth, sess, gen, manifest))
+    return av.register(rid, str(d), req, label, pane, birth, sess, gen, manifest, now)
+
+
 def main() -> int:
     base = Path(os.path.realpath(tempfile.mkdtemp()))
     root = base / "rt"
     root.mkdir()
+    JR = base / "journal"
+    JR.mkdir()
+    JR = str(JR)
     holder = lambda label: OWNER if label == "kb" else None  # noqa: E731
 
     # --- default off ---
@@ -63,50 +83,81 @@ def main() -> int:
     case("flag on without allowed roots: refuses", raises(lambda: ra.from_env(
         {"HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(base / "y.db")})))
     (base / "rootlink").symlink_to(root)
-    case("symlinked allowed root: refused", raises(lambda: ra.Availability(str(base / "z.db"), [str(base / "rootlink")])))
+    case("symlinked allowed root: refused", raises(lambda: ra.Availability(str(base / "z.db"), {"kb": str(base / "rootlink")}, JR)))
     DB = str(base / "ra.db")
-    a = ra.Availability(DB, [str(root)])
+    a = ra.Availability(DB, {"kb": str(root)}, JR)
 
     # --- binding ---
     d, req = setup(root, "kbreq_ok")
     case("register binds request digest + owner + manifest",
-         a.register("kbreq_ok", str(d), req, "kb", *OWNER, ["result.md", "run.out"], T0) == "registered")
+         reg(a, "kbreq_ok", str(d), req, "kb", *OWNER, ["result.md", "run.out"], T0) == "registered")
     case("same binding again is idempotent",
-         a.register("kbreq_ok", str(d), req, "kb", *OWNER, ["run.out", "result.md"], T0) == "already_registered")
+         reg(a, "kbreq_ok", str(d), req, "kb", *OWNER, ["run.out", "result.md"], T0) == "already_registered")
     case("same id, changed request text: refused (no inherited binding)",
-         raises(lambda: a.register("kbreq_ok", str(d), b"other", "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_ok", str(d), b"other", "kb", *OWNER, ["result.md"], T0)))
     case("same id, different owner generation: refused",
-         raises(lambda: a.register("kbreq_ok", str(d), req, "kb", "pane-1", "birth-1", "sess-1", 4, ["result.md", "run.out"], T0)))
+         raises(lambda: reg(a, "kbreq_ok", str(d), req, "kb", "pane-1", "birth-1", "sess-1", 4, ["result.md", "run.out"], T0)))
     case("same id, different session_id: refused",
-         raises(lambda: a.register("kbreq_ok", str(d), req, "kb", "pane-1", "birth-1", "sess-2", 3, ["result.md", "run.out"], T0)))
+         raises(lambda: reg(a, "kbreq_ok", str(d), req, "kb", "pane-1", "birth-1", "sess-2", 3, ["result.md", "run.out"], T0)))
     d2, req2 = setup(root, "kbreq_mm")
     case("dispatched text != request.txt on disk: refused",
-         raises(lambda: a.register("kbreq_mm", str(d2), b"something else", "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_mm", str(d2), b"something else", "kb", *OWNER, ["result.md"], T0)))
     case("missing owner identity: refused",
-         raises(lambda: a.register("kbreq_mm", str(d2), req2, "kb", "", "birth-1", "sess-1", 3, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_mm", str(d2), req2, "kb", "", "birth-1", "sess-1", 3, ["result.md"], T0)))
     case("missing session_id: refused",
-         raises(lambda: a.register("kbreq_mm", str(d2), req2, "kb", "pane-1", "birth-1", "", 3, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_mm", str(d2), req2, "kb", "pane-1", "birth-1", "", 3, ["result.md"], T0)))
     other = base / "other"
     other.mkdir()
     (other / "kbreq_out").mkdir()
     (other / "kbreq_out" / "request.txt").write_bytes(req2)
     case("canonical dir OUTSIDE the allowed roots: refused",
-         raises(lambda: a.register("kbreq_out", str(other / "kbreq_out"), req2, "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_out", str(other / "kbreq_out"), req2, "kb", *OWNER, ["result.md"], T0)))
     (root / "nest").mkdir()
     (root / "nest" / "kbreq_deep").mkdir()
     (root / "nest" / "kbreq_deep" / "request.txt").write_bytes(req2)
     case("nested dir (not a direct child of a root): refused",
-         raises(lambda: a.register("kbreq_deep", str(root / "nest" / "kbreq_deep"), req2, "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_deep", str(root / "nest" / "kbreq_deep"), req2, "kb", *OWNER, ["result.md"], T0)))
     case("non-normalized path (..) : refused",
-         raises(lambda: a.register("kbreq_mm", str(root / "nest" / ".." / "kbreq_mm"), req2, "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_mm", str(root / "nest" / ".." / "kbreq_mm"), req2, "kb", *OWNER, ["result.md"], T0)))
     case("dir not named after rid: refused",
-         raises(lambda: a.register("kbreq_zz", str(d2), req2, "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_zz", str(d2), req2, "kb", *OWNER, ["result.md"], T0)))
     for bad in (["../x"], ["a/b"], [".hidden"], ["request.txt"], [], [f"f{i}" for i in range(9)], ["a", "a"]):
-        case(f"manifest {bad[:2]}…: refused", raises(lambda b=bad: a.register("kbreq_mm", str(d2), req2, "kb", *OWNER, b, T0)))
+        case(f"manifest {bad[:2]}…: refused", raises(lambda b=bad: reg(a, "kbreq_mm", str(d2), req2, "kb", *OWNER, b, T0)))
     link = root / "kbreq_ln"
     link.symlink_to(d2)
     case("symlinked request dir: refused",
-         raises(lambda: a.register("kbreq_ln", str(link), req2, "kb", *OWNER, ["result.md"], T0)))
+         raises(lambda: reg(a, "kbreq_ln", str(link), req2, "kb", *OWNER, ["result.md"], T0)))
+    # --- settled-dispatch binding, label roots, journal ---
+    dn, rqn = setup(root, "kbreq_nojournal")
+    case("no settled dispatch in the journal: refused",
+         raises(lambda: a.register("kbreq_nojournal", str(dn), rqn, "kb", *OWNER, ["result.md"], T0)))
+    jn = Path(JR) / "kb" / "kbreq_nojournal"
+    jn.mkdir(parents=True)
+    (jn / ra.SETTLED_FILE).write_bytes(ra.settled_record("kbreq_nojournal", ra._sha(rqn), "kb", *OWNER, ["other.md"]))
+    case("settled dispatch for a different manifest: refused",
+         raises(lambda: a.register("kbreq_nojournal", str(dn), rqn, "kb", *OWNER, ["result.md"], T0)))
+    (jn / ra.SETTLED_FILE).unlink()
+    (jn / ra.SETTLED_FILE).symlink_to(base / "x.json")
+    (base / "x.json").write_bytes(ra.settled_record("kbreq_nojournal", ra._sha(rqn), "kb", *OWNER, ["result.md"]))
+    case("symlinked settled journal file: refused",
+         raises(lambda: a.register("kbreq_nojournal", str(dn), rqn, "kb", *OWNER, ["result.md"], T0)))
+    dots = base / "dots_root"
+    dots.mkdir()
+    case("two labels sharing one root: refused",
+         raises(lambda: ra.Availability(str(base / "s.db"), {"kb": str(root), "dots": str(root)}, JR)))
+    case("journal root inside an owner root: refused",
+         raises(lambda: ra.Availability(str(base / "s.db"), {"kb": str(base)}, JR)))
+    a2 = ra.Availability(str(base / "two.db"), {"kb": str(root), "dots": str(dots)}, JR)
+    dx, rqx = setup(root, "kbreq_cross")
+    case("CROSS-LABEL: kb's dir registered for label dots: refused",
+         raises(lambda: reg(a2, "kbreq_cross", dx, rqx, "dots", *OWNER, ["result.md"], T0)))
+    a2.close()
+    case("from_env: roots must be label=/abs/root pairs and a journal is required",
+         raises(lambda: ra.from_env({"HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": DB,
+                                     "HERDR_RESULT_AVAILABILITY_ROOTS": f"kb={root}"}))
+         and raises(lambda: ra.from_env({"HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": DB,
+                                         "HERDR_RESULT_AVAILABILITY_ROOTS": str(root),
+                                         "HERDR_RESULT_AVAILABILITY_JOURNAL": JR})))
     case("unregistered (legacy) dir is unverified_held, never scanned",
          a.state("kbreq_legacy")[0] == "unverified_held" and ra.classify_unregistered(root) == "unverified_held")
 
@@ -127,7 +178,7 @@ def main() -> int:
 
     def staged(rid, req=b"REQ x\n", owner=OWNER):
         dd, rq = setup(root, rid, req)
-        a.register(rid, str(dd), rq, "kb", *owner, ["result.md"], T0)
+        reg(a, rid, str(dd), rq, "kb", *owner, ["result.md"], T0)
         (dd / "result.md").write_text("r")
         a.tick(holder, Notices(), T0)
         a.tick(holder, Notices(), T0)
@@ -162,9 +213,35 @@ def main() -> int:
     case("no lease holder: held:stale_generation",
          a.tick(lambda label: None, n, T0 + 14)["kbreq_gone"] == "held:stale_generation" and not n.sent)
 
+    # --- settled journal changed after registration ---
+    staged("kbreq_jchg")
+    (Path(JR) / "kb" / "kbreq_jchg" / ra.SETTLED_FILE).write_bytes(b"{}\n")
+    case("settled journal changed after registration: held:dispatch_changed, no notice",
+         a.tick(holder, n, T0 + 14.5)["kbreq_jchg"] == "held:dispatch_changed" and not n.sent)
+
+    # --- separate durable stages ---
+    staged("kbreq_stage")
+    case("staged records ONLY the observed stage", set(a.stages("kbreq_stage")) == {"observed"})
+    pin = {"result.md": ra._sha(b"r")}
+    case("accept before verify/authentication: refused", not a.accept("kbreq_stage", "conductor", T0))
+    case("verify with a wrong pin: refused, nothing recorded",
+         not a.verify_pinned("kbreq_stage", {"result.md": "0" * 64}, T0) and "verified" not in a.stages("kbreq_stage"))
+    case("verify with pins not covering the manifest exactly: refused",
+         not a.verify_pinned("kbreq_stage", {**pin, "extra.md": "0" * 64}, T0))
+    case("verify with the caller's correct pins: verified", a.verify_pinned("kbreq_stage", pin, T0))
+    case("verified alone does not allow accept (no authenticated reply)", not a.accept("kbreq_stage", "conductor", T0))
+    case("authenticated reply needs a reference", not a.record_reply_authenticated("kbreq_stage", "", T0)
+         and a.record_reply_authenticated("kbreq_stage", "oex_auth_ref", T0))
+    a.tick(holder, Notices(), T0 + 14.6)
+    case("notice is its own stage; accept is a separate conductor act",
+         set(a.stages("kbreq_stage")) == {"observed", "noticed", "reply_authenticated", "verified"}
+         and a.accept("kbreq_stage", "conductor", T0) and "accepted" in a.stages("kbreq_stage"))
+    case("stages are append-only", raises_db(lambda: a.conn.execute("DELETE FROM ra_stages"))
+         and raises_db(lambda: a.conn.execute("UPDATE ra_stages SET evidence='x'")))
+
     # --- symlinked artifact ---
     ds, rq = setup(root, "kbreq_sym")
-    a.register("kbreq_sym", str(ds), rq, "kb", *OWNER, ["result.md"], T0)
+    reg(a, "kbreq_sym", str(ds), rq, "kb", *OWNER, ["result.md"], T0)
     (base / "outside.md").write_text("secret")
     (ds / "result.md").symlink_to(base / "outside.md")
     a.tick(holder, n, T0 + 15)
@@ -174,14 +251,14 @@ def main() -> int:
     # --- crash boundaries ---
     staged("kbreq_pre")
     a.close()
-    a = ra.Availability(DB, [str(root)])
+    a = ra.Availability(DB, {"kb": str(root)}, JR)
     n = Notices()
     case("CRASH before notice boundary: staged survives restart and notifies once",
          a.tick(holder, n, T0 + 20)["kbreq_pre"] == "notified" and len(n.sent) == 1)
     staged("kbreq_mid")
     a.conn.execute("UPDATE ra_requests SET state='notifying' WHERE rid='kbreq_mid'")  # crash after the commit
     a.close()
-    a = ra.Availability(DB, [str(root)])
+    a = ra.Availability(DB, {"kb": str(root)}, JR)
     n = Notices()
     case("notifying younger than NOTIFY_TIMEOUT_S: left alone as in-flight (no notice, no verdict)",
          a.tick(holder, n, T0 + 21)["kbreq_mid"] == "in_flight" and not n.sent)
@@ -205,7 +282,7 @@ def main() -> int:
 
     # --- interruption clears the observation (non-consecutive must not stage) ---
     di, rq = setup(root, "kbreq_int")
-    a.register("kbreq_int", str(di), rq, "kb", *OWNER, ["result.md"], T0)
+    reg(a, "kbreq_int", str(di), rq, "kb", *OWNER, ["result.md"], T0)
     (di / "result.md").write_text("r")
     a.tick(holder, Notices(), T0 + 30)                 # observing
     (di / "result.md").unlink()
@@ -216,7 +293,7 @@ def main() -> int:
 
     # --- ancestor symlink swap after registration ---
     dw, rq = setup(root, "kbreq_swap")
-    a.register("kbreq_swap", str(dw), rq, "kb", *OWNER, ["result.md"], T0)
+    reg(a, "kbreq_swap", str(dw), rq, "kb", *OWNER, ["result.md"], T0)
     evil = base / "evil" / "kbreq_swap"
     evil.mkdir(parents=True)
     (evil / "request.txt").write_bytes(rq)
@@ -231,9 +308,9 @@ def main() -> int:
     rr = base / "race"
     rr.mkdir()
     RDB = str(base / "race.db")
-    b = ra.Availability(RDB, [str(rr)])
+    b = ra.Availability(RDB, {"kb": str(rr)}, JR)
     dr, rq = setup(rr, "kbreq_race")
-    b.register("kbreq_race", str(dr), rq, "kb", *OWNER, ["result.md"], T0)
+    reg(b, "kbreq_race", str(dr), rq, "kb", *OWNER, ["result.md"], T0)
     (dr / "result.md").write_text("r")
     b.tick(holder, Notices(), T0)
     b.tick(holder, Notices(), T0)
@@ -242,13 +319,13 @@ def main() -> int:
     import subprocess
     child = (
         "import sys,time,os;sys.path.insert(0,sys.argv[1]);import result_availability as ra\n"
-        "a=ra.Availability(sys.argv[2],[sys.argv[3]])\n"
+        "a=ra.Availability(sys.argv[2],{'kb':sys.argv[3]},sys.argv[6])\n"
         "def n(t):\n open(sys.argv[4],'a').write('x\\n');time.sleep(0.2);return True\n"
         "while time.time()<float(sys.argv[5]):pass\n"
         "print(a.tick(lambda l:('pane-1','birth-1','sess-1',3),n,1.8e9+1).get('kbreq_race'))\n"
     )
     go = str(__import__("time").time() + 1.0)
-    procs = [subprocess.Popen([sys.executable, "-c", child, str(HERE / "lib"), RDB, str(rr), str(log), go],
+    procs = [subprocess.Popen([sys.executable, "-c", child, str(HERE / "lib"), RDB, str(rr), str(log), go, JR],
                               stdout=subprocess.PIPE, text=True) for _ in range(8)]
     outs = [p.communicate()[0].strip() for p in procs]
     calls = log.read_text().count("x") if log.exists() else 0
