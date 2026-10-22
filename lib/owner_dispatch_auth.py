@@ -253,7 +253,9 @@ def resolve(conn: sqlite3.Connection, auth_id: str, *, envelope_sha256_hex: str,
     """'resolved', or why not: resolve_invalid | resolve_missing | resolve_not_consumed |
     resolve_key_mismatch | resolve_duplicate | resolve_ambiguous:<Error>. new_request_id is
     recorded only; it grants nothing. Never raises."""
-    if not operator or not decision_ref or outcome not in OUTCOMES:
+    # Every outcome is an operator ASSERTION; `note` must carry its evidence
+    # (e.g. the owner's handoff read-back), it is not proof by itself.
+    if not operator or not decision_ref or outcome not in OUTCOMES or not (note or "").strip():
         return "resolve_invalid"
     try:
         conn.execute("BEGIN IMMEDIATE")

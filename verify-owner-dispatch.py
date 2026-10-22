@@ -381,6 +381,7 @@ def main() -> int:
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
@@ -724,11 +725,12 @@ def cli_cases(base: Path) -> None:
          rc == 4 and out == "refused:recovery_needs_operator auth:a_burn=consumed_unsent"
          and c.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_e'").fetchone()[0] == "granted")
     # operator resolution: wrong key keeps the hold; exact key lifts it for a_burn only; a_burn stays listed by unsent()
-    bad_key = oda.resolve(c, "a_burn", envelope_sha256_hex="0" * 64, operator="terrence", decision_ref="form-x",
+    bad_key = oda.resolve(c, "a_burn", envelope_sha256_hex="0" * 64, operator="terrence", decision_ref="form-x", note="handoff read-back: request.txt absent",
                           outcome="confirmed_not_delivered")
     rc_wrong = inproc("r_e", "a_e")[0]
     good = oda.resolve(c, "a_burn", envelope_sha256_hex=oda.envelope_sha256(oda._envelope(c, "a_burn")),
-                       operator="terrence", decision_ref="form-x", outcome="confirmed_not_delivered")
+                       operator="terrence", decision_ref="form-x", outcome="confirmed_not_delivered",
+                       note="handoff read-back: request.txt absent")
     rc2, out2 = inproc("r_e", "a_e")
     case("CLI: resolution with a wrong envelope key keeps exit 4; exact key lifts the hold; evidence still in unsent()",
          bad_key == "resolve_key_mismatch" and rc_wrong == 4 and good == "resolved" and (rc2, out2) == (0, "dispatched")
@@ -762,7 +764,8 @@ def operator_cases(base: Path) -> None:
     key = oda.envelope_sha256(env2)
     R = lambda aid, k=key, **kw: oda.resolve(c, aid, envelope_sha256_hex=k, operator=kw.get("op", "terrence"),
                                               decision_ref="form-2", outcome=kw.get("out", "abandoned_uncertain"),
-                                              new_request_id=kw.get("nr"))
+                                              new_request_id=kw.get("nr"), note=kw.get("note", "operator evidence"))
+    case("RESOLVE: an outcome without evidence (empty note) is refused", R("g2", note=" ") == "resolve_invalid")
     case("RESOLVE: invalid outcome / not consumed / missing / wrong key -> refused, no record",
          R("g2", out="ok") == "resolve_invalid" and R("g1") == "resolve_not_consumed" and R("nope") == "resolve_missing"
          and R("g2", k=key[::-1]) == "resolve_key_mismatch" and oda.unresolved(c, str(J)) == ["g2"])
@@ -914,6 +917,150 @@ def _raises(fn):
     except Exception as exc:  # noqa: BLE001
         return exc
     return None
+
+
+def issue_cases(base: Path) -> None:
+    """owner-dispatch-issue.py: one approval record -> expected gen-1 claim + one grant; every mismatch aborts."""
+    import importlib.util
+    import io
+    import contextlib
+    import time as _t
+    spec = importlib.util.spec_from_file_location("odissue", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    spec2 = importlib.util.spec_from_file_location("odcli2", HERE / "owner-dispatch.py")
+    odc = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(odc)
+    now = float(int(_t.time()))
+    iso = lambda t: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
+    n = [0]
+
+    def setup():
+        n[0] += 1
+        d = base / f"c{n[0]}"; d.mkdir(mode=0o700)
+        lc, av, roots, lease_db = env(d); av.close()
+        os.chmod(lease_db, 0o600)
+        adb = d / "auth.db"
+        c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); c.close(); os.chmod(adb, 0o600)
+        rq = d / "req"; rq.mkdir(); (rq / "req.txt").write_bytes(body)
+        proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+        return d, lc, lease_db, adb, rq, roots, proj
+
+    def approval(d, proj, **over):
+        rec = {"protocol": odi.PROTOCOL, "approval_id": f"appr-{n[0]}", "prompt_id": "form-20261022-kb-pilot",
+               "decided_at": iso(now - 60), "owner_label": KB, "project": proj, "expected_holder": dict(HOLD),
+               "expected_generation": 1, "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}", "request_name": "req.txt",
+               "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"], "auth_id": f"auth-{n[0]}",
+               "grant_expires_at": iso(now + 1800)}
+        rec.update(over)
+        data = json.dumps(rec, sort_keys=True).encode()
+        f = d / "approval.json"; f.write_bytes(data)
+        return f, hashlib.sha256(data).hexdigest(), rec
+
+    def run(d, lease_db, adb, rq, f, sha, resolve=reg_ok, flags=True, t=None):
+        E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+             "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                                                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")}
+        for k in saved: os.environ.pop(k, None)
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odi.main(["--approval", str(f), "--approval-sha256", sha, "--request-dir", str(rq)], resolve=resolve,
+                              now=now if t is None else t)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    def grants(adb):
+        c = sqlite3.connect(str(adb)); r = c.execute("SELECT COUNT(*) FROM owner_dispatch_auth").fetchone()[0]; c.close(); return r
+
+    def lease_rows(lc):
+        return lc.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0]
+
+    # happy path, then the SAME record again, then dispatch through the real CLI
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    f, sha, rec = approval(d, proj)
+    first = run(d, ldb, adb, rq, f, sha)
+    again = run(d, ldb, adb, rq, f, sha)
+    case("ISSUE: exact approval -> gen-1 claim + exactly one grant; replaying the record refuses (approval_already_used), still one grant",
+         first == (0, f"issued:{rec['auth_id']}:gen1") and again == (2, "refused:approval_already_used") and grants(adb) == 1
+         and ol.holder_tuple(lc, KB, now) == (*PANE[KB], SESS[KB], 1))
+    sent = []
+    E = {"HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": ldb,
+         "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb), "HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(d / "ra.db"),
+         "HERDR_RESULT_AVAILABILITY_JOURNAL": str(d / "journal"),
+         "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={roots[KB]}{os.pathsep}{DOTS}={roots[DOTS]}"}
+    saved = {k: os.environ.get(k) for k in E}
+    os.environ.update(E)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = odc.main(["--label", KB, "--rid", rec["request_id"], "--request-dir", str(rq), "--request-name", "req.txt",
+                           "--auth-id", rec["auth_id"], "--manifest", "result.md"],
+                          send=lambda pane, handoff, text: sent.append((pane, text)) or True, resolve=reg_ok)
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    case("ISSUE -> DISPATCH: the issued grant dispatches the frozen bytes once through owner-dispatch.py",
+         (rc, buf.getvalue().strip()) == (0, "dispatched") and (roots[KB] / rec["request_id"] / ra.REQUEST_FILE).read_bytes() == body)
+    lc.close()
+
+    # every pre-claim mismatch: refused, NOTHING written (no lease row, no grant)
+    other_sess = hashlib.sha256(b"other").hexdigest()
+    for name, over, kw, want in [
+        ("flags off", {}, {"flags": False}, (4, "refused:flags_off")),
+        ("approval bytes changed after sha", {}, {"tamper": True}, (2, "refused:approval_sha_mismatch")),
+        ("request bytes differ", {"request_sha256": "0" * 64}, {}, (2, "refused:request_sha_mismatch")),
+        ("window over 60 min", {"grant_expires_at": iso(now - 60 + 3601)}, {}, (2, "refused:approval_window_over_60min")),
+        ("expired", {"decided_at": iso(now - 1000), "grant_expires_at": iso(now - 10)}, {}, (2, "refused:approval_expired")),
+        ("non-canonical timestamp", {"grant_expires_at": iso(now + 600).replace("Z", "+00:00")}, {}, (2, "refused:bad_timestamp")),
+        ("generation != 1", {"expected_generation": 2}, {}, (2, "refused:approval_generation_not_initial")),
+        ("extra field", {"note": "x"}, {}, (2, "refused:approval_schema")),
+        ("holder digest differs from registry", {"expected_holder": {**HOLD, "session_digest": other_sess}}, {}, (2, "refused:identity_mismatch")),
+        ("dead/other owner label", {"owner_label": DOTS}, {}, (2, "refused:identity_mismatch")),
+        ("project differs", {"project": "tntpgh/other"}, {}, (2, "refused:owner_project_mismatch")),
+        ("registry has no session", {}, {"resolve": lambda l: None}, (2, "refused:identity_mismatch")),
+    ]:
+        d, lc, ldb, adb, rq, roots, proj = setup()
+        f, sha, rec = approval(d, proj, **over)
+        if kw.get("tamper"):
+            f.write_bytes(f.read_bytes().replace(b"result.md", b"result.mx"))
+        got = run(d, ldb, adb, rq, f, sha, resolve=kw.get("resolve", reg_ok), flags=kw.get("flags", True))
+        case(f"ISSUE refused before any write: {name}", got == want and grants(adb) == 0 and lease_rows(lc) == 0)
+        lc.close()
+
+    # an existing lease is never adopted: refused, the existing lease untouched, no grant
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now, session=SESS[KB])
+    f, sha, rec = approval(d, proj)
+    case("ISSUE: an existing lease is never adopted (not_initial), no grant", run(d, ldb, adb, rq, f, sha) == (2, "refused:not_initial")
+         and grants(adb) == 0 and lease_rows(lc) == 1)
+    lc.close()
+    # identity moves between claim and issue -> claimed_not_issued (exit 5), no grant, no retry
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    f, sha, rec = approval(d, proj)
+    calls = [0]
+    def moving(label):
+        calls[0] += 1
+        return reg_ok(label) if calls[0] == 1 else (PANE[KB][0], "term_new", SESS[KB])
+    case("ISSUE: identity changes after the claim -> claimed_not_issued exit 5, lease held, NO grant",
+         run(d, ldb, adb, rq, f, sha, resolve=moving) == (5, "claimed_not_issued:identity_mismatch") and grants(adb) == 0
+         and lease_rows(lc) == 1)
+    lc.close()
+    # auth_id / approval_id reuse: refused before the claim
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    f, sha, rec = approval(d, proj)
+    c = sqlite3.connect(str(adb), isolation_level=None)
+    insert_grant(c, "other", label=KB, project=proj, holder=(*PANE[KB], SESS[KB], 1), rid="x", sha="a" * 64, manifest=["m"],
+                 approval=rec["approval_id"])
+    c.close()
+    case("ISSUE: approval_id already used -> refused before claim, nothing new written",
+         run(d, ldb, adb, rq, f, sha) == (2, "refused:approval_already_used") and grants(adb) == 1 and lease_rows(lc) == 0)
+    lc.close()
 
 
 if __name__ == "__main__":
