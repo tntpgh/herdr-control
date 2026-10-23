@@ -32,8 +32,9 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 ENV_FLAG = "HERDR_QUEUE_SUPERVISOR"
 _PROOF = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -190,7 +191,7 @@ def tick(root: Path, labels: list[str], dispatcher: Dispatch, evidence: Evidence
         for label in labels:
             try:
                 result[label] = tick_lane(Lane(root, label), dispatcher, evidence, notify)
-            except Exception as exc:  # one bad lane must not stall the others
+            except Exception as exc:  # noqa: BLE001 — one bad lane must not stall the others
                 result[label] = f"error:{type(exc).__name__}"
         return result
     finally:

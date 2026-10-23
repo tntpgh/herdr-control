@@ -12,7 +12,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
-import queue_supervisor as qs  # noqa: E402
+import queue_supervisor as qs
 
 ON = {qs.ENV_FLAG: "1"}
 SHA = "a" * 40
@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory() as t:
     root.mkdir()
     setup(root, LANES)
     fc = FakeConductors()
-    tick = lambda env=ON: qs.tick(root, LANES, fc, fc.evidence, fc.notify, environ=env)  # noqa: E731
+    tick = lambda env=ON: qs.tick(root, LANES, fc, fc.evidence, fc.notify, environ=env)
 
     check("default off: no flag -> off, nothing sent, no ledger", tick({}) == {"_": "off"} and not fc.sent
           and not list(root.glob("*.ledger.jsonl")))
@@ -123,7 +123,8 @@ with tempfile.TemporaryDirectory() as t:
     check("one malformed lane does not stall others", r["kb"].startswith(("error:", "frozen:"))
           and r["monthly"] == "waiting:i3")
 
-    import fcntl, os  # noqa: E401,E402
+    import fcntl
+    import os
     fd = os.open(root / ".tick.lock", os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
     check("concurrent tick refused (busy), no double dispatch", tick() == {"_": "busy"})
