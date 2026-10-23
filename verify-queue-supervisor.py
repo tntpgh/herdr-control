@@ -8,6 +8,7 @@ no pane, no network, no registry, no real stores."""
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -41,6 +42,7 @@ class FakeConductors:
         self.ev: dict[str, dict] = {}
         self.jr: dict[str, str] = {}  # rid -> journal verdict
         self.notes: list[tuple[str, str, str]] = []
+        self.fail_notify: set[str] = set()  # labels whose notify() raises (delivery-failure fixture)
 
     def dispatch(self, label, rid, request_text, manifest, auth_id):
         self.calls.append((label, rid))
@@ -67,6 +69,8 @@ class FakeConductors:
         return self.jr.get(rid)
 
     def notify(self, label, item, reason):
+        if label in self.fail_notify:
+            raise RuntimeError("notify unavailable")
         self.notes.append((label, item, reason))
 
 
@@ -214,6 +218,10 @@ with tempfile.TemporaryDirectory() as t:
         "non-string request": [{**item("i1", "s"), "request": 5}],
         "missing auth_id": [{"id": "i1", "request": "x"}],
         "bad id chars": [item("../i1", "s")],
+        "cost_cents as string": [item("i1", "s", cost_cents="40")],
+        "cost_cents as bool": [item("i1", "s", cost_cents=True)],
+        "cost_cents as float": [item("i1", "s", cost_cents=1.5)],
+        "cost_cents negative": [item("i1", "s", cost_cents=-1)],
     }
     for name, q in bad.items():
         try:
@@ -222,6 +230,9 @@ with tempfile.TemporaryDirectory() as t:
         except ValueError:
             ok = True
         check(f"schema rejects {name}", ok)
+    check("schema accepts a valid non-negative int cost_cents and leaves it on the item",
+          qs.validate_queue([item("i1", "s", cost_cents=0)])[0]["cost_cents"] == 0
+          and qs.validate_queue([item("i2", "s")])[0].get("cost_cents") is None)
     s = mkroot(t, "schema", ["s"])
     (s / "s.queue.json").write_text(json.dumps(bad["manifest as string"]))
     r = tick(r=s, lanes=["s"])
@@ -307,6 +318,104 @@ with tempfile.TemporaryDirectory() as t:
     rc, out = run(env)
     check("CLI never creates a missing auth store", rc == 4 and out.startswith("refused:")
           and not Path(f"{t}/missing-auth.db").exists())
+
+# --- M3 fix: queue validation and the exhaustion digest share ONE raw read --
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t)
+    lane = qs.Lane(root, "snap")
+    c1 = json.dumps([item("i1", "snap")]).encode()
+    (root / "snap.queue.json").write_bytes(c1)
+    items, digest = lane.queue_snapshot()
+    (root / "snap.queue.json").write_bytes(b'[{"id":"i2","request":"later","auth_id":"g-snap-i2"}]')
+    check("digest is tied to the exact bytes already validated, not a second (now-mutated) read",
+          digest == hashlib.sha256(c1).hexdigest() and [i["id"] for i in items] == ["i1"])
+
+# --- M3: exhaustion record (lib/queue_supervisor.py:206-207 "idle:empty") --
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex"
+    root.mkdir()
+    (root / "x.queue.json").write_text("[]")
+    fc = FakeConductors()
+
+    def xtick(env=ON):
+        return qs.tick(root, ["x"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=env)
+
+    def ledger_kinds():
+        p = root / "x.ledger.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(line)["kind"] for line in p.read_text().splitlines()]
+
+    r = xtick()
+    check("empty queue -> idle:empty + exactly one exhausted record",
+          r["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 1)
+    check("exhaustion escalated exactly once", sum(n[0] == "x" for n in fc.notes) == 1)
+    rec = json.loads((root / "x.ledger.jsonl").read_text().splitlines()[0])
+    check("exhausted record carries lane, queue_sha and a timestamp",
+          rec["kind"] == "exhausted" and rec["lane"] == "x"
+          and rec["queue_sha"] == hashlib.sha256(b"[]").hexdigest() and isinstance(rec.get("at"), (int, float)))
+
+    xtick()
+    check("second tick, same empty queue: no duplicate exhausted record or re-escalation",
+          ledger_kinds().count("exhausted") == 1 and sum(n[0] == "x" for n in fc.notes) == 1)
+
+    (root / "x.queue.json").write_text(json.dumps([item("i1", "x")]))
+    fc.acc.add("q-x-i1")
+    check("new item re-arms the lane: dispatch resumes", xtick()["x"] == "dispatched:i1")
+    check("dispatched item settles", xtick()["x"] == "done:i1")
+    check("queue refilled then emptied again -> a NEW exhausted record (different digest)",
+          xtick()["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 2)
+    check("re-exhaustion escalated again", sum(n[0] == "x" for n in fc.notes) == 2)
+
+    (root / "x.queue.json").write_text("[]")  # revert to the ORIGINAL empty content
+    r = xtick()
+    check("same digest reappearing after real activity (dispatch+settle) in between "
+          "is a NEW episode, not a duplicate of the first",
+          r["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 3)
+    exhausted_shas = [json.loads(line)["queue_sha"] for line in (root / "x.ledger.jsonl").read_text().splitlines()
+                       if json.loads(line)["kind"] == "exhausted"]
+    check("1st and 3rd exhausted records share the original digest; 2nd (refilled queue) differs",
+          exhausted_shas[0] == exhausted_shas[2] == hashlib.sha256(b"[]").hexdigest()
+          and exhausted_shas[1] != exhausted_shas[0])
+    check("re-armed episode escalates again too", sum(n[0] == "x" for n in fc.notes) == 3)
+
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex_off"
+    root.mkdir()
+    (root / "x.queue.json").write_text("[]")
+    fc = FakeConductors()
+    r = qs.tick(root, ["x"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ={})
+    check("flag off: idle lane writes nothing, escalates nothing",
+          r == {"_": "off"} and not (root / "x.ledger.jsonl").exists() and not fc.notes)
+
+# --- M3 fix: notify() failure must not duplicate the durable 'exhausted' record ---
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex_notify_fail"
+    root.mkdir()
+    (root / "y.queue.json").write_text("[]")
+    fc = FakeConductors()
+    fc.fail_notify.add("y")
+
+    def ytick():
+        return qs.tick(root, ["y"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=ON)
+
+    def ykinds():
+        p = root / "y.ledger.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(line)["kind"] for line in p.read_text().splitlines()]
+
+    r1 = ytick()
+    check("notify failure on first exhaustion: durable record still lands exactly once",
+          r1["y"].startswith("error:") and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 0)
+    r2 = ytick()
+    check("retry while notify keeps failing: no duplicate exhausted record",
+          r2["y"].startswith("error:") and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 0)
+    fc.fail_notify.discard("y")
+    r3 = ytick()
+    check("notify recovers: escalation completes, still exactly one exhausted record",
+          r3["y"] == "idle:empty" and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 1
+          and sum(n[0] == "y" for n in fc.notes) == 1)
 
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

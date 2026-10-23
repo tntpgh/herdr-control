@@ -382,6 +382,7 @@ def main() -> int:
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
@@ -919,6 +920,21 @@ def _raises(fn):
     return None
 
 
+def _frozen_gen1_module(ref="1a0b873"):
+    """owner-dispatch-issue.py exactly as it existed at `ref` (the commit
+    this branch started from), read via `git show` and exec'd IN MEMORY --
+    never written to disk, never re-derived from the current file. Used
+    only to prove the classic gen1 (claim_initial) path's schema,
+    approval_bytes and render_form are byte-identical to that frozen,
+    pre-successor baseline."""
+    import types
+    src = subprocess.run(["git", "show", f"{ref}:owner-dispatch-issue.py"], cwd=HERE, capture_output=True, check=True).stdout
+    mod = types.ModuleType(f"odissue_frozen_{ref}")
+    mod.__file__ = f"<frozen:{ref}:owner-dispatch-issue.py>"
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
 def issue_cases(base: Path) -> None:
     """owner-dispatch-issue.py: trust root = the answered formserve record + served HTML;
     one approval -> expected gen-1 claim + one grant + immutable issuance record."""
@@ -932,7 +948,10 @@ def issue_cases(base: Path) -> None:
     odc = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(odc)
     now = float(int(_t.time()))
     HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    PANE2, SESS2 = ("w93:p9", "term_kb2"), hashlib.sha256(b"kb-session-2").hexdigest()
+    HOLD2 = {"pane_id": PANE2[0], "pane_birth": PANE2[1], "session_digest": SESS2}
     reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    reg_ok2 = {KB: (*PANE2, SESS2)}.get
     body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
     n = [0]
 
@@ -949,11 +968,15 @@ def issue_cases(base: Path) -> None:
         proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
         return d, lc, lease_db, adb, rq, roots, proj
 
-    def decision(d, proj, over=None, answers=None, status="answered", answered_at=None, html_extra=b""):
+    def decision(d, proj, over=None, answers=None, status="answered", answered_at=None, html_extra=b"",
+                prev_gen=0, prev_holder=None):
         rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1, "expected_holder": dict(HOLD),
-               "expected_generation": 1, "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}", "request_name": "req.txt",
-               "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"], "auth_id": f"auth-{n[0]}",
-               "grant_window_s": 1800}
+               "expected_generation": prev_gen + 1, "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}",
+               "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"],
+               "auth_id": f"auth-{n[0]}", "grant_window_s": 1800}
+        if prev_gen >= 1:
+            rec["expected_prev_generation"] = prev_gen
+            rec["expected_prev_holder"] = prev_holder
         rec.update(over or {})
         emb = odi.approval_bytes(rec)
         fid = f"20261022T1200{n[0] % 100:02d}-86{n[0] % 100:02d}"
@@ -1039,7 +1062,15 @@ def issue_cases(base: Path) -> None:
         ("window over 60 min", {"over": {"grant_window_s": 3601}}, (2, "refused:approval_field_grant_window_s")),
         ("max_open not 1 in record", {"over": {"max_open": 2}}, (2, "refused:approval_max_open_not_1")),
         ("request bytes differ", {"over": {"request_sha256": "0" * 64}}, (2, "refused:request_sha_mismatch")),
-        ("generation != 1", {"over": {"expected_generation": 2}}, (2, "refused:approval_generation_not_initial")),
+        ("generation != 1 (gen1 shape)", {"over": {"expected_generation": 2}}, (2, "refused:approval_generation_not_initial")),
+        ("expected_prev_generation negative (successor shape)",
+         {"prev_gen": 1, "prev_holder": dict(HOLD2), "over": {"expected_prev_generation": -1}},
+         (2, "refused:approval_field_expected_prev_generation")),
+        ("expected_prev_holder present without expected_prev_generation (not the frozen gen1 shape)",
+         {"over": {"expected_prev_holder": dict(HOLD)}}, (2, "refused:approval_schema")),
+        ("successor with no expected_prev_holder", {"prev_gen": 1, "over": {"expected_prev_holder": None}}, (2, "refused:approval_prev_holder_schema")),
+        ("successor generation mismatches prev+1", {"prev_gen": 1, "prev_holder": dict(HOLD2), "over": {"expected_generation": 5}},
+         (2, "refused:approval_generation_mismatch")),
         ("extra field", {"over": {"note": "x"}}, (2, "refused:approval_schema")),
         ("holder digest differs", {"over": {"expected_holder": {**HOLD, "session_digest": other}}}, (2, "refused:identity_mismatch")),
         ("dead/other owner label", {"over": {"owner_label": DOTS}}, (2, "refused:identity_mismatch")),
@@ -1049,7 +1080,8 @@ def issue_cases(base: Path) -> None:
     ]:
         d, lc, ldb, adb, rq, roots, proj = setup(max_open=kw.get("max_open", 1))
         fid, rec, asha = decision(d, proj, over=kw.get("over"), answers=kw.get("answers"), status=kw.get("status", "answered"),
-                                  answered_at=kw.get("answered_at"), html_extra=kw.get("html_extra", b""))
+                                  answered_at=kw.get("answered_at"), html_extra=kw.get("html_extra", b""),
+                                  prev_gen=kw.get("prev_gen", 0), prev_holder=kw.get("prev_holder"))
         got = run(d, ldb, adb, rq, fid, resolve=kw.get("resolve", reg_ok), flags=kw.get("flags", True))
         case(f"ISSUE refused before any write: {name}", got == want and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
              and lease_rows(lc) == 0)
@@ -1199,6 +1231,375 @@ def issue_cases(base: Path) -> None:
     case("ISSUE: failed issue with unreadable store -> issue_uncertain exit 6 store_unknown",
          got == (6, "issue_uncertain:error_OperationalError:store_unknown"))
     lc.close()
+
+    # --- SUCCESSOR CLAIM (claim_successor via owner-dispatch-issue.py) ---
+    # live predecessor: refused, no second row, no grant
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - 10)  # gen1, PANE[KB]/SESS[KB], still live (TTL 3600)
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: live predecessor refused, no second lease row, no grant",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_live_predecessor")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # wrong prev generation vs the actual (expired) predecessor
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, expired
+    fid, rec, asha = decision(d, proj, prev_gen=2, prev_holder=dict(HOLD), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: expected_prev_generation != actual predecessor generation refused",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_wrong_prev_generation")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # correct generation but the approval's expected_prev_holder no longer matches
+    # the real predecessor at that generation (stale/forged form content)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB] (HOLD), expired
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD2), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: expected_prev_holder no longer matches the real predecessor (same generation) refused, zero writes",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_prev_holder_mismatch")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+         and lc.execute("SELECT released_at FROM owner_leases WHERE generation=1").fetchone()[0] is None)
+    lc.close()
+
+    # same generation, same pane_id/pane_birth, but a DIFFERENT session digest
+    # (a renewal under the same pane with a new session) -- refused, zero writes, no grant
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB] (HOLD), expired
+    stale_sess = hashlib.sha256(b"stale-predecessor-session").hexdigest()
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder={**HOLD, "session_digest": stale_sess},
+                              over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: same generation/pane/birth but a changed session digest refused, zero writes, no grant",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_prev_holder_mismatch")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+         and lc.execute("SELECT released_at FROM owner_leases WHERE generation=1").fetchone()[0] is None)
+    lc.close()
+
+    # open owner_requests: refused rather than silently staled
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    g1 = acquire(lc, KB, now - TTL - 100)
+    ol.enqueue(lc, KB, g1, *PANE[KB], "open-req-1", now=now - TTL - 100)
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: open owner_requests refused, request left open (not staled)",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_open_requests")
+         and lease_rows(lc) == 1
+         and lc.execute("SELECT state FROM owner_requests WHERE request_id='open-req-1'").fetchone()[0] == "queued")
+    lc.close()
+
+    # new holder == predecessor holder: refused
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100, session=SESS2, pane=PANE2)  # gen1, expired, held by PANE2/SESS2
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD2), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: new holder equal to the predecessor holder refused",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_same_holder")
+         and lease_rows(lc) == 1)
+    lc.close()
+
+    # happy path: expired predecessor released (row kept) and gen2 claimed + grant issued
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB], expired
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD), over={"expected_holder": dict(HOLD2)})
+    got = run(d, ldb, adb, rq, fid, resolve=reg_ok2)
+    case("SUCCESSOR: expired predecessor released (row kept) -> gen2 claimed, one grant issued",
+         got == (0, f"issued:{rec['auth_id']}:gen2") and lease_rows(lc) == 2
+         and lc.execute("SELECT label, released_at IS NOT NULL, release_reason FROM owner_leases WHERE generation=1").fetchone()
+             == (KB, 1, "expired")
+         and ol.holder_tuple(lc, KB, now) == (*PANE2, SESS2, 2)
+         and q(adb, "SELECT lease_generation FROM owner_dispatch_auth") == [(2,)])
+    lc.close()
+
+    # BUILD-FORM successor: resolves the EXPIRED predecessor's identity from --lease-db
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB], expired
+    out = d / "built-successor.html"
+    with contextlib.redirect_stdout(io.StringIO()):
+        rcb = odi.main(["build-form", "--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                        "--request-id", "kbpilot-succ", "--auth-id", "auth-succ", "--manifest", "result.md",
+                        "--expected-prev-generation", "1", "--lease-db", ldb, "--out", str(out)], resolve=reg_ok2)
+    emb = odi.EMBED.findall(out.read_bytes())[0]
+    brec = json.loads(emb)
+    fidb = "20261022T120098-8698"
+    (d / "state" / "forms" / f"{fidb}.html").write_bytes(out.read_bytes())
+    (d / "state" / "forms" / f"{fidb}.json").write_text(json.dumps({"id": fidb, "status": "answered", "answered_at": int((now - 60) * 1000),
+        "answers": {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()}}))
+    case("BUILD-FORM successor: resolves the expired predecessor's identity, generation N+1, issuer accepts it",
+         rcb == 0 and brec["expected_prev_generation"] == 1 and brec["expected_prev_holder"] == HOLD
+         and brec["expected_generation"] == 2 and brec["expected_holder"] == HOLD2
+         and run(d, ldb, adb, rq, fidb, resolve=reg_ok2) == (0, "issued:auth-succ:gen2"))
+    lc.close()
+
+    # --- FROZEN COMPAT (1a0b873): classic gen1 shape is byte-identical to the pre-successor baseline ---
+    frozen = _frozen_gen1_module()
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)  # prev_gen=0 default -> classic shape, no successor keys at all
+    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes/render_form byte-identical to the frozen baseline",
+         set(rec) == frozen.KEYS
+         and frozen.validate_approval(dict(rec)) == rec
+         and frozen.approval_bytes(rec) == odi.approval_bytes(rec)
+         and frozen.render_form(rec) == odi.render_form(rec))
+    frozen_successor = _frozen_gen1_module(ref="0ac8ba1f7f5431899819b3a7fd1713957e965bb8")  # SUCCESSOR_KEYS postdates 1a0b873
+    saved_root = odi.STATE_ROOT
+    odi.STATE_ROOT = os.path.realpath(d / "state")
+    try:
+        dec_default = odi.read_decision(fid)  # DEFAULT kwargs: the standing extension must not change this
+    finally:
+        odi.STATE_ROOT = saved_root
+    case("STANDING EXTENSION DID NOT CHANGE SINGLE-USE: read_decision()'s default kwargs still select "
+         "validate_approval/render_form, window() still reads grant_window_s with no key kwarg, "
+         "MAX_WINDOW_S and KEYS are unchanged",
+         dec_default["rec"] == rec
+         and odi.window(dec_default, now) == dec_default["answered_at"] + rec["grant_window_s"]
+         and odi.MAX_WINDOW_S == 3600 and odi.KEYS == frozen.KEYS and odi.SUCCESSOR_KEYS == frozen_successor.SUCCESSOR_KEYS)
+    lc.close()
+
+
+def standing_issue_cases(base: Path) -> None:
+    """owner-dispatch-issue.py issue-standing: SEPARATE record kind
+    (STANDING_PROTOCOL/STANDING_KEYS), reusing read_decision parameterized
+    but NO lease claim -- only reconfirms the ALREADY-LIVE holder/generation,
+    then writes one kind='standing' row + issuance record in ONE transaction
+    via lib/owner_dispatch_auth, against an ALREADY-migrated store: the
+    issuer never migrates; a v1 store is refused. The signed queue_items
+    must equal the canonical derivation from the EXACT queue bytes."""
+    import importlib.util
+    import io
+    import contextlib
+    import time as _t
+    spec = importlib.util.spec_from_file_location("odissue_standing", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    now = float(int(_t.time()))
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    items = [{"id": "i1", "request": "do one\n", "auth_id": "standing-auth", "manifest": ["result.md"]},
+             {"id": "i2", "request": "do two\n", "auth_id": "standing-auth", "manifest": ["result.md"], "cost_cents": 40}]
+    queue_bytes = json.dumps(items).encode()
+    queue_sha = hashlib.sha256(queue_bytes).hexdigest()
+    canon_items = [{"id": it["id"], "request_sha256": hashlib.sha256(it["request"].encode()).hexdigest(),
+                    "manifest": list(it.get("manifest", [])), "cost_cents": it.get("cost_cents"),
+                    "action": "hold" if it.get("hold") else "dispatch"} for it in items]
+    assert odi.canonical_queue_items(queue_bytes) == canon_items  # the test's own derivation matches the real one
+    n = [0]
+
+    def setup(migrated=True):
+        n[0] += 1
+        d = base / f"s{n[0]}"; d.mkdir(mode=0o700)
+        lc, av, roots, lease_db = env(d); av.close()
+        os.chmod(lease_db, 0o600)
+        acquire(lc, KB, now=now - 10)   # the lane's holder is ALREADY live -- issue-standing claims nothing
+        adb = d / "auth.db"
+        ac0 = sqlite3.connect(str(adb), isolation_level=None)
+        if migrated:
+            oda.migrate(ac0)   # a SEPARATE, separately-approved setup step -- issue-standing never does this itself
+        else:
+            for stmt in oda.MIGRATIONS[1]:   # a genuinely v1-only store (no schema_version table at all)
+                ac0.execute(stmt)
+        ac0.close()
+        os.chmod(adb, 0o600)
+        qd = d / "q"; qd.mkdir(); (qd / "q.json").write_bytes(queue_bytes)
+        (d / "state" / "forms").mkdir(parents=True)
+        proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+        return d, lc, lease_db, adb, qd, roots, proj
+
+    def decision(d, proj, over=None, answers=None, status="answered", answered_at=None, html_extra=b""):
+        rec = {"protocol": odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj, "expected_holder": dict(HOLD),
+               "expected_generation": 1, "queue_sha256": queue_sha, "queue_items": [dict(it) for it in canon_items],
+               "item_cap": 5, "spend_cap_cents": 100, "auth_id": f"standing-auth-{n[0]}", "standing_window_s": 1800}
+        rec.update(over or {})
+        emb = odi.approval_bytes(rec)
+        fid = f"20261024T1300{n[0] % 100:02d}-91{n[0] % 100:02d}"
+        html = odi.render_standing_form(rec) + html_extra
+        ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
+        row = {"id": fid, "status": status, "answers": ans, "answered_at": int((now - 60) * 1000) if answered_at is None else answered_at}
+        (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
+        (d / "state" / "forms" / f"{fid}.json").write_text(json.dumps(row))
+        return fid, rec, hashlib.sha256(emb).hexdigest()
+
+    KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+    real_root = odi.STATE_ROOT
+
+    def run(d, lease_db, adb, qd, fid, resolve=reg_ok, flags=True, t=None):
+        E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+             "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
+        odi.STATE_ROOT = os.path.realpath(d / "state")
+        saved = {k: os.environ.get(k) for k in KEYS_ENV}
+        for k in saved: os.environ.pop(k, None)
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odi.main(["issue-standing", "--form-id", fid, "--queue-dir", str(qd), "--queue-name", "q.json"],
+                              resolve=resolve, now=now if t is None else t)
+        finally:
+            odi.STATE_ROOT = real_root
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    def q(adb, sql, params=()):
+        c = sqlite3.connect(str(adb)); r = c.execute(sql, params).fetchall(); c.close(); return r
+
+    def lease_rows(lc):
+        return lc.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0]
+
+    # happy path: standing row + immutable issuance record in ONE transaction, NO lease claim; replay refused
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    before_leases = lease_rows(lc)
+    fid, rec, asha = decision(d, proj)
+    first = run(d, ldb, adb, qd, fid)
+    again = run(d, ldb, adb, qd, fid)
+    g = q(adb, "SELECT kind, status, queue_sha256, item_cap, spend_cap_cents, used_count, spent_cents,"
+              " pane_id, pane_birth, session_digest, lease_generation FROM owner_dispatch_auth WHERE auth_id=?",
+          (rec["auth_id"],))
+    iss = q(adb, "SELECT auth_id, approval_sha256, form_id FROM owner_dispatch_issuance WHERE auth_id=?", (rec["auth_id"],))
+    case("STANDING ISSUE: answered standing form -> one kind='standing' row + issuance record; NO lease claimed; replay refused",
+         first == (0, f"issued:{rec['auth_id']}") and again == (2, "refused:approval_already_used")
+         and g == [("standing", "granted", queue_sha, 5, 100, 0, 0, *PANE[KB], SESS[KB], 1)]
+         and iss == [(rec["auth_id"], asha, fid)]
+         and lease_rows(lc) == before_leases)
+    lc.close()
+
+    # the issued standing row is then consumable by consume_standing, exactly like any other standing grant
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    run(d, ldb, adb, qd, fid)
+    ac = sqlite3.connect(str(adb), isolation_level=None)
+    child = oda.consume_standing(ac, rec["auth_id"], label=KB, project=proj, holder=(*PANE[KB], SESS[KB], 1),
+                                 request_id="i2", body_sha256="b" * 64, manifest=["result.md"], now=now,
+                                 queue_sha256=queue_sha, cost_cents=40)
+    case("STANDING ISSUE -> CONSUME: the real issued row dispatches a child through the real consume_standing",
+         isinstance(child, dict) and child["request_id"] == "i2" and child["lease_generation"] == 1)
+    ac.close(); lc.close()
+
+    other = hashlib.sha256(b"other").hexdigest()
+    for name, kw, want in [
+        ("flags off", {"flags": False}, (4, "refused:flags_off")),
+        ("form still open", {"status": "open"}, (2, "refused:form_not_answered")),
+        ("answer declines", {"answers": {"decision": "decline"}}, (2, "refused:form_not_approved")),
+        ("answer echoes a different record sha (tampered approval_sha256)",
+         {"answers": {"decision": "approve", "approval_sha256": other}},
+         (2, "refused:form_answer_not_bound_to_displayed_record")),
+        ("page carries two embedded records (tampered HTML)",
+         {"html_extra": b'<script type="application/json" id="owner-dispatch-approval">{}</script>'},
+         (2, "refused:form_html_no_single_embedded_approval")),
+        ("approval older than its own standing window", {"answered_at": int((now - 1801) * 1000)},
+         (2, "refused:approval_expired")),
+        ("standing window over its own cap (86400s)", {"over": {"standing_window_s": 86401}},
+         (2, "refused:standing_approval_field_standing_window_s")),
+        ("spend_cap_cents negative", {"over": {"spend_cap_cents": -1}},
+         (2, "refused:standing_approval_field_spend_cap_cents")),
+        ("item_cap not a positive int", {"over": {"item_cap": 0}}, (2, "refused:standing_approval_field_item_cap")),
+        ("extra field", {"over": {"note": "x"}}, (2, "refused:standing_approval_schema")),
+        ("holder digest differs", {"over": {"expected_holder": {**HOLD, "session_digest": other}}},
+         (2, "refused:identity_mismatch")),
+        ("project differs", {"over": {"project": "tntpgh/other"}}, (2, "refused:owner_project_mismatch")),
+        ("registry has no session", {"resolve": lambda l: None}, (2, "refused:identity_mismatch")),
+    ]:
+        d, lc, ldb, adb, qd, roots, proj = setup()
+        fid, rec, asha = decision(d, proj, over=kw.get("over"), answers=kw.get("answers"), status=kw.get("status", "answered"),
+                                  answered_at=kw.get("answered_at"), html_extra=kw.get("html_extra", b""))
+        got = run(d, ldb, adb, qd, fid, resolve=kw.get("resolve", reg_ok), flags=kw.get("flags", True))
+        case(f"STANDING ISSUE refused before any write: {name}", got == want
+             and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+             and lease_rows(lc) == 1)
+        lc.close()
+
+    # spend_cap_cents REQUIRED, not defaulted: a literal missing key is refused, never treated as 0/unbounded
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)
+    del_rec = dict(rec); del del_rec["spend_cap_cents"]
+    emb = odi.approval_bytes(del_rec)
+    fid2 = f"20261024T1301{n[0] % 100:02d}-92{n[0] % 100:02d}"
+    html2 = odi.render_standing_form(del_rec)
+    ans2 = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()}
+    row2 = {"id": fid2, "status": "answered", "answers": ans2, "answered_at": int((now - 60) * 1000)}
+    (d / "state" / "forms" / f"{fid2}.html").write_bytes(html2)
+    (d / "state" / "forms" / f"{fid2}.json").write_text(json.dumps(row2))
+    got_missing = run(d, ldb, adb, qd, fid2)
+    case("STANDING ISSUE: spend_cap_cents REQUIRED -- a literally missing key is refused, never defaulted",
+         got_missing == (2, "refused:standing_approval_schema")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # queue sha mismatch: the REAL queue bytes on disk differ from what the approval named
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    (qd / "q.json").write_bytes(json.dumps(items + [{"id": "i3", "request": "three\n", "auth_id": "standing-auth"}]).encode())
+    fid, rec, asha = decision(d, proj)   # approval still names the ORIGINAL 2-item queue_sha256
+    got_sha = run(d, ldb, adb, qd, fid)
+    case("STANDING ISSUE: the live queue file no longer matches the approved queue_sha256 -> refused, nothing written",
+         got_sha == (2, "refused:queue_sha_mismatch") and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # (1) the signed queue_items must EQUAL the canonical derivation from the EXACT queue bytes -- a
+    # caller cannot show one queue (hash matches) and sign a record naming different displayed items.
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    tampered = [dict(canon_items[0]), {**canon_items[1], "cost_cents": 999}]
+    fid, rec, asha = decision(d, proj, over={"queue_items": tampered})
+    got_items = run(d, ldb, adb, qd, fid)
+    case("STANDING ISSUE: signed queue_items differs from the canonical derivation of the EXACT queue bytes "
+         "(queue_sha256 still matches) -> refused, nothing written",
+         got_items == (2, "refused:queue_items_mismatch") and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # (2) issue-standing NEVER migrates: a v1 store is refused with a typed config refusal, BEFORE any
+    # write; the store's schema is byte-identical before and after (migration stays a separate setup step).
+    d, lc, ldb, adb, qd, roots, proj = setup(migrated=False)
+    fid, rec, asha = decision(d, proj)
+    before_schema = q(adb, "SELECT type, name, sql FROM sqlite_master ORDER BY name")
+    got_v1 = run(d, ldb, adb, qd, fid)
+    after_schema = q(adb, "SELECT type, name, sql FROM sqlite_master ORDER BY name")
+    case("STANDING ISSUE: a v1 (unmigrated) store is refused with a typed config refusal before any write; "
+         "sqlite_master (incl. no version table) is byte-identical before and after",
+         got_v1 == (4, "refused:auth_store_not_migrated")
+         and before_schema == after_schema
+         and not any(r[1] == "owner_dispatch_auth_schema_version" for r in before_schema)
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # (3) atomicity: a failure injected BETWEEN the parent-row insert and the issuance-record insert
+    # rolls back BOTH (neither present); standing_grant_state reports present/absent correctly either way.
+    d, lc, ldb, adb, qd, roots, proj = setup()
+    ac = sqlite3.connect(str(adb), isolation_level=None)
+    oda.migrate(ac)
+
+    def fixture_dec(fid, rec):
+        eb = odi.approval_bytes(rec)
+        return {"rec": rec, "approval_bytes": eb, "approval_sha256": hashlib.sha256(eb).hexdigest(),
+               "form_id": fid, "answered_at": now - 60, "form_record_sha256": "f" * 64, "form_html_sha256": "h" * 64}
+
+    n[0] += 1
+    rec_ok = {"protocol": odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj, "expected_holder": dict(HOLD),
+              "expected_generation": 1, "queue_sha256": queue_sha, "queue_items": [dict(it) for it in canon_items],
+              "item_cap": 5, "spend_cap_cents": 100, "auth_id": f"standing-atomic-ok-{n[0]}", "standing_window_s": 1800}
+    dec_ok = fixture_dec(f"fid-atomic-ok-{n[0]}", rec_ok)
+    odi.insert_standing_grant(ac, dec_ok, now + 1800)
+    case("ATOMICITY baseline: a normal insert_standing_grant succeeds; standing_grant_state reports 'present'",
+         odi.standing_grant_state(str(adb), dec_ok, now + 1800) == "present")
+
+    n[0] += 1
+    rec_bad = {**rec_ok, "auth_id": f"standing-atomic-bad-{n[0]}"}
+    fid_bad = f"fid-atomic-bad-{n[0]}"
+    dec_bad = fixture_dec(fid_bad, rec_bad)
+    # pre-occupy the UNIQUE(form_id) slot in owner_dispatch_issuance with a DIFFERENT auth_id: the
+    # parent-row insert into owner_dispatch_auth still succeeds; the issuance insert then collides.
+    ac.execute("INSERT INTO owner_dispatch_issuance(auth_id, approval_sha256, approval_bytes, form_id,"
+              " form_record_sha256, form_html_sha256, answered_at, issued_at) VALUES (?,?,?,?,?,?,?,?)",
+              ("someone-else", "a" * 64, b"x", fid_bad, "b" * 64, "c" * 64, now - 100, "2026-01-01T00:00:00Z"))
+    raised = None
+    try:
+        odi.insert_standing_grant(ac, dec_bad, now + 1800)
+    except Exception as exc:  # noqa: BLE001
+        raised = exc
+    gcount = ac.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE auth_id=?", (rec_bad["auth_id"],)).fetchone()[0]
+    icount = ac.execute("SELECT COUNT(*) FROM owner_dispatch_issuance WHERE auth_id=?", (rec_bad["auth_id"],)).fetchone()[0]
+    case("ATOMICITY: a failure injected between the parent-row insert and the issuance-record insert "
+         "rolls back BOTH inserts (one transaction, neither row present)",
+         raised is not None and gcount == 0 and icount == 0)
+    case("ATOMICITY: standing_grant_state correctly reports 'unknown' after the rolled-back attempt "
+         "(another issuance row with the same form_id still exists)",
+         odi.standing_grant_state(str(adb), dec_bad, now + 1800) == "unknown")
+    ac.close(); lc.close()
+
 
 
 if __name__ == "__main__":
