@@ -23,8 +23,10 @@ that the submit came from a loaded page. There is NO separately authenticated
 operator identity on this machine. The trust root is therefore "a first-hand
 answer on the local hub, under the same-UID trust boundary", nothing stronger.
 
-One approval authorizes, conditionally: the EXPECTED initial lease claim
-(generation 1) and issuing exactly ONE grant bound to the frozen request.
+One approval authorizes, conditionally: the EXPECTED lease claim -- initial
+generation 1 (expected_prev_generation 0) or a successor generation after an
+expired predecessor (expected_prev_generation >= 1) -- and issuing exactly
+ONE grant bound to the frozen request.
 Each check aborts on mismatch: request bytes; the registry identity (checked
 before the claim AND before issue); the owner_projects row (project AND
 max_open must equal the approval); initial-only claim; holder after the claim;
@@ -69,7 +71,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 FORM_ID = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9]{2,5}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 EMBED = re.compile(rb'<script type="application/json" id="owner-dispatch-approval">(.*?)</script>', re.S)
-KEYS = {"protocol", "owner_label", "project", "max_open", "expected_holder", "expected_generation", "lease_ttl_s",
+KEYS = {"protocol", "owner_label", "project", "max_open", "expected_holder", "expected_generation",
+        "expected_prev_generation", "expected_prev_holder", "lease_ttl_s",
         "request_id", "request_name", "request_sha256", "manifest", "auth_id", "grant_window_s"}
 HOLDER_KEYS = {"pane_id", "pane_birth", "session_digest"}
 
@@ -132,24 +135,43 @@ def approval_bytes(rec: dict) -> bytes:
     return json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
+def _valid_holder(h) -> bool:
+    return isinstance(h, dict) and set(h) == HOLDER_KEYS and all(isinstance(v, str) and v for v in h.values()) \
+        and bool(HEX64.match(h["session_digest"]))
+
+
 def render_form(rec: dict) -> bytes:
     """Deterministic decision page for one approval record. read_decision()
     accepts ONLY a stored page byte-identical to this rendering, so what was on
-    screen is exactly the record (including holder, request sha and window)."""
+    screen is exactly the record (including holder, request sha and window).
+    expected_prev_generation==0 renders identically to the original gen-1-only
+    form (claim_initial path); >=1 additionally names the released
+    predecessor and the generation being claimed (claim_successor path)."""
     emb = approval_bytes(rec)
     sha = hashlib.sha256(emb).hexdigest()
     h = rec["expected_holder"]
+    prev_gen = rec["expected_prev_generation"]
+    ph = rec.get("expected_prev_holder")
+    ph = ph if prev_gen and isinstance(ph, dict) else {}
     rows = [("Owner", rec["owner_label"]), ("Project", rec["project"]), ("Holder pane", h["pane_id"]),
             ("Holder birth", h["pane_birth"]), ("Holder session sha256", h["session_digest"]),
             ("Request", f'{rec["request_id"]} / {rec["request_name"]}'), ("Request sha256", rec["request_sha256"]),
-            ("Manifest", ", ".join(rec["manifest"])), ("Grant id", rec["auth_id"]),
-            ("Lease", f'generation {rec["expected_generation"]}, ttl {rec["lease_ttl_s"]} s, max_open {rec["max_open"]}'),
-            ("Approval valid for", f'{rec["grant_window_s"]} s after you answer'), ("Approval record sha256", sha)]
+            ("Manifest", ", ".join(rec["manifest"])), ("Grant id", rec["auth_id"])]
+    if prev_gen:
+        rows.append(("Predecessor",
+                     f'releases expired generation {prev_gen}, held by {ph.get("pane_id", "?")}@{ph.get("pane_birth", "?")}'))
+    rows += [("Lease", f'generation {rec["expected_generation"]}, ttl {rec["lease_ttl_s"]} s, max_open {rec["max_open"]}'),
+             ("Approval valid for", f'{rec["grant_window_s"]} s after you answer'), ("Approval record sha256", sha)]
     esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     table = "".join(f"<tr><th>{esc(k)}</th><td><code>{esc(v)}</code></td></tr>" for k, v in rows)
+    intro = ("<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
+             if not prev_gen else
+             f'<p>Approving releases the expired predecessor lease (generation {prev_gen}, held by '
+             f'{ph.get("pane_id", "?")}@{ph.get("pane_birth", "?")}) and issues exactly one '
+             f'generation-{rec["expected_generation"]} lease claim and one grant for the request below. Nothing retries.</p>')
     return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Approve ONE KB owner-dispatch pilot request</title></head><body>"
             "<h1>Approve ONE read-only KB pilot request?</h1>"
-            "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
+            f"{intro}"
             f"<table>{table}</table>"
             f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
             f'<button onclick="window.submitAnswers({{decision:\'approve\',approval_sha256:\'{sha}\'}})">Approve</button> '
@@ -160,9 +182,7 @@ def render_form(rec: dict) -> bytes:
 def validate_approval(rec) -> dict:
     if not isinstance(rec, dict) or set(rec) != KEYS:
         raise Refused("approval_schema")
-    h = rec["expected_holder"]
-    if not isinstance(h, dict) or set(h) != HOLDER_KEYS or not all(isinstance(v, str) and v for v in h.values()) \
-            or not HEX64.match(h["session_digest"]):
+    if not _valid_holder(rec["expected_holder"]):
         raise Refused("approval_holder_schema")
     if rec["protocol"] != PROTOCOL:
         raise Refused("approval_protocol")
@@ -176,8 +196,17 @@ def validate_approval(rec) -> dict:
     m = rec["manifest"]
     if not isinstance(m, list) or not m or not all(isinstance(x, str) and SAFE_ID.match(x) for x in m) or len(set(m)) != len(m):
         raise Refused("approval_field_manifest")
-    if type(rec["expected_generation"]) is not int or rec["expected_generation"] != 1:
-        raise Refused("approval_generation_not_initial")
+    pg = rec["expected_prev_generation"]
+    if type(pg) is not int or pg < 0:
+        raise Refused("approval_field_expected_prev_generation")
+    ph = rec["expected_prev_holder"]
+    if pg == 0:
+        if ph is not None:
+            raise Refused("approval_prev_holder_schema")
+    elif not _valid_holder(ph):
+        raise Refused("approval_prev_holder_schema")
+    if type(rec["expected_generation"]) is not int or rec["expected_generation"] != pg + 1:
+        raise Refused("approval_generation_mismatch")
     if type(rec["max_open"]) is not int or rec["max_open"] != 1:
         raise Refused("approval_max_open_not_1")
     if type(rec["lease_ttl_s"]) is not int or not 60 <= rec["lease_ttl_s"] <= MAX_WINDOW_S:
@@ -254,8 +283,8 @@ def expected_rows(dec, exp: float) -> tuple[tuple, tuple]:
     rec, h = dec["rec"], dec["rec"]["expected_holder"]
     decided_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec["answered_at"]))
     grant = (rec["auth_id"], oda.PROTOCOL, rec["owner_label"], rec["project"], h["pane_id"], h["pane_birth"], h["session_digest"],
-             1, rec["request_id"], rec["request_sha256"], oda.manifest_key(rec["manifest"]), dec["form_id"], dec["form_id"],
-             "granted", decided_iso, exp)
+             rec["expected_generation"], rec["request_id"], rec["request_sha256"], oda.manifest_key(rec["manifest"]),
+             dec["form_id"], dec["form_id"], "granted", decided_iso, exp)
     issuance = (rec["auth_id"], dec["approval_sha256"], dec["approval_bytes"], dec["form_id"], dec["form_record_sha256"],
                 dec["form_html_sha256"], dec["answered_at"])
     return grant, issuance
@@ -306,14 +335,22 @@ def grant_state(auth_db: str, dec, exp: float) -> str:
 def build_main(argv, resolve=None) -> int:
     """OFFLINE: write the deterministic decision page for ONE request, binding the
     holder identity resolved fresh from the registry NOW and the request bytes'
-    sha256. Serves nothing and records nothing."""
+    sha256. --expected-prev-generation 0 (default) is the initial gen-1 claim;
+    >=1 additionally resolves the EXPIRED predecessor's (pane_id, pane_birth,
+    session_digest) from --lease-db (read-only) for display in the form text.
+    Serves nothing and records nothing."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
     for a in ("--label", "--project", "--request-dir", "--request-name", "--request-id", "--auth-id", "--out"):
         ap.add_argument(a, required=True)
     ap.add_argument("--manifest", action="append", required=True)
     ap.add_argument("--lease-ttl-s", type=int, default=1800)
     ap.add_argument("--grant-window-s", type=int, default=1800)
+    ap.add_argument("--expected-prev-generation", type=int, default=0)
+    ap.add_argument("--lease-db")
     a = ap.parse_args(argv)
+    if a.expected_prev_generation < 0:
+        print("refused:expected_prev_generation_negative")
+        return 2
     if resolve is None:
         import publisher  # noqa: E402
         resolve = publisher.registry_resolver
@@ -321,6 +358,26 @@ def build_main(argv, resolve=None) -> int:
     if not ident:
         print("refused:identity_unresolved")
         return 2
+    prev_holder = None
+    if a.expected_prev_generation >= 1:
+        if not a.lease_db:
+            print("refused:lease_db_required_for_successor")
+            return 2
+        try:
+            plconn = private_sqlite.open_private(a.lease_db, ol.connect, require_table="owner_leases")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
+        try:
+            prow = plconn.execute(
+                "SELECT pane_id, pane_birth, session_digest FROM owner_leases WHERE label=? AND generation=?",
+                (a.label, a.expected_prev_generation)).fetchone()
+        finally:
+            plconn.close()
+        if not prow or not prow[2]:
+            print("refused:predecessor_unresolved")
+            return 2
+        prev_holder = {"pane_id": prow[0], "pane_birth": prow[1], "session_digest": prow[2]}
     try:
         data = oda.read_request_once(a.request_dir, a.request_name)
     except (ValueError, OSError):
@@ -328,8 +385,10 @@ def build_main(argv, resolve=None) -> int:
         return 2
     rec = {"protocol": PROTOCOL, "owner_label": a.label, "project": a.project, "max_open": 1,
            "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
-           "expected_generation": 1, "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id, "request_name": a.request_name,
-           "request_sha256": oda.body_sha256(data), "manifest": a.manifest, "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
+           "expected_generation": a.expected_prev_generation + 1, "expected_prev_generation": a.expected_prev_generation,
+           "expected_prev_holder": prev_holder, "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id,
+           "request_name": a.request_name, "request_sha256": oda.body_sha256(data), "manifest": a.manifest,
+           "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
     try:
         validate_approval(rec)
     except Refused as exc:
@@ -397,11 +456,17 @@ def main(argv=None, resolve=None, now=None) -> int:
             if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
                              (rec["auth_id"], dec["form_id"])).fetchone():
                 raise Refused("approval_already_used")
+            prev_gen = rec["expected_prev_generation"]
             try:
-                gen = ol.claim_initial(lconn, rec["owner_label"], h["pane_id"], h["pane_birth"], rec["lease_ttl_s"],
-                                       h["session_digest"], now=clock())
+                gen = (ol.claim_initial(lconn, rec["owner_label"], h["pane_id"], h["pane_birth"], rec["lease_ttl_s"],
+                                        h["session_digest"], now=clock())
+                       if prev_gen == 0 else
+                       ol.claim_successor(lconn, rec["owner_label"], prev_gen, h["pane_id"], h["pane_birth"],
+                                          rec["lease_ttl_s"], h["session_digest"], now=clock()))
             except ol.LeaseConflict:
                 raise Refused("not_initial") from None
+            except ol.SuccessorRefused as exc:
+                raise Refused(f"successor_{exc.code}") from None
             except (ol.Disabled, ol.InvalidOwner, ValueError) as exc:
                 raise Refused(f"claim_{type(exc).__name__}") from None
         except Refused as exc:
@@ -416,14 +481,15 @@ def main(argv=None, resolve=None, now=None) -> int:
                 raise Refused("generation_mismatch")
             window(dec, clock())
             same_identity(resolve, rec)                               # revalidation 2: before issue
-            if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"], h["session_digest"], 1):
+            if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"], h["session_digest"],
+                                                                       rec["expected_generation"]):
                 raise Refused("lease_holder_mismatch")
             insert_grant(store, dec, exp)
         except BaseException as exc:  # noqa: BLE001  after the claim: classify by what the store says
             reason = str(exc) if isinstance(exc, Refused) else f"error_{type(exc).__name__}"
             st = grant_state(auth_db, dec, exp)
             if st == "present":
-                print(f"issued:{rec['auth_id']}:gen1 (after {reason}; verified in store)")
+                print(f"issued:{rec['auth_id']}:gen{rec['expected_generation']} (after {reason}; verified in store)")
                 return 0
             if st == "absent" and isinstance(exc, Refused):
                 print(f"claimed_not_issued:{reason}")
@@ -436,7 +502,7 @@ def main(argv=None, resolve=None, now=None) -> int:
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
-    print(f"issued:{rec['auth_id']}:gen1")
+    print(f"issued:{rec['auth_id']}:gen{rec['expected_generation']}")
     return 0
 
 

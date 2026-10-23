@@ -96,6 +96,16 @@ class LeaseConflict(Exception):
     """Another live holder owns this label."""
 
 
+class SuccessorRefused(Exception):
+    """claim_successor() precondition failed. args[0] is a short machine
+    code (live_predecessor | wrong_prev_generation | open_requests |
+    same_holder); args[1] is a human-readable detail."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
 class FencedOut(Exception):
     """Caller is not the current live holder (generation/pane/birth), or the
     request belongs to another generation."""
@@ -292,6 +302,30 @@ def _live(conn, label, now):
         "WHERE label=? AND released_at IS NULL AND expires_at > ?", (label, _iso(now))).fetchone()
 
 
+def _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_digest) -> int:
+    """Release every unreleased lease row for `label` as expired and insert
+    the successor at MAX(generation)+1, staling any still-open requests of
+    older generations, all within the caller's transaction. Shared by
+    acquire()'s generation-change branch and claim_successor()."""
+    for (old_id, old_gen) in conn.execute(
+            "SELECT lease_id, generation FROM owner_leases WHERE label=? AND released_at IS NULL", (label,)).fetchall():
+        conn.execute("UPDATE owner_leases SET released_at=?, release_reason='expired' WHERE lease_id=?", (_iso(now), old_id))
+        _event(conn, now, label, "released", old_id, old_gen, "expired")
+    gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
+    lease_id = f"ol_{uuid.uuid4().hex}"
+    conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
+                 "session_digest) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (lease_id, label, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
+    _event(conn, now, label, "acquired", lease_id, gen, f"{pane_id}@{pane_birth}")
+    stale = conn.execute(
+        f"SELECT request_id, generation FROM owner_requests WHERE label=? AND generation<? AND state IN ({_q(OPEN)})",
+        (label, gen, *OPEN)).fetchall()
+    for rid, rgen in stale:
+        conn.execute("UPDATE owner_requests SET state='stale', updated_at=? WHERE request_id=?", (_iso(now), rid))
+        _event(conn, now, label, "request:stale", rid, rgen, f"superseded by gen {gen}")
+    return gen
+
+
 def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: float | None = None,
             session_digest: str = "") -> int:
     """Acquire or renew. Returns the holder's generation. On a generation change,
@@ -318,23 +352,7 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
                          (_iso(now), _iso(now + ttl_s), lease_id))
             _event(conn, now, label, "renewed", lease_id, gen)
             return gen
-        for (old_id, old_gen) in conn.execute(
-                "SELECT lease_id, generation FROM owner_leases WHERE label=? AND released_at IS NULL", (label,)).fetchall():
-            conn.execute("UPDATE owner_leases SET released_at=?, release_reason='expired' WHERE lease_id=?", (_iso(now), old_id))
-            _event(conn, now, label, "released", old_id, old_gen, "expired")
-        gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
-        lease_id = f"ol_{uuid.uuid4().hex}"
-        conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
-                     "session_digest) VALUES (?,?,?,?,?,?,?,?,?)",
-                     (lease_id, label, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
-        _event(conn, now, label, "acquired", lease_id, gen, f"{pane_id}@{pane_birth}")
-        stale = conn.execute(
-            f"SELECT request_id, generation FROM owner_requests WHERE label=? AND generation<? AND state IN ({_q(OPEN)})",
-            (label, gen, *OPEN)).fetchall()
-        for rid, rgen in stale:
-            conn.execute("UPDATE owner_requests SET state='stale', updated_at=? WHERE request_id=?", (_iso(now), rid))
-            _event(conn, now, label, "request:stale", rid, rgen, f"superseded by gen {gen}")
-        return gen
+        return _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_digest)
 
     return _tx(conn, body)
 
@@ -366,6 +384,54 @@ def claim_initial(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, s
                      (lease_id, label, pane_id, pane_birth, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
         _event(conn, now, label, "acquired", lease_id, 1, f"{pane_id}@{pane_birth} initial")
         return 1
+
+    return _tx(conn, body)
+
+
+def claim_successor(conn, label: str, expected_prev_gen: int, pane_id: str, pane_birth: str, ttl_s: int,
+                    session_digest: str, now: float | None = None) -> int:
+    """SUCCESSOR-ONLY claim: the next generation after an EXPIRED predecessor
+    whose generation is exactly expected_prev_gen. Reuses acquire()'s
+    successor transition (_successor_insert: release every unreleased row as
+    expired, gen = MAX+1, stale older-generation open requests) in the SAME
+    IMMEDIATE transaction, but first ADDITIONALLY refuses (SuccessorRefused)
+    unless: the predecessor is NOT live (no renewal or takeover of an
+    unexpired lease -- that is acquire()'s job, not this one's); the
+    predecessor's generation is exactly expected_prev_gen; the label has
+    ZERO open owner_requests (so the reused stale-loop is a verified no-op,
+    never a silent disposal); and the new holder differs from the
+    predecessor holder (a same-holder "successor" is a renewal in disguise).
+    Never renews, retries or takes over a live lease; never DELETEs; writes
+    nothing outside the one transaction."""
+    now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    if not SESSION_DIGEST_RE.match(session_digest or ""):
+        raise ValueError("session_digest must be 64 lowercase hex")
+    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= MAX_TTL_S:
+        raise ValueError(f"ttl_s must be an int in 1..{MAX_TTL_S}")
+    if not isinstance(expected_prev_gen, int) or isinstance(expected_prev_gen, bool) or expected_prev_gen < 1:
+        raise ValueError("expected_prev_gen must be an int >= 1")
+
+    def body():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        if _live(conn, label, now):
+            raise SuccessorRefused("live_predecessor",
+                                   f"{label}: predecessor lease is live (unexpired); successor claims are expired-only")
+        row = conn.execute(
+            "SELECT pane_id, pane_birth, session_digest, generation FROM owner_leases WHERE label=? "
+            "ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+        prev_pane, prev_birth, prev_sess, prev_gen = row if row else (None, None, None, 0)
+        if prev_gen != expected_prev_gen:
+            raise SuccessorRefused("wrong_prev_generation",
+                                   f"{label}: predecessor generation {prev_gen} != expected_prev_gen {expected_prev_gen}")
+        n_open = conn.execute(
+            f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})", (label, *OPEN)).fetchone()[0]
+        if n_open:
+            raise SuccessorRefused("open_requests", f"{label}: {n_open} open owner_requests; refused rather than silently staled")
+        if (pane_id, pane_birth, session_digest) == (prev_pane, prev_birth, prev_sess):
+            raise SuccessorRefused("same_holder", f"{label}: new holder {pane_id}@{pane_birth} equals predecessor holder")
+        return _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_digest)
 
     return _tx(conn, body)
 

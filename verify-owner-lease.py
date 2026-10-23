@@ -6,6 +6,7 @@ panes or network. Prints OK/FAIL per case; exit 1 on any FAIL.
 
   python3 verify-owner-lease.py
 """
+import hashlib
 import multiprocessing as mp
 import os
 import sqlite3
@@ -202,6 +203,68 @@ def main():
     ol.acquire(c, "kb", *H, TTL, T0 + 30)
     case("expired lease observed as stale even with a live pane",
          [o["reason"] for o in ol.observe_stale(c, {H}, T0 + 30 + TTL + 1)] == ["expired"])
+    c.close()
+
+    # --- SUCCESSOR CLAIM (claim_successor) ---
+    def sess(tag):
+        return hashlib.sha256(f"succ-{tag}".encode()).hexdigest()
+
+    def succ_code(fn):
+        try:
+            fn()
+        except ol.SuccessorRefused as exc:
+            return exc.code
+        return None
+
+    H1, S1 = ("w1:p1", "term_1"), sess("h1")
+    H2, S2 = ("w2:p1", "term_2"), sess("h2")
+
+    p, c = fresh()
+    g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
+    case("claim_successor: live predecessor refused",
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H2, TTL, S2, now=T0 + 1)) == "live_predecessor")
+    case("live-predecessor refusal leaves the live lease untouched",
+         count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 1
+         and ol.check_fence(c, "kb", g1, *H1, now=T0 + 1) is None)
+    c.close()
+
+    p, c = fresh()
+    g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
+    case("claim_successor: wrong expected_prev_gen refused",
+         succ_code(lambda: ol.claim_successor(c, "kb", g1 + 1, *H2, TTL, S2, now=T0 + TTL + 1)) == "wrong_prev_generation")
+    case("wrong-prev-gen refusal inserts no new lease row",
+         count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 1)
+    c.close()
+
+    p, c = fresh()
+    g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
+    ol.enqueue(c, "kb", g1, *H1, "open1", now=T0)
+    case("claim_successor: open owner_requests refused (never silently staled)",
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H2, TTL, S2, now=T0 + TTL + 1)) == "open_requests")
+    case("open-requests refusal leaves the request open, not staled",
+         c.execute("SELECT state FROM owner_requests WHERE request_id='open1'").fetchone()[0] == "queued")
+    c.close()
+
+    p, c = fresh()
+    g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
+    case("claim_successor: new holder == predecessor holder refused",
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, TTL, S1, now=T0 + TTL + 1)) == "same_holder")
+    c.close()
+
+    p, c = fresh()
+    g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
+    g2 = ol.claim_successor(c, "kb", g1, *H2, TTL, S2, now=T0 + TTL + 1)
+    case("claim_successor: expired predecessor released (row kept, reason 'expired') and gen2 claimed",
+         g2 == g1 + 1
+         and c.execute("SELECT released_at IS NOT NULL, release_reason FROM owner_leases WHERE label='kb' AND generation=?",
+                       (g1,)).fetchone() == (1, "expired")
+         and ol.holder_tuple(c, "kb", T0 + TTL + 1) == (*H2, S2, g2))
+    case("claim_successor never DELETEs: predecessor row kept, only its state flips",
+         count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 2)
+    case("claim_successor rejects a malformed/empty session_digest and an out-of-range ttl",
+         raises(lambda: ol.claim_successor(c, "kb", g2, "w3:p1", "term_3", TTL, "", now=T0 + 2 * TTL + 2), ValueError)
+         and raises(lambda: ol.claim_successor(c, "kb", g2, "w3:p1", "term_3", 0, sess("h3"), now=T0 + 2 * TTL + 2), ValueError)
+         and raises(lambda: ol.claim_successor(c, "kb", 0, "w3:p1", "term_3", TTL, sess("h3"), now=T0 + 2 * TTL + 2), ValueError))
     c.close()
 
     # --- policy, validation, auth-before-metadata, foreign keys ---
