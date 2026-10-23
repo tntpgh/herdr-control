@@ -177,14 +177,25 @@ with tempfile.TemporaryDirectory() as t:
     check("ledger files private 0600", all((p.stat().st_mode & 0o777) == 0o600 for p in root.glob("*.ledger.jsonl")))
 
     # --- lane ceiling, priority order, bounded sends ----------------------------
-    many = [f"l{i:02d}" for i in range(16)]
-    check("more than 15 lanes refused", tick(lanes=many) == {"_": "refused:lanes"})
-    check("duplicate lane labels refused", tick(lanes=["kb", "kb"]) == {"_": "refused:lanes"})
     six = ["revenue", "p1", "p2", "p3", "p4", "p5"]
-    p = mkroot(t, "prio", six)
-    r = tick(r=p, lanes=six)
+    check("more than 5 canonical lanes refused", tick(lanes=six) == {"_": "refused:lanes"})
+    check("duplicate lane labels refused", tick(lanes=["kb", "kb"]) == {"_": "refused:lanes"})
+    five = six[:5]
+    p = mkroot(t, "prio", five)
+    r = tick(r=p, lanes=five)
     check("at most 4 sends per pass, in operator order (revenue first)",
-          [r[x] for x in six] == ["dispatched:i1"] * 4 + ["deferred:i1"] * 2)
+          [r[x] for x in five] == ["dispatched:i1"] * 4 + ["deferred:i1"])
+    r = tick(r=p, lanes=five)
+    n_before = sum(c[0] in five for c in fc.calls)
+    for x in five:  # every lane settles and offers its next item
+        fc.acc.add(f"q-{x}-i1")
+    r2 = tick(r=p, lanes=five)
+    check("total in-flight never exceeds 5 across passes",
+          r["p4"] == "dispatched:i1" and n_before == 5
+          and sum(v.startswith("dispatched:") for v in r2.values()) == 0)
+    r3 = tick(r=p, lanes=five)
+    check("capacity freed by acceptance is reused on the next pass, still <=4 sends",
+          sum(v.startswith("dispatched:") for v in r3.values()) == 4 and r3["p4"] == "deferred:i3")
 
     # --- strict queue schema ----------------------------------------------------
     bad = {

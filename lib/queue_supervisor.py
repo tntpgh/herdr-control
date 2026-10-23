@@ -52,8 +52,9 @@ RETRY_SAFE = frozenset({"label_has_no_root", "bad_request", "bad_manifest", "own
                         "registry_lease_mismatch", "auth_missing"})
 TERMINAL = {"done", "cancelled"}
 FREEZING = {"blocked", "uncertain", "held_consumed"}
-MAX_LANES = 15  # the canonical project-lane ceiling
-MAX_DISPATCH_PER_TICK = 4  # bounded spend: at most this many new sends per pass
+MAX_LANES = 5  # operator-requested 1-5 canonical lanes
+MAX_IN_FLIGHT = 5  # TOTAL dispatched-and-unsettled items across all lanes and ticks
+MAX_DISPATCH_PER_TICK = 4  # additionally: at most this many new sends per pass
 ITEM_KEYS = {"id", "request", "manifest", "auth_id", "hold"}
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")  # result_availability.NAME_RE
@@ -249,11 +250,19 @@ def tick(root: Path, labels: list[str], dispatcher: Dispatch, accepted: Accepted
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {"_": "busy"}
-        result, sends = {}, 0
-        for label in labels:
-            lane = Lane(root, label)
+        lanes = [Lane(root, label) for label in labels]
+        occupied = 0
+        for lane in lanes:  # durable total capacity, counted before any send this pass
             try:
-                r = tick_lane(lane, dispatcher, accepted, events, notify, journal, sends < MAX_DISPATCH_PER_TICK)
+                occupied += _lane_state(lane.ledger())[0] is not None
+            except LedgerCorrupt:
+                occupied += 1  # unknown history counts as occupied capacity
+        result, sends = {}, 0
+        for lane in lanes:
+            label = lane.label
+            try:
+                may = sends < MAX_DISPATCH_PER_TICK and occupied < MAX_IN_FLIGHT
+                r = tick_lane(lane, dispatcher, accepted, events, notify, journal, may)
             except LedgerCorrupt:
                 r = "frozen:ledger_corrupt"
                 marker = root / f"{label}.corrupt-notified"
@@ -262,7 +271,9 @@ def tick(root: Path, labels: list[str], dispatcher: Dispatch, accepted: Accepted
                     marker.touch(mode=0o600)
             except Exception as exc:  # noqa: BLE001 — one bad lane must not stall the others
                 r = f"error:{type(exc).__name__}"
-            sends += r.startswith("dispatched:") and not r.endswith(":reconciled")
+            if r.startswith("dispatched:"):  # a reconciled send occupies capacity too
+                occupied += 1
+                sends += not r.endswith(":reconciled")
             result[label] = r
         return result
     finally:
