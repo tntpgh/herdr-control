@@ -919,6 +919,21 @@ def _raises(fn):
     return None
 
 
+def _frozen_gen1_module(ref="1a0b873"):
+    """owner-dispatch-issue.py exactly as it existed at `ref` (the commit
+    this branch started from), read via `git show` and exec'd IN MEMORY --
+    never written to disk, never re-derived from the current file. Used
+    only to prove the classic gen1 (claim_initial) path's schema,
+    approval_bytes and render_form are byte-identical to that frozen,
+    pre-successor baseline."""
+    import types
+    src = subprocess.run(["git", "show", f"{ref}:owner-dispatch-issue.py"], cwd=HERE, capture_output=True, check=True).stdout
+    mod = types.ModuleType(f"odissue_frozen_{ref}")
+    mod.__file__ = f"<frozen:{ref}:owner-dispatch-issue.py>"
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
 def issue_cases(base: Path) -> None:
     """owner-dispatch-issue.py: trust root = the answered formserve record + served HTML;
     one approval -> expected gen-1 claim + one grant + immutable issuance record."""
@@ -955,10 +970,12 @@ def issue_cases(base: Path) -> None:
     def decision(d, proj, over=None, answers=None, status="answered", answered_at=None, html_extra=b"",
                 prev_gen=0, prev_holder=None):
         rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1, "expected_holder": dict(HOLD),
-               "expected_generation": prev_gen + 1, "expected_prev_generation": prev_gen, "expected_prev_holder": prev_holder,
-               "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}", "request_name": "req.txt",
-               "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"], "auth_id": f"auth-{n[0]}",
-               "grant_window_s": 1800}
+               "expected_generation": prev_gen + 1, "lease_ttl_s": 1800, "request_id": f"kbpilot-{n[0]}",
+               "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"],
+               "auth_id": f"auth-{n[0]}", "grant_window_s": 1800}
+        if prev_gen >= 1:
+            rec["expected_prev_generation"] = prev_gen
+            rec["expected_prev_holder"] = prev_holder
         rec.update(over or {})
         emb = odi.approval_bytes(rec)
         fid = f"20261022T1200{n[0] % 100:02d}-86{n[0] % 100:02d}"
@@ -1044,9 +1061,12 @@ def issue_cases(base: Path) -> None:
         ("window over 60 min", {"over": {"grant_window_s": 3601}}, (2, "refused:approval_field_grant_window_s")),
         ("max_open not 1 in record", {"over": {"max_open": 2}}, (2, "refused:approval_max_open_not_1")),
         ("request bytes differ", {"over": {"request_sha256": "0" * 64}}, (2, "refused:request_sha_mismatch")),
-        ("generation mismatches prev+1", {"over": {"expected_generation": 2}}, (2, "refused:approval_generation_mismatch")),
-        ("expected_prev_generation negative", {"over": {"expected_prev_generation": -1}}, (2, "refused:approval_field_expected_prev_generation")),
-        ("expected_prev_holder present when prev=0", {"over": {"expected_prev_holder": dict(HOLD)}}, (2, "refused:approval_prev_holder_schema")),
+        ("generation != 1 (gen1 shape)", {"over": {"expected_generation": 2}}, (2, "refused:approval_generation_not_initial")),
+        ("expected_prev_generation negative (successor shape)",
+         {"prev_gen": 1, "prev_holder": dict(HOLD2), "over": {"expected_prev_generation": -1}},
+         (2, "refused:approval_field_expected_prev_generation")),
+        ("expected_prev_holder present without expected_prev_generation (not the frozen gen1 shape)",
+         {"over": {"expected_prev_holder": dict(HOLD)}}, (2, "refused:approval_schema")),
         ("successor with no expected_prev_holder", {"prev_gen": 1, "over": {"expected_prev_holder": None}}, (2, "refused:approval_prev_holder_schema")),
         ("successor generation mismatches prev+1", {"prev_gen": 1, "prev_holder": dict(HOLD2), "over": {"expected_generation": 5}},
          (2, "refused:approval_generation_mismatch")),
@@ -1230,6 +1250,17 @@ def issue_cases(base: Path) -> None:
          and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
     lc.close()
 
+    # correct generation but the approval's expected_prev_holder no longer matches
+    # the real predecessor at that generation (stale/forged form content)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB] (HOLD), expired
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder=dict(HOLD2), over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: expected_prev_holder no longer matches the real predecessor (same generation) refused, zero writes",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_prev_holder_mismatch")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+         and lc.execute("SELECT released_at FROM owner_leases WHERE generation=1").fetchone()[0] is None)
+    lc.close()
+
     # open owner_requests: refused rather than silently staled
     d, lc, ldb, adb, rq, roots, proj = setup()
     g1 = acquire(lc, KB, now - TTL - 100)
@@ -1281,6 +1312,17 @@ def issue_cases(base: Path) -> None:
          rcb == 0 and brec["expected_prev_generation"] == 1 and brec["expected_prev_holder"] == HOLD
          and brec["expected_generation"] == 2 and brec["expected_holder"] == HOLD2
          and run(d, ldb, adb, rq, fidb, resolve=reg_ok2) == (0, "issued:auth-succ:gen2"))
+    lc.close()
+
+    # --- FROZEN COMPAT (1a0b873): classic gen1 shape is byte-identical to the pre-successor baseline ---
+    frozen = _frozen_gen1_module()
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj)  # prev_gen=0 default -> classic shape, no successor keys at all
+    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes/render_form byte-identical to the frozen baseline",
+         set(rec) == frozen.KEYS
+         and frozen.validate_approval(dict(rec)) == rec
+         and frozen.approval_bytes(rec) == odi.approval_bytes(rec)
+         and frozen.render_form(rec) == odi.render_form(rec))
     lc.close()
 
 

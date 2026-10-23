@@ -388,23 +388,30 @@ def claim_initial(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, s
     return _tx(conn, body)
 
 
-def claim_successor(conn, label: str, expected_prev_gen: int, pane_id: str, pane_birth: str, ttl_s: int,
-                    session_digest: str, now: float | None = None) -> int:
+def claim_successor(conn, label: str, expected_prev_gen: int, expected_prev_pane_id: str, expected_prev_pane_birth: str,
+                    pane_id: str, pane_birth: str, ttl_s: int, session_digest: str, now: float | None = None) -> int:
     """SUCCESSOR-ONLY claim: the next generation after an EXPIRED predecessor
-    whose generation is exactly expected_prev_gen. Reuses acquire()'s
-    successor transition (_successor_insert: release every unreleased row as
-    expired, gen = MAX+1, stale older-generation open requests) in the SAME
-    IMMEDIATE transaction, but first ADDITIONALLY refuses (SuccessorRefused)
-    unless: the predecessor is NOT live (no renewal or takeover of an
-    unexpired lease -- that is acquire()'s job, not this one's); the
-    predecessor's generation is exactly expected_prev_gen; the label has
+    bound by its FULL tuple (pane_id, pane_birth, generation) -- not the
+    generation number alone. Reuses acquire()'s successor transition
+    (_successor_insert: release every unreleased row as expired, gen =
+    MAX+1, stale older-generation open requests) in the SAME IMMEDIATE
+    transaction, but first ADDITIONALLY refuses (SuccessorRefused) unless:
+    the predecessor is NOT live (no renewal or takeover of an unexpired
+    lease -- that is acquire()'s job, not this one's); the predecessor's
+    generation is exactly expected_prev_gen; the predecessor's (pane_id,
+    pane_birth) is exactly (expected_prev_pane_id, expected_prev_pane_birth)
+    -- a same-generation but replaced/different holder is refused even
+    though the generation number alone would have matched; the label has
     ZERO open owner_requests (so the reused stale-loop is a verified no-op,
     never a silent disposal); and the new holder differs from the
     predecessor holder (a same-holder "successor" is a renewal in disguise).
-    Never renews, retries or takes over a live lease; never DELETEs; writes
-    nothing outside the one transaction."""
+    All of the above is checked inside the one IMMEDIATE transaction before
+    any write. Never renews, retries or takes over a live lease; never
+    DELETEs; writes nothing outside that transaction, and a refusal writes
+    nothing at all."""
     now = time.time() if now is None else now
     _check_holder(pane_id, pane_birth)
+    _check_holder(expected_prev_pane_id, expected_prev_pane_birth)
     if not SESSION_DIGEST_RE.match(session_digest or ""):
         raise ValueError("session_digest must be 64 lowercase hex")
     if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= MAX_TTL_S:
@@ -425,6 +432,10 @@ def claim_successor(conn, label: str, expected_prev_gen: int, pane_id: str, pane
         if prev_gen != expected_prev_gen:
             raise SuccessorRefused("wrong_prev_generation",
                                    f"{label}: predecessor generation {prev_gen} != expected_prev_gen {expected_prev_gen}")
+        if (prev_pane, prev_birth) != (expected_prev_pane_id, expected_prev_pane_birth):
+            raise SuccessorRefused("prev_holder_mismatch",
+                                   f"{label}: generation {prev_gen} is held by {prev_pane}@{prev_birth}, "
+                                   f"expected {expected_prev_pane_id}@{expected_prev_pane_birth}")
         n_open = conn.execute(
             f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})", (label, *OPEN)).fetchone()[0]
         if n_open:
