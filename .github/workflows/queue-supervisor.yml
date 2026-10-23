@@ -1,0 +1,27 @@
+name: queue-supervisor
+# Default-off queue supervisor (lib/queue_supervisor.py, queue-supervisor.py, hub
+# _queue_tick). Offline checks only: fakes plus the real owner_dispatch/lease/auth/
+# result_availability code over disposable temp stores. No network, no secrets.
+on:
+  pull_request:
+    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", ".github/workflows/queue-supervisor.yml"]
+  push:
+    branches: [main]
+    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", ".github/workflows/queue-supervisor.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python3 verify-queue-supervisor.py
+      - run: python3 verify-queue-supervisor-e2e.py
