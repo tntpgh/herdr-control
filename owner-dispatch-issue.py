@@ -475,8 +475,8 @@ def main(argv=None, resolve=None, now=None) -> int:
                 else:
                     ph = rec["expected_prev_holder"]
                     gen = ol.claim_successor(lconn, rec["owner_label"], prev_gen, ph["pane_id"], ph["pane_birth"],
-                                             h["pane_id"], h["pane_birth"], rec["lease_ttl_s"], h["session_digest"],
-                                             now=clock())
+                                             ph["session_digest"], h["pane_id"], h["pane_birth"], rec["lease_ttl_s"],
+                                             h["session_digest"], now=clock())
             except ol.LeaseConflict:
                 raise Refused("not_initial") from None
             except ol.SuccessorRefused as exc:

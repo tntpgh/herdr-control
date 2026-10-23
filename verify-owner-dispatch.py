@@ -1261,6 +1261,19 @@ def issue_cases(base: Path) -> None:
          and lc.execute("SELECT released_at FROM owner_leases WHERE generation=1").fetchone()[0] is None)
     lc.close()
 
+    # same generation, same pane_id/pane_birth, but a DIFFERENT session digest
+    # (a renewal under the same pane with a new session) -- refused, zero writes, no grant
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    acquire(lc, KB, now - TTL - 100)  # gen1, PANE[KB]/SESS[KB] (HOLD), expired
+    stale_sess = hashlib.sha256(b"stale-predecessor-session").hexdigest()
+    fid, rec, asha = decision(d, proj, prev_gen=1, prev_holder={**HOLD, "session_digest": stale_sess},
+                              over={"expected_holder": dict(HOLD2)})
+    case("SUCCESSOR: same generation/pane/birth but a changed session digest refused, zero writes, no grant",
+         run(d, ldb, adb, rq, fid, resolve=reg_ok2) == (2, "refused:successor_prev_holder_mismatch")
+         and lease_rows(lc) == 1 and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+         and lc.execute("SELECT released_at FROM owner_leases WHERE generation=1").fetchone()[0] is None)
+    lc.close()
+
     # open owner_requests: refused rather than silently staled
     d, lc, ldb, adb, rq, roots, proj = setup()
     g1 = acquire(lc, KB, now - TTL - 100)

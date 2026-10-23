@@ -222,7 +222,7 @@ def main():
     p, c = fresh()
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
     case("claim_successor: live predecessor refused",
-         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, *H2, TTL, S2, now=T0 + 1)) == "live_predecessor")
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, S1, *H2, TTL, S2, now=T0 + 1)) == "live_predecessor")
     case("live-predecessor refusal leaves the live lease untouched",
          count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 1
          and ol.check_fence(c, "kb", g1, *H1, now=T0 + 1) is None)
@@ -231,7 +231,7 @@ def main():
     p, c = fresh()
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
     case("claim_successor: wrong expected_prev_gen refused",
-         succ_code(lambda: ol.claim_successor(c, "kb", g1 + 1, *H1, *H2, TTL, S2, now=T0 + TTL + 1)) == "wrong_prev_generation")
+         succ_code(lambda: ol.claim_successor(c, "kb", g1 + 1, *H1, S1, *H2, TTL, S2, now=T0 + TTL + 1)) == "wrong_prev_generation")
     case("wrong-prev-gen refusal inserts no new lease row",
          count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 1)
     c.close()
@@ -239,9 +239,9 @@ def main():
     p, c = fresh()
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
     H3 = ("w9:p9", "term_9")
-    case("claim_successor: correct generation but replaced/mismatched predecessor holder refused",
-         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H3, *H2, TTL, S2, now=T0 + TTL + 1)) == "prev_holder_mismatch")
-    case("prev-holder-mismatch refusal leaves zero rows changed (no new lease, predecessor untouched)",
+    case("claim_successor: correct generation but replaced/mismatched predecessor holder (pane/birth) refused",
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H3, sess("h3"), *H2, TTL, S2, now=T0 + TTL + 1)) == "prev_holder_mismatch")
+    case("prev-holder-mismatch (pane/birth) refusal leaves zero rows changed (no new lease, predecessor untouched)",
          count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 1
          and c.execute("SELECT released_at, release_reason FROM owner_leases WHERE label='kb' AND generation=?",
                        (g1,)).fetchone() == (None, None))
@@ -251,7 +251,7 @@ def main():
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
     ol.enqueue(c, "kb", g1, *H1, "open1", now=T0)
     case("claim_successor: open owner_requests refused (never silently staled)",
-         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, *H2, TTL, S2, now=T0 + TTL + 1)) == "open_requests")
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, S1, *H2, TTL, S2, now=T0 + TTL + 1)) == "open_requests")
     case("open-requests refusal leaves the request open, not staled",
          c.execute("SELECT state FROM owner_requests WHERE request_id='open1'").fetchone()[0] == "queued")
     c.close()
@@ -259,12 +259,12 @@ def main():
     p, c = fresh()
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
     case("claim_successor: new holder == predecessor holder refused",
-         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, *H1, TTL, S1, now=T0 + TTL + 1)) == "same_holder")
+         succ_code(lambda: ol.claim_successor(c, "kb", g1, *H1, S1, *H1, TTL, S1, now=T0 + TTL + 1)) == "same_holder")
     c.close()
 
     p, c = fresh()
     g1 = ol.acquire(c, "kb", *H1, TTL, T0, session_digest=S1)
-    g2 = ol.claim_successor(c, "kb", g1, *H1, *H2, TTL, S2, now=T0 + TTL + 1)
+    g2 = ol.claim_successor(c, "kb", g1, *H1, S1, *H2, TTL, S2, now=T0 + TTL + 1)
     case("claim_successor: expired predecessor released (row kept, reason 'expired') and gen2 claimed",
          g2 == g1 + 1
          and c.execute("SELECT released_at IS NOT NULL, release_reason FROM owner_leases WHERE label='kb' AND generation=?",
@@ -273,9 +273,10 @@ def main():
     case("claim_successor never DELETEs: predecessor row kept, only its state flips",
          count(c, "SELECT COUNT(*) FROM owner_leases WHERE label='kb'") == 2)
     case("claim_successor rejects a malformed/empty session_digest and an out-of-range ttl",
-         raises(lambda: ol.claim_successor(c, "kb", g2, *H2, "w3:p1", "term_3", TTL, "", now=T0 + 2 * TTL + 2), ValueError)
-         and raises(lambda: ol.claim_successor(c, "kb", g2, *H2, "w3:p1", "term_3", 0, sess("h3"), now=T0 + 2 * TTL + 2), ValueError)
-         and raises(lambda: ol.claim_successor(c, "kb", 0, *H2, "w3:p1", "term_3", TTL, sess("h3"), now=T0 + 2 * TTL + 2), ValueError))
+         raises(lambda: ol.claim_successor(c, "kb", g2, *H2, S2, "w3:p1", "term_3", TTL, "", now=T0 + 2 * TTL + 2), ValueError)
+         and raises(lambda: ol.claim_successor(c, "kb", g2, *H2, S2, "w3:p1", "term_3", 0, sess("h3"), now=T0 + 2 * TTL + 2), ValueError)
+         and raises(lambda: ol.claim_successor(c, "kb", 0, *H2, S2, "w3:p1", "term_3", TTL, sess("h3"), now=T0 + 2 * TTL + 2), ValueError)
+         and raises(lambda: ol.claim_successor(c, "kb", g2, *H2, "", "w3:p1", "term_3", TTL, sess("h3"), now=T0 + 2 * TTL + 2), ValueError))
     c.close()
 
     # --- policy, validation, auth-before-metadata, foreign keys ---
