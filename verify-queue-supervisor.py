@@ -312,6 +312,17 @@ with tempfile.TemporaryDirectory() as t:
     check("CLI never creates a missing auth store", rc == 4 and out.startswith("refused:")
           and not Path(f"{t}/missing-auth.db").exists())
 
+# --- M3 fix: queue validation and the exhaustion digest share ONE raw read --
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t)
+    lane = qs.Lane(root, "snap")
+    c1 = json.dumps([item("i1", "snap")]).encode()
+    (root / "snap.queue.json").write_bytes(c1)
+    items, digest = lane.queue_snapshot()
+    (root / "snap.queue.json").write_bytes(b'[{"id":"i2","request":"later","auth_id":"g-snap-i2"}]')
+    check("digest is tied to the exact bytes already validated, not a second (now-mutated) read",
+          digest == hashlib.sha256(c1).hexdigest() and [i["id"] for i in items] == ["i1"])
+
 # --- M3: exhaustion record (lib/queue_supervisor.py:206-207 "idle:empty") --
 with tempfile.TemporaryDirectory() as t:
     root = Path(t) / "ex"

@@ -124,12 +124,17 @@ class Lane:
         self.queue_path = root / f"{label}.queue.json"
         self.ledger_path = root / f"{label}.ledger.jsonl"
 
-    def queue(self) -> list[dict]:
+    def queue_snapshot(self) -> tuple[list[dict], str]:
+        """Read the queue file's raw bytes exactly ONCE; return (validated
+        items, sha256 of those same bytes). A missing file is the canonical
+        empty list, digest of b"[]" -- ties validation and the exhaustion
+        digest to one snapshot instead of two separate reads that could
+        race or disagree."""
         try:
-            raw = self.queue_path.read_text()
+            raw = self.queue_path.read_bytes()
         except FileNotFoundError:
-            return []
-        return validate_queue(json.loads(raw))
+            raw = b"[]"
+        return validate_queue(json.loads(raw)), hashlib.sha256(raw).hexdigest()
 
     def ledger(self) -> list[dict]:
         """Every line must be a JSON object. Anything else (torn write, edit) is
@@ -212,17 +217,6 @@ def _escalate(lane: Lane, escalated: set[str], notify: Notify, item: str, reason
     escalated.add(key)
 
 
-def _queue_digest(lane: Lane) -> str:
-    """sha256 of the queue file's raw bytes; a missing file is the canonical
-    empty list, matching Lane.queue()'s own FileNotFoundError handling. Used
-    to tell "still the same exhausted queue" from "the operator changed it"."""
-    try:
-        raw = lane.queue_path.read_bytes()
-    except FileNotFoundError:
-        raw = b"[]"
-    return hashlib.sha256(raw).hexdigest()
-
-
 def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify,
               journal: Journal, may_dispatch: bool = True) -> str:
     in_flight, frozen, settled, escalated, exhausted_open, exhausted_episode = _lane_state(lane.ledger())
@@ -240,9 +234,9 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
         return f"waiting:{in_flight}"
     if frozen:
         return f"frozen:{frozen}"
-    nxt = next((i for i in lane.queue() if i["id"] not in settled and not i.get("hold")), None)
+    items, digest = lane.queue_snapshot()
+    nxt = next((i for i in items if i["id"] not in settled and not i.get("hold")), None)
     if nxt is None:
-        digest = _queue_digest(lane)
         if exhausted_open != digest:  # durable episode marker, checked BEFORE writing
             lane.append(kind="exhausted", lane=lane.label, queue_sha=digest)  # idempotent across retries
             exhausted_episode += 1  # this tick's fresh episode ordinal
