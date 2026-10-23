@@ -1,54 +1,64 @@
 """Queue supervisor: keeps approved project lanes advancing (DEFAULT OFF).
 
-One tick() per hub attention interval (120s). For each lane (one project
-conductor/owner label) it either
-  * settles the lane's in-flight item from EVIDENCE (a handoff event naming the
-    item), or
-  * dispatches the lane's next approved item through the EXISTING fenced
-    lib/owner_dispatch.Dispatcher (lease, auth grant, DeliveryGate, journal).
-It never sends anything itself, never issues grants, never retries a send.
+One tick() per hub pass. For each lane (one project conductor / owner label)
+it either settles the lane's in-flight item, or dispatches the lane's next
+approved item through the EXISTING fenced lib/owner_dispatch.Dispatcher
+(lease, one-time owner-dispatch-auth grant, DeliveryGate, journal). It never
+sends anything itself, never issues, re-grants or re-arms authorization, and
+never retries anything that may have crossed the send boundary.
 
-State is an append-only ledger per lane (<root>/<label>.ledger.jsonl, fsynced).
-The queue is operator-approved input (<root>/<label>.queue.json):
-  [{"id": "...", "request": "...", "manifest": ["..."], "hold": false}, ...]
-"hold": true is an intentional hold and is skipped, never dispatched.
+Inputs (operator-approved, never written here):
+  <root>/<label>.queue.json
+    [{"id": "...", "request": "...", "manifest": ["..."], "auth_id": "...", "hold": false}]
+  "hold": true is an intentional hold: skipped, never dispatched. auth_id names
+  the one-time grant the operator issued for exactly that request.
+State: <root>/<label>.ledger.jsonl, append-only, fsynced, 0600.
 
-Lane outcomes and what they do:
-  done       evidence with a 40-hex commit or artifact sha256 -> advance
-  done_unproven  done event without proof -> escalate, lane frozen
-  blocked    -> escalate once, lane frozen until an operator appends "resume"
-  cancelled  -> advance, no escalation
-  uncertain  dispatcher outcome ambiguous/unrecorded/mismatch -> escalate,
-             lane frozen; the item is NEVER redispatched
-  held       dispatcher refused before sending (nothing sent) -> retried on a
-             later tick; escalated once per distinct reason
-Activation: HERDR_QUEUE_SUPERVISOR=1. Anything else -> tick() returns "off"
-and touches nothing.
+Completion is CONSUMED, never inferred:
+  done       result_availability stage `accepted` exists for the rid
+             (accepted requires verified AND reply_authenticated there).
+             A worker-written event or a hash-shaped string is NOT completion.
+  blocked    owner event {"event":"queue_blocked","rid":..,"reason":..}
+             -> escalate once, lane frozen until the operator appends "resume"
+  cancelled  owner event {"event":"queue_cancelled","rid":..} -> advance
+Dispatch outcomes:
+  dispatched/registered -> in flight
+  held:not_dispatched:<r>, r in RETRY_SAFE (refused BEFORE the grant is
+             consumed; nothing journaled, nothing sent) -> retried next tick,
+             escalated once per reason
+  held:not_dispatched:<other> (grant consumed or rid journaled) -> frozen,
+             escalated; the item is never retried (no automatic re-grant)
+  anything else (dispatched:unregistered, ambiguous*, ...) -> frozen,
+             escalated; the item is never redispatched
+Activation: HERDR_QUEUE_SUPERVISOR=1. Otherwise tick() returns "off" and
+touches nothing.
 """
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-import re
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
 ENV_FLAG = "HERDR_QUEUE_SUPERVISOR"
-_PROOF = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SENT = {"dispatched", "registered"}
+# owner_dispatch.Dispatcher._dispatch raises these BEFORE self.authorize()
+# consumes the grant and before any journal file exists (owner_dispatch.py:141-163).
+RETRY_SAFE = frozenset({"label_has_no_root", "bad_request", "bad_manifest", "owner_project_unmapped",
+                        "registry_lease_mismatch", "auth_missing"})
 TERMINAL = {"done", "cancelled"}
-FREEZING = {"blocked", "uncertain", "done_unproven"}
+FREEZING = {"blocked", "uncertain", "held_consumed"}
 
 
 class Dispatch(Protocol):
-    def dispatch(self, label: str, rid: str, request_text: bytes, manifest: list[str]) -> str: ...
+    def dispatch(self, label: str, rid: str, request_text: bytes, manifest: list[str], auth_id: str) -> str: ...
 
 
-# evidence(label, item_id) -> None | {"state": "done"|"blocked"|"cancelled", "proof": str, "reason": str}
-Evidence = Callable[[str, str], "dict | None"]
+Accepted = Callable[[str, str], bool]  # (label, rid) -> accepted stage present
+Events = Callable[[str, str], "dict | None"]  # (label, rid) -> latest queue_blocked/queue_cancelled event
 Notify = Callable[[str, str, str], None]  # (label, item_id, reason)
 
 
@@ -131,53 +141,50 @@ def _escalate(lane: Lane, escalated: set[str], notify: Notify, item: str, reason
     escalated.add(key)
 
 
-def tick_lane(lane: Lane, dispatcher: Dispatch, evidence: Evidence, notify: Notify) -> str:
+def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify) -> str:
     in_flight, frozen, settled, escalated = _lane_state(lane.ledger())
     if in_flight is not None:
-        ev = evidence(lane.label, in_flight)
-        if not ev:
-            return f"waiting:{in_flight}"
-        state = ev.get("state")
-        if state == "done":
-            if _PROOF.match(str(ev.get("proof", ""))):
-                lane.append(kind="done", item=in_flight, proof=ev["proof"])
-                return f"done:{in_flight}"
-            lane.append(kind="done_unproven", item=in_flight)
-            _escalate(lane, escalated, notify, in_flight, "done_without_proof")
-            return f"frozen:done_unproven:{in_flight}"
-        if state == "cancelled":
+        rid = rid_for(lane.label, in_flight)
+        if accepted(lane.label, rid):
+            lane.append(kind="done", item=in_flight, evidence="result_availability:accepted")
+            return f"done:{in_flight}"
+        ev = events(lane.label, rid) or {}
+        if ev.get("event") == "queue_cancelled":
             lane.append(kind="cancelled", item=in_flight, reason=str(ev.get("reason", "")))
             return f"cancelled:{in_flight}"
-        if state == "blocked":
+        if ev.get("event") == "queue_blocked":
             reason = str(ev.get("reason", "blocked"))
             lane.append(kind="blocked", item=in_flight, reason=reason)
             _escalate(lane, escalated, notify, in_flight, f"blocked:{reason}")
             return f"frozen:blocked:{in_flight}"
-        return f"waiting:{in_flight}"  # unknown evidence state: never guess
+        return f"waiting:{in_flight}"
     if frozen:
         return f"frozen:{frozen}"
     nxt = next((i for i in lane.queue() if i["id"] not in settled and not i.get("hold")), None)
     if nxt is None:
         return "idle:empty"
-    out = dispatcher.dispatch(lane.label, rid_for(lane.label, nxt["id"]),
-                              str(nxt.get("request", "")).encode(), list(nxt.get("manifest", [])))
+    out = dispatcher.dispatch(lane.label, rid_for(lane.label, nxt["id"]), str(nxt.get("request", "")).encode(),
+                              list(nxt.get("manifest", [])), str(nxt.get("auth_id", "")))
     if out in _SENT:
         lane.append(kind="dispatched", item=nxt["id"], outcome=out)
         return f"dispatched:{nxt['id']}"
     if out.startswith("held:not_dispatched:"):
-        _escalate(lane, escalated, notify, nxt["id"], out)  # nothing was sent; retried next tick
-        return f"held:{nxt['id']}:{out}"
-    # dispatched:unregistered, ambiguous*, unrecorded*, mismatch*, refused*: a send may have
-    # happened or cannot be tracked. Freeze; the item is never redispatched.
+        reason = out.split(":", 2)[2]
+        if reason in RETRY_SAFE:
+            _escalate(lane, escalated, notify, nxt["id"], out)  # nothing consumed, nothing sent
+            return f"held:{nxt['id']}:{out}"
+        lane.append(kind="held_consumed", item=nxt["id"], outcome=out)
+        _escalate(lane, escalated, notify, nxt["id"], f"held_consumed:{out}")
+        return f"frozen:held_consumed:{nxt['id']}"
     lane.append(kind="uncertain", item=nxt["id"], outcome=out)
     _escalate(lane, escalated, notify, nxt["id"], f"uncertain:{out}")
     return f"frozen:uncertain:{nxt['id']}"
 
 
-def tick(root: Path, labels: list[str], dispatcher: Dispatch, evidence: Evidence, notify: Notify,
-         environ=os.environ) -> dict[str, str]:
-    """One supervision pass over every lane. Serialized by an exclusive lock so two
-    ticks (hub thread + manual run) can never both dispatch the same item."""
+def tick(root: Path, labels: list[str], dispatcher: Dispatch, accepted: Accepted, events: Events,
+         notify: Notify, environ=os.environ) -> dict[str, str]:
+    """One pass over every lane, serialized by an exclusive non-blocking lock so
+    two passes can never both dispatch the same item."""
     if not enabled(environ):
         return {"_": "off"}
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -190,9 +197,27 @@ def tick(root: Path, labels: list[str], dispatcher: Dispatch, evidence: Evidence
         result = {}
         for label in labels:
             try:
-                result[label] = tick_lane(Lane(root, label), dispatcher, evidence, notify)
+                result[label] = tick_lane(Lane(root, label), dispatcher, accepted, events, notify)
             except Exception as exc:  # noqa: BLE001 — one bad lane must not stall the others
                 result[label] = f"error:{type(exc).__name__}"
         return result
     finally:
         os.close(lock)
+
+
+def latest_queue_event(events_file: Path, rid: str) -> dict | None:
+    """Last queue_blocked/queue_cancelled line for rid in an owner events.jsonl.
+    Malformed lines are skipped (same tolerance as lib/reconcile.sh:59)."""
+    last = None
+    try:
+        with events_file.open() as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("rid") == rid and ev.get("event") in ("queue_blocked", "queue_cancelled"):
+                    last = ev
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return last

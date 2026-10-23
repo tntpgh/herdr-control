@@ -1917,6 +1917,26 @@ def _action_tick() -> None:
         _live_log(f"action tick failed: {exc}")
 
 
+QUEUE_SCRIPT = Path(__file__).resolve().parent / "queue-supervisor.py"
+QUEUE_TICK_EVERY_S = 120
+_QUEUE_LAST = [0.0]
+
+
+def _queue_tick() -> None:
+    """Queue supervisor (lib/queue_supervisor.py): advance approved project lanes
+    through the existing owner-dispatch fences. OFF unless HERDR_QUEUE_SUPERVISOR=1
+    is in the hub's environment; at most one pass per QUEUE_TICK_EVERY_S. Never raises."""
+    if os.environ.get("HERDR_QUEUE_SUPERVISOR") != "1" or time.time() - _QUEUE_LAST[0] < QUEUE_TICK_EVERY_S:
+        return
+    _QUEUE_LAST[0] = time.time()
+    try:
+        r = subprocess.run([sys.executable, str(QUEUE_SCRIPT)], capture_output=True, text=True, timeout=300)
+        _live_log(f"queue tick rc={r.returncode} {r.stdout.strip()[:300]}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        _live_log(f"queue tick failed: {exc}")
+
+
+
 def _attention_loop() -> None:
     while True:
         try:
@@ -1928,6 +1948,10 @@ def _attention_loop() -> None:
             _action_tick()
         except Exception as e:  # noqa: BLE001 — same: never kill the loop
             _live_log(f"action tick error: {type(e).__name__}: {e}")
+        try:
+            _queue_tick()
+        except Exception as e:  # noqa: BLE001 — same: never kill the loop
+            _live_log(f"queue tick error: {type(e).__name__}: {e}")
         time.sleep(ATTENTION_INTERVAL_S)
 
 
