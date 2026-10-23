@@ -38,6 +38,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -51,15 +52,51 @@ RETRY_SAFE = frozenset({"label_has_no_root", "bad_request", "bad_manifest", "own
                         "registry_lease_mismatch", "auth_missing"})
 TERMINAL = {"done", "cancelled"}
 FREEZING = {"blocked", "uncertain", "held_consumed"}
+MAX_LANES = 15  # the canonical project-lane ceiling
+MAX_DISPATCH_PER_TICK = 4  # bounded spend: at most this many new sends per pass
+ITEM_KEYS = {"id", "request", "manifest", "auth_id", "hold"}
+_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")  # result_availability.NAME_RE
+MAX_MANIFEST = 8  # result_availability.MAX_MANIFEST
+
+
+class LedgerCorrupt(ValueError):
+    pass
 
 
 class Dispatch(Protocol):
     def dispatch(self, label: str, rid: str, request_text: bytes, manifest: list[str], auth_id: str) -> str: ...
 
 
-Accepted = Callable[[str, str], bool]  # (label, rid) -> accepted stage present
+Accepted = Callable[[str, str], bool]  # (label, rid) -> result_availability `accepted` stage present
 Events = Callable[[str, str], "dict | None"]  # (label, rid) -> latest queue_blocked/queue_cancelled event
 Notify = Callable[[str, str, str], None]  # (label, item_id, reason)
+# (label, rid) -> None (no journal dir: never dispatched) | "settled" | "refused" | "uncertain" | "intent_only"
+Journal = Callable[[str, str], "str | None"]
+
+
+def validate_queue(items) -> list[dict]:
+    """Strict operator-queue schema. Raises ValueError on anything else; never coerces."""
+    if not isinstance(items, list):
+        raise ValueError("queue is not a list")
+    seen: set[str] = set()
+    for i in items:
+        if not isinstance(i, dict) or set(i) - ITEM_KEYS or not {"id", "request", "auth_id"} <= set(i):
+            raise ValueError("item keys")
+        if not isinstance(i["id"], str) or not _ID_RE.match(i["id"]) or i["id"] in seen:
+            raise ValueError(f"item id: {i.get('id')!r}")
+        seen.add(i["id"])
+        if not isinstance(i["request"], str) or not i["request"].strip():
+            raise ValueError(f"request: {i['id']}")
+        if not isinstance(i["auth_id"], str) or not i["auth_id"]:
+            raise ValueError(f"auth_id: {i['id']}")
+        man = i.get("manifest", [])
+        if (not isinstance(man, list) or len(man) > MAX_MANIFEST or len(set(map(str, man))) != len(man)
+                or not all(isinstance(m, str) and _NAME_RE.match(m) for m in man)):
+            raise ValueError(f"manifest: {i['id']}")
+        if not isinstance(i.get("hold", False), bool):
+            raise ValueError(f"hold: {i['id']}")
+    return items
 
 
 def enabled(environ=os.environ) -> bool:
@@ -78,24 +115,25 @@ class Lane:
 
     def queue(self) -> list[dict]:
         try:
-            items = json.loads(self.queue_path.read_text())
+            raw = self.queue_path.read_text()
         except FileNotFoundError:
             return []
-        if not isinstance(items, list) or not all(isinstance(i, dict) and isinstance(i.get("id"), str) for i in items):
-            raise ValueError(f"malformed queue: {self.queue_path}")
-        return items
+        return validate_queue(json.loads(raw))
 
     def ledger(self) -> list[dict]:
+        """Every line must be a JSON object. Anything else (torn write, edit) is
+        LedgerCorrupt: the lane freezes rather than guessing its own history."""
         out = []
         try:
             with self.ledger_path.open() as f:
-                for line in f:
+                for n, line in enumerate(f, 1):
                     try:
                         rec = json.loads(line)
                     except ValueError:
-                        continue  # a torn last line must not wedge the lane
-                    if isinstance(rec, dict):
-                        out.append(rec)
+                        raise LedgerCorrupt(f"{self.ledger_path}:{n}") from None
+                    if not isinstance(rec, dict):
+                        raise LedgerCorrupt(f"{self.ledger_path}:{n}")
+                    out.append(rec)
         except FileNotFoundError:
             pass
         return out
@@ -141,7 +179,8 @@ def _escalate(lane: Lane, escalated: set[str], notify: Notify, item: str, reason
     escalated.add(key)
 
 
-def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify) -> str:
+def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify,
+              journal: Journal, may_dispatch: bool = True) -> str:
     in_flight, frozen, settled, escalated = _lane_state(lane.ledger())
     if in_flight is not None:
         rid = rid_for(lane.label, in_flight)
@@ -163,15 +202,28 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
     nxt = next((i for i in lane.queue() if i["id"] not in settled and not i.get("hold")), None)
     if nxt is None:
         return "idle:empty"
-    out = dispatcher.dispatch(lane.label, rid_for(lane.label, nxt["id"]), str(nxt.get("request", "")).encode(),
-                              list(nxt.get("manifest", [])), str(nxt.get("auth_id", "")))
+    rid = rid_for(lane.label, nxt["id"])
+    # Crash window: the Dispatcher's journal is written before/after the send but
+    # our ledger append comes after dispatch() returns. If the journal already
+    # knows this rid, reconcile from it and NEVER call dispatch() again.
+    js = journal(lane.label, rid)
+    if js == "settled":
+        lane.append(kind="dispatched", item=nxt["id"], outcome="reconciled:settled")
+        return f"dispatched:{nxt['id']}:reconciled"
+    if js is not None:
+        lane.append(kind="uncertain", item=nxt["id"], outcome=f"reconciled:{js}")
+        _escalate(lane, escalated, notify, nxt["id"], f"uncertain:journal_{js}")
+        return f"frozen:uncertain:{nxt['id']}"
+    if not may_dispatch:
+        return f"deferred:{nxt['id']}"
+    out = dispatcher.dispatch(lane.label, rid, nxt["request"].encode(), list(nxt.get("manifest", [])), nxt["auth_id"])
     if out in _SENT:
         lane.append(kind="dispatched", item=nxt["id"], outcome=out)
         return f"dispatched:{nxt['id']}"
     if out.startswith("held:not_dispatched:"):
         reason = out.split(":", 2)[2]
         if reason in RETRY_SAFE:
-            _escalate(lane, escalated, notify, nxt["id"], out)  # nothing consumed, nothing sent
+            _escalate(lane, escalated, notify, nxt["id"], out)  # nothing consumed, journaled or sent
             return f"held:{nxt['id']}:{out}"
         lane.append(kind="held_consumed", item=nxt["id"], outcome=out)
         _escalate(lane, escalated, notify, nxt["id"], f"held_consumed:{out}")
@@ -182,11 +234,14 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
 
 
 def tick(root: Path, labels: list[str], dispatcher: Dispatch, accepted: Accepted, events: Events,
-         notify: Notify, environ=os.environ) -> dict[str, str]:
-    """One pass over every lane, serialized by an exclusive non-blocking lock so
-    two passes can never both dispatch the same item."""
+         notify: Notify, journal: Journal, environ=os.environ) -> dict[str, str]:
+    """One pass over the lanes IN THE GIVEN ORDER (operator priority, e.g. revenue
+    first), at most MAX_DISPATCH_PER_TICK new sends, serialized by an exclusive
+    non-blocking lock so two passes can never both dispatch the same item."""
     if not enabled(environ):
         return {"_": "off"}
+    if len(labels) > MAX_LANES or len(set(labels)) != len(labels) or not all(_ID_RE.match(x) for x in labels):
+        return {"_": "refused:lanes"}
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = os.open(root / ".tick.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -194,12 +249,21 @@ def tick(root: Path, labels: list[str], dispatcher: Dispatch, accepted: Accepted
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {"_": "busy"}
-        result = {}
+        result, sends = {}, 0
         for label in labels:
+            lane = Lane(root, label)
             try:
-                result[label] = tick_lane(Lane(root, label), dispatcher, accepted, events, notify)
+                r = tick_lane(lane, dispatcher, accepted, events, notify, journal, sends < MAX_DISPATCH_PER_TICK)
+            except LedgerCorrupt:
+                r = "frozen:ledger_corrupt"
+                marker = root / f"{label}.corrupt-notified"
+                if not marker.exists():  # escalate once; the ledger itself is not trusted
+                    notify(label, "", "ledger_corrupt")
+                    marker.touch(mode=0o600)
             except Exception as exc:  # noqa: BLE001 — one bad lane must not stall the others
-                result[label] = f"error:{type(exc).__name__}"
+                r = f"error:{type(exc).__name__}"
+            sends += r.startswith("dispatched:") and not r.endswith(":reconciled")
+            result[label] = r
         return result
     finally:
         os.close(lock)

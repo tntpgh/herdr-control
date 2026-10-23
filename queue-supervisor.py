@@ -53,6 +53,23 @@ class GrantDispatch:
             label, rid, request_text, manifest)
 
 
+def journal_state(jroot: Path, label: str, rid: str) -> str | None:
+    """The owner_dispatch journal's verdict for rid (owner_dispatch.py docstring §2):
+    None = no journal dir (never dispatched); else exactly one outcome file, or
+    intent_only (crash across the send). A symlink anywhere is treated as uncertain."""
+    d = jroot / label / rid
+    if d.is_symlink() or (jroot / label).is_symlink():
+        return "uncertain"
+    if not d.exists():
+        return None
+    for name, verdict in (("settled.json", "settled"), ("uncertain.json", "uncertain"), ("refused.json", "refused")):
+        if (d / name).is_symlink():
+            return "uncertain"
+        if (d / name).is_file():
+            return verdict
+    return "intent_only"
+
+
 def main(environ=os.environ, send=None, resolve=None) -> int:
     if not qs.enabled(environ):
         print("off")
@@ -112,6 +129,9 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
         lroot = avail.roots.get(label)
         return qs.latest_queue_event(Path(lroot) / "events.jsonl", rid) if lroot else None
 
+    def journal(label, rid):
+        return journal_state(Path(avail.journal_root), label, rid)
+
     try:
         recov = od.Dispatcher(gate, avail, send, resolve).recover()
         bad = {k: v for k, v in recov.items() if v.startswith(("mismatch", "unrecorded"))}
@@ -120,7 +140,7 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
             print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad.items())))
             return 4
         out = qs.tick(qroot, [x for x in lanes.split(",") if x], GrantDispatch(gate, avail, send, resolve, store),
-                      accepted, events, notify, environ=environ)
+                      accepted, events, notify, journal, environ=environ)
     finally:
         store.close()
         gate.close()

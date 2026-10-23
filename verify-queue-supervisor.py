@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Offline proofs for lib/queue_supervisor.py and queue-supervisor.py.
 
-Four fake project conductors (kb, model, monthly, farm) behind an injected fake
-dispatcher, a fake result_availability `accepted` set and fake owner events.
-Temp dirs only: no herdr, no pane, no network, no registry, no real stores."""
+Fake project conductors behind an injected fake dispatcher that, like the real
+owner_dispatch.Dispatcher, journals a rid before reporting it; a fake
+result_availability `accepted` set; fake owner events. Temp dirs only: no herdr,
+no pane, no network, no registry, no real stores."""
 from __future__ import annotations
 
 import fcntl
@@ -32,16 +33,25 @@ def check(name, cond):
 
 class FakeConductors:
     def __init__(self):
-        self.sent: list[tuple[str, str, str]] = []  # (label, rid, auth_id) that crossed a send
+        self.sent: list[tuple[str, str, str]] = []
         self.calls: list[tuple[str, str]] = []
         self.outcome: dict[str, str] = {}
         self.acc: set[str] = set()
         self.ev: dict[str, dict] = {}
+        self.jr: dict[str, str] = {}  # rid -> journal verdict
         self.notes: list[tuple[str, str, str]] = []
 
     def dispatch(self, label, rid, request_text, manifest, auth_id):
         self.calls.append((label, rid))
         out = self.outcome.get(label, "dispatched")
+        if out in ("dispatched", "registered"):
+            self.jr[rid] = "settled"
+        elif out.startswith("held:not_dispatched:") and out.split(":", 2)[2] in qs.RETRY_SAFE:
+            pass  # refused before any journal file exists
+        elif out.startswith("held:"):
+            self.jr[rid] = "refused"
+        else:
+            self.jr[rid] = "uncertain"
         if not out.startswith("held:"):
             self.sent.append((label, rid, auth_id))
         return out
@@ -52,26 +62,35 @@ class FakeConductors:
     def events(self, label, rid):
         return self.ev.get(rid)
 
+    def journal(self, label, rid):
+        return self.jr.get(rid)
+
     def notify(self, label, item, reason):
         self.notes.append((label, item, reason))
 
 
+def item(i, lb, **kw):
+    return {"id": i, "request": f"{lb} {i}", "auth_id": f"g-{lb}-{i}", **kw}
+
+
+def mkroot(base, name, lanes):
+    root = Path(base) / name
+    root.mkdir()
+    for lb in lanes:
+        (root / f"{lb}.queue.json").write_text(json.dumps([item("i1", lb), item("i2", lb, hold=True), item("i3", lb)]))
+    return root
+
+
 LANES = ["kb", "model", "monthly", "farm"]
 with tempfile.TemporaryDirectory() as t:
-    root = Path(t) / "q"
-    root.mkdir()
-    for lb in LANES:
-        (root / f"{lb}.queue.json").write_text(json.dumps(
-            [{"id": "i1", "request": f"{lb} one", "auth_id": f"g-{lb}-1"},
-             {"id": "i2", "request": f"{lb} two", "auth_id": f"g-{lb}-2", "hold": True},
-             {"id": "i3", "request": f"{lb} three", "auth_id": f"g-{lb}-3"}]))
+    root = mkroot(t, "q", LANES)
     fc = FakeConductors()
 
-    def tick(env=ON):
-        return qs.tick(root, LANES, fc, fc.accepted, fc.events, fc.notify, environ=env)
+    def tick(env=ON, r=None, lanes=LANES):
+        return qs.tick(r or root, lanes, fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=env)
 
-    def resume(lb):
-        with (root / f"{lb}.ledger.jsonl").open("a") as f:
+    def resume(lb, r=None):
+        with ((r or root) / f"{lb}.ledger.jsonl").open("a") as f:
             f.write(json.dumps({"kind": "resume"}) + "\n")
 
     check("default off: no flag -> off, nothing called, no ledger",
@@ -81,19 +100,19 @@ with tempfile.TemporaryDirectory() as t:
     r = tick()
     check("4 lanes: three dispatch i1 with their own grant; farm held pre-grant",
           [r[x] for x in LANES[:3]] == ["dispatched:i1"] * 3 and r["farm"].startswith("held:i1")
-          and fc.sent == [("kb", "q-kb-i1", "g-kb-1"), ("model", "q-model-i1", "g-model-1"),
-                          ("monthly", "q-monthly-i1", "g-monthly-1")])
+          and fc.sent == [("kb", "q-kb-i1", "g-kb-i1"), ("model", "q-model-i1", "g-model-i1"),
+                          ("monthly", "q-monthly-i1", "g-monthly-i1")])
     fc.outcome.pop("farm")
     r = tick()
-    check("retry-safe hold (grant not consumed) is retried once cleared", r["farm"] == "dispatched:i1")
-    check("retry-safe hold escalated exactly once", sum(n[0] == "farm" for n in fc.notes) == 1)
-    n_calls = len(fc.calls)
+    check("pre-grant hold (nothing journaled) retried once cleared", r["farm"] == "dispatched:i1")
+    check("pre-grant hold escalated exactly once", sum(n[0] == "farm" for n in fc.notes) == 1)
+    n = len(fc.calls)
     tick()
-    check("no duplicate execution while in flight", len(fc.calls) == n_calls)
+    check("no duplicate execution while in flight", len(fc.calls) == n)
 
-    fc.ev["q-kb-i1"] = {"event": "kb_done", "rid": "q-kb-i1", "commit": "a" * 40}
-    r = tick()
-    check("worker done event + hex commit is NOT completion", r["kb"] == "waiting:i1")
+    fc.acc.update({"q-kb-i3", "q-other-i1"})  # accepted for a different item / a different owner label
+    check("acceptance of another item/owner does not complete this one", tick()["kb"] == "waiting:i1")
+    fc.acc.difference_update({"q-kb-i3", "q-other-i1"})
     fc.acc.add("q-kb-i1")
     fc.ev["q-model-i1"] = {"event": "queue_blocked", "rid": "q-model-i1", "reason": "needs-harness"}
     fc.ev["q-monthly-i1"] = {"event": "queue_cancelled", "rid": "q-monthly-i1", "reason": "superseded"}
@@ -102,7 +121,7 @@ with tempfile.TemporaryDirectory() as t:
     check("queue_blocked freezes + escalates", r["model"] == "frozen:blocked:i1"
           and ("model", "i1", "blocked:needs-harness") in fc.notes)
     check("queue_cancelled advances without escalation", r["monthly"] == "cancelled:i1"
-          and not any(n[0] == "monthly" for n in fc.notes))
+          and not any(x[0] == "monthly" for x in fc.notes))
     r = tick()
     check("intentional hold i2 never dispatched; next is i3",
           r["kb"] == "dispatched:i3" and not any(c[1].endswith("-i2") for c in fc.calls))
@@ -110,40 +129,46 @@ with tempfile.TemporaryDirectory() as t:
 
     resume("model")
     fc.outcome["model"] = "held:not_dispatched:auth_envelope_mismatch"
-    r = tick()
-    check("post-consumption hold freezes (no retry, no re-grant)", r["model"] == "frozen:held_consumed:i3")
+    check("post-grant hold freezes (no retry, no re-grant)", tick()["model"] == "frozen:held_consumed:i3")
     fc.outcome.pop("model")
-    calls = len(fc.calls)
+    n = len(fc.calls)
     tick()
-    check("consumed-hold lane makes no further dispatch call", len(fc.calls) == calls)
+    check("consumed-hold lane makes no further dispatch call", len(fc.calls) == n)
     resume("model")
     r = tick()
-    check("after operator resume the consumed item is NOT retried", r["model"] == "idle:empty"
+    check("after resume the consumed item is NOT retried", r["model"] == "idle:empty"
           and fc.calls.count(("model", "q-model-i3")) == 1)
 
-    uroot = Path(t) / "u"
-    uroot.mkdir()
-    (uroot / "u.queue.json").write_text(json.dumps([{"id": "i1", "request": "u", "auth_id": "g-u-1"}]))
+    # --- crash between dispatch() and the ledger append -------------------------
+    c = mkroot(t, "crash", ["c"])
+    fc.jr["q-c-i1"] = "settled"  # the Dispatcher journaled + sent; our append never happened
+    r = tick(r=c, lanes=["c"])
+    check("crash window, journal settled: reconciled, dispatch() NOT called again",
+          r["c"] == "dispatched:i1:reconciled" and ("c", "q-c-i1") not in fc.calls)
+    fc.jr["q-c-i3"] = "intent_only"
+    fc.acc.add("q-c-i1")
+    tick(r=c, lanes=["c"])
+    r = tick(r=c, lanes=["c"])
+    check("crash window, intent without outcome: frozen uncertain, never dispatched",
+          r["c"] == "frozen:uncertain:i3" and ("c", "q-c-i3") not in fc.calls
+          and ("c", "i3", "uncertain:journal_intent_only") in fc.notes)
+
+    u = mkroot(t, "u", ["u"])
     fc.outcome["u"] = "dispatched:unregistered"
-    r = qs.tick(uroot, ["u"], fc, fc.accepted, fc.events, fc.notify, environ=ON)
-    check("dispatched:unregistered is uncertain: frozen + escalated", r["u"] == "frozen:uncertain:i1"
-          and ("u", "i1", "uncertain:dispatched:unregistered") in fc.notes)
-    with (uroot / "u.ledger.jsonl").open("a") as f:
-        f.write(json.dumps({"kind": "resume"}) + "\n")
+    r = tick(r=u, lanes=["u"])
+    check("dispatched:unregistered is uncertain: frozen + escalated", r["u"] == "frozen:uncertain:i1")
     fc.outcome.pop("u")
-    r = qs.tick(uroot, ["u"], fc, fc.accepted, fc.events, fc.notify, environ=ON)
-    check("uncertain item NEVER redispatched after resume", fc.calls.count(("u", "q-u-i1")) == 1
-          and r["u"] == "idle:empty")
+    tick(r=u, lanes=["u"])
+    resume("u", u)
+    for _ in range(2):  # "restart": fresh passes read only durable state
+        tick(r=u, lanes=["u"])
+    check("uncertain item never redispatched across resume/restart", fc.calls.count(("u", "q-u-i1")) == 1)
 
     with (root / "farm.ledger.jsonl").open("a") as f:
         f.write('{"kind": "dispa')
-    check("torn ledger line tolerated", tick()["farm"] == "waiting:i1")
-
-    (root / "kb.queue.json").write_text("{not json")
-    fc.acc.add("q-kb-i3")
-    tick()
-    r = tick()
-    check("malformed queue isolates to its lane", r["kb"].startswith("error:") and r["farm"] == "waiting:i1")
+    r1, r2 = tick()["farm"], tick()["farm"]
+    check("malformed ledger line FREEZES the lane (no guessing)", r1 == r2 == "frozen:ledger_corrupt")
+    check("ledger corruption escalated exactly once", sum(x == ("farm", "", "ledger_corrupt") for x in fc.notes) == 1)
 
     fd = os.open(root / ".tick.lock", os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -151,16 +176,65 @@ with tempfile.TemporaryDirectory() as t:
     os.close(fd)
     check("ledger files private 0600", all((p.stat().st_mode & 0o777) == 0o600 for p in root.glob("*.ledger.jsonl")))
 
+    # --- lane ceiling, priority order, bounded sends ----------------------------
+    many = [f"l{i:02d}" for i in range(16)]
+    check("more than 15 lanes refused", tick(lanes=many) == {"_": "refused:lanes"})
+    check("duplicate lane labels refused", tick(lanes=["kb", "kb"]) == {"_": "refused:lanes"})
+    six = ["revenue", "a", "b", "c", "d", "e"]
+    p = mkroot(t, "prio", six)
+    r = tick(r=p, lanes=six)
+    check("at most 4 sends per pass, in operator order (revenue first)",
+          [r[x] for x in six] == ["dispatched:i1"] * 4 + ["deferred:i1"] * 2)
+
+    # --- strict queue schema ----------------------------------------------------
+    bad = {
+        "unknown field": [{**item("i1", "s"), "priority": 1}],
+        "duplicate id": [item("i1", "s"), item("i1", "s")],
+        "manifest as string": [{**item("i1", "s"), "manifest": "result.md"}],
+        "manifest path escape": [{**item("i1", "s"), "manifest": ["../x"]}],
+        "manifest duplicate": [{**item("i1", "s"), "manifest": ["a.md", "a.md"]}],
+        "manifest too long": [{**item("i1", "s"), "manifest": [f"f{i}.md" for i in range(9)]}],
+        "non-bool hold": [{**item("i1", "s"), "hold": "yes"}],
+        "non-string request": [{**item("i1", "s"), "request": 5}],
+        "missing auth_id": [{"id": "i1", "request": "x"}],
+        "bad id chars": [item("../i1", "s")],
+    }
+    for name, q in bad.items():
+        try:
+            qs.validate_queue(q)
+            ok = False
+        except ValueError:
+            ok = True
+        check(f"schema rejects {name}", ok)
+    s = mkroot(t, "schema", ["s"])
+    (s / "s.queue.json").write_text(json.dumps(bad["manifest as string"]))
+    r = tick(r=s, lanes=["s"])
+    check("invalid queue never dispatches", r["s"].startswith("error:") and not any(c[0] == "s" for c in fc.calls))
+
     ev = Path(t) / "events.jsonl"
     ev.write_text('{"event":"queue_blocked","rid":"r1","reason":"a"}\nnot json\n'
                   '{"event":"x_done","rid":"r1"}\n{"event":"queue_cancelled","rid":"r1"}\n')
-    check("events adapter: last queue_* line for rid; skips malformed and *_done",
+    check("events adapter: last queue_* line for rid; ignores *_done",
           qs.latest_queue_event(ev, "r1")["event"] == "queue_cancelled"
           and qs.latest_queue_event(ev, "r2") is None and qs.latest_queue_event(Path(t) / "nope", "r1") is None)
 
 spec = importlib.util.spec_from_file_location("qs_cli", HERE / "queue-supervisor.py")
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
+
+with tempfile.TemporaryDirectory() as t:
+    j = Path(t)
+    (j / "kb" / "r-settled").mkdir(parents=True)
+    (j / "kb" / "r-settled" / "intent.json").write_text("{}")
+    (j / "kb" / "r-settled" / "settled.json").write_text("{}")
+    (j / "kb" / "r-intent").mkdir()
+    (j / "kb" / "r-intent" / "intent.json").write_text("{}")
+    (j / "kb" / "r-unc").mkdir()
+    (j / "kb" / "r-unc" / "uncertain.json").write_text("{}")
+    (j / "kb" / "r-link").symlink_to(j / "kb" / "r-settled")
+    check("journal adapter maps real Dispatcher outcome files",
+          [cli.journal_state(j, "kb", x) for x in ("r-none", "r-settled", "r-intent", "r-unc", "r-link")]
+          == [None, "settled", "intent_only", "uncertain", "uncertain"])
 
 
 def run(env):
