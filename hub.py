@@ -1919,20 +1919,29 @@ def _action_tick() -> None:
 
 QUEUE_SCRIPT = Path(__file__).resolve().parent / "queue-supervisor.py"
 QUEUE_TICK_EVERY_S = 120
-_QUEUE_LAST = [0.0]
+QUEUE_STUCK_AFTER_S = 300
+_QUEUE_RUNNER: list = []
 
 
 def _queue_tick() -> None:
     """Queue supervisor (lib/queue_supervisor.py): advance approved project lanes
     through the existing owner-dispatch fences. OFF unless HERDR_QUEUE_SUPERVISOR=1
-    is in the hub's environment; at most one pass per QUEUE_TICK_EVERY_S. Never raises."""
-    if os.environ.get("HERDR_QUEUE_SUPERVISOR") != "1" or time.time() - _QUEUE_LAST[0] < QUEUE_TICK_EVERY_S:
+    is in the hub's environment. NON-BLOCKING: one supervisor subprocess at a time,
+    polled each attention pass, so a hung pass never delays attention/action
+    ticks. A child past QUEUE_STUCK_AFTER_S is logged, never killed. Never raises."""
+    if os.environ.get("HERDR_QUEUE_SUPERVISOR") != "1":
         return
-    _QUEUE_LAST[0] = time.time()
+    if not _QUEUE_RUNNER:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("queue_supervisor", QUEUE_SCRIPT.parent / "lib" / "queue_supervisor.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _QUEUE_RUNNER.append(mod.TickRunner([sys.executable, str(QUEUE_SCRIPT)], QUEUE_TICK_EVERY_S, QUEUE_STUCK_AFTER_S))
     try:
-        r = subprocess.run([sys.executable, str(QUEUE_SCRIPT)], capture_output=True, text=True, timeout=300)
-        _live_log(f"queue tick rc={r.returncode} {r.stdout.strip()[:300]}")
-    except (OSError, subprocess.SubprocessError) as exc:
+        st = _QUEUE_RUNNER[0].poll()
+        if st not in ("running", "waiting"):
+            _live_log(f"queue tick {st}")
+    except OSError as exc:
         _live_log(f"queue tick failed: {exc}")
 
 

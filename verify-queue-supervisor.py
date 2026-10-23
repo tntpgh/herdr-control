@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -120,9 +121,13 @@ with tempfile.TemporaryDirectory() as t:
     check("result_availability accepted -> done", r["kb"] == "done:i1")
     check("queue_blocked freezes + escalates", r["model"] == "frozen:blocked:i1"
           and ("model", "i1", "blocked:needs-harness") in fc.notes)
-    check("queue_cancelled advances without escalation", r["monthly"] == "cancelled:i1"
+    check("FORGED owner-written queue_cancelled does NOT advance", r["monthly"] == "waiting:i1")
+    with (root / "monthly.ledger.jsonl").open("a") as f:  # conductor/operator receipt, 0600 private ledger
+        f.write(json.dumps({"kind": "cancelled", "item": "i1", "by": "operator"}) + "\n")
+    r_cancel = tick()
+    check("operator cancel in the private ledger advances, no escalation", r_cancel["monthly"] == "dispatched:i3"
           and not any(x[0] == "monthly" for x in fc.notes))
-    r = tick()
+    r = r_cancel
     check("intentional hold i2 never dispatched; next is i3",
           r["kb"] == "dispatched:i3" and not any(c[1].endswith("-i2") for c in fc.calls))
     check("blocked lane stays frozen", r["model"].startswith("frozen:blocked"))
@@ -228,6 +233,42 @@ with tempfile.TemporaryDirectory() as t:
     check("events adapter: last queue_* line for rid; ignores *_done",
           qs.latest_queue_event(ev, "r1")["event"] == "queue_cancelled"
           and qs.latest_queue_event(ev, "r2") is None and qs.latest_queue_event(Path(t) / "nope", "r1") is None)
+
+with tempfile.TemporaryDirectory() as t:
+    fc = FakeConductors()
+    lb = "l" * 48  # owner_lease LABEL_RE max
+    lr = Path(t)
+    (lr / f"{lb}.queue.json").write_text(json.dumps([{"id": "x" * 49, "request": "r", "auth_id": "g"},
+                                                     {"id": "y" * 50, "request": "r", "auth_id": "g"}]))
+    r = qs.tick(lr, [lb], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=ON)
+    check("RID boundary: q-<48>-<49> = 100 chars is dispatched", len(qs.rid_for(lb, "x" * 49)) == 100
+          and r[lb] == f"dispatched:{'x' * 49}")
+    fc.acc.add(qs.rid_for(lb, "x" * 49))
+    qs.tick(lr, [lb], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=ON)
+    n = len(fc.calls)
+    r = qs.tick(lr, [lb], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=ON)
+    check("RID 101 chars: frozen BEFORE journal read, grant or dispatch", r[lb] == f"frozen:invalid_rid:{'y' * 50}"
+          and len(fc.calls) == n and (lb, "y" * 50, "invalid_rid") in fc.notes)
+
+clock = [0.0]
+runner = qs.TickRunner([sys.executable, "-c", "import time; time.sleep(30)"], 120, 5, clock=lambda: clock[0])
+t0 = time.monotonic()
+states = [runner.poll()]
+for step in (1, 6, 200):  # attention passes while the supervisor child hangs
+    clock[0] = step
+    states.append(runner.poll())
+elapsed = time.monotonic() - t0
+check("hung supervisor tick never blocks the attention loop; one child, no overlap, no kill",
+      states == ["started", "running", "stuck", "stuck"] and elapsed < 2 and runner.proc.poll() is None)
+runner.proc.kill()  # test cleanup only
+runner.proc.wait()
+clock[0] = 400
+fast = qs.TickRunner([sys.executable, "-c", "print('{}')"], 120, 5, clock=lambda: clock[0])
+fast.poll()
+fast.proc.wait()
+clock[0] = 401
+check("finished child reaped; next start waits for the interval", fast.poll().startswith("finished rc=0")
+      and fast.poll() == "waiting")
 
 spec = importlib.util.spec_from_file_location("qs_cli", HERE / "queue-supervisor.py")
 cli = importlib.util.module_from_spec(spec)

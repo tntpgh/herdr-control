@@ -20,7 +20,9 @@ Completion is CONSUMED, never inferred:
              A worker-written event or a hash-shaped string is NOT completion.
   blocked    owner event {"event":"queue_blocked","rid":..,"reason":..}
              -> escalate once, lane frozen until the operator appends "resume"
-  cancelled  owner event {"event":"queue_cancelled","rid":..} -> advance
+  cancelled  ONLY a conductor/operator record {"kind":"cancelled","item":..} in
+             the conductor-private 0600 ledger. An owner-writable events.jsonl
+             queue_cancelled line is ignored (an owner cannot cancel its own work).
 Dispatch outcomes:
   dispatched/registered -> in flight
   held:not_dispatched:<r>, r in RETRY_SAFE (refused BEFORE the grant is
@@ -102,6 +104,9 @@ def validate_queue(items) -> list[dict]:
 
 def enabled(environ=os.environ) -> bool:
     return environ.get(ENV_FLAG) == "1"
+
+
+_RID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,100}$")  # result_availability.RID_RE
 
 
 def rid_for(label: str, item_id: str) -> str:
@@ -189,9 +194,6 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
             lane.append(kind="done", item=in_flight, evidence="result_availability:accepted")
             return f"done:{in_flight}"
         ev = events(lane.label, rid) or {}
-        if ev.get("event") == "queue_cancelled":
-            lane.append(kind="cancelled", item=in_flight, reason=str(ev.get("reason", "")))
-            return f"cancelled:{in_flight}"
         if ev.get("event") == "queue_blocked":
             reason = str(ev.get("reason", "blocked"))
             lane.append(kind="blocked", item=in_flight, reason=reason)
@@ -204,6 +206,10 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
     if nxt is None:
         return "idle:empty"
     rid = rid_for(lane.label, nxt["id"])
+    if not _RID_RE.match(rid):  # checked before any journal read, grant consumption or send
+        lane.append(kind="held_consumed", item=nxt["id"], outcome="invalid_rid")
+        _escalate(lane, escalated, notify, nxt["id"], "invalid_rid")
+        return f"frozen:invalid_rid:{nxt['id']}"
     # Crash window: the Dispatcher's journal is written before/after the send but
     # our ledger append comes after dispatch() returns. If the journal already
     # knows this rid, reconcile from it and NEVER call dispatch() again.
@@ -296,3 +302,37 @@ def latest_queue_event(events_file: Path, rid: str) -> dict | None:
     except (FileNotFoundError, NotADirectoryError):
         return None
     return last
+
+
+class TickRunner:
+    """Runs one supervisor subprocess at a time WITHOUT blocking the caller (the
+    hub attention loop). poll() never waits: it reaps a finished child, starts a
+    new one only when none is running and the interval has elapsed, and reports a
+    child that has run past `stuck_after_s` (it is never killed: a kill mid-send
+    is exactly the crash window the Dispatcher journal turns into `uncertain`,
+    and this keeps that the only path)."""
+
+    def __init__(self, argv: list[str], interval_s: float, stuck_after_s: float, clock=time.monotonic):
+        self.argv, self.interval_s, self.stuck_after_s, self.clock = argv, interval_s, stuck_after_s, clock
+        self.proc = None
+        self.started = None
+        self.last_start = None
+
+    def poll(self) -> str:
+        import subprocess
+
+        now = self.clock()
+        if self.proc is not None:
+            rc = self.proc.poll()
+            if rc is None:
+                return "stuck" if now - self.started >= self.stuck_after_s else "running"
+            out = (self.proc.stdout.read() if self.proc.stdout else "") or ""
+            self.proc = None
+            if self.last_start is not None and now - self.last_start < self.interval_s:
+                return f"finished rc={rc} {out.strip()[:200]}"
+        if self.last_start is not None and now - self.last_start < self.interval_s:
+            return "waiting"
+        self.proc = subprocess.Popen(self.argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                     start_new_session=True)
+        self.started = self.last_start = now
+        return "started"
