@@ -8,6 +8,7 @@ no pane, no network, no registry, no real stores."""
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -307,6 +308,52 @@ with tempfile.TemporaryDirectory() as t:
     rc, out = run(env)
     check("CLI never creates a missing auth store", rc == 4 and out.startswith("refused:")
           and not Path(f"{t}/missing-auth.db").exists())
+
+# --- M3: exhaustion record (lib/queue_supervisor.py:206-207 "idle:empty") --
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex"
+    root.mkdir()
+    (root / "x.queue.json").write_text("[]")
+    fc = FakeConductors()
+
+    def xtick(env=ON):
+        return qs.tick(root, ["x"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=env)
+
+    def ledger_kinds():
+        p = root / "x.ledger.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(line)["kind"] for line in p.read_text().splitlines()]
+
+    r = xtick()
+    check("empty queue -> idle:empty + exactly one exhausted record",
+          r["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 1)
+    check("exhaustion escalated exactly once", sum(n[0] == "x" for n in fc.notes) == 1)
+    rec = json.loads((root / "x.ledger.jsonl").read_text().splitlines()[0])
+    check("exhausted record carries lane, queue_sha and a timestamp",
+          rec["kind"] == "exhausted" and rec["lane"] == "x"
+          and rec["queue_sha"] == hashlib.sha256(b"[]").hexdigest() and isinstance(rec.get("at"), (int, float)))
+
+    xtick()
+    check("second tick, same empty queue: no duplicate exhausted record or re-escalation",
+          ledger_kinds().count("exhausted") == 1 and sum(n[0] == "x" for n in fc.notes) == 1)
+
+    (root / "x.queue.json").write_text(json.dumps([item("i1", "x")]))
+    fc.acc.add("q-x-i1")
+    check("new item re-arms the lane: dispatch resumes", xtick()["x"] == "dispatched:i1")
+    check("dispatched item settles", xtick()["x"] == "done:i1")
+    check("queue refilled then emptied again -> a NEW exhausted record (different digest)",
+          xtick()["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 2)
+    check("re-exhaustion escalated again", sum(n[0] == "x" for n in fc.notes) == 2)
+
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex_off"
+    root.mkdir()
+    (root / "x.queue.json").write_text("[]")
+    fc = FakeConductors()
+    r = qs.tick(root, ["x"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ={})
+    check("flag off: idle lane writes nothing, escalates nothing",
+          r == {"_": "off"} and not (root / "x.ledger.jsonl").exists() and not fc.notes)
 
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

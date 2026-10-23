@@ -23,6 +23,10 @@ Completion is CONSUMED, never inferred:
   cancelled  ONLY a conductor/operator record {"kind":"cancelled","item":..} in
              the conductor-private 0600 ledger. An owner-writable events.jsonl
              queue_cancelled line is ignored (an owner cannot cancel its own work).
+  exhausted  queue has no eligible item (all settled or held) -> ledger
+             record {"kind":"exhausted","lane":...,"queue_sha":...} once per
+             queue-content digest, escalated once; a queue edit (new digest)
+             re-arms it.
 Dispatch outcomes:
   dispatched/registered -> in flight
   held:not_dispatched:<r>, r in RETRY_SAFE (refused BEFORE the grant is
@@ -38,6 +42,7 @@ touches nothing.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -185,6 +190,16 @@ def _escalate(lane: Lane, escalated: set[str], notify: Notify, item: str, reason
     escalated.add(key)
 
 
+def _queue_digest(lane: Lane) -> str:
+    """sha256 of the queue file's raw bytes; a missing file is the canonical
+    empty list, matching Lane.queue()'s own FileNotFoundError handling. Used
+    to tell "still the same exhausted queue" from "the operator changed it"."""
+    try:
+        raw = lane.queue_path.read_bytes()
+    except FileNotFoundError:
+        raw = b"[]"
+    return hashlib.sha256(raw).hexdigest()
+
 def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify,
               journal: Journal, may_dispatch: bool = True) -> str:
     in_flight, frozen, settled, escalated = _lane_state(lane.ledger())
@@ -204,6 +219,11 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
         return f"frozen:{frozen}"
     nxt = next((i for i in lane.queue() if i["id"] not in settled and not i.get("hold")), None)
     if nxt is None:
+        digest = _queue_digest(lane)
+        key = f"exhausted:{digest}"
+        if key not in escalated:  # first time THIS queue content is exhausted
+            lane.append(kind="exhausted", lane=lane.label, queue_sha=digest)
+            _escalate(lane, escalated, notify, "exhausted", digest)
         return "idle:empty"
     rid = rid_for(lane.label, nxt["id"])
     if not _RID_RE.match(rid):  # checked before any journal read, grant consumption or send
