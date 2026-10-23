@@ -313,6 +313,84 @@ check("STANDING QUEUE SHA: an edit after signing -> held queue_sha_mismatch, i2 
 check("STANDING: the default per-item path (GrantDispatch, LANES above) is untouched by any of this",
       store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE kind='standing'").fetchone()[0] == 3)
 
+# ---- (4) cost_cents threading through the REAL qs.tick/validate_queue pipeline
+# (never calling StandingDispatch.dispatch() directly): a validated cost, a
+# missing cost under a real spend cap, a validated cost that overruns the
+# cap, and an operator's malformed cost_cents rejected by the shared queue
+# schema (lib/queue_supervisor.validate_queue) before any dispatch at all. ----
+COST_LANES = ["proj-standing-cost", "proj-standing-budget", "proj-standing-malformed"]
+for i, lb in enumerate(COST_LANES):
+    PANE[lb] = (f"wC:p{i}", f"term_{lb.replace('-', '')}")
+    SESS[lb] = hashlib.sha256(f"session-{lb}".encode()).hexdigest()
+    ol.register_owner(lc, lb, f"tntpgh/{lb}", now=time.time())
+    ol.acquire(lc, lb, *PANE[lb], TTL, time.time(), session_digest=SESS[lb])
+    REG[lb] = (*PANE[lb], SESS[lb])
+    roots[lb] = base / f"root-{lb}"
+    roots[lb].mkdir()
+    av.roots[lb] = str(roots[lb])
+
+LB_COST = "proj-standing-cost"
+queue(LB_COST, [{"id": "i1", "request": "cost 1\n", "manifest": M, "auth_id": f"standing-{LB_COST}", "cost_cents": 40},
+               {"id": "i2", "request": "cost 2\n", "manifest": M, "auth_id": f"standing-{LB_COST}", "cost_cents": 40},
+               {"id": "i3", "request": "cost 3\n", "manifest": M, "auth_id": f"standing-{LB_COST}"}])
+qsha_cost = hashlib.sha256((qroot / f"{LB_COST}.queue.json").read_bytes()).hexdigest()
+grant_standing(LB_COST, item_cap=5, queue_sha=qsha_cost, spend_cap=100)
+
+r = tick_standing([LB_COST])
+check("STANDING COST: a validated cost_cents item dispatches through the real validate_queue + adapter",
+      r[LB_COST] == "dispatched:i1"
+      and store.execute("SELECT spent_cents FROM owner_dispatch_auth WHERE auth_id=?",
+                        (f"standing-{LB_COST}",)).fetchone()[0] == 40)
+ok_c1 = settle(LB_COST, "q-proj-standing-cost-i1", "ACK cost i1")
+r = tick_standing([LB_COST])
+check("STANDING COST: item1 settles", ok_c1 and r[LB_COST] == "done:i1")
+r = tick_standing([LB_COST])
+check("STANDING COST: item2's validated cost accumulates spend through the real pipeline",
+      r[LB_COST] == "dispatched:i2"
+      and store.execute("SELECT spent_cents FROM owner_dispatch_auth WHERE auth_id=?",
+                        (f"standing-{LB_COST}",)).fetchone()[0] == 80)
+ok_c2 = settle(LB_COST, "q-proj-standing-cost-i2", "ACK cost i2")
+r = tick_standing([LB_COST])
+check("STANDING COST: item2 settles", ok_c2 and r[LB_COST] == "done:i2")
+r = tick_standing([LB_COST])
+check("STANDING COST: a queued item with NO cost_cents against a REAL spend cap is held, never spent as free",
+      r[LB_COST].startswith("frozen:held_consumed:i3")
+      and store.execute("SELECT spent_cents FROM owner_dispatch_auth WHERE auth_id=?",
+                        (f"standing-{LB_COST}",)).fetchone()[0] == 80)
+
+LB_BUDGET = "proj-standing-budget"
+queue(LB_BUDGET, [{"id": "j1", "request": "budget 1\n", "manifest": M, "auth_id": f"standing-{LB_BUDGET}", "cost_cents": 90},
+                 {"id": "j2", "request": "budget 2\n", "manifest": M, "auth_id": f"standing-{LB_BUDGET}", "cost_cents": 30}])
+qsha_budget = hashlib.sha256((qroot / f"{LB_BUDGET}.queue.json").read_bytes()).hexdigest()
+grant_standing(LB_BUDGET, item_cap=5, queue_sha=qsha_budget, spend_cap=100)
+check("STANDING: the cost and budget parents land alongside the original 3 standing grants",
+      store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE kind='standing'").fetchone()[0] == 5)
+
+r = tick_standing([LB_BUDGET])
+check("STANDING BUDGET: first item's validated cost (90) dispatches under the 100 cap",
+      r[LB_BUDGET] == "dispatched:j1"
+      and store.execute("SELECT spent_cents FROM owner_dispatch_auth WHERE auth_id=?",
+                        (f"standing-{LB_BUDGET}",)).fetchone()[0] == 90)
+ok_b1 = settle(LB_BUDGET, "q-proj-standing-budget-j1", "ACK budget j1")
+r = tick_standing([LB_BUDGET])
+check("STANDING BUDGET: item1 settles", ok_b1 and r[LB_BUDGET] == "done:j1")
+r = tick_standing([LB_BUDGET])
+check("STANDING BUDGET: a validated cost (30) that would push spend past the cap (90+30>100) is held, nothing inserted",
+      r[LB_BUDGET].startswith("frozen:held_consumed:j2")
+      and store.execute("SELECT spent_cents FROM owner_dispatch_auth WHERE auth_id=?",
+                        (f"standing-{LB_BUDGET}",)).fetchone()[0] == 90
+      and store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE parent=?",
+                        (f"standing-{LB_BUDGET}",)).fetchone()[0] == 1)
+
+LB_MALFORMED = "proj-standing-malformed"
+queue(LB_MALFORMED, [{"id": "k1", "request": "bad cost\n", "manifest": M,
+                     "auth_id": f"standing-{LB_MALFORMED}", "cost_cents": "forty"}])
+r = tick_standing([LB_MALFORMED])
+check("STANDING MALFORMED: a non-int cost_cents is rejected by the shared queue schema before any dispatch",
+      r[LB_MALFORMED] == "error:ValueError"
+      and store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE owner_label=?",
+                        (LB_MALFORMED,)).fetchone()[0] == 0)
+
 print("send.calls", [(c[0], c[2].decode().strip()) for c in send.calls])
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

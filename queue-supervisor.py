@@ -80,7 +80,12 @@ class StandingDispatch:
     right before authorization, rather than reusing tick_lane's earlier
     snapshot: the grant is bound to the queue content AT THE MOMENT OF
     CONSUMPTION, so an edit landing between item-selection and send must
-    still be caught."""
+    still be caught. The SAME fresh bytes also carry the item's OWN
+    cost_cents (optional, validated here, never fabricated as 0): a queue
+    item MAY name {"cost_cents": <non-negative int>}; consume_standing
+    refuses standing_cost_missing when the grant has a real spend_cap_cents
+    and this item's cost is absent or not a validated non-negative int --
+    it never silently spends 0 against a real cap."""
 
     def __init__(self, gate, avail, send, resolve, store, lease_conn, root: Path):
         self.gate, self.avail, self.send, self.resolve, self.store = gate, avail, send, resolve, store
@@ -94,14 +99,44 @@ class StandingDispatch:
         except FileNotFoundError:
             raw = b"[]"
         queue_sha256 = hashlib.sha256(raw).hexdigest()
+        cost_cents = _item_cost_cents(raw, label, rid)
 
         def authorize(lb, project, holder, r, sha, man, now):
             return oda.consume_standing(self.store, auth_id, label=lb, project=project, holder=holder,
                                         request_id=r, body_sha256=sha, manifest=man, now=now,
-                                        queue_sha256=queue_sha256, lease_conn=self.lease_conn)
+                                        queue_sha256=queue_sha256, lease_conn=self.lease_conn,
+                                        cost_cents=cost_cents)
 
         return od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
             label, rid, request_text, manifest)
+
+
+def _item_cost_cents(raw: bytes, label: str, rid: str) -> int | None:
+    """The VALIDATED cost_cents (non-negative int) the operator priced the
+    queue item named by `rid` at, read from THIS exact snapshot of
+    <label>.queue.json; None when the item is missing from this snapshot,
+    carries no cost_cents field, or carries one that is not a validated
+    non-negative int. NEVER coerced to 0 here -- only consume_standing
+    decides whether a None cost actually matters (it does only when the
+    grant's spend_cap_cents is set), so an unpriced item under a lane with
+    no spend cap still dispatches normally."""
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        iid = item.get("id")
+        if not isinstance(iid, str) or qs.rid_for(label, iid) != rid:
+            continue
+        cost = item.get("cost_cents")
+        if isinstance(cost, int) and not isinstance(cost, bool) and cost >= 0:
+            return cost
+        return None
+    return None
 
 
 def journal_state(jroot: Path, label: str, rid: str) -> str | None:

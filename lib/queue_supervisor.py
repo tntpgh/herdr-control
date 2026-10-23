@@ -11,7 +11,11 @@ Inputs (operator-approved, never written here):
   <root>/<label>.queue.json
     [{"id": "...", "request": "...", "manifest": ["..."], "auth_id": "...", "hold": false}]
   "hold": true is an intentional hold: skipped, never dispatched. auth_id names
-  the one-time grant the operator issued for exactly that request.
+  the one-time grant the operator issued for exactly that request. cost_cents
+  (optional) is a strict non-negative int the operator priced the item at --
+  bool/float/str/negative is a validation error, never coerced; a queue that
+  never prices any item validates exactly as before (GrantDispatch, the
+  default per-item path, never reads it).
 State: <root>/<label>.ledger.jsonl, append-only, fsynced, 0600.
 
 Completion is CONSUMED, never inferred:
@@ -62,7 +66,7 @@ FREEZING = {"blocked", "uncertain", "held_consumed"}
 MAX_LANES = 5  # operator-requested 1-5 canonical lanes
 MAX_IN_FLIGHT = 5  # TOTAL dispatched-and-unsettled items across all lanes and ticks
 MAX_DISPATCH_PER_TICK = 4  # additionally: at most this many new sends per pass
-ITEM_KEYS = {"id", "request", "manifest", "auth_id", "hold"}
+ITEM_KEYS = {"id", "request", "manifest", "auth_id", "hold", "cost_cents"}
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")  # result_availability.NAME_RE
 MAX_MANIFEST = 8  # result_availability.MAX_MANIFEST
@@ -104,6 +108,10 @@ def validate_queue(items) -> list[dict]:
             raise ValueError(f"manifest: {i['id']}")
         if not isinstance(i.get("hold", False), bool):
             raise ValueError(f"hold: {i['id']}")
+        if "cost_cents" in i:
+            cost = i["cost_cents"]
+            if not isinstance(cost, int) or isinstance(cost, bool) or cost < 0:
+                raise ValueError(f"cost_cents: {i['id']}")
     return items
 
 

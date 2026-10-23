@@ -218,6 +218,10 @@ with tempfile.TemporaryDirectory() as t:
         "non-string request": [{**item("i1", "s"), "request": 5}],
         "missing auth_id": [{"id": "i1", "request": "x"}],
         "bad id chars": [item("../i1", "s")],
+        "cost_cents as string": [item("i1", "s", cost_cents="40")],
+        "cost_cents as bool": [item("i1", "s", cost_cents=True)],
+        "cost_cents as float": [item("i1", "s", cost_cents=1.5)],
+        "cost_cents negative": [item("i1", "s", cost_cents=-1)],
     }
     for name, q in bad.items():
         try:
@@ -226,6 +230,9 @@ with tempfile.TemporaryDirectory() as t:
         except ValueError:
             ok = True
         check(f"schema rejects {name}", ok)
+    check("schema accepts a valid non-negative int cost_cents and leaves it on the item",
+          qs.validate_queue([item("i1", "s", cost_cents=0)])[0]["cost_cents"] == 0
+          and qs.validate_queue([item("i2", "s")])[0].get("cost_cents") is None)
     s = mkroot(t, "schema", ["s"])
     (s / "s.queue.json").write_text(json.dumps(bad["manifest as string"]))
     r = tick(r=s, lanes=["s"])
