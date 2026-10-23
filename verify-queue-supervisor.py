@@ -180,7 +180,7 @@ with tempfile.TemporaryDirectory() as t:
     many = [f"l{i:02d}" for i in range(16)]
     check("more than 15 lanes refused", tick(lanes=many) == {"_": "refused:lanes"})
     check("duplicate lane labels refused", tick(lanes=["kb", "kb"]) == {"_": "refused:lanes"})
-    six = ["revenue", "a", "b", "c", "d", "e"]
+    six = ["revenue", "p1", "p2", "p3", "p4", "p5"]
     p = mkroot(t, "prio", six)
     r = tick(r=p, lanes=six)
     check("at most 4 sends per pass, in operator order (revenue first)",
