@@ -13,9 +13,17 @@ finds a mismatch / consumed-unsent grant (same rule as owner-dispatch.py).
 Env: HERDR_QUEUE_SUPERVISOR_ROOT (queue + ledger dir), HERDR_QUEUE_SUPERVISOR_LANES
 (comma-separated owner labels). Escalations append to <root>/escalations.jsonl
 for the hub/attention surface; this script contacts no one.
+
+HERDR_QUEUE_SUPERVISOR_STANDING=1 (default OFF) swaps GrantDispatch for
+StandingDispatch: the per-item fence (lease, DeliveryGate, journal) is
+IDENTICAL, only which grant each dispatch consumes changes -- a single-use
+row (GrantDispatch, oda.consume) or a fresh single-use child minted under a
+standing row (StandingDispatch, oda.consume_standing). Off, this file's
+behavior is byte-for-byte what it was before M9.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -48,6 +56,49 @@ class GrantDispatch:
         def authorize(lb, project, holder, r, sha, man, now):
             return oda.consume(self.store, auth_id, label=lb, project=project, holder=holder, request_id=r,
                                body_sha256=sha, manifest=man, now=now)
+
+        return od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
+            label, rid, request_text, manifest)
+
+
+STANDING_ENV_FLAG = "HERDR_QUEUE_SUPERVISOR_STANDING"
+
+
+def standing_enabled(environ=os.environ) -> bool:
+    return environ.get(STANDING_ENV_FLAG) == "1"
+
+
+class StandingDispatch:
+    """qs.Dispatch over one od.Dispatcher using the STANDING grant named by
+    the item's auth_id (oda.consume_standing): each dispatch mints its own
+    single-use child under that parent row instead of consuming a one-time
+    grant. Active only when the conductor wires THIS class in instead of
+    GrantDispatch (standing_enabled()); the Dispatcher and its fences are
+    otherwise identical to the default per-item path.
+
+    root: the SAME queue dir queue_supervisor reads -- re-read fresh here,
+    right before authorization, rather than reusing tick_lane's earlier
+    snapshot: the grant is bound to the queue content AT THE MOMENT OF
+    CONSUMPTION, so an edit landing between item-selection and send must
+    still be caught."""
+
+    def __init__(self, gate, avail, send, resolve, store, lease_conn, root: Path):
+        self.gate, self.avail, self.send, self.resolve, self.store = gate, avail, send, resolve, store
+        self.lease_conn, self.root = lease_conn, root
+
+    def dispatch(self, label, rid, request_text, manifest, auth_id):
+        if not auth_id:
+            return "held:not_dispatched:auth_missing"
+        try:
+            raw = (self.root / f"{label}.queue.json").read_bytes()
+        except FileNotFoundError:
+            raw = b"[]"
+        queue_sha256 = hashlib.sha256(raw).hexdigest()
+
+        def authorize(lb, project, holder, r, sha, man, now):
+            return oda.consume_standing(self.store, auth_id, label=lb, project=project, holder=holder,
+                                        request_id=r, body_sha256=sha, manifest=man, now=now,
+                                        queue_sha256=queue_sha256, lease_conn=self.lease_conn)
 
         return od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
             label, rid, request_text, manifest)
@@ -139,7 +190,9 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
         if bad:
             print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad.items())))
             return 4
-        out = qs.tick(qroot, [x for x in lanes.split(",") if x], GrantDispatch(gate, avail, send, resolve, store),
+        dispatcher = (StandingDispatch(gate, avail, send, resolve, store, lconn, qroot)
+                     if standing_enabled(environ) else GrantDispatch(gate, avail, send, resolve, store))
+        out = qs.tick(qroot, [x for x in lanes.split(",") if x], dispatcher,
                       accepted, events, notify, journal, environ=environ)
     finally:
         store.close()
