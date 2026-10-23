@@ -16,8 +16,15 @@ it also covers every form already on disk. Three cases, by what the form has:
    guide forms): the template's dark palette is set on those variables.
 3. Already dark by declaration (`color-scheme: dark`): only the meta is added.
 4. Light-only (no dark variant at all): the page is colour-inverted, with
-   media re-inverted so photos stay true. Recolouring such a form by hand
-   would leave its hard-coded light backgrounds under forced light text.
+   media re-inverted so photos stay true. `color` is pinned on `html`
+   alongside `background` so an UNSTYLED page (no author CSS at all, e.g.
+   owner-dispatch-issue.py's render_form()) inverts from a KNOWN pair
+   instead of from the `color-scheme: dark` meta's own implicit UA text
+   color — pinning the live value first avoids the meta's dark default
+   getting inverted a second time, landing text and background at nearly
+   the same post-invert shade (unreadable until selected: Terrence,
+   2026-10-23). Recolouring such a form by hand would leave its
+   hard-coded light backgrounds under forced light text.
 """
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ import re
 
 MARKER = 'id="herdr-force-dark"'
 _META = '<meta name="color-scheme" content="dark">'
-_INVERT = ("html{filter:invert(.92) hue-rotate(180deg);background:#fff}"
+_INVERT = ("html{filter:invert(.92) hue-rotate(180deg);background:#fff;color:#000}"
            "img,video,picture,canvas,svg image{filter:invert(1) hue-rotate(180deg)}")
 
 _DARK_MEDIA = re.compile(r"@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{", re.I)
