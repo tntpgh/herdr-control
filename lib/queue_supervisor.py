@@ -160,25 +160,47 @@ class Lane:
 
 
 def _lane_state(ledger: list[dict]):
-    """-> (in_flight_item | None, frozen_reason | None, settled_ids, escalated_keys)"""
+    """-> (in_flight_item | None, frozen_reason | None, settled_ids, escalated_keys,
+    open_exhaustion_digest | None, exhausted_episode_count)
+
+    open_exhaustion_digest is the queue_sha of the most recent 'exhausted'
+    record, UNLESS some OTHER state-changing record (dispatched/terminal/
+    freezing) was written after it -- that is real activity, proof the lane
+    was not sitting idle, so it closes the episode. The same digest showing
+    up empty again later is then a NEW episode, not a duplicate of the old
+    one. exhausted_episode_count is the total number of 'exhausted' records
+    ever written for this lane; it gives each episode (even a same-digest
+    repeat) its own escalation key, so re-exhaustion re-notifies instead of
+    being silently absorbed by the first episode's lifetime escalation key.
+    An 'escalated' record (including the exhaustion's own notification
+    receipt) never closes its own episode -- notification delivery is
+    tracked separately via `escalated`."""
     in_flight = frozen = None
     settled: set[str] = set()
     escalated: set[str] = set()
+    exhausted: str | None = None
+    exhausted_episode = 0
     for r in ledger:
         kind, item = r.get("kind"), r.get("item")
         if kind == "dispatched":
             in_flight = item
+            exhausted = None
         elif kind in TERMINAL:
             settled.add(item)
             in_flight = None if in_flight == item else in_flight
+            exhausted = None
         elif kind in FREEZING:
             settled.add(item)
             in_flight, frozen = None, f"{kind}:{item}"
+            exhausted = None
         elif kind == "resume":
             frozen = None
         elif kind == "escalated":
             escalated.add(r.get("key", ""))
-    return in_flight, frozen, settled, escalated
+        elif kind == "exhausted":
+            exhausted = r.get("queue_sha")
+            exhausted_episode += 1
+    return in_flight, frozen, settled, escalated, exhausted, exhausted_episode
 
 
 def _escalate(lane: Lane, escalated: set[str], notify: Notify, item: str, reason: str) -> None:
@@ -200,9 +222,10 @@ def _queue_digest(lane: Lane) -> str:
         raw = b"[]"
     return hashlib.sha256(raw).hexdigest()
 
+
 def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Events, notify: Notify,
               journal: Journal, may_dispatch: bool = True) -> str:
-    in_flight, frozen, settled, escalated = _lane_state(lane.ledger())
+    in_flight, frozen, settled, escalated, exhausted_open, exhausted_episode = _lane_state(lane.ledger())
     if in_flight is not None:
         rid = rid_for(lane.label, in_flight)
         if accepted(lane.label, rid):
@@ -220,10 +243,10 @@ def tick_lane(lane: Lane, dispatcher: Dispatch, accepted: Accepted, events: Even
     nxt = next((i for i in lane.queue() if i["id"] not in settled and not i.get("hold")), None)
     if nxt is None:
         digest = _queue_digest(lane)
-        key = f"exhausted:{digest}"
-        if key not in escalated:  # first time THIS queue content is exhausted
-            lane.append(kind="exhausted", lane=lane.label, queue_sha=digest)
-            _escalate(lane, escalated, notify, "exhausted", digest)
+        if exhausted_open != digest:  # durable episode marker, checked BEFORE writing
+            lane.append(kind="exhausted", lane=lane.label, queue_sha=digest)  # idempotent across retries
+            exhausted_episode += 1  # this tick's fresh episode ordinal
+        _escalate(lane, escalated, notify, "exhausted", f"{digest}:{exhausted_episode}")
         return "idle:empty"
     rid = rid_for(lane.label, nxt["id"])
     if not _RID_RE.match(rid):  # checked before any journal read, grant consumption or send

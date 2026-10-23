@@ -42,6 +42,7 @@ class FakeConductors:
         self.ev: dict[str, dict] = {}
         self.jr: dict[str, str] = {}  # rid -> journal verdict
         self.notes: list[tuple[str, str, str]] = []
+        self.fail_notify: set[str] = set()  # labels whose notify() raises (delivery-failure fixture)
 
     def dispatch(self, label, rid, request_text, manifest, auth_id):
         self.calls.append((label, rid))
@@ -68,6 +69,8 @@ class FakeConductors:
         return self.jr.get(rid)
 
     def notify(self, label, item, reason):
+        if label in self.fail_notify:
+            raise RuntimeError("notify unavailable")
         self.notes.append((label, item, reason))
 
 
@@ -346,6 +349,18 @@ with tempfile.TemporaryDirectory() as t:
           xtick()["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 2)
     check("re-exhaustion escalated again", sum(n[0] == "x" for n in fc.notes) == 2)
 
+    (root / "x.queue.json").write_text("[]")  # revert to the ORIGINAL empty content
+    r = xtick()
+    check("same digest reappearing after real activity (dispatch+settle) in between "
+          "is a NEW episode, not a duplicate of the first",
+          r["x"] == "idle:empty" and ledger_kinds().count("exhausted") == 3)
+    exhausted_shas = [json.loads(line)["queue_sha"] for line in (root / "x.ledger.jsonl").read_text().splitlines()
+                       if json.loads(line)["kind"] == "exhausted"]
+    check("1st and 3rd exhausted records share the original digest; 2nd (refilled queue) differs",
+          exhausted_shas[0] == exhausted_shas[2] == hashlib.sha256(b"[]").hexdigest()
+          and exhausted_shas[1] != exhausted_shas[0])
+    check("re-armed episode escalates again too", sum(n[0] == "x" for n in fc.notes) == 3)
+
 with tempfile.TemporaryDirectory() as t:
     root = Path(t) / "ex_off"
     root.mkdir()
@@ -354,6 +369,35 @@ with tempfile.TemporaryDirectory() as t:
     r = qs.tick(root, ["x"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ={})
     check("flag off: idle lane writes nothing, escalates nothing",
           r == {"_": "off"} and not (root / "x.ledger.jsonl").exists() and not fc.notes)
+
+# --- M3 fix: notify() failure must not duplicate the durable 'exhausted' record ---
+with tempfile.TemporaryDirectory() as t:
+    root = Path(t) / "ex_notify_fail"
+    root.mkdir()
+    (root / "y.queue.json").write_text("[]")
+    fc = FakeConductors()
+    fc.fail_notify.add("y")
+
+    def ytick():
+        return qs.tick(root, ["y"], fc, fc.accepted, fc.events, fc.notify, fc.journal, environ=ON)
+
+    def ykinds():
+        p = root / "y.ledger.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(line)["kind"] for line in p.read_text().splitlines()]
+
+    r1 = ytick()
+    check("notify failure on first exhaustion: durable record still lands exactly once",
+          r1["y"].startswith("error:") and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 0)
+    r2 = ytick()
+    check("retry while notify keeps failing: no duplicate exhausted record",
+          r2["y"].startswith("error:") and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 0)
+    fc.fail_notify.discard("y")
+    r3 = ytick()
+    check("notify recovers: escalation completes, still exactly one exhausted record",
+          r3["y"] == "idle:empty" and ykinds().count("exhausted") == 1 and ykinds().count("escalated") == 1
+          and sum(n[0] == "y" for n in fc.notes) == 1)
 
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)
