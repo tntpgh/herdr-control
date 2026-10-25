@@ -46,6 +46,35 @@ refused by triggers), keyed by auth_id + envelope_sha256 of the grant row:
 This module has NO function that writes a grant. A worker or caller cannot
 authorize itself. Issuing a grant is a separate, unapproved surface; tests
 insert fixture rows directly into a disposable store.
+
+Standing grants (M9, default OFF): one row with kind='standing' binds a
+LANE (owner_label, project), a holder FLOOR (pane_id, pane_birth,
+session_digest, lease_generation), an item cap, an optional spend cap and
+the sha256 of the approved queue.json -- never a single request. Each
+dispatched item instead gets its own single-use CHILD row, inserted
+pre-consumed (status='consumed', parent=<standing auth_id>) by
+consume_standing(), which never touches consume()'s one-time-grant path.
+UNIQUE(parent, request_id) makes a child impossible to insert twice for the
+same item, so the UPDATE-style double-spend guard above is unnecessary
+there; consume_standing uses an explicit pre-check instead for a clearer
+hold reason. The parent's own status stays 'granted' for its whole life
+(existing revoke() denies it exactly like any other row) -- it is never
+itself marked 'consumed'. A generation above the floor is accepted only
+under the §8a restart rule: same holder, the floor generation released
+reason='expired' with zero open requests, and the live generation is
+EXACTLY floor+1 -- verified against the lease DB, not assumed from holder
+tuple equality alone.
+
+migrate() is VERSIONED (owner_dispatch_auth_schema_version, mirroring
+lib/owner_lease.py's MIGRATIONS): v1 is the schema exactly as first shipped
+(0ac8ba1f); v2 (M9) ADD COLUMNs the seven standing-grant fields and adds
+ONE new index, onto whatever a v1 store already holds. ALTER TABLE ADD
+COLUMN never touches an existing row's data and the new UNIQUE(parent,
+request_id) index is safe against any pre-existing data (every row older
+than M9 has parent=NULL, and SQLite never treats NULLs as a collision) --
+an EXISTING store upgrades with every row preserved, never deleted or
+rewritten. A fresh store reaches the identical end schema by applying both
+versions in order.
 """
 from __future__ import annotations
 
@@ -55,6 +84,7 @@ import os
 import sqlite3
 import stat
 import time
+import uuid
 
 import private_sqlite
 
@@ -120,11 +150,53 @@ ISSUANCE_SCHEMA = (
 OUTCOMES = ("confirmed_delivered", "confirmed_not_delivered", "abandoned_uncertain")
 
 
-def migrate(conn: sqlite3.Connection) -> None:
-    """Creates the tables in a store the CALLER chose (tests: a temp file)."""
-    conn.execute(SCHEMA)
-    for stmt in OPERATOR_SCHEMA + ISSUANCE_SCHEMA:
-        conn.execute(stmt)
+MIGRATIONS = {
+    # v1 is the ORIGINAL schema exactly as first shipped (0ac8ba1f, M2).
+    # Never edit this entry: a store at v1 exists with exactly these
+    # columns/tables. CREATE TABLE/TRIGGER IF NOT EXISTS is idempotent, so
+    # re-applying v1 to a store a pre-versioned migrate() already built is
+    # always a safe no-op.
+    1: (SCHEMA,) + OPERATOR_SCHEMA + ISSUANCE_SCHEMA,
+    # v2 (M9, default OFF): standing-grant columns, additive only.
+    2: (
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'"
+        " CHECK (kind IN ('single','standing'))",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN parent TEXT REFERENCES owner_dispatch_auth(auth_id)",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN queue_sha256 TEXT",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN item_cap INTEGER",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN spend_cap_cents INTEGER",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE owner_dispatch_auth ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0",
+        "CREATE UNIQUE INDEX owner_dispatch_auth_parent_request ON owner_dispatch_auth(parent, request_id)",
+    ),
+}
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Applies pending versioned migrations, in order, inside ONE transaction,
+    preserving every existing row: v1 (CREATE TABLE/TRIGGER IF NOT EXISTS,
+    a no-op on an already-v1 store) then v2 (M9, ALTER TABLE ADD COLUMN plus
+    one new index -- no DELETE, no table rebuild, no row touched). Safe to
+    call against a BRAND NEW store, an existing v1 (pre-M9) store with real
+    rows, or an already-v2 store (re-applying is a no-op via the version
+    check). Returns the resulting schema version."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS owner_dispatch_auth_schema_version"
+                     " (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
+        cur = conn.execute("SELECT COALESCE(MAX(version),0) FROM owner_dispatch_auth_schema_version").fetchone()[0]
+        for v in sorted(MIGRATIONS):
+            if v > cur:
+                for stmt in MIGRATIONS[v]:
+                    conn.execute(stmt)
+                conn.execute("INSERT INTO owner_dispatch_auth_schema_version VALUES (?,?)", (v, _now_iso()))
+                cur = v
+        conn.execute("COMMIT")
+        return cur
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def manifest_key(manifest) -> str:
@@ -177,6 +249,109 @@ def consume(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str,
                 conn.execute("ROLLBACK")
     except (sqlite3.Error, TypeError, ValueError) as exc:
         return f"auth_ambiguous:{type(exc).__name__}"
+
+
+def consume_standing(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str, holder, request_id: str,
+                     body_sha256: str, manifest, now: float, queue_sha256: str,
+                     lease_conn: sqlite3.Connection | None = None, cost_cents: int | None = None):
+    """The consumed CHILD envelope (dict, same shape consume() returns) when
+    this call inserted a new single-use child row under the standing grant
+    `auth_id`; else a hold reason (str). Never raises. Inserts exactly one
+    child row and bumps the parent's counters, or writes nothing.
+
+    holder = the CURRENT live (pane_id, pane_birth, session_digest,
+    generation), exactly as consume() expects. A generation above the
+    grant's floor is accepted ONLY under the §8a restart rule, which needs
+    `lease_conn` (the owner-lease store) to verify: the floor generation's
+    own lease row was released reason='expired', had zero OPEN
+    owner_requests, and the live generation is EXACTLY floor+1 with the
+    identical (pane_id, pane_birth, session_digest) the grant names. Without
+    `lease_conn`, or outside that exact window, any generation other than
+    the floor is standing_holder_changed -- the fence is never relaxed on
+    trust alone.
+
+    queue_sha256 is the CALLER's fresh digest of the exact queue.json bytes
+    at THIS moment (never a digest reused from an earlier read in the same
+    tick): a mismatch refuses queue_sha_mismatch even when this item's own
+    body_sha256 still looks fine -- the grant is bound to the whole signed
+    queue, not to one item in isolation.
+
+    cost_cents is the CALLER's validated per-item cost, or None when none
+    was ever validated (never coerced to a free 0 by THIS function). It is
+    only load-bearing when the grant has a real spend_cap_cents: an absent
+    or malformed cost_cents against an active cap is standing_cost_missing,
+    never silently treated as free -- a fabricated zero would let an
+    unpriced item through a real cap for nothing. Without a cap, cost_cents
+    is recorded for audit only (0 when not a validated non-negative int)."""
+    pane, birth, sess, gen = holder
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT protocol, owner_label, project, pane_id, pane_birth, session_digest, lease_generation,"
+                " prompt_id, approval_id, status, expires_at, queue_sha256, item_cap, spend_cap_cents,"
+                " used_count, spent_cents FROM owner_dispatch_auth WHERE auth_id=? AND kind='standing'",
+                (auth_id,)).fetchone()
+            if row is None:
+                return "standing_missing"
+            (proto, lb, pj, g_pane, g_birth, g_sess, floor_gen, prompt, approval, st, exp,
+             g_qsha, item_cap, spend_cap, used, spent) = row
+            if proto != PROTOCOL or lb != label or pj != project or not project:
+                return "standing_mismatch"
+            if st == "denied":
+                return "standing_denied"
+            if st != "granted":
+                return "standing_mismatch"
+            if not isinstance(exp, (int, float)) or now >= exp:
+                return "standing_expired"
+            if (pane, birth, sess) != (g_pane, g_birth, g_sess) or gen < floor_gen:
+                return "standing_holder_changed"
+            if gen > floor_gen:
+                if gen != floor_gen + 1 or lease_conn is None:
+                    return "standing_holder_changed"
+                prev = lease_conn.execute(
+                    "SELECT pane_id, pane_birth, session_digest, release_reason FROM owner_leases"
+                    " WHERE label=? AND generation=?", (label, floor_gen)).fetchone()
+                if prev is None or prev[3] != "expired" or (prev[0], prev[1], prev[2]) != (pane, birth, sess):
+                    return "standing_holder_changed"
+                n_open = lease_conn.execute(
+                    "SELECT COUNT(*) FROM owner_requests WHERE label=? AND generation=? AND state IN"
+                    " ('queued','held','blocked','delivering')", (label, floor_gen)).fetchone()[0]
+                if n_open:
+                    return "standing_holder_changed"
+            if g_qsha != queue_sha256:
+                return "queue_sha_mismatch"
+            if item_cap is not None and used >= item_cap:
+                return "standing_cap"
+            cost_valid = isinstance(cost_cents, int) and not isinstance(cost_cents, bool) and cost_cents >= 0
+            if spend_cap is not None:
+                if not cost_valid:
+                    return "standing_cost_missing"
+                if spent + cost_cents > spend_cap:
+                    return "budget"
+            spend_delta = cost_cents if cost_valid else 0
+            if conn.execute("SELECT 1 FROM owner_dispatch_auth WHERE parent=? AND request_id=?",
+                            (auth_id, request_id)).fetchone():
+                return "standing_consumed"
+            child_id = f"{auth_id}:{uuid.uuid4().hex}"
+            decided = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            conn.execute(
+                "INSERT INTO owner_dispatch_auth(auth_id,protocol,owner_label,project,pane_id,pane_birth,"
+                "session_digest,lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,status,"
+                "decided_at,expires_at,consumed_at,kind,parent)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'consumed',?,?,?,'single',?)",
+                (child_id, PROTOCOL, label, project, pane, birth, sess, gen, request_id, body_sha256,
+                 manifest_key(manifest), prompt, approval, decided, exp, decided, auth_id))
+            conn.execute("UPDATE owner_dispatch_auth SET used_count=used_count+1, spent_cents=spent_cents+?"
+                        " WHERE auth_id=?", (spend_delta, auth_id))
+            env = _envelope(conn, child_id)
+            conn.execute("COMMIT")
+            return env
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        return f"standing_ambiguous:{type(exc).__name__}"
 
 
 def _read_intent(journal_root: str, label: str, rid: str) -> dict | None:
