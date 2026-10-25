@@ -151,6 +151,12 @@ caioniehues/herdmates: **never show a wrong reason**; degrade to a plain
 sidebar cards — enable them by merging `docs/herdr-config-snippet.toml` into
 `config.toml` (invalid token names fail silently; `herdr config check`).
 
+**Moving a live session to another space** (no restart, same session):
+`herdr pane move <pane> --workspace <ws> --new-tab` (target from
+`ensure-workspace.sh --no-focus <repo>`), then `herdr tab rename`. Verified
+2026-10-19 on the idle KB omp pane: same `terminal_id`, `agent_session` path and
+revision after the move. herdr has no `tab move`; move the pane.
+
 ---
 
 ## Proactive lifecycle — don't wait to be asked
