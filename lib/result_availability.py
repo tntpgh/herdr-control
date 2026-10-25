@@ -95,6 +95,15 @@ CREATE TRIGGER IF NOT EXISTS ra_stages_no_update BEFORE UPDATE ON ra_stages
   BEGIN SELECT RAISE(ABORT, 'ra_stages is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS ra_stages_no_delete BEFORE DELETE ON ra_stages
   BEGIN SELECT RAISE(ABORT, 'ra_stages is append-only'); END;
+CREATE TABLE IF NOT EXISTS ra_submit_receipts (
+  receipt_id TEXT PRIMARY KEY, rid TEXT NOT NULL UNIQUE REFERENCES ra_requests(rid),
+  request_digest TEXT NOT NULL, owner_label TEXT NOT NULL, pane_id TEXT NOT NULL,
+  pane_birth TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+  pins TEXT NOT NULL, created_utc REAL NOT NULL, receipt_digest TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS ra_submit_receipts_no_update BEFORE UPDATE ON ra_submit_receipts
+  BEGIN SELECT RAISE(ABORT, 'ra_submit_receipts is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ra_submit_receipts_no_delete BEFORE DELETE ON ra_submit_receipts
+  BEGIN SELECT RAISE(ABORT, 'ra_submit_receipts is append-only'); END;
 """
 
 Holder = Callable[[str], "tuple[str, str, str, int] | None"]  # label -> (pane_id, pane_birth, session_id, generation)
@@ -246,6 +255,128 @@ class Availability:
     def _journal(self, label: str, rid: str) -> str | None:
         r = self._read(Path(self.journal_root) / label / rid, SETTLED_FILE)
         return r[0] if r else None
+
+    # --- item 9: narrow submit-owner-result producer + receipt-based accept ---
+    # TRUST LIMIT (state per the spec): this proves the result bytes and the
+    # caller's OWN resolved pane identity matched the rid's registered owner
+    # incarnation at submit time, and still match at accept time. It is
+    # Herdr's same-UID/command-approval boundary only -- NOT human approval,
+    # and NOT cryptographic isolation from another process running as the
+    # same UID. `caller_pane` must be resolved from process ancestry
+    # (lib/pane-guard.sh's caller_pane_from_ancestry) by the CLI BEFORE
+    # calling this method -- never a self-asserted env var (security review
+    # PR #252, F2: a worker can export HERDR_PANE_ID as anything it likes).
+    # `holder` is the SAME Holder protocol tick()/record_reply_authenticated
+    # already take (label -> the LIVE (pane_id, pane_birth, session_id,
+    # generation), or None) -- this method only COMPARES the caller's
+    # resolved pane and the live holder to the rid's registered owner; it
+    # never resolves either identity itself.
+    def submit_owner_result(self, rid: str, caller_pane: str, holder: Holder,
+                            now: float | None = None) -> str | None:
+        """Takes rid only (no caller-supplied flags or paths). Every binding
+        is DERIVED from the already-registered rid row and the journal.
+        Returns the receipt_id on success; None on an ordinary refusal
+        (unregistered rid, the rid's owner is no longer the LIVE holder, the
+        caller's own pane is not that live holder's pane, journal digest
+        mismatch, a manifest file unreadable). Raises Refused only for a
+        genuine conflicting resubmit (same rid, different content) -- a
+        byte-identical resubmit is idempotent and returns the SAME
+        receipt_id, never a second row."""
+        row = self.conn.execute(
+            "SELECT request_dir, request_digest, owner_label, pane_id, pane_birth, session_id, generation, manifest"
+            " FROM ra_requests WHERE rid=?", (rid,)).fetchone()
+        if row is None:
+            return None
+        rdir, rdig, label, pane, birth, sess, gen, man_json = row
+        live = holder(label)
+        if live is None or live != (pane, birth, sess, gen):
+            return None  # the rid's registered owner is no longer the live lease holder
+        if caller_pane != pane:
+            return None  # the CALLING process (resolved from ancestry) is not that live owner's pane
+        manifest = json.loads(man_json)
+        if self._journal(label, rid) != _sha(settled_record(rid, rdig, label, pane, birth, sess, gen, manifest)):
+            return None
+        pins: dict[str, str] = {}
+        for name in sorted(manifest):
+            got = self._read(Path(rdir), name)
+            if got is None:
+                return None
+            pins[name] = got[0]
+        evidence = json.dumps({"rid": rid, "request_digest": rdig, "owner": [pane, birth, sess, gen], "pins": pins},
+                              sort_keys=True)
+        receipt_digest = _sha(evidence.encode())
+        receipt_id = f"recv_{receipt_digest[:32]}"
+        now = time.time() if now is None else now
+        try:
+            self.conn.execute(
+                "INSERT INTO ra_submit_receipts (receipt_id, rid, request_digest, owner_label, pane_id, pane_birth,"
+                " session_id, generation, pins, created_utc, receipt_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (receipt_id, rid, rdig, label, pane, birth, sess, gen, json.dumps(pins, sort_keys=True), now,
+                 receipt_digest))
+            return receipt_id
+        except sqlite3.IntegrityError:
+            prior = self.conn.execute("SELECT receipt_digest FROM ra_submit_receipts WHERE rid=?", (rid,)).fetchone()
+            if prior is None:
+                raise  # receipt_id collided with a DIFFERENT rid: astronomically unlikely; surface it, never swallow
+            if prior[0] != receipt_digest:
+                raise Refused(f"{rid}: a receipt already exists with different content (conflicting resubmit)") from None
+            return receipt_id
+
+    def accept_receipt(self, receipt_id: str, reviewer_pins: dict[str, str], holder: Holder, by: str,
+                       now: float | None = None) -> bool:
+        """Consumer (item 9): input is receipt_id plus the INDEPENDENT
+        reviewer pins only -- no rid, no auth-ref. Re-verifies every binding
+        FRESH (the receipt's own digest, the rid row, the journal, the
+        owner's CURRENT live incarnation via `holder`, and the receipt's own
+        pins against the CURRENT bytes) before separately requiring the
+        reviewer's pins to ALSO match. Writes the SAME 'accepted' stage the
+        old verify_pinned/record_reply_authenticated/accept pipeline uses
+        (lib/queue_supervisor's lane-completion check is unchanged: it only
+        ever looks for "accepted" in stages(rid)), but this path has its own
+        complete, self-contained precondition chain -- it never depends on
+        and never requires 'verified'/'reply_authenticated' from that other
+        pipeline."""
+        row = self.conn.execute(
+            "SELECT rid, request_digest, owner_label, pane_id, pane_birth, session_id, generation, pins,"
+            " receipt_digest FROM ra_submit_receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
+        if row is None:
+            return False
+        rid, rdig, label, pane, birth, sess, gen, pins_json, receipt_digest = row
+        try:
+            pins = json.loads(pins_json)
+            recomputed = _sha(json.dumps(
+                {"rid": rid, "request_digest": rdig, "owner": [pane, birth, sess, gen], "pins": pins},
+                sort_keys=True).encode())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False  # a stored column has the wrong type/shape: fail closed, never raise to the caller
+        if recomputed != receipt_digest:
+            return False  # the receipt row itself was forged or edited
+        rrow = self.conn.execute(
+            "SELECT request_dir, request_digest, owner_label, pane_id, pane_birth, session_id, generation, manifest"
+            " FROM ra_requests WHERE rid=?", (rid,)).fetchone()
+        if rrow is None:
+            return False
+        rdir, cur_rdig, cur_label, cur_pane, cur_birth, cur_sess, cur_gen, man_json = rrow
+        if (cur_rdig, cur_label, cur_pane, cur_birth, cur_sess, cur_gen) != (rdig, label, pane, birth, sess, gen):
+            return False  # the rid row disagrees with the receipt it was issued against
+        manifest = json.loads(man_json)
+        if self._journal(label, rid) != _sha(settled_record(rid, rdig, label, pane, birth, sess, gen, manifest)):
+            return False  # the request was mutated in the journal since the receipt
+        live = holder(label)
+        if live != (pane, birth, sess, gen):
+            return False  # the owner is no longer the SAME live incarnation the receipt was issued to
+        for name, sha in pins.items():
+            got = self._read(Path(rdir), name)
+            if got is None or got[0] != sha:
+                return False  # the result changed since the receipt was issued
+        if sorted(reviewer_pins) != sorted(manifest):
+            return False
+        for name, sha in reviewer_pins.items():
+            got = self._read(Path(rdir), name)
+            if got is None or got[0] != sha:
+                return False  # the independent reviewer's own pins do not match the current bytes
+        return self._stage(rid, "accepted", receipt_id, time.time() if now is None else now)
+
 
     # --- stages (separate durable facts; none implies another) ---
     def stages(self, rid) -> dict[str, str]:

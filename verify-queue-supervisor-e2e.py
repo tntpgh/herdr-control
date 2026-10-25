@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import redirect_stdout
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -126,6 +129,24 @@ def tick():
                    lambda lb, item, reason: notes.append((lb, item, reason)),
                    lambda lb, rid: cli.journal_state(base / "journal", lb, rid), environ=ON)
 
+# NOTE: item 9 (SPEC.md) supersedes item 8's auth-ref design entirely and
+# retires result-availability-accept.py (removed). This e2e suite's
+# acceptance calls are reverted to DIRECT av.verify_pinned/
+# record_reply_authenticated/accept calls (the OLD pipeline, which still
+# exists unchanged in lib/result_availability.py and still writes the SAME
+# "accepted" stage queue_supervisor's lane-completion check reads) rather
+# than left pointing at a deleted file. Routing this suite through the NEW
+# submit-owner-result.py/accept-owner-result.py receipt pipeline is flagged
+# as follow-up: it needs synthesizing a caller_pane + Holder matching this
+# suite's own dispatch flow's real (pane, birth, session, generation), which
+# this revert does not attempt.
+def accept_via_cli(rid, pins, auth_ref="fixture-oex", by="conductor"):
+    return (av.verify_pinned(rid, pins) and av.record_reply_authenticated(rid, auth_ref)
+           and av.accept(rid, by))
+
+
+
+
 
 r = tick()
 print("pass1", json.dumps(r, sort_keys=True))
@@ -160,9 +181,9 @@ for _ in range(3):
 check("worker result observed+noticed is NOT accepted -> lane still waiting",
       av.state("q-proj-kb-i1")[0] == "notified" and tick()["proj-kb"] == "waiting:i1")
 pins = {"result.md": hashlib.sha256(b"ACK kb i1").hexdigest()}
-check("wrong pin does not verify", not av.verify_pinned("q-proj-kb-i1", {"result.md": "0" * 64}))
-ok = (av.verify_pinned("q-proj-kb-i1", pins) and av.record_reply_authenticated("q-proj-kb-i1", "inbox:fixture-oex")
-      and av.accept("q-proj-kb-i1", "conductor"))
+check("wrong pin does not verify (through the real public entrypoint)",
+      not accept_via_cli("q-proj-kb-i1", {"result.md": "0" * 64}) and "accepted" not in av.stages("q-proj-kb-i1"))
+ok = accept_via_cli("q-proj-kb-i1", pins)
 r = tick()
 check("independently verified + authenticated + accepted -> done; next item sent with ITS grant",
       ok and r["proj-kb"] == "done:i1" and tick()["proj-kb"] == "dispatched:i2" and send.count("proj-kb") == 2)
@@ -243,8 +264,7 @@ def settle(lb, rid, text):
     for _ in range(3):
         av.tick(holder_fn, lambda t: True)  # noqa: E731
     pins = {"result.md": hashlib.sha256(text.encode()).hexdigest()}
-    return (av.verify_pinned(rid, pins) and av.record_reply_authenticated(rid, "inbox:fixture-standing")
-            and av.accept(rid, "conductor"))
+    return accept_via_cli(rid, pins, auth_ref="oex_fixture_standing")
 
 
 # ---- (1) one standing grant -> 3 successive items, each child consumed once, zero further issuance ----
@@ -390,6 +410,268 @@ check("STANDING MALFORMED: a non-int cost_cents is rejected by the shared queue 
       r[LB_MALFORMED] == "error:ValueError"
       and store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE owner_label=?",
                         (LB_MALFORMED,)).fetchone()[0] == 0)
+
+# ===== recovery scoping (queue-supervisor.py main()), through the REAL CLI
+# entrypoint -- not lib/queue_supervisor.tick() in isolation -- since that is
+# the actual process boundary the hub drives (hub.py's TickRunner argv). =====
+ISO_A, ISO_B = "proj-isoa", "proj-isob"
+for i, lb in enumerate((ISO_A, ISO_B)):
+    PANE[lb] = (f"wI:p{i}", f"term_{lb.replace('-', '')}")
+    SESS[lb] = hashlib.sha256(f"session-{lb}".encode()).hexdigest()
+    ol.register_owner(lc, lb, f"tntpgh/{lb}", now=time.time())
+    ol.acquire(lc, lb, *PANE[lb], TTL, time.time(), session_digest=SESS[lb])
+    REG[lb] = (*PANE[lb], SESS[lb])
+    roots[lb] = base / f"root-{lb}"
+    roots[lb].mkdir()
+    av.roots[lb] = str(roots[lb])
+queue(ISO_A, [{"id": "i1", "request": "isoA one\n", "manifest": M, "auth_id": grant(ISO_A, "i1", "isoA one\n", M)}])
+queue(ISO_B, [{"id": "i1", "request": "isoB one\n", "manifest": M, "auth_id": grant(ISO_B, "i1", "isoB one\n", M)}])
+env_iso = {**ON, "HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+           "HERDR_QUEUE_SUPERVISOR_ROOT": str(qroot), "HERDR_QUEUE_SUPERVISOR_LANES": f"{ISO_A},{ISO_B}",
+           "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(base / "auth.db"),
+           "HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
+           "HERDR_RESULT_AVAILABILITY_JOURNAL": str(base / "journal"),
+           "HERDR_RESULT_AVAILABILITY_ROOTS": os.pathsep.join(f"{lb}={roots[lb]}" for lb in (ISO_A, ISO_B))}
+for private_path in (lease_db, str(base / "auth.db")):
+    os.chmod(private_path, 0o600)  # private_sqlite.open_private requires no group/other bits
+    for sfx in ("-wal", "-shm", "-journal"):
+        if os.path.exists(private_path + sfx):
+            os.chmod(private_path + sfx, 0o600)
+
+
+def run_cli(env):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main(environ=env, send=send, resolve=REG.get)
+    return rc, buf.getvalue().strip()
+
+
+# --- shared-store failure FIRST (before either lane has dispatched, so an
+# otherwise-eligible proj-isob is genuinely blocked, not merely in-flight).
+# A REAL admitted (gate state 'queued') request whose journal intent.json is
+# malformed: recover()'s crash-recovery path cannot even read it to decide
+# whether it was pre- or post-send -- genuine shared uncertainty (a corrupt
+# journal), not scoped to one label's effects. Uses the gate directly (no
+# grant consumed, no auth store involved) so it disturbs nothing else.
+sent_before = len(send.calls)
+bad_rid = qs.rid_for(ISO_A, "corrupt")
+adm = gate.admit(ISO_A, *PANE[ISO_A], bad_rid, time.time())
+bad_j = base / "journal" / ISO_A / bad_rid
+bad_j.mkdir(parents=True)
+(bad_j / "intent.json").write_bytes(b"{not json")
+rc_fail, out_fail = run_cli(env_iso)
+check("SHARED-STORE FAILURE through the real CLI: a corrupt journal entry fails closed GLOBALLY, nothing sent",
+      adm.ok and rc_fail == 4 and out_fail.startswith("refused:recovery_needs_operator shared_store=")
+      and len(send.calls) == sent_before)
+shutil.rmtree(bad_j)  # clear the corrupt entry: recover() would otherwise re-raise on every later pass
+
+# --- lane isolation: proj-isoa carries a PRE-EXISTING bad journal entry
+# (settled.json with no matching gate row -> recover() reports
+# "unrecorded:settled.json"), independent of proj-isob (distinct label,
+# project and auth rows) ---
+bad_dir = base / "journal" / ISO_A / "q-isoa-stale"
+bad_dir.mkdir(parents=True)
+(bad_dir / "intent.json").write_text("{}")
+(bad_dir / "settled.json").write_text("{}")
+rc_iso, out_iso = run_cli(env_iso)
+result = json.loads(out_iso)
+check("LANE ISOLATION through the real CLI: independent lane B ticks while A's bad journal entry holds only A",
+      rc_iso == 0 and result[ISO_B] == "dispatched:i1"
+      and result[ISO_A].startswith("refused:recovery_needs_operator") and f"{ISO_A}/q-isoa-stale" in result[ISO_A]
+      and len(send.calls) == sent_before + 1 and send.calls[-1][0] == ISO_B)
+
+# ===== item 9b (SPEC.md): wired production chain, public entrypoints =====
+# LABELING: every "crash" below is SIMULATED -- an injected exception in a
+# test-only seam (crashing_waker / crashing_post_accept), observed from a
+# FRESH main() call afterward (new argv parse, new ra.Availability and
+# owner_lease connections constructed inside that call -- no shared
+# in-memory state with the call that "crashed"). No OS process is ever
+# killed here; that would need a real subprocess + SIGKILL, which this
+# offline suite does not attempt. Do not read "simulated crash" as a real
+# crash test.
+#
+# Chain, named by file:line:
+#   1. owner submit:        submit-owner-result.py:main()
+#                            -> lib/result_availability.py:274 submit_owner_result()
+#   2. wake to Main:         submit-owner-result.py:77 wake_main()
+#                            -> send-to-agent.sh (existing, unmodified),
+#                               $HERDR_MAIN_PANE_ID target (attention-tick.sh:216's
+#                               own pattern), gated by lib/pane-guard.sh:41 pane_is_agent()
+#   3. independent verification: accept-owner-result.py's --pin (the reviewer's
+#                            OWN values, never the receipt's)
+#                            -> lib/result_availability.py:369-374 reviewer-pins check
+#   4. acceptance consumer:  accept-owner-result.py:main()
+#                            -> lib/result_availability.py:325 accept_receipt()
+#                            -> lib/result_availability.py:375 _stage(rid, "accepted", ...)
+#   5. next tick dispatches the successor: queue-supervisor.py:211-212 accepted()
+#                            (reads avail.stages(rid), unchanged by this task)
+#                            -> lib/queue_supervisor.py:234-236 done transition
+#                            -> lib/queue_supervisor.py:246-254,272 successor dispatch
+#                               on the NEXT tick() call
+import importlib.util as _ilu
+
+_sub_spec = _ilu.spec_from_file_location("submit_owner_result_cli", HERE / "submit-owner-result.py")
+sub_cli = _ilu.module_from_spec(_sub_spec)
+_sub_spec.loader.exec_module(sub_cli)
+_acc_spec = _ilu.spec_from_file_location("accept_owner_result_cli", HERE / "accept-owner-result.py")
+acc_cli = _ilu.module_from_spec(_acc_spec)
+_acc_spec.loader.exec_module(acc_cli)
+
+RA_ENVIRON = {"HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
+             "HERDR_RESULT_AVAILABILITY_JOURNAL": str(base / "journal"), "HERDR_OWNER_LEASE_DB": lease_db}
+
+
+def ra_environ_for(labels):
+    return {**RA_ENVIRON, "HERDR_RESULT_AVAILABILITY_ROOTS": os.pathsep.join(f"{lb}={roots[lb]}" for lb in labels)}
+
+
+def run_main(mod, args, **kw):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = mod.main(args, **kw)
+    return rc, buf.getvalue().strip()
+
+
+def tick9(labels):
+    return qs.tick(qroot, labels, cli.GrantDispatch(gate, av, send, REG.get, store),
+                   lambda lb, rid: "accepted" in av.stages(rid),
+                   lambda lb, rid: qs.latest_queue_event(roots[lb] / "events.jsonl", rid),
+                   lambda lb, item, reason: notes.append((lb, item, reason)),
+                   lambda lb, rid: cli.journal_state(base / "journal", lb, rid), environ=ON)
+
+
+def new_lane(lb, n):
+    PANE[lb] = (f"w9:p{n}", f"term_{lb.replace('-', '')}")
+    SESS[lb] = hashlib.sha256(f"session-{lb}".encode()).hexdigest()
+    ol.register_owner(lc, lb, f"tntpgh/{lb}", now=time.time())
+    ol.acquire(lc, lb, *PANE[lb], TTL, time.time(), session_digest=SESS[lb])
+    REG[lb] = (*PANE[lb], SESS[lb])
+    roots[lb] = base / f"root-{lb}"
+    roots[lb].mkdir()
+    av.roots[lb] = str(roots[lb])
+    queue(lb, [{"id": "i1", "request": f"{lb} one\n", "manifest": M, "auth_id": grant(lb, "i1", f"{lb} one\n", M)},
+              {"id": "i2", "request": f"{lb} two\n", "manifest": M, "auth_id": grant(lb, "i2", f"{lb} two\n", M)}])
+
+
+def ok_waker(rid, receipt_id, caller_pane):
+    ok_waker.calls.append((rid, receipt_id, caller_pane))
+    return "wake:sent"
+
+
+ok_waker.calls = []
+
+# --- fixture: a dedicated item-9 lane with 2 queued items, so acceptance of
+# item 1 (through the real CLI chain) can prove a real successor dispatch ---
+LB9 = "proj-item9"
+new_lane(LB9, 0)
+r = tick9([LB9])
+check("item9 setup: i1 dispatched normally through the EXISTING production dispatcher (no change needed)",
+      r[LB9] == "dispatched:i1")
+
+rid9 = qs.rid_for(LB9, "i1")
+(roots[LB9] / rid9 / "result.md").write_text("item9 ACK i1")
+owner9_pane = ol.holder_tuple(lc, LB9, time.time())[0]
+env9 = ra_environ_for([LB9])
+
+
+def crashing_waker(rid, receipt_id, caller_pane):
+    raise RuntimeError("fixture: SIMULATED crash in the wake step (injected exception, not a real process kill)")
+
+
+try:
+    run_main(sub_cli, ["--rid", rid9], caller_pane_resolver=lambda: owner9_pane, waker=crashing_waker, environ=env9)
+    submit_crashed = False
+except RuntimeError:
+    submit_crashed = True
+check("9b SIMULATED CRASH (submit, injected exception in the wake step): "
+     "the receipt is ALREADY durably written despite the crash",
+      submit_crashed
+      and av.conn.execute("SELECT COUNT(*) FROM ra_submit_receipts WHERE rid=?", (rid9,)).fetchone()[0] == 1)
+
+rc9a, out9a = run_main(sub_cli, ["--rid", rid9], caller_pane_resolver=lambda: owner9_pane,
+                       waker=ok_waker, environ=env9)
+receipt9 = out9a.split(":")[1] if out9a.startswith("submitted:") else None
+check("9b RETRY after the simulated crash (FRESH main() call: new argv parse, new Availability/"
+     "owner_lease connections -- no shared in-memory state with the crashed call): "
+     "exactly one receipt, SAME receipt_id, retry itself succeeds and wakes Main",
+      rc9a == 0 and receipt9 is not None
+      and av.conn.execute("SELECT COUNT(*) FROM ra_submit_receipts WHERE rid=?", (rid9,)).fetchone()[0] == 1
+      and ok_waker.calls == [(rid9, receipt9, owner9_pane)])
+
+pins9 = {"result.md": hashlib.sha256(b"item9 ACK i1").hexdigest()}
+
+
+def crashing_post_accept():
+    raise RuntimeError("fixture: SIMULATED crash after accept_receipt's durable write, before the caller or"
+                       " the next queue tick observes it (injected exception, not a real process kill)")
+
+
+try:
+    run_main(acc_cli, ["--receipt-id", receipt9, "--by", "reviewer9", "--pin", f"result.md={pins9['result.md']}"],
+            post_accept=crashing_post_accept, environ=env9)
+    accept_crashed = False
+except RuntimeError:
+    accept_crashed = True
+check("9b SIMULATED CRASH (accept, injected exception AFTER the durable write): "
+     "the 'accepted' stage is ALREADY durably written despite the crash",
+      accept_crashed and "accepted" in av.stages(rid9))
+
+rc9b, out9b = run_main(acc_cli, ["--receipt-id", receipt9, "--by", "reviewer9",
+                                 "--pin", f"result.md={pins9['result.md']}"], environ=env9)
+check("9b RETRY after the simulated accept-side crash (FRESH main() call): idempotent, exactly one accepted row",
+      rc9b == 0 and out9b == "accepted"
+      and av.conn.execute("SELECT COUNT(*) FROM ra_stages WHERE rid=? AND stage='accepted'",
+                          (rid9,)).fetchone()[0] == 1)
+
+r9a, r9b, r9c = tick9([LB9]), tick9([LB9]), tick9([LB9])
+check("9b CHAIN COMPLETE through the public entrypoints named above: queue-supervisor.py's accepted() "
+     "predicate reads the SAME stage lib/queue_supervisor.py's done-transition consumes -> "
+     "the successor dispatches EXACTLY ONCE across a repeat tick, never twice",
+      r9a[LB9] == "done:i1" and r9b[LB9] == "dispatched:i2" and r9c[LB9] == "waiting:i2" and send.count(LB9) == 2)
+
+# ===== item 9b scenario: 4-5 project-owner lanes, ONE held, the others'
+# successor dispatch (or pre-existing state) unaffected =====
+LB9B, LB9C = "proj-item9-ok2", "proj-item9-held"
+new_lane(LB9B, 1)
+new_lane(LB9C, 2)
+SCENARIO_LANES = [LB9B, LB9C, "proj-kb", "proj-monthly", LB9]  # 5 lanes total
+env_scn = ra_environ_for(SCENARIO_LANES)
+r = tick9(SCENARIO_LANES)
+check("scenario setup: both fresh item9 lanes dispatched i1; the two UNRELATED pre-existing "
+     "lanes (proj-kb still mid-flight on i2, proj-monthly still frozen since earlier in this file) "
+     "are completely untouched by sharing one tick() call with the item9 lanes",
+      r[LB9B] == "dispatched:i1" and r[LB9C] == "dispatched:i1"
+      and r["proj-kb"] == "waiting:i2" and r["proj-monthly"] == "frozen:blocked:i1" and r[LB9] == "waiting:i2")
+
+rid9b = qs.rid_for(LB9B, "i1")
+(roots[LB9B] / rid9b / "result.md").write_text(f"{LB9B} ACK i1")
+owner9b_pane = ol.holder_tuple(lc, LB9B, time.time())[0]
+rc, out = run_main(sub_cli, ["--rid", rid9b], caller_pane_resolver=lambda: owner9b_pane, waker=ok_waker, environ=env_scn)
+receipt9b = out.split(":")[1]
+pins9b = {"result.md": hashlib.sha256(f"{LB9B} ACK i1".encode()).hexdigest()}
+rc, out = run_main(acc_cli, ["--receipt-id", receipt9b, "--by", "reviewer",
+                             "--pin", f"result.md={pins9b['result.md']}"], environ=env_scn)
+check("scenario: the ok item9 lane's acceptance succeeded through the real CLI chain", out == "accepted")
+
+rid9c = qs.rid_for(LB9C, "i1")
+(roots[LB9C] / rid9c / "result.md").write_text(f"{LB9C} ACK i1")
+rc_held, out_held = run_main(sub_cli, ["--rid", rid9c], caller_pane_resolver=lambda: "pane-IMPOSTER",
+                             waker=ok_waker, environ=env_scn)
+check("scenario: a NON-OWNER caller's submit is HELD -- never a receipt, never reaching accept or dispatch",
+      rc_held == 2 and out_held == "held:not_submitted:bindings_did_not_match"
+      and av.conn.execute("SELECT COUNT(*) FROM ra_submit_receipts WHERE rid=?", (rid9c,)).fetchone()[0] == 0)
+
+r2 = tick9(SCENARIO_LANES)
+r3 = tick9(SCENARIO_LANES)
+check("SCENARIO (5 lanes, ONE held): the ok item9 lane's successor dispatches exactly once; "
+     "the held lane never advances past i1 (no accepted stage ever exists for it); the two "
+     "unrelated pre-existing lanes' outcomes are byte-identical before and after, across BOTH ticks",
+      r2[LB9B] == "done:i1" and r3[LB9B] == "dispatched:i2" and send.count(LB9B) == 2
+      and r2[LB9C] == "waiting:i1" and r3[LB9C] == "waiting:i1"
+      and r2["proj-kb"] == "waiting:i2" and r3["proj-kb"] == "waiting:i2"
+      and r2["proj-monthly"] == "frozen:blocked:i1" and r3["proj-monthly"] == "frozen:blocked:i1"
+      and r2[LB9] == "waiting:i2" and r3[LB9] == "waiting:i2")
+
 
 print("send.calls", [(c[0], c[2].decode().strip()) for c in send.calls])
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")

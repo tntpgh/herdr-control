@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -318,6 +319,193 @@ def main() -> int:
     os.symlink(evil, dw)
     case("REQUEST DIR swapped for a symlink after registration: never observed",
          a.tick(holder, Notices(), T0 + 33)["kbreq_swap"] == "held:request_changed")
+
+    # --- item 9: submit_owner_result / accept_receipt (RECONCILED contract,
+    # supersedes item 8's auth-ref design entirely -- no oex_id, no task_id,
+    # the inbox exchange system plays no role here at all). Tested directly
+    # against the library (the trust logic lives there; the CLIs
+    # (submit-owner-result.py/accept-owner-result.py) are thin wrappers that
+    # additionally resolve the caller's own pane from process ancestry,
+    # which needs a live herdr daemon and is NOT exercised here). ---
+    OWNER9 = ("pane-9", "birth-9", "sess-9", 1)
+
+    def holder9(label, live=None):
+        live = live if live is not None else OWNER9
+        return lambda lb: live if lb == label else None
+
+    d9, rq9 = setup(root, "kbreq_submit")
+    reg(a, "kbreq_submit", str(d9), rq9, "kb", *OWNER9, ["result.md"], T0)
+    (d9 / "result.md").write_text("submitted body")
+    pins9 = {"result.md": ra._sha(b"submitted body")}
+
+    case("(f) no rid registered: submit refused",
+         a.submit_owner_result("kbreq_nope", "pane-9", holder9("kb")) is None)
+    case("submit: caller pane differs from the live owner's pane: refused",
+         a.submit_owner_result("kbreq_submit", "pane-NOT-9", holder9("kb")) is None)
+    case("submit: rid's registered owner is no longer the LIVE holder (stale incarnation): refused",
+         a.submit_owner_result("kbreq_submit", "pane-9", holder9("kb", ("pane-9", "birth-9", "sess-9", 2))) is None)
+    receipt1 = a.submit_owner_result("kbreq_submit", "pane-9", holder9("kb"))
+    case("Positive: a matched caller + live owner + journal + pins -> submitted once",
+         receipt1 is not None and receipt1.startswith("recv_"))
+    receipt1_again = a.submit_owner_result("kbreq_submit", "pane-9", holder9("kb"))
+    case("submit: byte-identical resubmit is idempotent, SAME receipt_id, no second row",
+         receipt1_again == receipt1
+         and a.conn.execute("SELECT COUNT(*) FROM ra_submit_receipts WHERE rid='kbreq_submit'").fetchone()[0] == 1)
+    # 9a: "simulate a crash after the receipt write and before the ack" --
+    # the receipt write (one INSERT, autocommit) and the return value the
+    # caller treats as the ack are the SAME durable fact, so there is no
+    # window where the row exists but the ack does not: a retrying caller
+    # (a fresh submit_owner_result call with IDENTICAL inputs, as if the
+    # first call's process died before it ever saw receipt1's return value)
+    # observes exactly the row already committed -- never a second write,
+    # never a different outcome.
+    receipt1_retry_after_sim_crash = a.submit_owner_result("kbreq_submit", "pane-9", holder9("kb"))
+    case("9a CRASH-RETRY (submit): a retry after a simulated ack-loss returns the SAME receipt_id, exactly one row",
+         receipt1_retry_after_sim_crash == receipt1
+         and a.conn.execute("SELECT COUNT(*) FROM ra_submit_receipts WHERE rid='kbreq_submit'").fetchone()[0] == 1)
+    # 9a: "no grant consumption" -- structurally guaranteed, not just
+    # tested: submit_owner_result/accept_receipt take no owner_dispatch_auth
+    # connection or store argument at all (see their signatures), so
+    # neither this call nor its retry can reach a grant table to consume
+    # anything, let alone twice.
+    (d9 / "result.md").write_text("MUTATED after the receipt")
+    case("(c) the result mutated after the receipt: a conflicting resubmit refuses",
+         raises(lambda: a.submit_owner_result("kbreq_submit", "pane-9", holder9("kb"))))
+    (d9 / "result.md").write_text("submitted body")  # restore for the consumer tests below
+
+    case("(f) accept: no receipt for this id: refused",
+         not a.accept_receipt("recv_doesnotexist", pins9, holder9("kb"), "reviewer"))
+    case("Positive: matched receipt + fresh bindings + reviewer pins -> accepted once",
+         a.accept_receipt(receipt1, pins9, holder9("kb"), "reviewer")
+         and a.stages("kbreq_submit").get("accepted") == receipt1)
+    case("(g) idempotent: a second accept of the SAME receipt is a no-op, no second accepted stage",
+         a.accept_receipt(receipt1, pins9, holder9("kb"), "reviewer")
+         and a.conn.execute("SELECT COUNT(*) FROM ra_stages WHERE rid='kbreq_submit' AND stage='accepted'")
+             .fetchone()[0] == 1)
+    # 9a: "simulate a crash ... after accept and before the queue advance.
+    # A retry completes exactly one advance." accept_receipt's own write is
+    # the same atomic INSERT-or-idempotent-no-op pattern as submit above, so
+    # a retrying accept call observes the SAME terminal outcome (True, same
+    # receipt_id evidence), never writing a second "accepted" row. The queue
+    # advance itself is lib/queue_supervisor.tick_lane's
+    # `"accepted" in avail.stages(rid)` check -- a pure boolean membership
+    # read with no side effect of its own, so its result is IDENTICAL
+    # (True) whether read once or many times after accept_receipt first
+    # returns True; it can only ever drive one "done" transition for a
+    # given rid, by construction, not by a test needing to catch a race.
+    accept_retry_after_sim_crash = a.accept_receipt(receipt1, pins9, holder9("kb"), "reviewer")
+    accepted_stage_before = a.stages("kbreq_submit")["accepted"]
+    case("9a CRASH-RETRY (accept): a retry after a simulated ack-loss returns the SAME terminal outcome, exactly one row",
+         accept_retry_after_sim_crash is True
+         and a.conn.execute("SELECT COUNT(*) FROM ra_stages WHERE rid='kbreq_submit' AND stage='accepted'")
+             .fetchone()[0] == 1)
+    case("9a NO QUEUE ADVANCE on repeat: the queue-supervisor completion check "
+         "('accepted' in stages(rid)) reads the SAME evidence before and after the retry -- one advance, not two",
+         "accepted" in a.stages("kbreq_submit") and a.stages("kbreq_submit")["accepted"] == accepted_stage_before == receipt1)
+
+    # (should-close a) accept-side: the result mutated AFTER the receipt was
+    # issued, caught by the RECEIPT'S OWN pins check (lines 365-368, before
+    # reviewer pins are even reached) -- distinct from the earlier SUBMIT-side
+    # mutation test, which exercises the conflicting-resubmit path instead.
+    d9m, rq9m = setup(root, "kbreq_mutate_after_receipt")
+    reg(a, "kbreq_mutate_after_receipt", str(d9m), rq9m, "kb", *OWNER9, ["result.md"], T0)
+    (d9m / "result.md").write_text("original body")
+    receipt_m = a.submit_owner_result("kbreq_mutate_after_receipt", "pane-9", holder9("kb"))
+    (d9m / "result.md").write_text("MUTATED after the receipt, before accept")
+    case("(should-close a) accept refused: the result changed after the receipt, caught by the RECEIPT's "
+         "own pins (not the reviewer's) -- even reviewer pins computed against the NEW bytes don't help",
+         receipt_m is not None
+         and not a.accept_receipt(receipt_m, {"result.md": ra._sha(b"MUTATED after the receipt, before accept")},
+                                  holder9("kb"), "reviewer"))
+
+    # (should-close b) accept_receipt's OWN digest recompute (lines 346-350),
+    # independent of the ra_submit_receipts append-only DB trigger: insert a
+    # row directly (INSERT, not UPDATE -- the trigger only blocks UPDATE/DELETE,
+    # so this bypasses it entirely) whose pins disagree with its own stored
+    # receipt_digest, as if forged by some path other than submit_owner_result.
+    # Own fresh rid + registered request (not kbreq_mutate_after_receipt's):
+    # that rid already has a genuine ra_submit_receipts row from receipt_m
+    # above, and the table's rid column is UNIQUE, so reusing it collided.
+    d9f, rq9f = setup(root, "kbreq_forged_digest")
+    reg(a, "kbreq_forged_digest", str(d9f), rq9f, "kb", *OWNER9, ["result.md"], T0)
+    (d9f / "result.md").write_text("forged original body")
+    forged_digest = ra._sha(b"whatever, does not matter: this is intentionally wrong")
+    a.conn.execute(
+        "INSERT INTO ra_submit_receipts (receipt_id, rid, request_digest, owner_label, pane_id, pane_birth,"
+        " session_id, generation, pins, created_utc, receipt_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("recv_forged_digest_mismatch", "kbreq_forged_digest", ra._sha(rq9f), "kb", "pane-9", "birth-9", "sess-9", 1,
+         ra.json.dumps({"result.md": ra._sha(b"forged original body")}, sort_keys=True), time.time(), forged_digest))
+    case("(should-close b) accept refused by the digest recompute ITSELF (not the DB trigger, which never "
+         "fired here -- this row was INSERTed, not UPDATEd): a row whose pins disagree with its own "
+         "receipt_digest is refused before any rid/journal/holder check even runs",
+         not a.accept_receipt("recv_forged_digest_mismatch", {"result.md": ra._sha(b"forged original body")},
+                              holder9("kb"), "reviewer"))
+
+    d9t, rq9t = setup(root, "kbreq_wrong_type_digest")
+    reg(a, "kbreq_wrong_type_digest", str(d9t), rq9t, "kb", *OWNER9, ["result.md"], T0)
+    (d9t / "result.md").write_text("typed body")
+    a.conn.execute(
+        "INSERT INTO ra_submit_receipts (receipt_id, rid, request_digest, owner_label, pane_id, pane_birth,"
+        " session_id, generation, pins, created_utc, receipt_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("recv_wrong_type_digest", "kbreq_wrong_type_digest", rq9t, "kb", "pane-9", "birth-9", "sess-9", 1,
+         ra.json.dumps({"result.md": ra._sha(b"typed body")}, sort_keys=True), time.time(),
+         ra._sha(b"irrelevant: never reached, the type error fires first")))
+    case("WRONG-TYPED COLUMN: request_digest stored as bytes (not the real str type a genuine receipt "
+         "has) makes accept_receipt fail CLOSED -- returns False, raises nothing, writes no accepted stage",
+         a.accept_receipt("recv_wrong_type_digest", {"result.md": ra._sha(b"typed body")},
+                          holder9("kb"), "reviewer") is False
+         and "accepted" not in a.stages("kbreq_wrong_type_digest"))
+
+
+
+    d9b, rq9b = setup(root, "kbreq_submit_b")
+    reg(a, "kbreq_submit_b", str(d9b), rq9b, "kb", *OWNER9, ["result.md"], T0)
+    (d9b / "result.md").write_text("b body")
+    receipt_b = a.submit_owner_result("kbreq_submit_b", "pane-9", holder9("kb"))
+    case("(a) receipt_id intrinsically names its OWN rid (no separate target-rid input exists to desync); "
+         "accepting receipt1 never touches kbreq_submit_b and accepting receipt_b never touches kbreq_submit",
+         receipt_b is not None
+         and a.accept_receipt(receipt1, {"result.md": ra._sha(b"b body")}, holder9("kb"), "reviewer") is False
+         and a.stages("kbreq_submit_b").get("accepted") is None)
+    unrelated_before = a.stages("kbreq_submit")["accepted"]
+    case("(c2) GENUINE, untampered, correctly-pinned receipt for an unrelated rid accepts ONLY its own rid: "
+         "accepting receipt_b with receipt_b's OWN correct pins leaves kbreq_submit's existing acceptance "
+         "byte-identical (no cross-rid leakage even when every check on the presented receipt itself passes)",
+         receipt_b is not None
+         and a.accept_receipt(receipt_b, {"result.md": ra._sha(b"b body")}, holder9("kb"), "reviewer") is True
+         and a.stages("kbreq_submit_b").get("accepted") == receipt_b
+         and a.stages("kbreq_submit")["accepted"] == unrelated_before == receipt1)
+    case("(b) ra_submit_receipts is append-only: a forged edit of an existing receipt row is refused at the DB layer",
+         raises_db(lambda: a.conn.execute("UPDATE ra_submit_receipts SET pins='{}' WHERE receipt_id=?", (receipt_b,))))
+
+    def tamper_journal(rid):
+        (Path(JR) / "kb" / rid / ra.SETTLED_FILE).write_bytes(b"tampered, not the original settled record")
+
+    tamper_journal("kbreq_submit_b")
+    case("(d) the request mutated in the journal after the receipt (digest no longer recomputes): accept refused",
+         not a.accept_receipt(receipt_b, {"result.md": ra._sha(b"b body")}, holder9("kb"), "reviewer"))
+
+
+    d9c, rq9c = setup(root, "kbreq_submit_c")
+    reg(a, "kbreq_submit_c", str(d9c), rq9c, "kb", *OWNER9, ["result.md"], T0)
+    (d9c / "result.md").write_text("c body")
+    receipt_c = a.submit_owner_result("kbreq_submit_c", "pane-9", holder9("kb"))
+    case("(c) owner re-registered to a new incarnation since the receipt: accept refused",
+         receipt_c is not None
+         and not a.accept_receipt(receipt_c, {"result.md": ra._sha(b"c body")},
+                                  holder9("kb", ("pane-9", "birth-9", "sess-9", 2)), "reviewer"))
+    case("(e) a reviewer pin mismatch while the receipt itself is valid: accept refused",
+         not a.accept_receipt(receipt_c, {"result.md": "0" * 64}, holder9("kb"), "reviewer"))
+
+    d9s, rq9s = setup(root, "kbreq_submit_sym")
+    reg(a, "kbreq_submit_sym", str(d9s), rq9s, "kb", *OWNER9, ["result.md"], T0)
+    (base / "outside_submit.md").write_text("secret")
+    (d9s / "result.md").symlink_to(base / "outside_submit.md")
+    case("(h) a symlinked result slot: submit refused (the existing O_NOFOLLOW _read fence, reused, not reimplemented)",
+         a.submit_owner_result("kbreq_submit_sym", "pane-9", holder9("kb")) is None)
+
+
+
     a.close()
 
     # --- multiprocess CAS race: one staged row, many concurrent tickers ---

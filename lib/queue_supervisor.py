@@ -50,6 +50,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -351,17 +352,30 @@ def latest_queue_event(events_file: Path, rid: str) -> dict | None:
 
 class TickRunner:
     """Runs one supervisor subprocess at a time WITHOUT blocking the caller (the
-    hub attention loop). poll() never waits: it reaps a finished child, starts a
-    new one only when none is running and the interval has elapsed, and reports a
-    child that has run past `stuck_after_s` (it is never killed: a kill mid-send
-    is exactly the crash window the Dispatcher journal turns into `uncertain`,
-    and this keeps that the only path)."""
+    hub attention loop). poll() never waits on the OS (no blocking wait()):
+    it reaps a finished child, starts a new one only when none is running and
+    the interval has elapsed, and ESCALATES a child stuck past `stuck_after_s`
+    instead of logging it forever -- SIGTERM first, SIGKILL after
+    KILL_GRACE_S if it ignores that, both sent to the child's own process
+    group (start_new_session=True), never awaited inline. A kill mid-send is
+    exactly the crash window the Dispatcher journal already turns into
+    `uncertain` (never retried) -- the same path any other process death
+    takes, so killing a child that has outrun its budget is safe, not a new
+    hazard. last_start is untouched by a kill: the normal interval_s throttle
+    still gates the NEXT start, so a repeatedly-stuck child cannot restart in
+    a tight loop (no blind restart), and because poll() always starts a fresh
+    queue-supervisor.py subprocess -- whose own main() runs recover() before
+    tick() on every invocation -- journal reconciliation precedes any new
+    dispatch with no extra wiring here (no duplicate dispatch)."""
+
+    KILL_GRACE_S = 5
 
     def __init__(self, argv: list[str], interval_s: float, stuck_after_s: float, clock=time.monotonic):
         self.argv, self.interval_s, self.stuck_after_s, self.clock = argv, interval_s, stuck_after_s, clock
         self.proc = None
         self.started = None
         self.last_start = None
+        self.kill_sent_at: float | None = None  # monotonic time we signaled THIS proc, else None
 
     def poll(self) -> str:
         import subprocess
@@ -370,9 +384,20 @@ class TickRunner:
         if self.proc is not None:
             rc = self.proc.poll()
             if rc is None:
-                return "stuck" if now - self.started >= self.stuck_after_s else "running"
+                if self.kill_sent_at is not None:
+                    if now - self.kill_sent_at >= self.KILL_GRACE_S:
+                        self._signal(signal.SIGKILL)
+                    return "stuck_killing"
+                if now - self.started >= self.stuck_after_s:
+                    self._signal(signal.SIGTERM)
+                    self.kill_sent_at = now
+                    return "stuck_killing"
+                return "running"
             out = (self.proc.stdout.read() if self.proc.stdout else "") or ""
-            self.proc = None
+            killed = self.kill_sent_at is not None
+            self.proc, self.kill_sent_at = None, None
+            if killed:
+                return f"stuck_killed rc={rc}"
             if self.last_start is not None and now - self.last_start < self.interval_s:
                 return f"finished rc={rc} {out.strip()[:200]}"
         if self.last_start is not None and now - self.last_start < self.interval_s:
@@ -381,3 +406,14 @@ class TickRunner:
                                      start_new_session=True)
         self.started = self.last_start = now
         return "started"
+
+    def _signal(self, sig) -> None:
+        """Best-effort, never blocks: the process group first (start_new_session
+        means its pid IS the pgid), falling back to the bare process."""
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                self.proc.send_signal(sig)
+            except ProcessLookupError:
+                pass

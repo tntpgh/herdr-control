@@ -171,8 +171,12 @@ def main() -> int:
          and files(J / KB / "r_badman") is None)
 
     # --- duplicate ---
-    case("DUPLICATE rid: refused, sender not called again, journal unchanged",
-         d.dispatch(KB, "r_kb1", b"REQ kb\n", ["result.md"], T0).startswith("held:not_dispatched:owner_lease_duplicate")
+    # Journal duplicate detection now runs BEFORE admit() (intent.json is
+    # written ahead of admission so a refused admission is always durable --
+    # see owner_dispatch.py's admission-refusal fix); a RID with an existing
+    # journal entry is caught there, never reaching the gate a second time.
+    case("DUPLICATE rid: refused by the journal, sender not called again, journal unchanged",
+         d.dispatch(KB, "r_kb1", b"REQ kb\n", ["result.md"], T0) == "held:not_dispatched:duplicate_rid"
          and len(s.calls) == 2 and files(J / KB / "r_kb1") == ["intent.json", "settled.json"])
     (roots[KB] / "r_pre").mkdir()
     case("handoff dir already exists: refused with an immutable refused.json, no send",
@@ -232,7 +236,7 @@ def main() -> int:
          out[f"{KB}/r_crash_pre"] == "refused_recovered" and files(J / KB / "r_crash_pre") == ["intent.json", "refused.json"]
          and G["gate"].record("r_crash_pre")[2:] == ("blocked", "crash_recovered_pre_send") and not s2.calls)
     case("RECOVER pre-send crash: the blocked request is never re-admitted (no resend grant)",
-         mk(s2).dispatch(KB, "r_crash_pre", b"REQ\n", ["result.md"], T0).startswith("held:not_dispatched:owner_lease_duplicate")
+         mk(s2).dispatch(KB, "r_crash_pre", b"REQ\n", ["result.md"], T0) == "held:not_dispatched:duplicate_rid"
          and not s2.calls)
     case("RECOVER reconciles every durable outcome: refused / ambiguous entries report as such",
          out[f"{KB}/r_pre"] == "refused" and out[f"{KB}/r_err"] == "ambiguous" and out[f"{KB}/r_kb1"] == "dispatched")
@@ -364,8 +368,12 @@ def main() -> int:
     want = {lab: min(12, max(0, bound[lab] - open_before[lab])) for lab in (KB, DOTS)}  # 12 distinct rids
     case(f"CONCURRENT via the real queue: exactly max_open - open dispatched per label ({total} == {want})",
          total == want and all(not o[1] for o in outs))
-    case("CONCURRENT: every racing duplicate refused by the queue; each process sent only its own label",
-         all(line.split()[2].startswith("held:not_dispatched:owner_") for line in lines) and len(lines) == 4)
+    # Each process's own final re-dispatch of its label's q0 races against a
+    # journal entry (its own OR its racing twin's, same shared journal root)
+    # that is guaranteed to exist by then -- the journal's exclusive mkdir
+    # catches it before the gate is asked again.
+    case("CONCURRENT: every racing duplicate refused by the already-journaled rid; each process sent only its own label",
+         all(line.split()[2] == "held:not_dispatched:duplicate_rid" for line in lines) and len(lines) == 4)
     av = ra.Availability(str(base / "ra.db"), {k: str(v) for k, v in roots.items()}, str(J))
     settled = sum(1 for lab in (KB, DOTS) for r in (J / lab).iterdir()
                   if r.name.startswith(lab + "_q") and (r / "settled.json").exists())
@@ -479,9 +487,14 @@ def auth_contract_cases(base: Path) -> None:
     lc.execute("UPDATE owner_projects SET max_open=1 WHERE label=?", (KB,))
     grant("a_q", rid="r_q")
     rq_res = mkd("a_q").dispatch(KB, "r_q", body, man, T0)
-    case("UNSENT: consumed then refused at admission -> held, no journal, listed by unsent(); never regranted",
-         rq_res.startswith("held:not_dispatched:") and status("a_q") == "consumed" and files(J / KB / "r_q") is None
-         and oda.unsent(store, str(J)) == ["a_q"])
+    case("ADMISSION REFUSED: consumed then refused at admission (queue full) -> durably journaled as refused, "
+         "never surfaced as consumed-unsent, never regranted",
+         rq_res == "held:not_dispatched:owner_queue_full" and status("a_q") == "consumed"
+         and files(J / KB / "r_q") == ["intent.json", "refused.json"]
+         and oda.unsent(store, str(J)) == [] and oda.unresolved(store, str(J)) == [])
+    case("ADMISSION REFUSED: recover() classifies it cleanly as refused, never mismatch/unrecorded "
+         "(no gate row exists for a refusal admit() never admitted)",
+         mkd("a_q").recover(T0)[f"{KB}/r_q"] == "refused")
     lc.execute("UPDATE owner_projects SET max_open=? WHERE label=?", (ol.DEFAULT_MAX_OPEN, KB))
     grant("a_amb", rid="r_amb")
     broken = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
