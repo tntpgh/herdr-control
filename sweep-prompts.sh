@@ -53,7 +53,8 @@ COMMON='(^|[;&|[:space:](`'"'"'"\$])(([A-Za-z0-9_.-]*/)+)?(rm|unlink|shred|trash
 if [ "$MODE" = "implement" ]; then
   DENY="$COMMON"
 else
-  DENY="$COMMON|git[[:space:]]+(push|merge|rebase|commit)|gh[[:space:]]+pr[[:space:]]+edit|>[[:space:]]*(src|public|config|\.github)/"
+  # `merge` must not match `git merge-base`/`merge-tree` (read-only; every reviewer runs one).
+  DENY="$COMMON|git[[:space:]]+(push|rebase|commit|merge([[:space:]]|$))|gh[[:space:]]+pr[[:space:]]+edit|>[[:space:]]*(src|public|config|\.github)/"
 fi
 
 # Extract the command/code body of a live "Allow tool" box. Bounded between the
