@@ -12,7 +12,10 @@
 #    (binary, native, hook = agent-hooks/omp-herdr-control.ts, extension manifest);
 #  3 every extensions.manifest entry hashes to its file;
 #  4 the full tree (type, mode, sha256 per path) equals the base release except ./omp;
-#  5 both release-label lines name this release directory.
+#  5 both release-label lines name this release directory;
+#  6 the env-binding guard (issue #362: PI_CONFIG_FILES et al.) is present in the
+#    release's omp, byte-identical to tests/fixtures/launcher-env-guard.v26g.sh,
+#    and runs before the argv scan.
 set -uo pipefail
 [ $# -eq 3 ] || { echo "usage: $0 <release_dir> <base_release_dir> <commit>" >&2; exit 2; }
 rel="${1%/}" base="${2%/}" commit="$3"
@@ -76,5 +79,59 @@ printf 'release manifest sha256 %s\n' "$(s "$tmp/rel.m")"
 label="$(basename "$rel")"
 n="$(grep -c -- "$label" "$omp")"
 [ "$n" = 2 ] && grep -q "^export OMP_BOUND_RELEASE_ID=$label$" "$omp" && ok "release label $label x2" || bad "release label $label count $n"
+
+# 6. env-binding guard (issue #362): release's own block vs the pinned fixture
+# contract. Each defect mode fails closed (negative-tested below) so a wrong,
+# missing, or tampered guard -- in the fixture OR the release -- is caught
+# rather than silently skipped.
+env_guard_fixture="$here/tests/fixtures/launcher-env-guard.v26g.sh"
+env_guard_fixture_sha=b5192ce9510895be69c1dc76b23dc218feeb470b6a5b0c3f465f68ee61f64793
+env_guard_block_of() { awk '/^for env_var in /,/^done$/' "$1" 2>/dev/null; }
+env_guard_shape_ok() {
+  printf '%s\n' "$1" | grep -q '^for env_var in PI_CONFIG_FILES ' \
+    && printf '%s\n' "$1" | grep -q 'die "\$env_var may bypass the bound overlays"' \
+    && printf '%s\n' "$1" | grep -q '^done$'
+}
+env_guard_digest() { printf '%s\n' "$1" | shasum -a 256 | awk '{print $1}'; }
+load_env_guard() {  # <file> <pinned-sha>: prints block, nonzero on any defect
+  [ -f "$1" ] || return 1
+  local b; b="$(env_guard_block_of "$1")"
+  [ -n "$b" ] && env_guard_shape_ok "$b" && [ "$(env_guard_digest "$b")" = "$2" ] || return 1
+  printf '%s' "$b"
+}
+fixture_block="$(load_env_guard "$env_guard_fixture" "$env_guard_fixture_sha")" \
+  && ok "env-guard fixture present, shape ok, digest pinned ($env_guard_fixture_sha)" \
+  || bad "env-guard fixture missing/empty/wrong shape/digest mismatch: $env_guard_fixture"
+rel_block="$(env_guard_block_of "$omp")"
+[ -n "$rel_block" ] && env_guard_shape_ok "$rel_block" && [ "$(env_guard_digest "$rel_block")" = "$env_guard_fixture_sha" ] \
+  && ok "release omp env-binding guard == pinned fixture ($env_guard_fixture_sha)" \
+  || bad "release omp env-binding guard missing or differs from pinned fixture"
+# env-guard must run before the argv scan, so PI_CONFIG_FILES etc. can never
+# reach a --config <overlay> check that only validates the two herdr paths.
+guard_line="$(grep -n '^for env_var in PI_CONFIG_FILES ' "$omp" | head -1 | cut -d: -f1)"
+argv_line="$(grep -n '^args=("\$@")$' "$omp" | head -1 | cut -d: -f1)"
+[ -n "$guard_line" ] && [ -n "$argv_line" ] && [ "$guard_line" -lt "$argv_line" ] \
+  && ok "env-binding guard (line $guard_line) runs before argv scan (line $argv_line)" \
+  || bad "env-binding guard missing or does not precede the argv scan"
+
+# negatives: load_env_guard must fail closed on every defect mode
+mkdir -p "$tmp/env_neg"
+load_env_guard "$tmp/env_neg/absent.sh" "$env_guard_fixture_sha" >/dev/null \
+  && bad "missing env-guard fixture loaded" || ok "missing env-guard fixture fails closed"
+: > "$tmp/env_neg/empty.sh"
+load_env_guard "$tmp/env_neg/empty.sh" "$env_guard_fixture_sha" >/dev/null \
+  && bad "empty env-guard fixture loaded" || ok "empty env-guard fixture fails closed"
+sed 's/may bypass the bound overlays/may bypass the bound overlays!/' "$env_guard_fixture" > "$tmp/env_neg/tampered.sh"
+load_env_guard "$tmp/env_neg/tampered.sh" "$env_guard_fixture_sha" >/dev/null \
+  && bad "tampered env-guard fixture loaded" || ok "tampered env-guard fixture: digest mismatch fails closed"
+load_env_guard "$env_guard_fixture" 0000000000000000000000000000000000000000000000000000000000000000 >/dev/null \
+  && bad "wrong env-guard pin accepted" || ok "wrong pinned env-guard digest fails closed"
+printf 'for env_var in PI_CONFIG_FILES; do\n  :\ndone\n' > "$tmp/env_neg/shape.sh"
+load_env_guard "$tmp/env_neg/shape.sh" "$(env_guard_digest "$(env_guard_block_of "$tmp/env_neg/shape.sh")")" >/dev/null \
+  && bad "wrong-shape env-guard loaded" || ok "wrong-shape env-guard fails closed even with a matching digest"
+printf '' > "$tmp/env_neg/no_guard_omp"
+rel_block_missing="$(env_guard_block_of "$tmp/env_neg/no_guard_omp")"
+[ -z "$rel_block_missing" ] && ok "a release omp with no env-guard block is detected as absent" \
+  || bad "env_guard_block_of found a block that should not exist"
 
 [ $fails -eq 0 ] && { echo "PASS: 0 failing"; exit 0; } || { echo "FAIL: $fails failing"; exit 1; }
