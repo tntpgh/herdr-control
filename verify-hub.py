@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import shutil
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +25,9 @@ from unittest.mock import Mock, patch
 spec = importlib.util.spec_from_file_location("herdr_hub", Path(__file__).with_name("hub.py"))
 hub = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hub)
+
+import owner_dispatch_auth as oda  # noqa: E402 -- lib/ is on sys.path once hub.py has executed
+import owner_lease as ol  # noqa: E402
 
 NOW = dt.datetime(2026, 9, 7, 14, tzinfo=dt.timezone.utc)
 CANARY = "private-credential-must-not-appear"
@@ -2207,6 +2212,149 @@ class SentinelTrend(unittest.TestCase):
             status="degraded", failed=["rating_usefulness"])
         self.assertEqual(loop["outcome"], "degraded")
         self.assertIn("failed signals: rating_usefulness", loop["detail"])
+
+
+class OwnersView(unittest.TestCase):
+    """SPEC.md (feat/hub-owners-view): owners_data() and its four read-only
+    sources (registry `owners` table, owner_lease, owner_dispatch_auth,
+    HERDR_QUEUE_SUPERVISOR_LANES) must never conflate 'store unreadable'
+    with 'legitimately nothing registered'. Fixture DBs live under this
+    worktree's own tmp/, never the system temp dir (SPEC.md Rules)."""
+
+    def setUp(self):
+        fixtures_root = Path(__file__).resolve().parent / "tmp"
+        fixtures_root.mkdir(exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(dir=str(fixtures_root)))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = patch.dict(os.environ, {}, clear=False)
+        p.start()
+        self.addCleanup(p.stop)
+        for k in ("HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB",
+                  "HERDR_QUEUE_SUPERVISOR_LANES", "HERDR_QUEUE_SUPERVISOR"):
+            os.environ.pop(k, None)
+
+    def _registry_with_owner(self, label="conductor", pane_id="w8:p2", agent_session=""):
+        reg = self.tmp / "registry.sqlite3"
+        conn = sqlite3.connect(reg)
+        conn.execute("CREATE TABLE owners (label TEXT PRIMARY KEY, pane_id TEXT, pane_birth TEXT, "
+                     "agent_session TEXT, workspace TEXT, registered_at TEXT, updated_at TEXT)")
+        conn.execute("INSERT INTO owners VALUES (?,?,?,?,?,?,?)",
+                     (label, pane_id, "term_abc", agent_session, "/Users/x/Code/herdr-control",
+                      "2026-10-20T00:00:00Z", "2026-10-26T00:00:00Z"))
+        conn.commit()
+        conn.close()
+        return reg
+
+    def test_populated_store_joins_registration_lease_lane_and_grant(self):
+        reg = self._registry_with_owner()
+        lease_db = self.tmp / "owner_lease.sqlite3"
+        lconn = ol.connect(str(lease_db))
+        ol.migrate(lconn)
+        ol.register_owner(lconn, "herdr-control", "tntpgh/herdr-control", now=time.time())
+        ol.claim_initial(lconn, "herdr-control", "w9:p1", "term_xyz", 600, "a" * 64, now=time.time())
+        lconn.close()
+
+        auth_db = self.tmp / "auth.sqlite3"
+        aconn = sqlite3.connect(str(auth_db))
+        aconn.executescript(oda.SCHEMA)
+        for stmt in oda.OPERATOR_SCHEMA:
+            aconn.execute(stmt)
+        for stmt in oda.ISSUANCE_SCHEMA:
+            aconn.execute(stmt)
+        aconn.execute(
+            "INSERT INTO owner_dispatch_auth (auth_id,protocol,owner_label,project,pane_id,pane_birth,"
+            "session_digest,lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,"
+            "status,decided_at,expires_at,consumed_at) VALUES "
+            "('a1','p','herdr-control','tntpgh/herdr-control','w9:p1','term_xyz','d',1,'r1','sha','[]',"
+            "'prompt','appr','granted','2026-10-26T00:00:00Z',?,NULL)", (time.time() + 600,))
+        aconn.commit()
+        aconn.close()
+
+        with patch.object(hub, "REGISTRY", reg), patch.dict(os.environ, {
+                "HERDR_OWNER_LEASE_DB": str(lease_db), "HERDR_OWNER_DISPATCH_AUTH_DB": str(auth_db),
+                "HERDR_QUEUE_SUPERVISOR_LANES": "herdr-control,other-lane"}):
+            out = hub.owners_data()
+        self.assertEqual(out["sources"], {
+            "registered_owners": "ok", "owner_lease": "ok",
+            "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"})
+        by_label = {o["label"]: o for o in out["owners"]}
+        self.assertEqual(set(by_label), {"conductor", "herdr-control", "other-lane"})
+        self.assertEqual(by_label["conductor"]["registered"]["pane_id"], "w8:p2")
+        self.assertIsNone(by_label["conductor"]["lease"], "conductor was never registered as a project owner")
+        self.assertEqual(by_label["herdr-control"]["project"], "tntpgh/herdr-control")
+        self.assertEqual(by_label["herdr-control"]["lease"]["pane_id"], "w9:p1")
+        self.assertEqual(by_label["herdr-control"]["lease"]["state"], "live")
+        self.assertTrue(by_label["herdr-control"]["queue_lane"])
+        self.assertFalse(by_label["conductor"]["queue_lane"])
+        self.assertEqual([g["auth_id"] for g in by_label["herdr-control"]["grants"]], ["a1"])
+        self.assertEqual(by_label["other-lane"]["registered"], None)
+
+    def test_missing_stores_report_unavailable_never_empty(self):
+        """Every source absent (the common deployed state: owner_lease,
+        owner_dispatch_auth and the queue supervisor are all INERT/
+        DEFAULT-OFF today) must say so per source, not render as a quiet,
+        indistinguishable 'nothing registered'."""
+        with patch.object(hub, "REGISTRY", self.tmp / "no-such-registry.sqlite3"):
+            out = hub.owners_data()
+        self.assertEqual(out["owners"], [])
+        for name, status in out["sources"].items():
+            self.assertTrue(status.startswith("unavailable:"), f"{name}: {status}")
+
+    def test_unreadable_lease_store_is_unavailable_not_silently_empty(self):
+        bogus = self.tmp / "not-a-db.sqlite3"
+        bogus.write_bytes(b"not a sqlite file")
+        with patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(bogus)}):
+            out = hub.owner_lease_data()
+        self.assertTrue(out["status"].startswith("unavailable:"), out["status"])
+        self.assertEqual(out["projects"], {})
+        self.assertEqual(out["live"], {})
+
+    def test_a_store_down_marks_only_its_own_fields_unavailable(self):
+        """registered_owners stays readable while owner_lease is down: the
+        per-label join must not let one dead source blank out another."""
+        reg = self._registry_with_owner()
+        with patch.object(hub, "REGISTRY", reg), \
+                patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(self.tmp / "missing.sqlite3")}):
+            out = hub.owners_data()
+        row = out["owners"][0]
+        self.assertIsInstance(row["registered"], dict)
+        self.assertEqual(row["lease"], "unavailable")
+        self.assertEqual(row["project"], "unavailable")
+        self.assertEqual(row["grants"], "unavailable")
+        self.assertEqual(row["queue_lane"], "unavailable")
+
+    def test_handler_opens_every_store_read_only(self):
+        """lib/owner_lease.py's own connect() is writable; hub.py's readers
+        must use their OWN read-only open (`mode=ro`), never that one, so a
+        read of this view can never mutate the store it is reading."""
+        lease_db = self.tmp / "owner_lease.sqlite3"
+        lconn = ol.connect(str(lease_db))
+        ol.migrate(lconn)
+        ol.register_owner(lconn, "herdr-control", "tntpgh/herdr-control", now=time.time())
+        lconn.close()
+        conn = hub._ro_sqlite(str(lease_db))
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as cm:
+                conn.execute("INSERT INTO owner_projects VALUES ('x','tntpgh/x','2026-01-01T00:00:00Z',5)")
+                conn.commit()
+            self.assertIn("readonly", str(cm.exception).lower())
+        finally:
+            conn.close()
+
+    def test_render_owners_never_emits_the_raw_agent_session_value(self):
+        """publisher.py's own docstring: agent_session is an absolute
+        filesystem path that encodes the username. /owners may say one was
+        captured; it must never print the path itself."""
+        reg = self._registry_with_owner(
+            agent_session="/Users/x/.local/share/sessions/-Users-x-secret-path")
+        with patch.object(hub, "REGISTRY", reg):
+            data = hub.owners_data()
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: data)}):
+            rendered = hub.render_owners()
+        self.assertIn("conductor", rendered)
+        self.assertIn("session", rendered)
+        self.assertNotIn("secret-path", rendered)
+        self.assertNotIn("/Users/x/.local/share/sessions", rendered)
 
 
 if __name__ == "__main__":
