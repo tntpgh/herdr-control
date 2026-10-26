@@ -2286,7 +2286,10 @@ class OwnersView(unittest.TestCase):
         self.assertEqual(by_label["herdr-control"]["lease"]["state"], "live")
         self.assertTrue(by_label["herdr-control"]["queue_lane"])
         self.assertFalse(by_label["conductor"]["queue_lane"])
-        self.assertEqual([g["auth_id"] for g in by_label["herdr-control"]["grants"]], ["a1"])
+        self.assertEqual([g["status"] for g in by_label["herdr-control"]["grants"]], ["granted"])
+        self.assertNotIn("auth_id", by_label["herdr-control"]["grants"][0])
+        self.assertNotIn("request_id", by_label["herdr-control"]["grants"][0])
+        self.assertFalse(out["queue_supervisor_enabled"])  # HERDR_QUEUE_SUPERVISOR unset in this fixture
         self.assertEqual(by_label["other-lane"]["registered"], None)
 
     def test_missing_stores_report_unavailable_never_empty(self):
@@ -2355,6 +2358,132 @@ class OwnersView(unittest.TestCase):
         self.assertIn("session", rendered)
         self.assertNotIn("secret-path", rendered)
         self.assertNotIn("/Users/x/.local/share/sessions", rendered)
+
+    def test_workspace_and_store_paths_never_leave_registered_owners_data(self):
+        """Item 2 (second review): `workspace` is a free-text field a
+        caller can set to a real filesystem path (register-owner.sh passes
+        the pane's own reported workspace) -- this view has no way to tell
+        that apart from a harmless label, so it must never leave this
+        process, and a missing-store status must never carry the store's
+        own path either."""
+        reg = self._registry_with_owner()
+        with patch.object(hub, "REGISTRY", reg):
+            out = hub.registered_owners_data()
+        self.assertNotIn("workspace", out["rows"]["conductor"])
+        self.assertNotIn("/Users/x/Code/herdr-control", json.dumps(out))
+        missing = self.tmp / "no-such-lease.sqlite3"
+        with patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(missing)}):
+            lease_out = hub.owner_lease_data()
+        self.assertEqual(lease_out["status"], "unavailable:missing")
+        self.assertNotIn(str(missing), lease_out["status"])
+
+    def test_output_never_carries_exception_text_or_capability_ids(self):
+        """Items 2/3 (second review): a corrupt/unreadable store must report
+        a bounded code only -- never the exception's own text -- and a
+        grant row must never carry auth_id/request_id, both capability-like
+        identifiers a holder could use to look up or replay the grant."""
+        reg = self._registry_with_owner()
+        bogus_lease = self.tmp / "not-a-db.sqlite3"
+        bogus_lease.write_bytes(b"not a sqlite file")
+        with patch.object(hub, "REGISTRY", reg), \
+                patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(bogus_lease)}):
+            out = hub.owners_data()
+        blob = json.dumps(out)
+        self.assertNotIn(str(self.tmp), blob)
+        self.assertNotIn("OperationalError", blob)
+        self.assertNotIn("DatabaseError", blob)
+        self.assertNotIn("sqlite3", blob)
+        self.assertNotIn("auth_id", blob)
+        self.assertNotIn("request_id", blob)
+        for status in out["sources"].values():
+            self.assertRegex(status, r"^(ok|unavailable:[a-z_]+)$", status)
+
+    def test_aggregate_json_excludes_owners_data(self):
+        """Item 1 (second review): /?json=1 (the all-CACHES aggregate every
+        other page's ?json=1 also goes through) must never carry owners
+        data -- that surface is served ONLY at /api/owners and
+        /owners?json=1."""
+        secret_label = "secret-owner-" + CANARY
+        secret = {"owners": [{"label": secret_label}], "sources": {}, "queue_supervisor_enabled": False}
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
+        caches["owners"] = Mock(get=lambda: secret)
+        with patch.dict(hub.CACHES, caches):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                with urllib.request.urlopen(base + "/?json=1", timeout=10) as response:
+                    overview_body = response.read().decode()
+                with urllib.request.urlopen(base + "/api/owners", timeout=10) as response:
+                    owners_body = response.read().decode()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=10)
+        self.assertNotIn("owners", json.loads(overview_body))
+        self.assertNotIn(secret_label, overview_body)
+        self.assertIn(secret_label, owners_body)
+
+    def test_html_distinguishes_source_unavailable_from_truly_empty(self):
+        """Item 4 (second review): a genuinely empty, readable set of
+        sources must render different text than a set where every source
+        was unreadable -- the earlier wording was identical for both."""
+        readable_empty = {"registered_owners": "ok", "owner_lease": "ok",
+                           "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"}
+        all_down = {k: "unavailable:missing" for k in readable_empty}
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
+                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False})}):
+            empty_html = hub.render_owners()
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
+                "owners": [], "sources": all_down, "queue_supervisor_enabled": False})}):
+            down_html = hub.render_owners()
+        empty_msg = re.search(r"colspan=6>([^<]+)<", empty_html).group(1)
+        down_msg = re.search(r"colspan=6>([^<]+)<", down_html).group(1)
+        self.assertNotEqual(empty_msg, down_msg)
+
+    def test_supervisor_enabled_reported_independent_of_lane_configuration(self):
+        """Item 5 (second review): HERDR_QUEUE_SUPERVISOR's actual state must
+        be visible even when no lane list is configured, and vice versa --
+        collapsing both into one "unavailable" hid which one was true."""
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR": "1"}, clear=False):
+            os.environ.pop("HERDR_QUEUE_SUPERVISOR_LANES", None)
+            enabled_unconfigured = hub.queue_supervisor_lanes_data()
+        self.assertTrue(enabled_unconfigured["enabled"])
+        self.assertEqual(enabled_unconfigured["status"], "unavailable:not_configured")
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_LANES": "herdr-control"}, clear=False):
+            os.environ.pop("HERDR_QUEUE_SUPERVISOR", None)
+            configured_disabled = hub.queue_supervisor_lanes_data()
+        self.assertFalse(configured_disabled["enabled"])
+        self.assertEqual(configured_disabled["status"], "ok")
+
+    def test_lease_liveness_compares_same_timestamp_format(self):
+        """LOW finding (pr361-REVIEW.md): owner_lease_data() must compare
+        expires_at against a 'now' in the SAME microsecond format
+        lib/owner_lease.py's own _iso()/_live() use for expires_at -- the
+        earlier whole-second comparison misreported a lease still live as
+        'expired' for up to 1s whenever the two seconds-values coincided
+        ('.' sorts below 'Z' in a lexical string compare)."""
+        lease_db = self.tmp / "owner_lease.sqlite3"
+        lconn = ol.connect(str(lease_db))
+        ol.migrate(lconn)
+        ol.register_owner(lconn, "herdr-control", "tntpgh/herdr-control", now=time.time())
+        base_sec = int(time.time()) + 10_000  # arbitrary future whole second
+        claim_now = base_sec - 599.5  # expires_at lands exactly 0.5s into base_sec
+        ol.claim_initial(lconn, "herdr-control", "w9:p1", "term_xyz", 600, "a" * 64, now=claim_now)
+        lconn.close()
+
+        class FrozenDatetime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return dt.datetime.fromtimestamp(base_sec, tz)
+
+        with patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(lease_db)}), \
+                patch.object(hub.dt, "datetime", FrozenDatetime):
+            out = hub.owner_lease_data()
+        row = out["live"]["herdr-control"]
+        self.assertTrue(row["expires_at"].endswith(".500000Z"), row["expires_at"])
+        self.assertEqual(row["state"], "live")
 
 
 if __name__ == "__main__":
