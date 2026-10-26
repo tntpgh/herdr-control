@@ -230,7 +230,7 @@ EOF
 }
 
 cmd_decide() {                          # approve|decline|supersede id [flags]
-  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" asha="" row tj route verdict
+  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" asha="" via="" slack_user="" slack_team="" row tj route verdict
   shift 2 2>/dev/null || die "usage: herdr-action.sh $verb <request_id> --authority conductor|human …"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -238,6 +238,9 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       --review-category) cat="${2:-}"; shift 2 ;;
       --review-reason) why="${2:-}"; shift 2 ;;
       --form) form="${2:-}"; shift 2 ;;
+      --via) via="${2:-}"; shift 2 ;;
+      --slack-user) slack_user="${2:-}"; shift 2 ;;
+      --slack-team) slack_team="${2:-}"; shift 2 ;;
       --action-sha256) asha="${2:-}"; shift 2 ;;
       *) die "unknown argument $1" ;;
     esac
@@ -273,6 +276,28 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       fi
       _ha_decide "$id" "$status" conductor "$(_ha_field "$tj" conductor_pane_id)" "$cat" "$why" "$row" ;;
     human)
+      # SOURCE ONLY, default OFF (HERDR_BOUND_CLEARANCE_SLACK=1 required).
+      # Part B's Route 1: the Slack bridge's own button click, gated by its
+      # existing OAuth allowlist (authorized() in slack-herdr-bridge.py), is
+      # a synchronous human-present decision — the click IS the decision,
+      # with no decoupled form-POST window to race. It does not reuse the
+      # hub-form `--form <id>` path below: that path's identity proof is
+      # "a same-uid local process answered the loopback form", which
+      # menu-occurrence-design.md §3 explicitly retracts as insufficient on
+      # its own. This branch instead trusts the SAME channel herdr-select.sh
+      # already trusts for HERDR_SELECT_VIA=slack-button (human authority
+      # comes only from the bridge's own allowlist check, never
+      # self-asserted) — `decided_by` records the actual Slack user/team for
+      # audit, never "the conductor" or an unverified flag.
+      if [ "$via" = slack-button ]; then
+        [ "${HERDR_BOUND_CLEARANCE_SLACK:-0}" = 1 ] || die "slack-button clearance is disabled (HERDR_BOUND_CLEARANCE_SLACK=1 required)" 8
+        [ -n "$slack_user" ] && [ -n "$slack_team" ] || die "--via slack-button requires --slack-user and --slack-team" 2
+        [ -n "$asha" ] || die "--via slack-button requires --action-sha256" 2
+        [ "$asha" = "$(_ha_field "$row" action_sha256)" ] || die "wrong action_sha256 for request $id — refusing a mismatched/stale digest" 8
+        [ "$route" = human ] || die "request $id is not human-route ($route) — a Slack button may not decide it" 8
+        _ha_decide "$id" "$status" human "slack-button:${slack_user}@${slack_team}" "" "$why" "$row"
+        return
+      fi
       local ans pinned
       # Only the formserve record the hub tick pinned when it served THIS
       # request's form counts — a record written later by anything else does not.
