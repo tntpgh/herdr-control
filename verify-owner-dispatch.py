@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -614,21 +615,42 @@ def lease_writer_cases(base: Path) -> None:
     events = lambda: lc.execute("SELECT count(*) FROM owner_events").fetchone()[0]
     case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and leases(KB) == [])
     case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and leases(DOTS) == [])
-    # L1 (REVIEW.md Low-1): a TTL under MIN_LEASE_REMAINING_S (180s) must be
-    # refused BEFORE any lease is written -- it would pass claim_initial()'s
-    # own 1..MAX_TTL_S range check and then perpetually fail
-    # DeliveryGate.begin_notice()'s lease_too_short fence, parking every
-    # queued item forever.
-    case("WRITER: TTL below the delivery floor (180s) -> refused, no lease",
-         run(KB, ttl=old.MIN_LEASE_REMAINING_S - 1) == (2, f"refused:ttl_below_delivery_floor:{old.MIN_LEASE_REMAINING_S}")
+    # (REVIEW.md round-2 Medium): a claim-time TTL check against bare
+    # MIN_LEASE_REMAINING_S (180s) gives a lease claimed at exactly that
+    # floor ZERO slack -- begin_notice()'s own remaining-time fence is
+    # evaluated at whatever LATER wall-clock moment a separate
+    # owner-dispatch.py/queue-supervisor.py process reaches it, so ANY
+    # claim-to-delivery delay reproduces the exact "parked at queued
+    # forever" failure (REVIEW.md Low-1) the floor exists to close -- it
+    # only moved the threshold, it never added margin. The floor is now
+    # CLAIM_TTL_FLOOR_S = MIN_LEASE_REMAINING_S + CLAIM_TO_DELIVERY_SLACK_S.
+    case("WRITER: TTL below the delivery floor -> refused, no lease",
+         run(KB, ttl=old.CLAIM_TTL_FLOOR_S - 1) == (2, f"refused:ttl_below_delivery_floor:{old.CLAIM_TTL_FLOOR_S}")
          and leases(KB) == [])
     # Exactly-at-floor TTL folded into the real gen1 claim below (a second
     # successful claim here would consume the only initial-claim slot KB
-    # has, breaking every case that follows).
-    rc, out = run(KB, ttl=old.MIN_LEASE_REMAINING_S)
+    # has, breaking every case that follows). owner-lease-claim.py never
+    # accepts an injected `now`, so the real wall clock is the claim
+    # moment: captured as t_claim for the margin check right after.
+    t_claim = time.time()
+    rc, out = run(KB, ttl=old.CLAIM_TTL_FLOOR_S)
     ht = ol.holder_tuple(lc, KB)
     case("WRITER: initial claim = generation 1 with EXACTLY the registry (pane, birth, session digest)",
          rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB] and ht[3] == 1)
+    # The margin itself (REVIEW.md round-2 Medium, not reverted -- reasoned
+    # against the pre-fix floor): run begin_notice() against the SAME
+    # just-claimed KB lease with an INJECTED `now` -- no real sleep -- set
+    # past the OLD 180s margin. Under the pre-fix floor (TTL == 180 exactly)
+    # this delay alone would already put remaining time below
+    # MIN_LEASE_REMAINING_S, returning 'lease_too_short'; the new floor's
+    # extra CLAIM_TO_DELIVERY_SLACK_S must still clear it.
+    margin_gate = old.DeliveryGate(lease_db)
+    adm = margin_gate.admit(KB, *PANE[KB], "r_margin", now=time.time())
+    case("DELIVERY: margin fixture admitted at gen1", adm.ok and adm.generation == 1)
+    delayed_now = t_claim + old.MIN_LEASE_REMAINING_S + 1  # 1s past the OLD 180s slack
+    case("DELIVERY: a claim at the NEW floor still clears begin_notice() after a delay past the old 180s margin",
+         margin_gate.begin_notice(KB, *PANE[KB], 1, "r_margin", now=delayed_now) == "delivering")
+    margin_gate.close()
     before, ev = leases(KB), events()
     case("WRITER: a second run (same holder, live lease) -> not_initial; nothing renewed or written",
          run(KB) == (2, "refused:not_initial") and leases(KB) == before and events() == ev)
@@ -722,6 +744,25 @@ def register_cases(base: Path) -> None:
     after_write = projects()
     case("REGISTER: idempotent re-run, same label/project -> succeeds again, no duplicate row",
          run()[0] == 0 and projects() == after_write)
+    # (REVIEW.md round-2 Minor): once a lease exists for the label, the
+    # DELETE rollback line is guaranteed to be refused by foreign_keys=ON
+    # -- the idempotent re-registration case above is exactly that moment
+    # (SPEC.md item 2). The printed guidance must name the REAL procedure
+    # (lib/owner_lease.py's disable(), non-destructive, preserves grants and
+    # the audit trail) instead of only repeating a DELETE line that will
+    # fail. Fails without the change: the old _rollback_line() always
+    # printed the bare DELETE line, with no disable()/stop-admission
+    # guidance at all once it is refused.
+    ol.acquire(lc, NEW, *NEW_PANE, TTL, time.time(), session_digest=NEW_SESS)
+    rc, out = run()
+    lines = out.splitlines()
+    case("REGISTER: once a lease exists, idempotent re-run still succeeds and names the real rollback",
+         rc == 0 and lines[0] == f"registered:{NEW}:tntpgh/tourguide"
+         and lines[1] == f"rollback: DELETE FROM owner_projects WHERE label={NEW!r} "
+                          f"(run against {lease_db}; refused by foreign_keys=ON once any lease/request exists for this label)"
+         and "DELETE refused" in lines[2]
+         and "disable(" in out and "owner_state.enabled=0" in out
+         and "never delete once a lease or request references the label" in out)
     case("REGISTER: same label, DIFFERENT project -> refused, row unchanged",
          run(project="tntpgh/other-project") == (2, "refused:InvalidOwner") and projects() == after_write)
     os.chmod(lease_db, 0o644)

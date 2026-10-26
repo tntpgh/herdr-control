@@ -55,6 +55,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -3203,6 +3204,8 @@ def queue_supervisor_lanes_data() -> dict:
 
 
 ESCALATIONS_SHOWN = 10  # latest N lines shown on the attention surface
+ESCALATIONS_MAX_READ_BYTES = 65536  # tail cap: bound the read regardless of file size (REVIEW.md round-2 Low)
+ESCALATIONS_MAX_READ_LINES = 200  # cap on candidate lines parsed from that tail, well above ESCALATIONS_SHOWN
 
 
 def escalations_data() -> dict:
@@ -3215,17 +3218,52 @@ def escalations_data() -> dict:
     are both the ordinary case, never an error -- same split as
     owner_lease_data() above. `latest` carries only notify()'s own four
     fields (queue-supervisor.py:203-206: at/label/item/reason), never the
-    configured root path itself, so this surface cannot leak host layout."""
+    configured root path itself, so this surface cannot leak host layout.
+
+    Bounded (REVIEW.md round-2 Low): reads at most the last
+    ESCALATIONS_MAX_READ_BYTES bytes and ESCALATIONS_MAX_READ_LINES lines no
+    matter how large the append-only log has grown. Opens with O_NOFOLLOW --
+    refusing a symlinked path rather than following it, matching the
+    writer's own open() (queue-supervisor.py:204) -- and O_NONBLOCK, so a
+    path that resolves to a FIFO or other non-regular file returns promptly
+    (rejected below via the fstat S_ISREG check) instead of this read
+    blocking forever waiting on a writer to show up. Never takes a lock of
+    its own: the writer never takes one either (O_APPEND is atomic for its
+    small per-record writes), so there is nothing here that can block
+    waiting on one."""
     root = os.environ.get("HERDR_QUEUE_SUPERVISOR_ROOT", "")
     if not root:
         return {"status": "unavailable:not_configured", "count": 0, "latest": []}
     path = Path(root) / "escalations.jsonl"
-    if not path.exists():
-        return {"status": "unavailable:missing", "count": 0, "latest": []}
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {"status": "unavailable:missing", "count": 0, "latest": []}
     except OSError:
         return {"status": "unavailable:unreadable", "count": 0, "latest": []}
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return {"status": "unavailable:unreadable", "count": 0, "latest": []}
+        if not stat.S_ISREG(st.st_mode):
+            # FIFO / device / socket: never attempt to read one -- that is
+            # exactly the shape that can block indefinitely waiting for a
+            # writer to show up.
+            return {"status": "unavailable:unreadable", "count": 0, "latest": []}
+        size = st.st_size
+        offset = max(0, size - ESCALATIONS_MAX_READ_BYTES)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            raw = os.read(fd, size - offset)
+        except OSError:
+            return {"status": "unavailable:unreadable", "count": 0, "latest": []}
+    finally:
+        os.close(fd)
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]  # the tail read may start mid-line; drop that fragment
+    lines = lines[-ESCALATIONS_MAX_READ_LINES:]
     rows = []
     for line in lines:
         line = line.strip()

@@ -2648,6 +2648,82 @@ class OwnersView(unittest.TestCase):
         self.assertIn("queue_blocked", rendered)
         self.assertIn("Queue escalations (1)", rendered)
 
+    def test_escalations_oversized_file_is_bounded_not_read_whole(self):
+        """REVIEW.md round-2 Low: escalations.jsonl is append-only with
+        nothing in the tree that ever truncates or rotates it, so a
+        long-running supervisor on a frequently-escalating lane grows it
+        without bound and the old path.read_text() read the WHOLE file on
+        every cache-expiry hit. hub.escalations_data() must cap what it
+        reads (ESCALATIONS_MAX_READ_LINES on this small-record fixture)
+        regardless of how many valid rows the file actually holds. Fails
+        without the change: the old reader has no bound and would report
+        every one of the 500 rows written here, not a capped subset."""
+        root = self.tmp / "oversized-root"
+        root.mkdir()
+        esc_path = root / "escalations.jsonl"
+        rows = [{"at": 1000.0 + i, "label": "herdr-control", "item": f"r{i}", "reason": "queue_blocked"}
+                for i in range(500)]
+        esc_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+            out = hub.escalations_data()
+        self.assertEqual(out["status"], "ok")
+        self.assertLess(out["count"], 500, out)
+        self.assertLessEqual(out["count"], hub.ESCALATIONS_MAX_READ_LINES, out)
+        self.assertEqual(len(out["latest"]), 10)  # ESCALATIONS_SHOWN
+        self.assertEqual(out["latest"][-1]["item"], "r499")  # tail is the newest rows
+
+    def test_escalations_symlink_is_refused_not_followed(self):
+        """REVIEW.md round-2 Low: the writer opens with O_NOFOLLOW
+        (queue-supervisor.py:204) but the old reader did plain
+        path.exists()/path.read_text(), which DOES follow a symlink --
+        inconsistent with every other store-opening path in this tree. A
+        symlinked escalations.jsonl must be refused, not read through.
+        Fails without the change: the old reader would happily return the
+        symlink target's content as status 'ok'."""
+        root = self.tmp / "symlink-root"
+        root.mkdir()
+        target = self.tmp / "symlink-target.jsonl"
+        target.write_text(json.dumps({"at": 1.0, "label": "l", "item": "i", "reason": "queue_blocked"}) + "\n",
+                           encoding="utf-8")
+        (root / "escalations.jsonl").symlink_to(target)
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+            out = hub.escalations_data()
+        self.assertEqual(out["status"], "unavailable:unreadable", out)
+        self.assertEqual(out["count"], 0)
+        self.assertEqual(out["latest"], [])
+
+    def test_escalations_fifo_never_blocks_the_reader(self):
+        """REVIEW.md round-2 Low ("Hanging the hub"): if escalations.jsonl
+        ever resolves to a FIFO with no writer attached, a plain
+        open()+read() (the old path.read_text()) BLOCKS INDEFINITELY --
+        opening a FIFO for reading waits for a writer, i.e. this read never
+        returns while 'the writer' (whatever is supposed to write to it)
+        never shows up -- and that happens while CACHES["owners"]'s instance
+        lock is held (hub.py Cached.get(), no stale_ok branch for this
+        source), freezing every concurrent /owners and /api/owners request.
+        hub.escalations_data() must refuse a non-regular file outright
+        rather than attempt to read it. Run on a background thread with a
+        bounded join() so a regression here fails this test instead of
+        hanging the suite. Fails without the change: the old reader's
+        path.read_text() would block this thread forever (no writer ever
+        opens the FIFO), so the join() below times out and the assertion on
+        the result fails."""
+        root = self.tmp / "fifo-root"
+        root.mkdir()
+        fifo_path = root / "escalations.jsonl"
+        os.mkfifo(fifo_path)
+        result = {}
+
+        def call():
+            with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+                result["out"] = hub.escalations_data()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        self.assertFalse(t.is_alive(), "escalations_data() blocked on the FIFO instead of refusing it")
+        self.assertEqual(result.get("out", {}).get("status"), "unavailable:unreadable", result)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

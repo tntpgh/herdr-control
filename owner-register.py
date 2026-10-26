@@ -30,7 +30,19 @@ run directly against the configured HERDR_OWNER_LEASE_DB, before any lease
 or request references the label — owner_leases/owner_requests both FOREIGN
 KEY onto owner_projects.label, so SQLite's own foreign_keys=ON (every
 connection here) refuses that DELETE once anything does. This script prints
-that exact rollback line after every successful registration and dry-run.
+that exact rollback line after every successful registration and dry-run
+(REVIEW.md round-2 Minor: including the idempotent re-registration of an
+already-active, already-leased label, by which point the DELETE is
+guaranteed to be refused). Once the DELETE is refused: the real procedure is
+lib/owner_lease.py's own disable(conn) — a single non-destructive
+`UPDATE owner_state SET enabled=0`, so every mutation fails closed while
+every table, grant and the owner_events/owner_requests/owner_dispatch_auth
+audit trail is preserved and readers (observe_stale, check_fence,
+export_backup) keep working — or unsetting HERDR_OWNER_LEASE_DELIVERY /
+HERDR_OWNER_DISPATCH / HERDR_QUEUE_SUPERVISOR. Stop admission; never delete
+once anything references the label. This script prints that fallback line
+too whenever the DELETE would be refused (any existing lease or request for
+the label at the time of this run).
 """
 from __future__ import annotations
 
@@ -49,9 +61,17 @@ import owner_lease as ol  # noqa: E402
 import private_sqlite  # noqa: E402
 
 
-def _rollback_line(db: str, label: str) -> str:
-    return (f"rollback: DELETE FROM owner_projects WHERE label={label!r} "
+def _rollback_line(db: str, label: str, delete_will_be_refused: bool) -> str:
+    line = (f"rollback: DELETE FROM owner_projects WHERE label={label!r} "
             f"(run against {db}; refused by foreign_keys=ON once any lease/request exists for this label)")
+    if delete_will_be_refused:
+        line += (f"\nDELETE refused (lease/request already exists for {label!r}): "
+                 "stop admission instead -- disable the label via lib/owner_lease.py's "
+                 "disable(conn) (non-destructive: flips owner_state.enabled=0, fails every "
+                 "mutation closed, preserves every grant and the full audit trail) or unset "
+                 "HERDR_OWNER_LEASE_DELIVERY / HERDR_OWNER_DISPATCH / HERDR_QUEUE_SUPERVISOR; "
+                 "never delete once a lease or request references the label.")
+    return line
 
 
 def main(argv=None, resolve=None) -> int:
@@ -91,17 +111,23 @@ def main(argv=None, resolve=None) -> int:
             iso = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             print(f"dry-run:owner_projects(label={a.label!r}, project={proj!r}, "
                   f"registered_at={iso!r}, max_open={a.max_open})")
-            print(_rollback_line(db, a.label))
+            refused_delete = bool(conn.execute(
+                "SELECT 1 FROM owner_leases WHERE label=? UNION SELECT 1 FROM owner_requests WHERE label=? LIMIT 1",
+                (a.label, a.label)).fetchone())
+            print(_rollback_line(db, a.label, refused_delete))
             return 0
         try:
             proj = ol.register_owner(conn, a.label, a.project, a.max_open)
         except (ol.InvalidOwner, ol.Disabled, ValueError) as exc:
             print(f"refused:{type(exc).__name__}")
             return 2
+        refused_delete = bool(conn.execute(
+            "SELECT 1 FROM owner_leases WHERE label=? UNION SELECT 1 FROM owner_requests WHERE label=? LIMIT 1",
+            (a.label, a.label)).fetchone())
     finally:
         conn.close()
     print(f"registered:{a.label}:{proj}")
-    print(_rollback_line(db, a.label))
+    print(_rollback_line(db, a.label, refused_delete))
     return 0
 
 

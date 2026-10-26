@@ -57,6 +57,18 @@ RETRY_APPROVAL = "retry:approval"
 DELIVERY_TIMEOUT_S = 120   # publisher's herdr-deliver.sh subprocess timeout
 SAFETY_MARGIN_S = 60       # settle + clock skew allowance after a full timeout
 MIN_LEASE_REMAINING_S = DELIVERY_TIMEOUT_S + SAFETY_MARGIN_S
+# REVIEW.md round-2 Medium: a claim-time TTL check against MIN_LEASE_REMAINING_S
+# alone gives a lease claimed at exactly 180s ZERO slack -- begin_notice()'s own
+# remaining-time fence (above) is evaluated at a LATER wall-clock `now` (a
+# separate owner-dispatch.py/queue-supervisor.py process reaching
+# begin_notice()), so any delay at all between the claim and that first
+# delivery attempt reproduces the exact "parked at queued forever" failure
+# the floor exists to close, just moved from "TTL < 180" to "TTL == 180".
+# CLAIM_TO_DELIVERY_SLACK_S is the operational margin reserved for that gap:
+# process spawn + registry resolution + up to one queue-supervisor poll tick
+# (cron/poll-driven, not instantaneous -- lib/queue_supervisor.py tick_lane).
+CLAIM_TO_DELIVERY_SLACK_S = 300
+CLAIM_TTL_FLOOR_S = MIN_LEASE_REMAINING_S + CLAIM_TO_DELIVERY_SLACK_S
 
 
 @dataclass(frozen=True)
