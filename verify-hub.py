@@ -2485,6 +2485,84 @@ class OwnersView(unittest.TestCase):
         self.assertTrue(row["expires_at"].endswith(".500000Z"), row["expires_at"])
         self.assertEqual(row["state"], "live")
 
+    def test_html_distinguishes_partial_unavailable_from_both_other_cases(self):
+        """SPEC item 1 (pr361-r2 LOW follow-up): zero rows with SOME sources
+        readable and others down must not read as either the all-down
+        message or the readable-empty message -- a reader seeing the
+        readable-empty wording would trust an answer actually missing a
+        share, because its own readable sources had nothing even though an
+        unreadable sibling might have."""
+        readable_empty = {"registered_owners": "ok", "owner_lease": "ok",
+                           "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"}
+        all_down = {k: "unavailable:missing" for k in readable_empty}
+        partial = dict(readable_empty, owner_lease="unavailable:missing")
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
+                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False})}):
+            empty_html = hub.render_owners()
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
+                "owners": [], "sources": all_down, "queue_supervisor_enabled": False})}):
+            down_html = hub.render_owners()
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
+                "owners": [], "sources": partial, "queue_supervisor_enabled": False})}):
+            partial_html = hub.render_owners()
+        empty_msg = re.search(r"colspan=6>([^<]+)<", empty_html).group(1)
+        down_msg = re.search(r"colspan=6>([^<]+)<", down_html).group(1)
+        partial_msg = re.search(r"colspan=6>([^<]+)<", partial_html).group(1)
+        self.assertEqual(len({empty_msg, down_msg, partial_msg}), 3)
+        self.assertIn("other sources unavailable", partial_msg)
+
+    def test_lease_fencing_tuple_and_registered_pane_birth_never_published(self):
+        """SPEC item 2: (pane_id, pane_birth, generation) together are
+        exactly the fencing tuple owner_lease.py's _fence() checks as
+        holder proof for release()/enqueue()/transition()
+        (pr361-r2-REVIEW.md LOW finding 2) -- pane_birth and generation
+        must never leave this process via owners_data() (and so never via
+        /api/owners or /owners HTML), on the lease row or the
+        registered-owner row."""
+        reg = self._registry_with_owner()
+        lease_db = self.tmp / "owner_lease.sqlite3"
+        lconn = ol.connect(str(lease_db))
+        ol.migrate(lconn)
+        ol.register_owner(lconn, "herdr-control", "tntpgh/herdr-control", now=time.time())
+        ol.claim_initial(lconn, "herdr-control", "w9:p1", "term_xyz", 600, "a" * 64, now=time.time())
+        lconn.close()
+        with patch.object(hub, "REGISTRY", reg), \
+                patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(lease_db)}):
+            out = hub.owners_data()
+        by_label = {o["label"]: o for o in out["owners"]}
+        self.assertEqual(by_label["herdr-control"]["lease"]["pane_id"], "w9:p1")
+        self.assertNotIn("pane_birth", by_label["herdr-control"]["lease"])
+        self.assertNotIn("generation", by_label["herdr-control"]["lease"])
+        self.assertNotIn("pane_birth", by_label["conductor"]["registered"])
+        blob = json.dumps(out)
+        self.assertNotIn("pane_birth", blob)
+        self.assertNotIn("term_xyz", blob)   # the lease row's pane_birth value
+        self.assertNotIn("term_abc", blob)   # the registered row's pane_birth value
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: out)}):
+            rendered = hub.render_owners()
+        self.assertNotIn("term_xyz", rendered)
+        self.assertNotIn("term_abc", rendered)
+        self.assertNotIn("gen ", rendered)
+
+    def test_grant_age_rendered_sane_for_expiry_about_one_hour_out(self):
+        """LOW finding 1 (pr361-r2-REVIEW.md): owner_dispatch_auth.expires_at
+        is a seconds epoch; _age() expects milliseconds, so the grants cell
+        must convert before calling it -- the unconverted call divided a
+        ~1.79e9-second value by 1000 and landed around 1970-01-21."""
+        expires_at = time.time() + 3600  # ~1 hour out, seconds epoch
+        owner = {
+            "label": "conductor", "registered": None, "project": None, "lease": None,
+            "queue_lane": False,
+            "grants": [{"label": "conductor", "project": "x", "status": "granted",
+                        "decided_at": "2026-10-26T00:00:00Z", "expires_at": expires_at, "consumed_at": None}],
+        }
+        row_html = hub._owner_row(owner)
+        m = re.search(r"exp (in \d+m)</span>", row_html)
+        self.assertIsNotNone(m, row_html)
+        minutes = int(re.search(r"\d+", m.group(1)).group())
+        self.assertTrue(55 <= minutes <= 60, m.group(1))
+        self.assertNotIn("1970", row_html)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

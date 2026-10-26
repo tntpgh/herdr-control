@@ -3210,12 +3210,25 @@ def owners_data() -> dict:
     owners = []
     for label in sorted(labels):
         live = lease["live"].get(label)
+        # Drop pane_birth/generation here, not in owner_lease_data(): together
+        # with pane_id they are exactly the fencing tuple owner_lease.py's
+        # _fence() checks as holder proof for release()/enqueue()/
+        # transition() -- and unlike acquire()'s renewal check, _fence()
+        # does NOT also require session_digest (pr361-r2-REVIEW.md LOW
+        # finding 2). Nothing writes this store yet, but this view must not
+        # pre-publish that proof to every unauthenticated loopback reader.
+        live_public = ({"pane_id": live["pane_id"], "expires_at": live["expires_at"], "state": live["state"]}
+                       if live else live)
+        reg_row = reg["rows"].get(label)
+        # pane_birth dropped for the same reason -- it is half of the
+        # fencing tuple above, so this view has no business republishing it.
+        reg_public = {k: v for k, v in reg_row.items() if k != "pane_birth"} if reg_row else reg_row
         owners.append({
             "label": label,
-            "registered": "unavailable" if reg["status"] != "ok" else reg["rows"].get(label),
+            "registered": "unavailable" if reg["status"] != "ok" else reg_public,
             "project": ("unavailable" if lease["status"] != "ok"
                         else (lease["projects"].get(label) or {}).get("project")),
-            "lease": "unavailable" if lease["status"] != "ok" else live,
+            "lease": "unavailable" if lease["status"] != "ok" else live_public,
             "queue_lane": "unavailable" if lanes["status"] != "ok" else (label in lanes["labels"]),
             "grants": ("unavailable" if grants["status"] != "ok"
                        else [g for g in grants["rows"] if g["label"] == label]),
@@ -5445,7 +5458,7 @@ def _owner_row(o: dict) -> str:
         lease_cell = "<span class=dim>unavailable</span>"
     elif lease:
         lease_cell = (f"<span class='pill {'ok' if lease['state'] == 'live' else 'bad'}'>{_esc(lease['state'])}</span> "
-                      f"{_esc(lease['pane_id'])} gen {lease['generation']}<br>"
+                      f"{_esc(lease['pane_id'])}<br>"
                       f"<span class=dim title='{_esc(lease['expires_at'])}'>exp {_age(lease['expires_at'])}</span>")
     else:
         lease_cell = "<span class=dim>none</span>"
@@ -5458,7 +5471,7 @@ def _owner_row(o: dict) -> str:
     elif grants:
         grants_cell = "<br>".join(
             f"<span class='pill {'run' if g['status'] == 'consumed' else ''}'>{_esc(g['status'])}</span> "
-            f"<span class=dim title='{_esc(g['expires_at'])}'>exp {_age(g['expires_at'])}</span>"
+            f"<span class=dim title='{_esc(g['expires_at'])}'>exp {_age(g['expires_at'] * 1000)}</span>"
             for g in grants)
     else:
         grants_cell = "<span class=dim>none</span>"
@@ -5474,12 +5487,18 @@ def render_owners() -> str:
     d = CACHES["owners"].get()
     rows = "".join(_owner_row(o) for o in d["owners"])
     if not rows:
-        # Item 4 (second review): "no rows" from a store that could not be
-        # read must read differently than "no rows" from a readable, empty
-        # one -- the first is "go check the stores below", the second is a
-        # real, trustworthy answer.
-        if all(v != "ok" for v in d["sources"].values()):
+        # Item 4 (second review) + SPEC item 1 (pr361-r2 LOW): "no rows" from
+        # a store that could not be read must read differently than "no
+        # rows" from a readable, empty one, AND differently again from "no
+        # rows, some sources readable but others down" -- the middle case
+        # must not be reported as the trustworthy, truly-empty answer, since
+        # the readable sources alone might just be missing their share.
+        statuses = d["sources"].values()
+        if all(v != "ok" for v in statuses):
             rows = "<tr><td class=dim colspan=6>no sources were readable -- see sources below</td></tr>"
+        elif any(v != "ok" for v in statuses):
+            rows = ("<tr><td class=dim colspan=6>no rows from readable sources; "
+                    "other sources unavailable (see sources below)</td></tr>")
         else:
             rows = "<tr><td class=dim colspan=6>no owner/lease/lane/grant state registered</td></tr>"
     src_note = " · ".join(f"{_esc(k)}: {_esc(v)}" for k, v in d["sources"].items())
