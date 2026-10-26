@@ -8571,7 +8571,7 @@ _cp_registry_git_show_readonly() {      # raw
   [ "${HERDR_REGISTRY_GIT_SHOW_READONLY:-0}" = 1 ] || return 1
   local raw="$1" seg bare n=0 segments tidy
   tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
-  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*|*'<'*) return 1 ;; esac
   segments="$(_cp_coderef_split "$tidy")"
   case "$segments" in '@CP_PROTECT_FAILED@') return 1 ;; esac
   while IFS= read -r seg; do
@@ -8627,21 +8627,68 @@ _cp_registry_git_show_readonly() {      # raw
       [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$bare" | awk '{print $1}')" ] || return 1
       case "$_cp_wcmd" in
         sed)
-          local -a s=("${_CP_LOC[@]:1}") si has_n=0
+          # Only `-n` and `-E` are identical in BSD and GNU sed; any other
+          # flag (including `-i`/`-i.*`/`--in-place`/`--in-place=*`,
+          # `-f`/--file (script-from-file), `-r`/`-R`, and the attached
+          # no-dot suffix form `-ibak` the old `-i|-i.*` pattern missed)
+          # is refused outright. At most one non-flag token — the sed
+          # script itself — is allowed; a second positional is the
+          # trailing-filename bypass (sed reads it instead of stdin) and
+          # is refused.
+          #
+          # The script content itself is also a read/write/exec surface
+          # independent of any flag: `r`/`R` read an arbitrary file into
+          # the output stream, `w`/`W` (and `s///w`) write an arbitrary
+          # file, and GNU sed's `e` command (or `s///e` flag) executes a
+          # shell command. None of those are flags this loop can catch,
+          # so the script is additionally required to match a strict
+          # print-only allowlist: a line number, a line range, `$` (last
+          # line), or a `/regex/` address, each followed by nothing but
+          # the bare `p` command. Anything else — including multiple
+          # semicolon-joined commands — fails closed.
+          local -a s=("${_CP_LOC[@]:1}") si has_n=0 saw_script=0 script=""
           for si in "${s[@]}"; do
             case "$si" in
               -n) has_n=1 ;;
-              -i|-i.*|--in-place|--in-place=*) return 1 ;;
+              -E) ;;
+              -*) return 1 ;;
+              *)
+                [ "$saw_script" -eq 0 ] || return 1
+                saw_script=1; script="$si" ;;
             esac
           done
-          [ "$has_n" -eq 1 ] || return 1 ;;
+          [ "$has_n" -eq 1 ] && [ "$saw_script" -eq 1 ] || return 1
+          [[ "$script" =~ ^([0-9]+(,([0-9]+|\$))?|\$|/[^/]*/)p$ ]] || return 1 ;;
         grep)
-          local -a s=("${_CP_LOC[@]:1}") si has_n=0
+          # Only `-n` is allowed; `-f`/`--file` (pattern-from-file),
+          # `-r`/`-R` (recursive directory read) and every other flag are
+          # refused. At most one non-flag token — the pattern — is
+          # allowed; a second positional is the trailing-filename/
+          # directory bypass and is refused.
+          local -a s=("${_CP_LOC[@]:1}") si has_n=0 saw_pattern=0
           for si in "${s[@]}"; do
-            case "$si" in -n) has_n=1 ;; esac
+            case "$si" in
+              -n) has_n=1 ;;
+              -*) return 1 ;;
+              *)
+                [ "$saw_pattern" -eq 0 ] || return 1
+                saw_pattern=1 ;;
+            esac
           done
-          [ "$has_n" -eq 1 ] || return 1 ;;
-        wc) ;;
+          [ "$has_n" -eq 1 ] && [ "$saw_pattern" -eq 1 ] || return 1 ;;
+        wc)
+          # No operand is ever legitimate here — wc on stdin takes none.
+          # Only its counting flags are allowed (restricted to the set
+          # identical in BSD and GNU wc — `-L`, max line length, is a
+          # GNU-only extension and is excluded); any positional (the
+          # trailing-filename bypass) is refused.
+          local -a s=("${_CP_LOC[@]:1}") si
+          for si in "${s[@]}"; do
+            case "$si" in
+              -l|-w|-c|-m) ;;
+              *) return 1 ;;
+            esac
+          done ;;
         *) return 1 ;;
       esac
     fi

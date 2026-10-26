@@ -4944,6 +4944,59 @@ check_reserved "git show readonly: extra positional after REF:PATH refuses" \
   "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh extra | sed -n '1p'"
 check_reserved "git show readonly: leading-dash REF:PATH (disguised flag) refuses" \
   "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv -O:claims.sh | sed -n '1p'"
+# PR #359 review (pr359-REVIEW.md) HIGH/MEDIUM findings: the downstream
+# sed/grep/wc filter must be able to read ONLY stdin. Each case below is a
+# bypass the review proved live against this repo's own files; these must
+# all stay reserved even with the flag ON.
+check_reserved "git show readonly: trailing-filename bypass, wc -l FILE" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | wc -l README.md"
+check_reserved "git show readonly: trailing-filename bypass, sed -n FILE" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p' README.md"
+check_reserved "git show readonly: trailing-filename bypass, grep -n FILE" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | grep -n . README.md"
+check_reserved "git show readonly: input-redirect bypass, sed -n < FILE" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p' < README.md"
+check_reserved "git show readonly: multi-filename bypass, wc FILE FILE" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | wc README.md README.md"
+check_reserved "git show readonly: recursive-directory bypass, grep -rn DIR" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | grep -rn . lib"
+check_reserved "git show readonly: sed -f (script-from-file) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n -f /etc/hosts"
+check_reserved "git show readonly: grep -f (pattern-from-file) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | grep -n -f /etc/hosts"
+check_reserved "git show readonly: sed -ibak attached no-dot suffix refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -ibak -n '1p'"
+check_reserved "git show readonly: sed -r (GNU-only, not BSD-identical) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -rn '1p'"
+check_reserved "git show readonly: wc with an extra operand but no flag refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | wc /etc/hosts"
+# Conductor follow-up on the PR #359 fix: the sed SCRIPT itself is a
+# read/write/exec surface no flag check can see. These stay reserved even
+# though `-n` is present and no extra flag or positional is used — the
+# script allowlist (print-only: line number/range, `$`, or `/regex/`,
+# always ending in a bare `p`) must reject every one of them.
+check_reserved "git show readonly: sed script 'r' command reads an arbitrary file" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1r /etc/passwd'"
+check_reserved "git show readonly: sed script 'R' command reads a line from an arbitrary file" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1R /etc/passwd'"
+check_reserved "git show readonly: sed script 'w' command writes an arbitrary file" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1w /tmp/x'"
+check_reserved "git show readonly: sed script 'W' command writes an arbitrary file" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1W /tmp/x'"
+check_reserved "git show readonly: sed script 'e' command executes a shell command (GNU)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1e id'"
+check_reserved "git show readonly: sed s///w flag writes an arbitrary file" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n 's/a/b/w /tmp/x'"
+check_reserved "git show readonly: sed s///e flag executes a shell command (GNU)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n 's/a/b/e'"
+check_reserved "git show readonly: sed script multiple semicolon-joined commands refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p;2p'"
+check_unreserved "git show readonly: sed script last-line \$p allowed" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '\$p'"
+check_unreserved "git show readonly: sed script range-to-end 1,\$p allowed" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1,\$p'"
+check_unreserved "git show readonly: sed script regex-address /foo/p allowed" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '/foo/p'"
 
 unset HERDR_REGISTRY_GIT_SHOW_READONLY
 check_reserved "git show readonly: flag default OFF keeps the registry read reserved" \
