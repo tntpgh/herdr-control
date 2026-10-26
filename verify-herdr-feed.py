@@ -44,8 +44,24 @@ d3 = feed.needs_you({**SUMMARY, "open_decisions": 2, "open_ids": "A,B"}, [], NOW
 check("same open decisions -> quiet", feed.changes(d1, d2) == [])
 check("new decision -> announced", ("+", d3["decisions:A,B"]) in feed.changes(d1, d3))
 
-# Hub down is itself the one item, not a silent empty set.
-check("hub down -> single hub item", list(feed.needs_you(None, None, NOW, GRACE)) == ["hub:down"])
+# Outages: the blocked set is UNKNOWN, so already-shown blocked panes must not
+# read as cleared, and the outage itself is announced.
+hub_down = feed.needs_you(None, None, NOW, GRACE, prev=a)
+check("hub down -> hub item, blocked pane not cleared",
+      [s for s, _ in feed.changes(a, hub_down)] == ["+"] and "hub:down" in hub_down)
+sub_down = feed.needs_you({**SUMMARY, "live_connected": False}, None, NOW, GRACE, prev=a)
+check("subscription down -> hub:live, blocked pane not cleared",
+      [s for s, _ in feed.changes(a, sub_down)] == ["+"] and "hub:live" in sub_down)
+check("recovery -> only the outage item clears", feed.changes(sub_down, a) == [("-", sub_down["hub:live"])])
+
+# poll(): a disconnected hub's [] is unknown (None); a 503 backs off instead of spinning.
+slept = []
+feed.time.sleep = slept.append
+responses = {"/api/blocked": {"connected": False, "version": 7, "blocked": []}, "/api/summary": SUMMARY}
+feed._get = lambda path, timeout: None if path.startswith("/api/blocked/wait") else responses.get(path)
+v, s, blk = feed.poll(3, 30)
+check("503 on wait -> backs off before the fallback", slept == [5.0])
+check("disconnected [] -> blocked unknown (None)", blk is None and s is SUMMARY)
 
 # A failing controller surfaces even when nothing is blocked.
 h = feed.needs_you({**SUMMARY, "stall_watchdog": {"last_error": "boom"}}, [], NOW, GRACE)

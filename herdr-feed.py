@@ -37,17 +37,21 @@ def _age(seconds: float) -> str:
     return f"{s}s" if s < 90 else f"{s // 60}m" if s < 5400 else f"{s // 3600}h"
 
 
-def needs_you(summary: dict | None, blocked: list[dict] | None, now: float, grace: float) -> dict[str, str]:
+def needs_you(summary: dict | None, blocked: list[dict] | None, now: float, grace: float,
+              prev: dict[str, str] | None = None) -> dict[str, str]:
     """Current needs-you set: stable key -> display text.
 
     Keys carry identity (pane birth, decision ids, drift target sha), so an item
     that is replaced by a different one of the same kind reads as clear + new.
     Display text never feeds the key, so a ticking age never re-announces.
+
+    blocked=None means the blocked set is UNKNOWN (hub down, or the hub lost its
+    herdr subscription and serves an empty list). The previous blocked items are
+    carried forward unchanged: an outage must never read as "cleared".
     """
     items: dict[str, str] = {}
-    if summary is None:
-        items["hub:down"] = f"hub unreachable at {HUB}"
-        return items
+    if blocked is None:
+        items.update({k: v for k, v in (prev or {}).items() if k.startswith("blocked:")})
     for b in blocked or []:
         since = b.get("since")
         if since is None or now - float(since) < grace:
@@ -55,13 +59,20 @@ def needs_you(summary: dict | None, blocked: list[dict] | None, now: float, grac
         label = b.get("label") if b.get("label") not in (None, "", b.get("pane_id")) else "(no task)"
         items[f"blocked:{b.get('pane_id')}@{b.get('birth')}"] = (
             f"blocked {_age(now - float(since))}  {b.get('pane_id')}  {label}  [{b.get('workspace', '?')}]")
-    if summary.get("live_connected") is False:
+    if summary is None:
+        items["hub:down"] = f"hub unreachable at {HUB}"
+        return items
+    if blocked is None or summary.get("live_connected") is False:
         items["hub:live"] = "hub lost its herdr subscription — blocked panes are not being seen"
     n, ids = summary.get("open_decisions") or 0, summary.get("open_ids") or ""
     if n:
         items[f"decisions:{ids}"] = f"{n} open decision(s) → {DECISIONS_URL}"
     if summary.get("open_portal_decisions"):
-        items["decisions:portal"] = f"{summary['open_portal_decisions']} open portal decision(s)"
+        # ceiling: /api/summary exposes only a portal COUNT, so one portal
+        # decision swapped for another in the same poll goes unannounced.
+        # Upgrade: have hub.py publish portal ids like open_ids, key on them.
+        n_portal = summary["open_portal_decisions"]
+        items[f"decisions:portal:{n_portal}"] = f"{n_portal} open portal decision(s)"
     for d in summary.get("deploy_drift") or []:
         items[f"drift:{d.get('repo')}:{d.get('main')}"] = (
             f"deploy drift: {d.get('repo')} runs {d.get('deployed')}, main is {d.get('main')}")
@@ -89,15 +100,20 @@ def _get(path: str, timeout: float) -> dict | None:
 
 
 def poll(version: int, wait_s: float) -> tuple[int, dict | None, list[dict] | None]:
-    """One long-poll round: returns as soon as an agent status changes, else after wait_s."""
+    """One long-poll round: returns as soon as an agent status changes, else after wait_s.
+
+    blocked is None when the blocked set is unknown (see needs_you)."""
     live = _get(f"/api/blocked/wait?since={version}&timeout={wait_s:g}", wait_s + 10)
-    if live is None or "blocked" not in live:  # 503 "too many waiters" or hub down
+    if live is None or "blocked" not in live:
+        # 503 "too many waiters" or hub down: the wait did not block, so back
+        # off here or the loop spins against a hub that is asking for relief.
+        time.sleep(min(wait_s, 5.0))
         live = _get("/api/blocked", 10)
-    if live is None:
-        # Without the blocked set every blocked item would falsely read as
-        # cleared; report the hub as down instead.
-        return version, None, None
-    return int(live.get("version") or version), _get("/api/summary", 10), live.get("blocked") or []
+    summary = _get("/api/summary", 10)
+    if live is None or live.get("connected") is False:
+        # live_attention() serves [] while disconnected — unknown, not empty.
+        return version, summary, None
+    return int(live.get("version") or version), summary, live.get("blocked") or []
 
 
 def main() -> int:
@@ -121,12 +137,10 @@ def main() -> int:
         return 0
     while True:
         version, summary, blocked = poll(version, wait_s)
-        cur = needs_you(summary, blocked, time.time(), args.grace)
+        cur = needs_you(summary, blocked, time.time(), args.grace, prev)
         for sign, text in changes(prev, cur):
             print(f"{time.strftime('%H:%M')}  {'+' if sign == '+' else '✓'} {text}", flush=True)
         prev = cur
-        if summary is None:
-            time.sleep(wait_s)  # hub down: the long-poll returned instantly; don't spin
 
 
 if __name__ == "__main__":
