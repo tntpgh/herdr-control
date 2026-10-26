@@ -4881,6 +4881,76 @@ for _stubname in exit2 empty partial; do
   check_broken_awk_true "_cp_find_word_injection_present still flags find argv injection ($_stubdesc)" "$_stubdir" _cp_find_word_injection_present "$_find_injection_cmd"
 done
 
+# ---- Part A: _cp_registry_git_show_readonly ---------------------------
+# approval-classification-repair-5d6e094a.md item (A), .handoffs/SPEC.md
+# (task feat/readonly-git-classifier). SOURCE ONLY, default OFF: the first
+# block below sets HERDR_REGISTRY_GIT_SHOW_READONLY=1 so these assertions
+# exercise the predicate's OWN refusal/exemption logic, not just the
+# default-OFF gate (that gate gets its own check at the end of this
+# section, with the flag unset again).
+HERDR_REGISTRY_GIT_SHOW_READONLY=1
+
+check_unreserved "git show readonly: bare REF:PATH (claims.sh, registry branch)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh"
+check_unreserved "git show readonly: piped sed -n (claims.sh)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_unreserved "git show readonly: piped grep -n (claims.sh)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | grep -n foo"
+check_unreserved "git show readonly: piped wc (claims.sh)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | wc -l"
+check_unreserved "git show readonly: chained sed | wc" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1,5p' | wc -l"
+check_unreserved "git show readonly: -c alias.show=show exact literal allowed (run-registry.sh, governance branch)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c alias.show=show --no-pager show --no-textconv HEAD:lib/run-registry.sh | sed -n '1p'"
+
+# Negative test table, approval-classification-repair-5d6e094a.md item (A)
+# "Negative tests (must still refuse)" — each of these stays reserved even
+# with the flag ON, proving the predicate itself closes the shape, not the
+# default-OFF gate.
+check_reserved "git show readonly: redirection refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh > /tmp/x"
+check_reserved "git show readonly: tee refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | tee /tmp/x"
+check_reserved "git show readonly: --output on git show refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv --output=/tmp/x HEAD:claims.sh"
+check_reserved "git show readonly: alias override refuses (design table literal shape)" \
+  "git -c alias.show='!rm -rf /tmp' show HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: alias override refuses (only env/pager/textconv missing is the -c value itself)" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c alias.show='!rm -rf /tmp' --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: config override refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c core.pager=evil --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: pager, missing --no-pager flag refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: textconv, missing --no-textconv flag refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: system/global config, missing env prefix refuses" \
+  "git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: chained write (&&) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p' && rm -rf /tmp/x"
+check_reserved "git show readonly: eval/subshell refuses" \
+  "eval 'git show HEAD:claims.sh' | sed -n '1p'"
+# Not in the design's own table, but required by the shape it specifies:
+check_reserved "git show readonly: non-sed/grep/wc downstream (cat) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | cat"
+check_reserved "git show readonly: sed -i refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -i '' -e '1p'"
+check_reserved "git show readonly: sed without -n refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed '1p'"
+check_reserved "git show readonly: grep without -n refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | grep foo"
+check_reserved "git show readonly: git log instead of show refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager log --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: extra positional after REF:PATH refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh extra | sed -n '1p'"
+check_reserved "git show readonly: leading-dash REF:PATH (disguised flag) refuses" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv -O:claims.sh | sed -n '1p'"
+
+unset HERDR_REGISTRY_GIT_SHOW_READONLY
+check_reserved "git show readonly: flag default OFF keeps the registry read reserved" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-pager show --no-textconv HEAD:claims.sh | sed -n '1p'"
+check_reserved "git show readonly: flag default OFF keeps the governance read reserved" \
+  "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c alias.show=show --no-pager show --no-textconv HEAD:lib/run-registry.sh | sed -n '1p'"
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
