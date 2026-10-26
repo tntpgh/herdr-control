@@ -4881,6 +4881,76 @@ for _stubname in exit2 empty partial; do
   check_broken_awk_true "_cp_find_word_injection_present still flags find argv injection ($_stubdesc)" "$_stubdir" _cp_find_word_injection_present "$_find_injection_cmd"
 done
 
+
+printf '== (iii) conductor_reserved_reason diagnostics: opt-in, off-by-default, byte-identical return value ==\n'
+_rr_logdir="$(mktemp -d)"; _rr_log="$_rr_logdir/cp-debug.log"
+# Unset (the default): the printed string is byte-identical across repeated
+# calls and across the three distinct rules in the unrolled first branch,
+# and the function never touches a file. `conductor_reserved_reason` is a
+# shell FUNCTION, not an executable -- `env -u` cannot exec it, so unset in
+# a subshell instead.
+_rr_u1="$(unset HERDR_CP_DEBUG_LOG; conductor_reserved_reason 'cat .ssh/id_rsa')"
+_rr_u2="$(unset HERDR_CP_DEBUG_LOG; conductor_reserved_reason 'cat .ssh/id_rsa')"
+_rr_u3="$(unset HERDR_CP_DEBUG_LOG; conductor_reserved_reason 'echo $KB_API_KEY')"
+total=$((total + 1))
+if [ "$_rr_u1" = "$_rr_u2" ] && [ "$_rr_u1" = 'credential-value access remains human-only' ] \
+   && [ "$_rr_u3" = 'credential-value access remains human-only' ] && [ ! -e "$_rr_log" ]; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG unset: byte-identical across repeated/different-rule calls, no file touched" "reserved"
+else
+  printf 'FAIL  %-52s => u1=[%s] u2=[%s] u3=[%s] log_exists=%s\n' \
+    "HERDR_CP_DEBUG_LOG unset: byte-identical across repeated/different-rule calls, no file touched" \
+    "$_rr_u1" "$_rr_u2" "$_rr_u3" "$([ -e "$_rr_log" ] && echo yes || echo no)"
+  failed=$((failed + 1))
+fi
+check_reserved "HERDR_CP_DEBUG_LOG unset: still reserves the identical credential-shaped command" 'cat .ssh/id_rsa'
+check_unreserved "HERDR_CP_DEBUG_LOG unset: still allows the identical ordinary command" 'git status --short --branch'
+# Set: the printed reservation string is UNCHANGED, and the log names which
+# of the three unrolled sub-rules fired, one per distinct trigger.
+_rr_path="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'cat .ssh/id_rsa')"
+total=$((total + 1))
+if [ "$_rr_path" = 'credential-value access remains human-only' ] && grep -q ' rule=path-or-keyword cmd=cat \.ssh/id_rsa$' "$_rr_log"; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: names path-or-keyword, printed string unchanged" "reserved"
+else
+  printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: names path-or-keyword, printed string unchanged" "$_rr_path" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+: > "$_rr_log"
+_rr_secret="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'echo $KB_API_KEY')"
+total=$((total + 1))
+if [ "$_rr_secret" = 'credential-value access remains human-only' ] && grep -q ' rule=secret-var-expansion ' "$_rr_log"; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: names secret-var-expansion, printed string unchanged" "reserved"
+else
+  printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: names secret-var-expansion, printed string unchanged" "$_rr_secret" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+: > "$_rr_log"
+_rr_dump="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'env')"
+total=$((total + 1))
+if [ "$_rr_dump" = 'credential-value access remains human-only' ] && grep -q ' rule=env-dump ' "$_rr_log"; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: names env-dump, printed string unchanged" "reserved"
+else
+  printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: names env-dump, printed string unchanged" "$_rr_dump" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+: > "$_rr_log"
+_rr_shaped="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'KB_API_KEY="sk-live-9f8e7d6c5b4a39281706"')"
+total=$((total + 1))
+if [ "$_rr_shaped" = 'credential-value access remains human-only' ] && grep -q ' rule=cred-shaped-value ' "$_rr_log"; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: names cred-shaped-value (second branch, unmodified structure)" "reserved"
+else
+  printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: names cred-shaped-value (second branch, unmodified structure)" "$_rr_shaped" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+: > "$_rr_log"
+_rr_allow="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'git status --short --branch')"
+total=$((total + 1))
+if [ -z "$_rr_allow" ] && [ ! -s "$_rr_log" ]; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: an unreserved command writes nothing to the log" "unreserved"
+else
+  printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: an unreserved command writes nothing to the log" "$_rr_allow" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+rm -rf "$_rr_logdir"
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

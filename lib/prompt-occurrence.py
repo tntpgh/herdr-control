@@ -111,6 +111,15 @@ def occurrence_key(run_id: str, task_id: str, pane_id: str, pane_birth: str,
     return "occ_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def _identity_verified(payload: dict) -> bool:
+    """The one true definition of 'is this occurrence's identity proven' —
+    shared by the write path (authorize_bound's last gate) and the read
+    path (fold_task), so they can never diverge again (M1, Main review:
+    a bound Approve must never durably succeed on an identity fold_task
+    would independently reject)."""
+    return bool(payload.get("pane_birth")) and bool(payload.get("native_session"))
+
+
 def _canonical_input_body(tool: str, tool_input: object) -> bytes:
     return json.dumps({"tool": tool, "input": tool_input, "known": tool_input is not None},
                       sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -711,6 +720,9 @@ def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pa
         if closed:
             conn.rollback()
             return {"occ_key": key, "written": "closed_or_mismatched"}
+        if not _identity_verified(payload):
+            conn.rollback()
+            return {"occ_key": key, "written": "identity_unverified"}
         conn.execute(
             "INSERT INTO approvals (approval_id,run_id,task_id,pane_id,prompt_id,choice,choice_text,"
             "decided_by,authority,policy_verdict,command,decided_at,attempted_at) "
@@ -874,7 +886,7 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
             # not "a value equal to another occurrence's missing value" —
             # it is unknown identity, and a consumer must treat it with the
             # same caution as correlation_mismatch (never send keys on it).
-            rec["identity_verified"] = bool(payload.get("pane_birth")) and bool(payload.get("native_session"))
+            rec["identity_verified"] = _identity_verified(payload)
             if rec["lifecycle"] == "unknown":
                 rec["lifecycle"] = "requested"
         elif typ == "prompt_occ_enriched":
