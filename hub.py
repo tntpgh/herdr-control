@@ -3202,6 +3202,46 @@ def queue_supervisor_lanes_data() -> dict:
     return {"status": "ok", "enabled": enabled, "labels": [x for x in raw.split(",") if x]}
 
 
+ESCALATIONS_SHOWN = 10  # latest N lines shown on the attention surface
+
+
+def escalations_data() -> dict:
+    """{"status", "count", "latest": [...]} from queue-supervisor.py's
+    notify() append-only log at $HERDR_QUEUE_SUPERVISOR_ROOT/escalations.jsonl
+    (REVIEW.md Medium-2: that log had no reader anywhere before this --
+    queue-supervisor.py's own docstring says plainly "this script contacts
+    no one"). Queue-supervisor is OFF BY DEFAULT and most hubs will never
+    set $HERDR_QUEUE_SUPERVISOR_ROOT, so "not configured" and "no file yet"
+    are both the ordinary case, never an error -- same split as
+    owner_lease_data() above. `latest` carries only notify()'s own four
+    fields (queue-supervisor.py:203-206: at/label/item/reason), never the
+    configured root path itself, so this surface cannot leak host layout."""
+    root = os.environ.get("HERDR_QUEUE_SUPERVISOR_ROOT", "")
+    if not root:
+        return {"status": "unavailable:not_configured", "count": 0, "latest": []}
+    path = Path(root) / "escalations.jsonl"
+    if not path.exists():
+        return {"status": "unavailable:missing", "count": 0, "latest": []}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {"status": "unavailable:unreadable", "count": 0, "latest": []}
+    rows = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        rows.append({"at": rec.get("at"), "label": rec.get("label"),
+                     "item": rec.get("item"), "reason": rec.get("reason")})
+    return {"status": "ok", "count": len(rows), "latest": rows[-ESCALATIONS_SHOWN:]}
+
+
 def owners_data() -> dict:
     """The one join /owners and /api/owners both read: every label seen in
     ANY of the four sources, each field `"unavailable"` when ITS OWN source
@@ -3211,6 +3251,7 @@ def owners_data() -> dict:
     lease = owner_lease_data()
     grants = owner_dispatch_grants_data()
     lanes = queue_supervisor_lanes_data()
+    esc = escalations_data()
 
     labels = set(reg["rows"]) | set(lease["projects"]) | set(lease["live"]) | set(lanes["labels"])
     labels |= {g["label"] for g in grants["rows"] if g["label"]}
@@ -3248,9 +3289,11 @@ def owners_data() -> dict:
         # second review): a per-label "no lane" must never be read as "the
         # supervisor itself is off" or vice versa.
         "queue_supervisor_enabled": lanes["enabled"],
+        "escalations": esc,
         "sources": {
             "registered_owners": reg["status"], "owner_lease": lease["status"],
             "owner_dispatch_auth": grants["status"], "queue_supervisor_lanes": lanes["status"],
+            "escalations": esc["status"],
         },
     }
 
@@ -5511,6 +5554,23 @@ def render_owners() -> str:
             rows = "<tr><td class=dim colspan=6>no owner/lease/lane/grant state registered</td></tr>"
     src_note = " · ".join(f"{_esc(k)}: {_esc(v)}" for k, v in d["sources"].items())
     supervisor_note = f"queue supervisor enabled: {d['queue_supervisor_enabled']}"
+    esc = d["escalations"]
+    if esc["status"] != "ok":
+        esc_block = ""
+    else:
+        esc_rows = "".join(
+            f"<tr><td class=dim>{_esc(_age((e['at'] or 0) * 1000))}</td><td>{_esc(e['label'] or '')}</td>"
+            f"<td>{_esc(e['item'] or '')}</td><td>{_esc(e['reason'] or '')}</td></tr>"
+            for e in reversed(esc["latest"]))
+        if not esc_rows:
+            esc_rows = "<tr><td class=dim colspan=4>no escalations logged</td></tr>"
+        esc_block = (
+            f"<h2 style='margin-top:20px'>Queue escalations ({esc['count']})</h2>"
+            "<p class=dim>Latest entries from queue-supervisor.py's escalations.jsonl "
+            "(frozen/blocked lanes the supervisor could not advance on its own).</p>"
+            "<table><tr><td class=dim>at</td><td class=dim>label</td><td class=dim>item</td>"
+            f"<td class=dim>reason</td></tr>{esc_rows}</table>"
+        )
     body = (
         "<h2>Owners &amp; lanes</h2>"
         "<p class=dim>Registered project owners and their lease / queue-lane / owner-dispatch-grant state, "
@@ -5518,6 +5578,7 @@ def render_owners() -> str:
         "<table><tr><td class=dim>label</td><td class=dim>registered owner</td><td class=dim>project</td>"
         f"<td class=dim>lease</td><td class=dim>queue lane</td><td class=dim>dispatch grants</td></tr>{rows}</table>"
         f"<p class=dim style='margin-top:10px'>{supervisor_note} · sources — {src_note}</p>"
+        f"{esc_block}"
     )
     return page("owners", "/owners", body, refresh=30)
 

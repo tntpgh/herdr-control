@@ -11,6 +11,13 @@ Requires an existing owner_projects mapping (never registers one). Acquires
 only as an INITIAL claim (owner_lease.claim_initial): generation 1 for a label
 with no lease or request history at all. Never renews, releases, reaps,
 stales or takes over. The lease DB is opened via lib/private_sqlite.
+--ttl is refused below lib/owner_lease_delivery.py's own
+MIN_LEASE_REMAINING_S (DELIVERY_TIMEOUT_S + SAFETY_MARGIN_S, currently 180s)
+(REVIEW.md Low-1): a lease claimed with too short a TTL would pass
+claim_initial()'s own 1..MAX_TTL_S check, then perpetually fail
+DeliveryGate.begin_notice()'s `lease_too_short` fence, parking every queued
+item at `queued` forever -- fails closed, but silently, so this is caught
+here instead.
 Exit: 0 acquired (prints generation); 2 refused (typed reason); 4 config.
 Rollback: unset the flags; the lease expires on its own TTL.
 """
@@ -26,6 +33,7 @@ sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
+import owner_lease_delivery as oled  # noqa: E402
 import private_sqlite  # noqa: E402
 
 
@@ -37,6 +45,9 @@ def main(argv=None, resolve=None) -> int:
     if os.environ.get("HERDR_OWNER_LEASE_WRITER") != "1" or os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
         print("refused:flags_off")
         return 4
+    if a.ttl < oled.MIN_LEASE_REMAINING_S:
+        print(f"refused:ttl_below_delivery_floor:{oled.MIN_LEASE_REMAINING_S}")
+        return 2
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
     try:

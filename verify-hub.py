@@ -2244,7 +2244,7 @@ class OwnersView(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         for k in ("HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB",
-                  "HERDR_QUEUE_SUPERVISOR_LANES", "HERDR_QUEUE_SUPERVISOR"):
+                  "HERDR_QUEUE_SUPERVISOR_LANES", "HERDR_QUEUE_SUPERVISOR", "HERDR_QUEUE_SUPERVISOR_ROOT"):
             os.environ.pop(k, None)
 
     def _registry_with_owner(self, label="conductor", pane_id="w8:p2", agent_session=""):
@@ -2290,7 +2290,8 @@ class OwnersView(unittest.TestCase):
             out = hub.owners_data()
         self.assertEqual(out["sources"], {
             "registered_owners": "ok", "owner_lease": "ok",
-            "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"})
+            "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok",
+            "escalations": "unavailable:not_configured"})
         by_label = {o["label"]: o for o in out["owners"]}
         self.assertEqual(set(by_label), {"conductor", "herdr-control", "other-lane"})
         self.assertEqual(by_label["conductor"]["registered"]["pane_id"], "w8:p2")
@@ -2446,11 +2447,14 @@ class OwnersView(unittest.TestCase):
         readable_empty = {"registered_owners": "ok", "owner_lease": "ok",
                            "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"}
         all_down = {k: "unavailable:missing" for k in readable_empty}
+        no_esc = {"status": "unavailable:not_configured", "count": 0, "latest": []}
         with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
-                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False})}):
+                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False,
+                "escalations": no_esc})}):
             empty_html = hub.render_owners()
         with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
-                "owners": [], "sources": all_down, "queue_supervisor_enabled": False})}):
+                "owners": [], "sources": all_down, "queue_supervisor_enabled": False,
+                "escalations": no_esc})}):
             down_html = hub.render_owners()
         empty_msg = re.search(r"colspan=6>([^<]+)<", empty_html).group(1)
         down_msg = re.search(r"colspan=6>([^<]+)<", down_html).group(1)
@@ -2510,14 +2514,18 @@ class OwnersView(unittest.TestCase):
                            "owner_dispatch_auth": "ok", "queue_supervisor_lanes": "ok"}
         all_down = {k: "unavailable:missing" for k in readable_empty}
         partial = dict(readable_empty, owner_lease="unavailable:missing")
+        no_esc = {"status": "unavailable:not_configured", "count": 0, "latest": []}
         with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
-                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False})}):
+                "owners": [], "sources": readable_empty, "queue_supervisor_enabled": False,
+                "escalations": no_esc})}):
             empty_html = hub.render_owners()
         with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
-                "owners": [], "sources": all_down, "queue_supervisor_enabled": False})}):
+                "owners": [], "sources": all_down, "queue_supervisor_enabled": False,
+                "escalations": no_esc})}):
             down_html = hub.render_owners()
         with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: {
-                "owners": [], "sources": partial, "queue_supervisor_enabled": False})}):
+                "owners": [], "sources": partial, "queue_supervisor_enabled": False,
+                "escalations": no_esc})}):
             partial_html = hub.render_owners()
         empty_msg = re.search(r"colspan=6>([^<]+)<", empty_html).group(1)
         down_msg = re.search(r"colspan=6>([^<]+)<", down_html).group(1)
@@ -2576,6 +2584,69 @@ class OwnersView(unittest.TestCase):
         minutes = int(re.search(r"\d+", m.group(1)).group())
         self.assertTrue(55 <= minutes <= 60, m.group(1))
         self.assertNotIn("1970", row_html)
+
+    def test_escalations_not_configured_vs_missing_vs_ok(self):
+        """REVIEW.md Medium-2: escalations.jsonl had no reader anywhere
+        before this -- $HERDR_QUEUE_SUPERVISOR_ROOT unset and a configured
+        root with no file yet must both report 'unavailable', never an
+        error, and must never be confused with each other or with a real
+        empty/non-empty log. Fails without hub.escalations_data()."""
+        os.environ.pop("HERDR_QUEUE_SUPERVISOR_ROOT", None)
+        self.assertEqual(hub.escalations_data(),
+                          {"status": "unavailable:not_configured", "count": 0, "latest": []})
+        root = self.tmp / "qroot"
+        root.mkdir()
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+            self.assertEqual(hub.escalations_data(),
+                              {"status": "unavailable:missing", "count": 0, "latest": []})
+            esc_path = root / "escalations.jsonl"
+            rows = [{"at": 1000.0 + i, "label": "herdr-control", "item": f"r{i}", "reason": "queue_blocked"}
+                    for i in range(15)]
+            esc_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            out = hub.escalations_data()
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["count"], 15)
+        self.assertEqual(len(out["latest"]), 10)  # ESCALATIONS_SHOWN
+        self.assertEqual(out["latest"][-1]["item"], "r14")
+        self.assertEqual(out["latest"][0]["item"], "r5")
+
+    def test_escalations_root_path_never_leaks_and_bad_lines_are_skipped(self):
+        """No path leak (matches owner_lease_data()'s own contract), and a
+        corrupt line in the append-only log must never crash the reader --
+        queue-supervisor.py's os.write is append-only but not transactional
+        across a crash mid-write."""
+        root = self.tmp / "leak-check-root"
+        root.mkdir()
+        esc_path = root / "escalations.jsonl"
+        esc_path.write_text(
+            json.dumps({"at": 1.0, "label": "l", "item": "i", "reason": "queue_blocked"}) + "\n"
+            + "{not json\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+            out = hub.escalations_data()
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["count"], 1)
+        self.assertNotIn(str(root), json.dumps(out))
+
+    def test_escalations_wired_into_owners_data_and_rendered(self):
+        """REVIEW.md Medium-2's actual fix: the hub's /owners surface must
+        show the escalation count and latest entries, not just the
+        supervisor's enabled flag and lane list (the gap the review named).
+        Fails without hub.py threading escalations_data() into
+        owners_data()/render_owners()."""
+        root = self.tmp / "wired-root"
+        root.mkdir()
+        (root / "escalations.jsonl").write_text(
+            json.dumps({"at": time.time(), "label": "herdr-control", "item": "req-42",
+                        "reason": "queue_blocked"}) + "\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HERDR_QUEUE_SUPERVISOR_ROOT": str(root)}):
+            data = hub.owners_data()
+        self.assertEqual(data["sources"]["escalations"], "ok")
+        self.assertEqual(data["escalations"]["count"], 1)
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: data)}):
+            rendered = hub.render_owners()
+        self.assertIn("req-42", rendered)
+        self.assertIn("queue_blocked", rendered)
+        self.assertIn("Queue escalations (1)", rendered)
 
 
 if __name__ == "__main__":
