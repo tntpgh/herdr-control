@@ -157,8 +157,12 @@ class Dispatcher:
             raise NotDispatched("registry_lease_mismatch")
         pane, birth, sess, gen = holder
         # One-time authorization, consumed BEFORE admission or any file write.
-        # A refusal or crash after this point leaves the grant consumed with no
-        # intent.json: owner_dispatch_auth.unsent() surfaces it for an operator.
+        # The journal is now opened immediately below, BEFORE gate.admit(): a
+        # refused or crashed admission is therefore always durable (intent.json
+        # exists with this call's consumed envelope), so
+        # owner_dispatch_auth.unsent() -- which only checks THAT intent.json
+        # against the consumed envelope, never a terminal outcome -- never
+        # again surfaces a refused admission as consumed-unsent.
         if self.authorize is None:
             raise NotDispatched("auth_missing")
         body_sha = hashlib.sha256(request_text).hexdigest()
@@ -174,9 +178,6 @@ class Dispatcher:
         if any(verdict.get(k) != v for k, v in want.items()) or not verdict.get("auth_id"):
             raise NotDispatched("auth_envelope_mismatch")
         auth_envelope = verdict
-        adm = self.gate.admit(label, pane, birth, rid, now)
-        if not adm.ok or adm.generation != gen:
-            raise NotDispatched(adm.reason or "admit_generation_changed")
         digest = hashlib.sha256(request_text).hexdigest()
 
         jroot = ra._open_dir(self.avail.journal_root)
@@ -192,13 +193,33 @@ class Dispatcher:
         finally:
             os.close(lfd)
         try:
-            # The gate identity is part of the intent: recovery reconciles the
-            # journal against exactly this owner_requests row.
+            # Written BEFORE admission runs: gate_generation/gate_state are
+            # provisional (admission has not happened yet) and are never
+            # re-read by recovery -- only request_digest/pane_id/pane_birth/
+            # session_id/generation/manifest are (see _register, recover()).
             _write_excl(jfd, "intent.json", _record(rid=rid, label=label, request_digest=digest, pane_id=pane,
                                                      pane_birth=birth, session_id=sess, generation=gen,
                                                      manifest=sorted(manifest), gate_request_id=rid,
-                                                     gate_generation=adm.generation, gate_state="queued", at=now,
+                                                     gate_generation=None, gate_state="pending_admission", at=now,
                                                      auth=auth_envelope))
+
+            adm = self.gate.admit(label, pane, birth, rid, now)
+            if not adm.ok or adm.generation != gen:
+                reason = adm.reason or "admit_generation_changed"
+                # Most refusals (disabled/no_lease/queue_full/fenced) never
+                # created a gate row at all; settle() would transition a row
+                # we do not own. Only a genuine race -- admit() succeeded
+                # under a DIFFERENT live generation than ours -- leaves a
+                # real row behind, so only then is a settle attempted,
+                # best-effort (never blocks the durable refused.json below).
+                st = "not_admitted"
+                if adm.ok and adm.generation is not None:
+                    try:
+                        st = self.gate.settle(label, pane, birth, adm.generation, rid, "blocked", reason, now)
+                    except Exception:
+                        st = "not_admitted"
+                _write_excl(jfd, "refused.json", _record(reason=reason, gate_state=st, at=now))
+                raise NotDispatched(reason)
 
             def refuse(reason, t):
                 # PRE-SEND only. Settle the gate FIRST, then make the journal
@@ -316,6 +337,13 @@ class Dispatcher:
             _write_excl(jfd, "uncertain.json", _record(reason="crash_recovered_post_send", gate_state=gstate, at=now))
             return "ambiguous"
         if gstate is None:
+            if outcome == "refused.json":
+                rj = json.loads(_read_small(Path(self.avail.journal_root) / label / rid, "refused.json"))
+                if rj.get("gate_state") == "not_admitted":
+                    # Self-declared: admission was refused before any gate row
+                    # existed, so no row is EXPECTED here -- this is the
+                    # terminal, correct classification, not a mismatch.
+                    return "refused"
             return f"unrecorded:{outcome}"
         if outcome == ra.SETTLED_FILE:
             if gstate not in SETTLED_GATE_STATES:

@@ -1928,7 +1928,9 @@ def _queue_tick() -> None:
     through the existing owner-dispatch fences. OFF unless HERDR_QUEUE_SUPERVISOR=1
     is in the hub's environment. NON-BLOCKING: one supervisor subprocess at a time,
     polled each attention pass, so a hung pass never delays attention/action
-    ticks. A child past QUEUE_STUCK_AFTER_S is logged, never killed. Never raises."""
+    ticks. A child past QUEUE_STUCK_AFTER_S is terminated (SIGTERM, then SIGKILL
+    after TickRunner.KILL_GRACE_S) and logged, never left running forever; the
+    next subprocess always runs recover() before any dispatch. Never raises."""
     if os.environ.get("HERDR_QUEUE_SUPERVISOR") != "1":
         return
     if not _QUEUE_RUNNER:

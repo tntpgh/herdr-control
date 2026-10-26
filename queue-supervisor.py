@@ -219,16 +219,45 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
         return journal_state(Path(avail.journal_root), label, rid)
 
     try:
-        recov = od.Dispatcher(gate, avail, send, resolve).recover()
-        bad = {k: v for k, v in recov.items() if v.startswith(("mismatch", "unrecorded"))}
-        bad.update({f"auth:{a}": "consumed_unsent" for a in oda.unresolved(store, str(avail.journal_root))})
-        if bad:
-            print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad.items())))
+        try:
+            recov = od.Dispatcher(gate, avail, send, resolve).recover()
+            # Scope recovery per owner label: a mismatch/unrecorded journal
+            # entry for label L, or a consumed-unsent auth row bound to L,
+            # stops ONLY L's lane this pass. An auth row whose label cannot
+            # be determined (deleted/ambiguous since consumption), or any
+            # failure reading the journal/auth store itself, is genuinely
+            # shared uncertainty and still fails closed globally below.
+            bad_by_label: dict[str, dict[str, str]] = {}
+            for key, v in recov.items():
+                if not v.startswith(("mismatch", "unrecorded")):
+                    continue
+                label, _, _ = key.partition("/")
+                bad_by_label.setdefault(label, {})[key] = v
+            shared_bad: dict[str, str] = {}
+            for aid in oda.unresolved(store, str(avail.journal_root)):
+                row = store.execute("SELECT owner_label FROM owner_dispatch_auth WHERE auth_id=?", (aid,)).fetchone()
+                if row is None or not row[0]:
+                    shared_bad[f"auth:{aid}"] = "consumed_unsent:lane_unknown"
+                else:
+                    bad_by_label.setdefault(row[0], {})[f"auth:{aid}"] = "consumed_unsent"
+        except Exception as exc:
+            print(f"refused:recovery_needs_operator shared_store={type(exc).__name__}")
             return 4
+        if shared_bad:
+            all_bad = dict(shared_bad)
+            for lb in bad_by_label.values():
+                all_bad.update(lb)
+            print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(all_bad.items())))
+            return 4
+        lane_labels = [x for x in lanes.split(",") if x]
+        runnable = [lb for lb in lane_labels if lb not in bad_by_label]
         dispatcher = (StandingDispatch(gate, avail, send, resolve, store, lconn, qroot)
                      if standing_enabled(environ) else GrantDispatch(gate, avail, send, resolve, store))
-        out = qs.tick(qroot, [x for x in lanes.split(",") if x], dispatcher,
-                      accepted, events, notify, journal, environ=environ)
+        out = qs.tick(qroot, runnable, dispatcher, accepted, events, notify, journal, environ=environ)
+        for lb in lane_labels:
+            if lb in bad_by_label:
+                out[lb] = ("refused:recovery_needs_operator "
+                          + " ".join(f"{k}={v}" for k, v in sorted(bad_by_label[lb].items())))
     finally:
         store.close()
         gate.close()

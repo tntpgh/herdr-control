@@ -261,16 +261,31 @@ with tempfile.TemporaryDirectory() as t:
     check("RID 101 chars: frozen BEFORE journal read, grant or dispatch", r[lb] == f"frozen:invalid_rid:{'y' * 50}"
           and len(fc.calls) == n and (lb, "y" * 50, "invalid_rid") in fc.notes)
 
+# Ignores SIGTERM (the real queue-supervisor.py child always exits on a
+# signal; this fixture proves escalation to SIGKILL still happens).
+TRAP = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
 clock = [0.0]
-runner = qs.TickRunner([sys.executable, "-c", "import time; time.sleep(30)"], 120, 5, clock=lambda: clock[0])
+runner = qs.TickRunner([sys.executable, "-c", TRAP], 120, 5, clock=lambda: clock[0])
 t0 = time.monotonic()
 states = [runner.poll()]
-for step in (1, 6, 200):  # attention passes while the supervisor child hangs
+for step in (1, 6):  # attention passes while the supervisor child hangs
     clock[0] = step
     states.append(runner.poll())
 elapsed = time.monotonic() - t0
-check("hung supervisor tick never blocks the attention loop; one child, no overlap, no kill",
-      states == ["started", "running", "stuck", "stuck"] and elapsed < 2 and runner.proc.poll() is None)
+check("hung supervisor tick never blocks the attention loop; stuck escalates to a non-blocking SIGTERM",
+      states == ["started", "running", "stuck_killing"] and elapsed < 2 and runner.proc is not None)
+clock[0] = 12  # past KILL_GRACE_S since the SIGTERM
+check("SIGTERM ignored past the grace period -> SIGKILL sent, poll() still never blocks",
+      runner.poll() == "stuck_killing" and time.monotonic() - t0 < 2)
+time.sleep(0.5)  # real wall-clock: let the OS actually reap the killed process
+clock[0] = 13
+final = runner.poll()
+check("stuck child is actually terminated (never left running forever) and reaped exactly once",
+      final.startswith("stuck_killed") and runner.proc is None)
+check("after a kill, last_start is untouched -> no blind restart before the interval elapses",
+      runner.poll() == "waiting")
+clock[0] = 121  # interval_s(120) past the ORIGINAL start(0) has now elapsed
+check("once the normal interval elapses, a fresh child starts", runner.poll() == "started")
 runner.proc.kill()  # test cleanup only
 runner.proc.wait()
 clock[0] = 400
