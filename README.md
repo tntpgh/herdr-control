@@ -212,6 +212,11 @@ overridable as an environment variable per run.
 ./attention.sh --focus                           # the one thing to look at next
 ./attention.sh --dry-run                          # classify every agent, change nothing
 
+# Feed: a quiet notification tab — one line when a needs-you item appears or clears
+./herdr-feed.py                                   # blocked >90s, decisions, deploy drift, handoff debt, hub health
+./herdr-feed.py --once                            # current needs-you set, then exit
+./herdr-feed.py --grace 120                       # a pane must stay blocked 120s before it shows
+
 # Wait: block (in the background) until any/some agent needs input, then report
 ./wait-for-blocked.sh                             # waits on the hub's herdr subscription
 ./wait-for-blocked.sh 10 30 w1:p2 w2:p1            # 60min budget in 10s units, these two panes
