@@ -14,9 +14,11 @@ the two things that need a human — attention items and open decisions.
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
   /projects    thurber-os docs/project-contract-plan.md §2: per project, live tasks, open PRs, open decisions, SPEC.md checklist, next step
+  /owners      registered owners, lease/queue-lane/owner-dispatch-grant state (SPEC.md feat/hub-owners-view) -- read-only, no raw sqlite needed
   /timeline    registry events in a window (?since=&until=, default last 24h; ?repo= scope) — "what moved while I was away"
   /api/summary {attention, attention_tasks, handoff_debt, open_decisions, deploy_drift} — what the omp extension's one-liner reads
   /api/projects same join as /projects, JSON — what fleet-tools.ts's project_status tool and the ambient card read
+  /api/owners  same join as /owners, JSON
   /api/timeline same window as JSON: event rows only, never a derived task status
   /api/panes   every pane herdr knows, with its agent and live agent_status
   /api/blocked just the panes waiting on a person, joined to their task
@@ -393,7 +395,15 @@ class Cached:
     def get(self):
         with self.lock:
             age = time.monotonic() - self.at
-            if age <= self.ttl:
+            # `self.at` starts (and resets, via invalidate()) at 0.0 as a
+            # "never filled" sentinel. time.monotonic() has no epoch
+            # guarantee -- on a freshly booted CI runner it can itself be
+            # under a few seconds, let alone under a 60s ttl, so an unfilled
+            # cache's age looked "fresh" and this returned None without ever
+            # calling fn(). `self.val is not None` is the actual freshness
+            # precondition; the stale and wait-for-in-flight branches below
+            # already require it, this one just didn't.
+            if self.val is not None and age <= self.ttl:
                 return self.val
             # Serve stale only while a reader is plausibly watching. `at` only
             # advances when a fill COMPLETES and a refresh is only ever kicked
@@ -3029,6 +3039,222 @@ def deploy_drift_data() -> dict:
     return {"repos": [_repo_drift(repo, path) for repo, path in DEPLOY_DRIFT_REPOS]}
 
 
+# ── owners, leases, queue lanes, dispatch grants (read-only) ───────────────────
+# SPEC.md (feat/hub-owners-view): "see, without raw sqlite access, which
+# projects have a registered owner and what lane/lease/grant state exists."
+# Every store here is opened `mode=ro` (sqlite URI) and never migrated -- this
+# surface only reads what register-owner.sh / owner_lease.py / the queue
+# supervisor already wrote. A missing or unreadable store reports itself as
+# `"unavailable: <reason>"` in `sources`, and that same marker is threaded
+# into every per-label field that source would have filled: a store being
+# down must never look identical to "nobody registered anything yet" (None/
+# []/False, which stay the legitimate "asked, and there is nothing").
+def _ro_sqlite(path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+
+
+def _sqlite_unavailable_code(exc: sqlite3.Error) -> str:
+    """Bounded error code for a failed read against one of the owners/lease/
+    dispatch/lane stores below -- never the exception's own text (which can
+    name a column, a constraint, or embed a filesystem path) and never the
+    store's path, so an unauthenticated caller of /owners or /api/owners
+    never learns host layout from a read failure."""
+    msg = str(exc).lower()
+    if "locked" in msg:
+        return "unavailable:locked"
+    if "malformed" in msg or "not a database" in msg or "encrypted" in msg:
+        return "unavailable:corrupt"
+    return "unavailable:unreadable"
+
+
+def registered_owners_data() -> dict:
+    """{"status", "rows": {label: {...}}} from REGISTRY's `owners` table
+    (register-owner.sh / lib/run-registry.sh schema v8; unregister-owner.sh
+    is the only other writer). Mirrors remote-mcp/publisher.py's
+    registry_owners(), minus the raw agent_session value -- that is an
+    absolute filesystem path encoding a username (publisher.py's own
+    _owner_session_token docstring), so this surface reports only whether
+    one was captured, never the path itself. `workspace` is dropped too --
+    register-owner.sh passes the pane's own reported workspace, a
+    free-text field this view has no way to validate as a label rather than
+    a real filesystem path, so it never leaves this process. `status` is
+    always a bounded code (see _sqlite_unavailable_code), never raw
+    exception text or a store path."""
+    if not REGISTRY.exists():
+        return {"status": "unavailable:missing", "rows": {}}
+    try:
+        conn = _ro_sqlite(REGISTRY)
+        try:
+            if not conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owners'").fetchone():
+                return {"status": "unavailable:schema", "rows": {}}
+            conn.row_factory = sqlite3.Row
+            rows = {}
+            for r in conn.execute(
+                    "SELECT label, pane_id, pane_birth, agent_session, registered_at, updated_at FROM owners"):
+                rows[r["label"]] = {
+                    "pane_id": r["pane_id"] or "", "pane_birth": r["pane_birth"] or "",
+                    "has_agent_session": bool(r["agent_session"]),
+                    "registered_at": r["registered_at"] or "", "updated_at": r["updated_at"] or "",
+                }
+            return {"status": "ok", "rows": rows}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"status": _sqlite_unavailable_code(exc), "rows": {}}
+
+
+def owner_lease_data() -> dict:
+    """{"status", "projects": {label: {project,registered_at}},
+    "live": {label: {pane_id,pane_birth,generation,expires_at,state}}} from
+    lib/owner_lease.py's store at $HERDR_OWNER_LEASE_DB (INERT contract:
+    nothing currently writes it, so "not configured" is the common case,
+    never an error). `live` is every UNRELEASED lease row; `state` is `live`
+    or `expired` by comparing its `expires_at` against `now`, the same
+    liveness test owner_lease._live() applies, without the write path."""
+    path = os.environ.get("HERDR_OWNER_LEASE_DB", "")
+    if not path:
+        return {"status": "unavailable:not_configured", "projects": {}, "live": {}}
+    if not Path(path).exists():
+        return {"status": "unavailable:missing", "projects": {}, "live": {}}
+    try:
+        conn = _ro_sqlite(path)
+        try:
+            if not conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_projects'").fetchone():
+                return {"status": "unavailable:schema", "projects": {}, "live": {}}
+            conn.row_factory = sqlite3.Row
+            projects = {r["label"]: {"project": r["project"], "registered_at": r["registered_at"]}
+                        for r in conn.execute("SELECT label, project, registered_at FROM owner_projects")}
+            # Same microsecond format lib/owner_lease.py's own _iso()/_live()
+            # use for expires_at -- _now_iso_utc()'s whole-second string
+            # compared lexically against a microsecond expires_at misreported
+            # a lease still live by up to 1s as "expired" ('.' sorts below
+            # 'Z') whenever the two seconds-values coincided (pr361-REVIEW.md
+            # LOW finding).
+            now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            live = {}
+            for r in conn.execute(
+                    "SELECT label, pane_id, pane_birth, generation, expires_at FROM owner_leases WHERE released_at IS NULL"):
+                live[r["label"]] = {
+                    "pane_id": r["pane_id"], "pane_birth": r["pane_birth"], "generation": r["generation"],
+                    "expires_at": r["expires_at"], "state": "live" if r["expires_at"] > now_iso else "expired",
+                }
+            return {"status": "ok", "projects": projects, "live": live}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"status": _sqlite_unavailable_code(exc), "projects": {}, "live": {}}
+
+
+def owner_dispatch_grants_data() -> dict:
+    """{"status", "rows": [...]} of non-denied owner_dispatch_auth rows
+    (status in granted/consumed -- the pending/active set) from
+    lib/owner_dispatch_auth.py's store at $HERDR_OWNER_DISPATCH_AUTH_DB
+    approval_bytes/manifest/prompt_id/approval_id columns -- those are
+    request content and consumer identity, not what this view is for. Never
+    auth_id or request_id either -- both are capability-like identifiers a
+    holder could use to look up or replay the grant, not state this view
+    needs to show."""
+    path = os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
+    if not path:
+        return {"status": "unavailable:not_configured", "rows": []}
+    if not Path(path).exists():
+        return {"status": "unavailable:missing", "rows": []}
+    try:
+        conn = _ro_sqlite(path)
+        try:
+            if not conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_dispatch_auth'").fetchone():
+                return {"status": "unavailable:schema", "rows": []}
+            conn.row_factory = sqlite3.Row
+            rows = [
+                {"label": r["owner_label"], "project": r["project"], "status": r["status"],
+                 "decided_at": r["decided_at"], "expires_at": r["expires_at"], "consumed_at": r["consumed_at"]}
+                for r in conn.execute(
+                    "SELECT owner_label, project, status, decided_at, expires_at, consumed_at "
+                    "FROM owner_dispatch_auth WHERE status IN ('granted','consumed') ORDER BY decided_at DESC")
+            ]
+            return {"status": "ok", "rows": rows}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"status": _sqlite_unavailable_code(exc), "rows": []}
+
+
+def queue_supervisor_lanes_data() -> dict:
+    """{"status", "enabled", "labels"} as the HUB'S OWN environment sees
+    them. `enabled` is $HERDR_QUEUE_SUPERVISOR's actual value regardless of
+    whether a lane list is configured -- the supervisor toggle and the lane
+    list toggle independently (enabled with no lanes claimed yet, or lanes
+    configured while the supervisor itself stays off), so collapsing them
+    into one "unavailable" whenever only the lane list was unset hid which
+    one was actually true. $HERDR_QUEUE_SUPERVISOR_LANES is the same comma
+    list queue-supervisor.py's main() reads; hub.py's own _queue_tick only
+    checks $HERDR_QUEUE_SUPERVISOR before spawning that subprocess and never
+    parses the lane list itself, so this is a direct env read, not a derived
+    cache, and needs no new flag to view: both vars already exist for the
+    supervisor itself."""
+    enabled = os.environ.get("HERDR_QUEUE_SUPERVISOR") == "1"
+    raw = os.environ.get("HERDR_QUEUE_SUPERVISOR_LANES", "")
+    if not raw:
+        return {"status": "unavailable:not_configured", "enabled": enabled, "labels": []}
+    return {"status": "ok", "enabled": enabled, "labels": [x for x in raw.split(",") if x]}
+
+
+def owners_data() -> dict:
+    """The one join /owners and /api/owners both read: every label seen in
+    ANY of the four sources, each field `"unavailable"` when ITS OWN source
+    could not be read, otherwise the real value -- None/[]/False are
+    legitimate "nothing here", never "I don't know"."""
+    reg = registered_owners_data()
+    lease = owner_lease_data()
+    grants = owner_dispatch_grants_data()
+    lanes = queue_supervisor_lanes_data()
+
+    labels = set(reg["rows"]) | set(lease["projects"]) | set(lease["live"]) | set(lanes["labels"])
+    labels |= {g["label"] for g in grants["rows"] if g["label"]}
+
+    owners = []
+    for label in sorted(labels):
+        live = lease["live"].get(label)
+        # Drop pane_birth/generation here, not in owner_lease_data(): together
+        # with pane_id they are exactly the fencing tuple owner_lease.py's
+        # _fence() checks as holder proof for release()/enqueue()/
+        # transition() -- and unlike acquire()'s renewal check, _fence()
+        # does NOT also require session_digest (pr361-r2-REVIEW.md LOW
+        # finding 2). Nothing writes this store yet, but this view must not
+        # pre-publish that proof to every unauthenticated loopback reader.
+        live_public = ({"pane_id": live["pane_id"], "expires_at": live["expires_at"], "state": live["state"]}
+                       if live else live)
+        reg_row = reg["rows"].get(label)
+        # pane_birth dropped for the same reason -- it is half of the
+        # fencing tuple above, so this view has no business republishing it.
+        reg_public = {k: v for k, v in reg_row.items() if k != "pane_birth"} if reg_row else reg_row
+        owners.append({
+            "label": label,
+            "registered": "unavailable" if reg["status"] != "ok" else reg_public,
+            "project": ("unavailable" if lease["status"] != "ok"
+                        else (lease["projects"].get(label) or {}).get("project")),
+            "lease": "unavailable" if lease["status"] != "ok" else live_public,
+            "queue_lane": "unavailable" if lanes["status"] != "ok" else (label in lanes["labels"]),
+            "grants": ("unavailable" if grants["status"] != "ok"
+                       else [g for g in grants["rows"] if g["label"] == label]),
+        })
+
+    return {
+        "owners": owners,
+        # Reported separately from queue_lane/sources above (item 5,
+        # second review): a per-label "no lane" must never be read as "the
+        # supervisor itself is off" or vice versa.
+        "queue_supervisor_enabled": lanes["enabled"],
+        "sources": {
+            "registered_owners": reg["status"], "owner_lease": lease["status"],
+            "owner_dispatch_auth": grants["status"], "queue_supervisor_lanes": lanes["status"],
+        },
+    }
+
+
 CACHES = {
     # Liveness: cheap, filled inline, never served stale. See Cached.
     "herdr": Cached(5, herdr_data, name="herdr"),
@@ -3051,6 +3277,9 @@ CACHES = {
     # a request is never blocked on it; STALE_MAX above bounds the "priming
     # loop somehow hasn't run yet" case.
     "deploy_drift": Cached(180, deploy_drift_data, stale_ok=True, name="deploy_drift"),
+    # Up to four tiny read-only sqlite opens, local disk: cheap like
+    # forms/debt above, filled inline, never served stale.
+    "owners": Cached(10, owners_data, name="owners"),
 }
 
 
@@ -3147,7 +3376,7 @@ STYLE = """
  .chips a.chip.on{border-color:#6aa6ff;color:#cfe0f5;background:#11161d}
  .chips a.chip.hot{border-color:#ff7a7a} .chips a.chip.hot small{color:#ff9d9d}
 """
-NAV = [("/", "overview"), ("/projects", "projects"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
+NAV = [("/", "overview"), ("/projects", "projects"), ("/owners", "owners"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 # ---- SCOPE: one hub, many projects ------------------------------------------
 # Every task in the registry already carries the repo it belongs to, and the
@@ -5220,6 +5449,79 @@ def render_links() -> str:
     return page("links", "/links", f"<h2>Surfaces</h2><table>{rows}</table>", refresh=60)
 
 
+def _owner_row(o: dict) -> str:
+    reg = o["registered"]
+    if reg == "unavailable":
+        reg_cell = "<span class=dim>unavailable</span>"
+    elif reg:
+        reg_cell = (f"{_esc(reg['pane_id'])}<br><span class=dim title='{_esc(reg['registered_at'])}'>"
+                    f"registered {_age(reg['registered_at'])} ago{' · session' if reg['has_agent_session'] else ''}</span>")
+    else:
+        reg_cell = "<span class=dim>none</span>"
+    proj = o["project"]
+    proj_cell = ("<span class=dim>unavailable</span>" if proj == "unavailable"
+                else (_esc(proj) if proj else "<span class=dim>none</span>"))
+    lease = o["lease"]
+    if lease == "unavailable":
+        lease_cell = "<span class=dim>unavailable</span>"
+    elif lease:
+        lease_cell = (f"<span class='pill {'ok' if lease['state'] == 'live' else 'bad'}'>{_esc(lease['state'])}</span> "
+                      f"{_esc(lease['pane_id'])}<br>"
+                      f"<span class=dim title='{_esc(lease['expires_at'])}'>exp {_age(lease['expires_at'])}</span>")
+    else:
+        lease_cell = "<span class=dim>none</span>"
+    ql = o["queue_lane"]
+    lane_cell = ("<span class=dim>unavailable</span>" if ql == "unavailable"
+                else ("<span class='pill ok'>lane</span>" if ql else "<span class=dim>—</span>"))
+    grants = o["grants"]
+    if grants == "unavailable":
+        grants_cell = "<span class=dim>unavailable</span>"
+    elif grants:
+        grants_cell = "<br>".join(
+            f"<span class='pill {'run' if g['status'] == 'consumed' else ''}'>{_esc(g['status'])}</span> "
+            f"<span class=dim title='{_esc(g['expires_at'])}'>exp {_age(g['expires_at'] * 1000)}</span>"
+            for g in grants)
+    else:
+        grants_cell = "<span class=dim>none</span>"
+    return (f"<tr><td>{_esc(o['label'])}</td><td>{reg_cell}</td><td>{proj_cell}</td>"
+           f"<td>{lease_cell}</td><td>{lane_cell}</td><td>{grants_cell}</td></tr>")
+
+
+def render_owners() -> str:
+    """SPEC.md (feat/hub-owners-view): who can verify lane prerequisites
+    without raw sqlite access. Read-only index over owners_data()'s four
+    sources; `sources` is always shown so "nothing here" (a legitimately
+    empty, readable store) is never confused with "could not be read"."""
+    d = CACHES["owners"].get()
+    rows = "".join(_owner_row(o) for o in d["owners"])
+    if not rows:
+        # Item 4 (second review) + SPEC item 1 (pr361-r2 LOW): "no rows" from
+        # a store that could not be read must read differently than "no
+        # rows" from a readable, empty one, AND differently again from "no
+        # rows, some sources readable but others down" -- the middle case
+        # must not be reported as the trustworthy, truly-empty answer, since
+        # the readable sources alone might just be missing their share.
+        statuses = d["sources"].values()
+        if all(v != "ok" for v in statuses):
+            rows = "<tr><td class=dim colspan=6>no sources were readable -- see sources below</td></tr>"
+        elif any(v != "ok" for v in statuses):
+            rows = ("<tr><td class=dim colspan=6>no rows from readable sources; "
+                    "other sources unavailable (see sources below)</td></tr>")
+        else:
+            rows = "<tr><td class=dim colspan=6>no owner/lease/lane/grant state registered</td></tr>"
+    src_note = " · ".join(f"{_esc(k)}: {_esc(v)}" for k, v in d["sources"].items())
+    supervisor_note = f"queue supervisor enabled: {d['queue_supervisor_enabled']}"
+    body = (
+        "<h2>Owners &amp; lanes</h2>"
+        "<p class=dim>Registered project owners and their lease / queue-lane / owner-dispatch-grant state, "
+        "as the hub itself can see it. Read-only: this is an index, not a control.</p>"
+        "<table><tr><td class=dim>label</td><td class=dim>registered owner</td><td class=dim>project</td>"
+        f"<td class=dim>lease</td><td class=dim>queue lane</td><td class=dim>dispatch grants</td></tr>{rows}</table>"
+        f"<p class=dim style='margin-top:10px'>{supervisor_note} · sources — {src_note}</p>"
+    )
+    return page("owners", "/owners", body, refresh=30)
+
+
 # ---- SLO header (project-contract-plan.md §2, "symptom SLOs, not per-event
 # pings"): time-to-unblock percentiles and wake delivery rate, both derived
 # from timestamps the registry already carries — no new table.
@@ -5558,7 +5860,8 @@ def render_loops() -> str:
 SCOPED_PAGES = ("/", "/herdr")
 PAGES = {"/": (render_overview, None), "/herdr": (render_herdr, "herdr"), "/decisions": (render_decisions, "forms"),
          "/loops": (render_loops, "loops"), "/search": (render_search, "search"), "/kb": (render_kb, "kb"),
-         "/links": (render_links, "links"), "/projects": (render_projects, "projects")}
+         "/links": (render_links, "links"), "/projects": (render_projects, "projects"),
+         "/owners": (render_owners, "owners")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5646,6 +5949,8 @@ class Handler(BaseHTTPRequestHandler):
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
         if path == "/api/projects":
             return self._send(200, "application/json", json.dumps(CACHES["projects"].get(), default=str).encode())
+        if path == "/api/owners":
+            return self._send(200, "application/json", json.dumps(CACHES["owners"].get(), default=str).encode())
         if path == "/api/panes":
             return self._send(200, "application/json", json.dumps(live_data(), default=str).encode())
         if path == "/api/blocked":
@@ -5706,7 +6011,12 @@ class Handler(BaseHTTPRequestHandler):
         render, source = PAGES[path]
         scope = scope_of(query)
         if "json=1" in query:
-            data = {n: CACHES[n].get() for n in CACHES} if source is None else CACHES[source].get()
+            # Item 1 (second review): "owners" is excluded from the all-
+            # CACHES aggregate -- that surface is served ONLY at /api/owners
+            # and /owners?json=1 (source == "owners" below), never swept
+            # into every other page's ?json=1 by this blanket comprehension.
+            data = ({n: CACHES[n].get() for n in CACHES if n != "owners"}
+                    if source is None else CACHES[source].get())
             if path in ("/herdr", "/"):
                 # Additive: every existing consumer of /herdr?json=1 keeps its
                 # keys, and gains herdr's live truth beside the registry's.
