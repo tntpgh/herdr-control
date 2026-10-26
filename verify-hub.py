@@ -1418,6 +1418,20 @@ class CacheFreshness(unittest.TestCase):
         c = hub.Cached(60, lambda: {"n": 1}, stale_ok=True)
         self.assertEqual(c.get(), {"n": 1})
 
+    def test_a_never_filled_cache_does_not_read_as_fresh_on_a_low_uptime_clock(self):
+        # `self.at` starts (and invalidate() resets) at 0.0 as a "never
+        # filled" sentinel. time.monotonic() carries no epoch guarantee --
+        # on a freshly booted machine (observed on CI, PR #361 f1be4f8) it
+        # can itself read under a few seconds, so age = monotonic() - 0.0
+        # looked "fresh" against a 60s ttl and get() returned None without
+        # ever calling fn().
+        calls = []
+        c = hub.Cached(60, lambda: calls.append(1) or {"n": 1})
+        with patch("time.monotonic", return_value=0.01):
+            self.assertEqual(c.get(), {"n": 1},
+                              "a never-filled cache read as fresh on a low-uptime clock")
+        self.assertEqual(len(calls), 1, "fn() was never called")
+
     def test_fresh_value_is_reused(self):
         calls = []
         c = hub.Cached(60, lambda: calls.append(1) or {"n": len(calls)})

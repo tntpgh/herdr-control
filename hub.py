@@ -395,7 +395,15 @@ class Cached:
     def get(self):
         with self.lock:
             age = time.monotonic() - self.at
-            if age <= self.ttl:
+            # `self.at` starts (and resets, via invalidate()) at 0.0 as a
+            # "never filled" sentinel. time.monotonic() has no epoch
+            # guarantee -- on a freshly booted CI runner it can itself be
+            # under a few seconds, let alone under a 60s ttl, so an unfilled
+            # cache's age looked "fresh" and this returned None without ever
+            # calling fn(). `self.val is not None` is the actual freshness
+            # precondition; the stale and wait-for-in-flight branches below
+            # already require it, this one just didn't.
+            if self.val is not None and age <= self.ttl:
                 return self.val
             # Serve stale only while a reader is plausibly watching. `at` only
             # advances when a fill COMPLETES and a refresh is only ever kicked
