@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -386,6 +387,7 @@ def main() -> int:
 
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    register_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
@@ -592,7 +594,7 @@ def lease_writer_cases(base: Path) -> None:
     lc, av, roots, lease_db = env(base)
     reg = {KB: (*PANE[KB], SESS[KB])}
 
-    def run(label, flags=True, resolve=reg.get):
+    def run(label, flags=True, resolve=reg.get, ttl=TTL):
         saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY", "HERDR_OWNER_LEASE_DB")}
         if flags:
             os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DELIVERY="1", HERDR_OWNER_LEASE_DB=lease_db)
@@ -602,7 +604,7 @@ def lease_writer_cases(base: Path) -> None:
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                rc = olc.main(["--label", label, "--ttl", str(TTL)], resolve=resolve)
+                rc = olc.main(["--label", label, "--ttl", str(ttl)], resolve=resolve)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
@@ -613,10 +615,42 @@ def lease_writer_cases(base: Path) -> None:
     events = lambda: lc.execute("SELECT count(*) FROM owner_events").fetchone()[0]
     case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and leases(KB) == [])
     case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and leases(DOTS) == [])
-    rc, out = run(KB)
+    # (REVIEW.md round-2 Medium): a claim-time TTL check against bare
+    # MIN_LEASE_REMAINING_S (180s) gives a lease claimed at exactly that
+    # floor ZERO slack -- begin_notice()'s own remaining-time fence is
+    # evaluated at whatever LATER wall-clock moment a separate
+    # owner-dispatch.py/queue-supervisor.py process reaches it, so ANY
+    # claim-to-delivery delay reproduces the exact "parked at queued
+    # forever" failure (REVIEW.md Low-1) the floor exists to close -- it
+    # only moved the threshold, it never added margin. The floor is now
+    # CLAIM_TTL_FLOOR_S = MIN_LEASE_REMAINING_S + CLAIM_TO_DELIVERY_SLACK_S.
+    case("WRITER: TTL below the delivery floor -> refused, no lease",
+         run(KB, ttl=old.CLAIM_TTL_FLOOR_S - 1) == (2, f"refused:ttl_below_delivery_floor:{old.CLAIM_TTL_FLOOR_S}")
+         and leases(KB) == [])
+    # Exactly-at-floor TTL folded into the real gen1 claim below (a second
+    # successful claim here would consume the only initial-claim slot KB
+    # has, breaking every case that follows). owner-lease-claim.py never
+    # accepts an injected `now`, so the real wall clock is the claim
+    # moment: captured as t_claim for the margin check right after.
+    t_claim = time.time()
+    rc, out = run(KB, ttl=old.CLAIM_TTL_FLOOR_S)
     ht = ol.holder_tuple(lc, KB)
     case("WRITER: initial claim = generation 1 with EXACTLY the registry (pane, birth, session digest)",
          rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB] and ht[3] == 1)
+    # The margin itself (REVIEW.md round-2 Medium, not reverted -- reasoned
+    # against the pre-fix floor): run begin_notice() against the SAME
+    # just-claimed KB lease with an INJECTED `now` -- no real sleep -- set
+    # past the OLD 180s margin. Under the pre-fix floor (TTL == 180 exactly)
+    # this delay alone would already put remaining time below
+    # MIN_LEASE_REMAINING_S, returning 'lease_too_short'; the new floor's
+    # extra CLAIM_TO_DELIVERY_SLACK_S must still clear it.
+    margin_gate = old.DeliveryGate(lease_db)
+    adm = margin_gate.admit(KB, *PANE[KB], "r_margin", now=time.time())
+    case("DELIVERY: margin fixture admitted at gen1", adm.ok and adm.generation == 1)
+    delayed_now = t_claim + old.MIN_LEASE_REMAINING_S + 1  # 1s past the OLD 180s slack
+    case("DELIVERY: a claim at the NEW floor still clears begin_notice() after a delay past the old 180s margin",
+         margin_gate.begin_notice(KB, *PANE[KB], 1, "r_margin", now=delayed_now) == "delivering")
+    margin_gate.close()
     before, ev = leases(KB), events()
     case("WRITER: a second run (same holder, live lease) -> not_initial; nothing renewed or written",
          run(KB) == (2, "refused:not_initial") and leases(KB) == before and events() == ev)
@@ -643,6 +677,99 @@ def lease_writer_cases(base: Path) -> None:
     case("WRITER: group/other-readable lease DB -> refused before any claim", run(KB)[1] == "refused:lease_db_not_private_regular")
     os.chmod(lease_db, 0o600)
     av.close(); lc.close()
+
+
+def register_cases(base: Path) -> None:
+    """owner-register.py: REVIEW.md Medium-1 -- the first and only
+    production/CLI caller of owner_lease.register_owner(), the write
+    everything downstream (owner-lease-claim.py, owner-dispatch.py,
+    queue-supervisor.py) is fenced on. Mirrors lease_writer_cases()'s own
+    refusal-posture coverage for owner-lease-claim.py."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("orc", HERE / "owner-register.py")
+    orc = importlib.util.module_from_spec(spec); spec.loader.exec_module(orc)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    NEW = "tourguide"  # env() only pre-registers KB and DOTS; this label is fresh
+    NEW_PANE = ("w5:p5", "term_tg1")
+    NEW_SESS = hashlib.sha256(b"tg-session-1").hexdigest()
+    reg = {NEW: (*NEW_PANE, NEW_SESS)}
+
+    def run(label=NEW, project="tntpgh/tourguide", max_open=None, flags=True, dry_run=False, resolve=reg.get):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--project", project]
+        if max_open is not None:
+            argv += ["--max-open", str(max_open)]
+        if dry_run:
+            argv.append("--dry-run")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = orc.main(argv, resolve=resolve)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    os.chmod(lease_db, 0o600)
+    projects = lambda: lc.execute("SELECT label, project, max_open FROM owner_projects ORDER BY label").fetchall()
+    before = projects()
+    case("REGISTER: flags off -> refused, no row",
+         run(flags=False) == (4, "refused:flags_off") and projects() == before)
+    case("REGISTER: label not resolvable in the registry -> refused, no row",
+         run(label="ghost") == (2, "refused:not_registered_or_no_session") and projects() == before)
+    rc, out = run(dry_run=True)
+    case("REGISTER: --dry-run prints the exact row and never writes it",
+         rc == 0 and f"dry-run:owner_projects(label={NEW!r}" in out and "project='tntpgh/tourguide'" in out
+         and f"rollback: DELETE FROM owner_projects WHERE label={NEW!r}" in out and projects() == before)
+    case("REGISTER: non-canonical project is refused, no row",
+         run(project="not-a-github-url") == (2, "refused:InvalidOwner") and projects() == before)
+    case("REGISTER: max_open out of range is refused, no row",
+         run(max_open=ol.MAX_OPEN_LIMIT + 1) == (2, f"refused:max_open_out_of_range:1..{ol.MAX_OPEN_LIMIT}")
+         and projects() == before)
+    rc, out = run()
+    lines = out.splitlines()
+    case("REGISTER: writes the row and prints the rollback line",
+         rc == 0 and lines[0] == f"registered:{NEW}:tntpgh/tourguide"
+         and lines[1] == f"rollback: DELETE FROM owner_projects WHERE label={NEW!r} "
+                          f"(run against {lease_db}; refused by foreign_keys=ON once any lease/request exists for this label)"
+         and projects() == before + [(NEW, "tntpgh/tourguide", ol.DEFAULT_MAX_OPEN)])
+    after_write = projects()
+    case("REGISTER: idempotent re-run, same label/project -> succeeds again, no duplicate row",
+         run()[0] == 0 and projects() == after_write)
+    # (REVIEW.md round-2 Minor): once a lease exists for the label, the
+    # DELETE rollback line is guaranteed to be refused by foreign_keys=ON
+    # -- the idempotent re-registration case above is exactly that moment
+    # (SPEC.md item 2). The printed guidance must name the REAL procedure
+    # (lib/owner_lease.py's disable(), non-destructive, preserves grants and
+    # the audit trail) instead of only repeating a DELETE line that will
+    # fail. Fails without the change: the old _rollback_line() always
+    # printed the bare DELETE line, with no disable()/stop-admission
+    # guidance at all once it is refused.
+    ol.acquire(lc, NEW, *NEW_PANE, TTL, time.time(), session_digest=NEW_SESS)
+    rc, out = run()
+    lines = out.splitlines()
+    case("REGISTER: once a lease exists, idempotent re-run still succeeds and names the real rollback",
+         rc == 0 and lines[0] == f"registered:{NEW}:tntpgh/tourguide"
+         and lines[1] == f"rollback: DELETE FROM owner_projects WHERE label={NEW!r} "
+                          f"(run against {lease_db}; refused by foreign_keys=ON once any lease/request exists for this label)"
+         and "DELETE refused" in lines[2]
+         and "disable(" in out and "owner_state.enabled=0" in out
+         and "never delete once a lease or request references the label" in out)
+    case("REGISTER: same label, DIFFERENT project -> refused, row unchanged",
+         run(project="tntpgh/other-project") == (2, "refused:InvalidOwner") and projects() == after_write)
+    os.chmod(lease_db, 0o644)
+    case("REGISTER: group/other-readable lease DB -> refused before any write",
+         run(label="another-fresh-label")[1] == "refused:lease_db_not_private_regular" and projects() == after_write)
+    os.chmod(lease_db, 0o600)
+    lc.close()
 
 
 def cli_cases(base: Path) -> None:

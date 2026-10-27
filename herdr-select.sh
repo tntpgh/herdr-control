@@ -365,7 +365,7 @@ if [ -n "$bound_request_id" ]; then
     approval_attempted "$approval_id" >/dev/null 2>&1 || true
     approval_confirmed "$approval_id" "lost-race" \
       "bound request was not claimed: $(printf '%s' "$authorized_json" | jq -r '.written // "unknown"')" >/dev/null 2>&1 || true
-    echo "herdr-select: exact bound request was not claimed; current authority or one-shot state changed." >&2
+    echo "herdr-select: exact bound request was not claimed ($(printf '%s' "$authorized_json" | jq -r '.written // "unknown"')); current authority or one-shot state changed." >&2
     exit 8
   fi
   approval_confirmed "$approval_id" "bound-request" \
