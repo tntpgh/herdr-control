@@ -1,24 +1,29 @@
 # Owner-lease reap wiring
 
-Status: design plus dry-run-only code. Nothing here touches the live lease store.
-It reads no live pane state, sets no `HERDR_` flag and changes no runtime caller.
-REAP apply stays OFF, as Terrence set it.
+Status: phase 1 (`lib/owner_lease_reap.py`) plus phase 2 wiring (S4(c):
+`owner-lease-reap.py`, `hub.py` `_reap_tick()`). Both OFF by default.
+Nothing here touches the live lease store: the phase-2 CLI opens it
+READ-ONLY, sets no `HERDR_OWNER_LEASE_REAP` flag itself (the hub's
+environment must already carry it), and changes no other runtime caller.
+REAP apply stays OFF, as Terrence set it, with no code path to turn it on.
 
-Code: `lib/owner_lease_reap.py`. Offline proof: `verify-owner-lease-reap-wiring.py`,
-which runs in `.github/workflows/owner-lease.yml`.
+Code: `lib/owner_lease_reap.py`, `owner-lease-reap.py`, `hub.py` `_reap_tick()`
+(sibling of `_queue_tick`, `hub.py:1937`, at `hub.py:1967`). Offline proof:
+`verify-owner-lease-reap-wiring.py` and `verify-owner-lease-reap-cli.py`,
+both run in `.github/workflows/owner-lease.yml`.
 
 ## Answers
 
 | Question | Answer |
 |---|---|
 | Who calls `observe_stale` / `reap`? | Only `owner_lease_reap.reap_tick()`. It calls `observe_stale` through `plan_reap()`, then calls `reap()`. Never `acquire()`, `claim_initial()` or `claim_successor()`. |
-| When? | Today, nothing calls `reap_tick` automatically. Phase 2 adds a hub tick behind `HERDR_OWNER_LEASE_REAP=1`, still dry-run. Phase 3 (apply) is a separate, approved change. |
-| Probe source | `herdr pane list` JSON (`(.result.panes // .panes)`), plus a `captured_at` that the caller records. |
-| Dry run | Structural: no parameter reaches `reap(dry_run=False)`. The phase-2 caller opens the store read-only. |
-| Fail closed | Whole-tick SKIP when the probe is missing, stale, of unknown age, unparseable, or has any unknown birth. Per-lease HOLD when a holder's identity can't be proven gone. |
+| When? | `owner-lease-reap.py` is a one-shot CLI; `hub.py` `_reap_tick()` spawns it at most once per 60s, and only when `HERDR_OWNER_LEASE_REAP=1` is in the hub's own environment (unset today). Phase 3 (apply) is a separate, approved change. |
+| Probe source | `herdr pane list`, one subprocess per CLI run (5s timeout), captured by the CLI itself -- not the hub's live pane subscription. See "Probe". |
+| Dry run | Structural: no parameter, flag or env read anywhere in this change reaches `reap(dry_run=False)`. The CLI opens the store read-only (`mode=ro`). |
+| Fail closed | Whole-tick SKIP when the probe is missing, stale, of unknown age, unparseable, or has any unknown birth. Per-lease HOLD when a holder's identity can't be proven gone, OR when it was claimed at/after the snapshot was captured (`claimed_after_snapshot`; see "Probe"). |
 | Does `acquire` refuse a dead caller? | No. See "acquire and a dead caller". |
 | How does REAP_APPLY stay off? | No apply code path exists, no `*_REAP_APPLY` variable is read anywhere, and the store is opened read-only. |
-| Rollback | Unset the flag and restart the hub. The registry has `disable()`, and `export_backup()` gives a restore point. See "Rollback". |
+| Rollback | Unset `HERDR_OWNER_LEASE_REAP` and restart the hub. Nothing was written, so there is nothing to undo. The registry has `disable()`, and `export_backup()` gives a restore point. See "Rollback". |
 
 ## Why a guard layer
 
@@ -73,16 +78,21 @@ flowchart LR
   R --> W[would_reap report; zero writes]
 ```
 
-- **Phase 1 (this change):** `reap_tick` exists, but nothing calls it
-  automatically. Its callers are the offline verifier and
-  `tmp/c1/reap-tick-smoke.py`, which runs on fixture pane lists.
-- **Phase 2 (dry-run in the hub, needs approval to flip):** a hub controller,
-  added as a sibling of `_queue_tick` (`hub.py:1936`) on the attention cadence.
-  It runs only when `HERDR_OWNER_LEASE_REAP` is exactly `"1"`. Every 60 s at most,
-  it opens the lease DB read-only, calls `reap_tick`, and logs a structured line
-  (counts, labels, generations, reasons). It writes no `owner_events`. Exceptions
-  are caught and logged, and the attention loop keeps running. Probe input is
-  covered below.
+- **Phase 1:** `reap_tick` exists, but nothing calls it automatically. Its
+  callers are the offline verifier and `tmp/c1/reap-tick-smoke.py`, which
+  runs on fixture pane lists.
+- **Phase 2 (S4(c), wired and OFF by default):** `owner-lease-reap.py` is a
+  one-shot CLI. `hub.py` `_reap_tick()`, a sibling of `_queue_tick`
+  (`hub.py:1937`, itself at `hub.py:1967`), runs it on the attention
+  cadence through the same non-blocking `TickRunner` the queue tick uses
+  (`lib/queue_supervisor.py:353-419`). It runs only when
+  `HERDR_OWNER_LEASE_REAP` is exactly `"1"` in the hub's own environment
+  (unset today). At most once per 60 s, the CLI reads `herdr pane list`,
+  opens the lease DB read-only, calls `reap_tick`, and appends a structured
+  JSON line to its own report log (counts, labels, generations, reasons).
+  It writes no `owner_events`. Exceptions inside the hub's poll are caught
+  and logged (`reap tick error: ...`), and the attention loop keeps
+  running. Probe input is covered below.
 - **Phase 3 (apply):** see "Turning REAP_APPLY on".
 
 **Not a caller:** `acquire()`, `claim_initial()` and `claim_successor()`. Each is
@@ -101,21 +111,38 @@ herdr's payload carries no timestamp, so the caller passes `captured_at`, the
 epoch seconds at which the output was read. Age is `now - captured_at`, and it
 must be in `[0, 30]` s (`DEFAULT_MAX_SNAPSHOT_AGE_S`).
 
-Phase-2 source: `hub.py:497-504` documents why the hub stopped shelling out to
-`herdr pane list` (it would be a second, disagreeing model of pane state). So the
-phase-2 controller must not add a new poll. It should feed `reap_tick` the
-`panes` array from the subscription's own `session.snapshot` resync
-(`lib/herdr_live.py:695-699`), along with that resync's wall-clock time.
-Prerequisites before phase 2:
+**Probe source: a dedicated `herdr pane list` subprocess, one per CLI run, NOT
+the hub's live pane subscription.** `hub.py:497-504`'s objection is to a
+per-read shell-out behind a 3 s cache inside the hub itself -- 84 RPCs per
+60 s of a reader waiting, which the push-based control plane removed. This
+design's CLI runs one RPC per 60 s in its own child process, the same cadence
+`lib/reconcile.sh:105,125` and `lib/pane-guard.sh:87,301` already use per
+sweep/action. The live subscription's own `LiveState` projection drops
+`agent_session` (`lib/herdr_live.py:181-192`) and records no snapshot time,
+so feeding it to `reap_tick` would hold every reissued birth
+`identity_uncertain` -- safe, but an under-report -- and would need
+`LiveState` code changes first. `owner-lease-reap.py` records
+`captured_at = time.time()` **before** the subprocess call, so the clock
+read can only make the snapshot look OLDER than it is, never younger; a
+process read before the call cannot be skewed by the RPC's own latency.
 
-- `LiveState` exposes the last authoritative snapshot's `panes` (identity fields
-  only) and its capture time. Today the projection drops `agent_session`
-  (`lib/herdr_live.py:181-192`) and records no snapshot time.
-- [INFERENCE, unverified] `session.snapshot` panes carry `agent_session.value` in
-  the same shape as `pane list`. `_pane_record` reads `terminal_id` from them,
-  but nothing here reads `agent_session` from a snapshot. Without
-  `agent_session`, every reissued birth is held `identity_uncertain`. That is
-  safe, but it would make the dry run under-report.
+**Claimed-after-snapshot hold.** A pane that spawns and claims AFTER
+`captured_at` can still be absent from that same snapshot even though it is
+alive -- the spawn/register race `lib/reconcile.sh:119-122` already guards
+against. `plan_reap(..., snapshot_at=captured_at)` holds any `pane-gone`
+observation whose `acquired_at >= _iso(snapshot_at)` as
+`claimed_after_snapshot`, string-compared on `_iso()`'s fixed-width,
+always-UTC, microsecond format (`lib/owner_lease.py:130-131`) so the
+comparison needs no parsing. A renewal does not need the same check: a
+renewal must present the exact live `(pane, birth, session)`
+(`lib/owner_lease.py:349`), and a birth is never reused
+(`lib/pane-guard.sh:79-80`), so a holder whose `(pane, birth)` is absent
+from a pre-renewal snapshot was already absent at renewal time.
+`snapshot_at=None` (a direct `plan_reap` caller with no capture time) holds
+EVERY `pane-gone` observation this way -- fail-safe for unknown freshness.
+`reap_tick` always passes a real `captured_at` once it has already passed
+its own `stale_snapshot` freshness check, so this arm never fires on the
+hub's path.
 
 ## Fail-closed rules
 
@@ -126,6 +153,7 @@ Prerequisites before phase 2:
 | any birth empty, missing or malformed (fullmatch `term_[0-9a-z]{1,40}`) | SKIP `unknown_birth` |
 | `captured_at` missing, non-numeric, or a bool; age negative, non-finite or > 30 s | SKIP `stale_snapshot` |
 | holder's pane id present under a new birth, identity not proven different | lease held (`birth_reissued` / `identity_uncertain`) |
+| lease `acquired_at` >= the snapshot's `captured_at` (or `captured_at` unknown) | lease held `claimed_after_snapshot` |
 | SQLite error | exception: the tick fails, nothing is applied |
 
 A SKIP never shrinks the live set and never yields a candidate. A connected,
@@ -156,6 +184,34 @@ Decision: **`acquire()` / `claim_*()` do not probe liveness and do not refuse a
 - Cost of the alternative: an external RPC inside the IMMEDIATE transaction (see
   above). A pre-claim liveness check in `owner-dispatch-issue.py` would also be a
   new control for a failure nobody has observed, so it is not proposed here.
+
+## S1 preflight must read S3 precondition (b); no path disposes of open requests
+
+Reap wiring is orthogonal to S3 (the stale `kb-gitstatus-003` lease,
+`ol_dbd380b4...`): `observe_stale` reports it `expired` before it can ever be
+`pane-gone` (`lib/owner_lease.py:551`), so reap never touches it in dry-run OR
+apply mode. S3's own path is `claim_successor()`, which requires `_live()`
+false (released or expired) AND **zero open `owner_requests` for the label**
+AND a different new holder (`lib/owner_lease.py:430-432, 445-448, 449-450`).
+
+The runbook's S1 preflight (`/tmp/factory-p1-preflight.sh`, read-only) must
+read precondition (b) -- zero open `owner_requests` for the label -- BEFORE
+any `build-form`/`claim_successor` attempt, not discover it as a mid-transaction
+refusal. `build_main` (`owner-dispatch-issue.py:535-593`, "build-form") reads
+the predecessor tuple from `--lease-db` but does not itself query
+`owner_requests`; today the check only happens inside `claim_successor`'s own
+transaction, at issue time.
+
+**Gap, not invented a path for:** if precondition (b) fails (open requests
+exist on the expired, dead-holder lease), there is **no production code path**
+that disposes of them. `_fence` (`lib/owner_lease.py:469-472`) refuses because
+the holder isn't live, so `transition()` can't clear them either; `acquire()`'s
+staling branch has no production caller; reap does not touch requests at all
+(`lib/owner_lease.py:561-592` only ever releases lease rows). `claim_successor`
+then refuses `open_requests` (`owner-dispatch-issue.py:784-785`), and S3 stops
+and goes to T. This change does not add one: inventing a disposal path here
+would be new, unreviewed control-plane surface for a gap the design only needs
+to detect, not resolve.
 
 ## After a reap (phase 3 only)
 
@@ -224,7 +280,8 @@ Decision: **`acquire()` / `claim_*()` do not probe liveness and do not refuse a
    describes, or by having an operator approve a successor claim for a different
    session.
 5. **Code:** reverting this branch's commits removes `lib/owner_lease_reap.py`.
-   Nothing imports it at runtime.
+   Nothing else (`owner-lease-reap.py`, `hub.py` `_reap_tick()`) imports it or
+   runs unless `HERDR_OWNER_LEASE_REAP=1` is also set in the hub's environment.
 
 ## Lineage and unverified items
 
@@ -233,4 +290,7 @@ Decision: **`acquire()` / `claim_*()` do not probe liveness and do not refuse a
   which reviewers had approved through r3. **PR state UNVERIFIED** (this worker
   has no `gh`/network access). If that branch merges first, rebasing this one
   drops the duplicate patches.
-- The phase-2 subscription `agent_session` shape is unverified (see "Probe").
+- S4(c) (DESIGN-reap.md, ACCEPT-WITH-NOTES review) replaced the prior doc's
+  LiveState-subscription probe plan with a dedicated `herdr pane list`
+  subprocess per CLI run (see "Probe"); the subscription's unverified
+  `agent_session` shape is no longer load-bearing for phase 2.

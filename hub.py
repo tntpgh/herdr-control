@@ -1958,6 +1958,39 @@ def _queue_tick() -> None:
         _live_log(f"queue tick failed: {exc}")
 
 
+REAP_SCRIPT = Path(__file__).resolve().parent / "owner-lease-reap.py"
+REAP_TICK_EVERY_S = 60
+REAP_STUCK_AFTER_S = 30
+_REAP_RUNNER: list = []
+
+
+def _reap_tick() -> None:
+    """DRY-RUN-ONLY stale-pane reap report (lib/owner_lease_reap.py,
+    owner-lease-reap.py; docs/design/lease-reap-wiring.md). OFF unless
+    HERDR_OWNER_LEASE_REAP=1 is in the hub's environment. NON-BLOCKING, the
+    same TickRunner shape as _queue_tick: one report subprocess at a time,
+    polled each attention pass, throttled to at most one start per
+    REAP_TICK_EVERY_S, a stuck child killed (SIGTERM, then SIGKILL after
+    TickRunner.KILL_GRACE_S) after REAP_STUCK_AFTER_S. The subprocess opens
+    the lease store READ-ONLY and calls reap_tick() with its own
+    dry_run=True default -- REAP_APPLY stays off: no parameter, flag or env
+    read anywhere in this change reaches reap(dry_run=False). Never raises."""
+    if os.environ.get("HERDR_OWNER_LEASE_REAP") != "1":
+        return
+    if not _REAP_RUNNER:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("owner_lease_reap_mod", REAP_SCRIPT.parent / "lib" / "queue_supervisor.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REAP_RUNNER.append(mod.TickRunner([sys.executable, str(REAP_SCRIPT)], REAP_TICK_EVERY_S, REAP_STUCK_AFTER_S))
+    try:
+        st = _REAP_RUNNER[0].poll()
+        if st not in ("running", "waiting"):
+            _live_log(f"reap tick {st}")
+    except OSError as exc:
+        _live_log(f"reap tick failed: {exc}")
+
+
 
 def _attention_loop() -> None:
     while True:
@@ -1974,6 +2007,10 @@ def _attention_loop() -> None:
             _queue_tick()
         except Exception as e:  # noqa: BLE001 — same: never kill the loop
             _live_log(f"queue tick error: {type(e).__name__}: {e}")
+        try:
+            _reap_tick()
+        except Exception as e:  # noqa: BLE001 — same: never kill the loop
+            _live_log(f"reap tick error: {type(e).__name__}: {e}")
         time.sleep(ATTENTION_INTERVAL_S)
 
 

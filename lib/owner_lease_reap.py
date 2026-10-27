@@ -9,23 +9,31 @@ completely. A controller that drops an unknown-birth record before building
 live holder. Likewise a herdr server restart reissues `terminal_id` (the pane
 birth) for every pane whose agent never died (lib/run-registry.sh:229-238,
 lib/reconcile.sh corroboration): an exact (pane_id, birth) comparison alone
-calls every such holder "pane-gone".
+calls every such holder "pane-gone". A third hazard (S4(c), DESIGN-reap.md
+§3a): a pane that spawns and claims AFTER the snapshot was captured can be
+absent from that snapshot even though it is alive -- the spawn/register race
+lib/reconcile.sh:119-122 already guards against.
 
 Entry points, all read-only on the lease store:
   snapshot_from_pane_list(payload) — `herdr pane list` JSON -> {pane_id: rec}
                                      or None when unparseable.
-  plan_reap(conn, snapshot, age)   — fails the WHOLE tick closed (SKIP + reason)
-                                     unless the snapshot is fresh, well-formed
-                                     and every birth is known; otherwise
-                                     `pane-gone` candidates plus `held` leases
-                                     whose pane id is still present under a new
-                                     birth and is not positively proven to be a
-                                     different agent session.
+  plan_reap(conn, snapshot, age, snapshot_at=None) — fails the WHOLE tick
+                                     closed (SKIP + reason) unless the
+                                     snapshot is fresh, well-formed and every
+                                     birth is known; otherwise `pane-gone`
+                                     candidates plus `held` leases that are
+                                     either claimed at/after `snapshot_at` (or
+                                     `snapshot_at` is unknown -- fail-safe) or
+                                     whose pane id is still present under a
+                                     new birth and not positively proven to be
+                                     a different agent session.
   reap_tick(conn, payload, captured_at) — the ONLY caller of observe_stale()
                                      (via plan_reap) and reap(). Always
                                      dry-run: no argument reaches reap()'s
                                      apply mode. Apply is a separate, approved
                                      change (design doc "Turning REAP_APPLY on").
+                                     Passes `captured_at` through to
+                                     `plan_reap` as `snapshot_at`.
 
 Expired leases are excluded from candidates: the clock-based successor path
 owns those, and stamping one `reaped:expired` would break the standing-grant
@@ -96,7 +104,7 @@ def _held(o, reason):
 
 
 def plan_reap(conn, pane_snapshot, snapshot_age_s, now=None,
-              max_snapshot_age_s=DEFAULT_MAX_SNAPSHOT_AGE_S) -> dict:
+              max_snapshot_age_s=DEFAULT_MAX_SNAPSHOT_AGE_S, snapshot_at=None) -> dict:
     """Read-only. Returns one of:
 
       {"status": "skip", "reason": <str>}
@@ -106,20 +114,31 @@ def plan_reap(conn, pane_snapshot, snapshot_age_s, now=None,
     `pane_snapshot` is a `{pane_id: record}` projection (snapshot_from_pane_list)
     — `None` means the probe is unavailable. `snapshot_age_s` is the age in
     seconds of the data behind it (`None` when no freshness metadata exists).
-    `candidates` contains only `reason == "pane-gone"` observations; this
-    function never releases anything.
+    `snapshot_at` is the epoch seconds the snapshot was CAPTURED (reap_tick
+    passes its own `captured_at`). `candidates` contains only
+    `reason == "pane-gone"` observations; this function never releases
+    anything.
 
     SKIP, for the whole tick, when:
       - `pane_snapshot` is `None` (probe unavailable) or not a dict (malformed);
       - any record in it is not a dict, or has an empty/missing `birth`;
       - `snapshot_age_s` is missing, negative, or exceeds `max_snapshot_age_s`.
 
-    A pane-gone observation whose pane id IS in the snapshot (under a different
-    birth) is a candidate only when the record's agent_session is present and
-    its digest positively differs from the lease's session_digest (the pane id
-    was recycled to another agent). Same digest -> held `birth_reissued` (a
-    herdr restart, the holder is alive); either side unknown -> held
-    `identity_uncertain`.
+    A `pane-gone` observation whose lease was acquired at or after
+    `snapshot_at` is held `claimed_after_snapshot`, never a candidate: the
+    snapshot predates (or ties) the claim, so the pane being absent from it
+    proves nothing about whether the holder is alive (DESIGN-reap.md §3a).
+    `snapshot_at=None` holds EVERY pane-gone observation this way -- fail-safe
+    for a direct `plan_reap` caller that doesn't know when its snapshot was
+    taken; `reap_tick` always passes a real `captured_at` once it has passed
+    its own freshness check, so this arm never fires on the hub's path.
+
+    Otherwise, a pane-gone observation whose pane id IS in the snapshot (under
+    a different birth) is a candidate only when the record's agent_session is
+    present and its digest positively differs from the lease's session_digest
+    (the pane id was recycled to another agent). Same digest -> held
+    `birth_reissued` (a herdr restart, the holder is alive); either side
+    unknown -> held `identity_uncertain`.
     """
     if pane_snapshot is None:
         return {"status": "skip", "reason": "probe_unavailable"}
@@ -142,12 +161,16 @@ def plan_reap(conn, pane_snapshot, snapshot_age_s, now=None,
     for o in ol.observe_stale(conn, live_panes, now=now):
         if o["reason"] != "pane-gone":
             continue
+        row = conn.execute("SELECT session_digest, acquired_at FROM owner_leases WHERE lease_id=?",
+                           (o["lease_id"],)).fetchone()
+        lease_digest, acquired_at = (row[0], row[1]) if row else ("", None)
+        if snapshot_at is None or acquired_at is None or acquired_at >= ol._iso(snapshot_at):
+            held.append(_held(o, "claimed_after_snapshot"))
+            continue
         rec = pane_snapshot.get(o["pane"])
         if rec is None:
             candidates.append(o)
             continue
-        row = conn.execute("SELECT session_digest FROM owner_leases WHERE lease_id=?", (o["lease_id"],)).fetchone()
-        lease_digest = row[0] if row else ""
         live_session = rec.get("agent_session")
         if not (isinstance(live_session, str) and live_session
                 and isinstance(lease_digest, str) and ol.SESSION_DIGEST_RE.fullmatch(lease_digest)):
@@ -180,7 +203,7 @@ def reap_tick(conn, pane_list_payload, captured_at, now=None,
     age = None
     if isinstance(captured_at, (int, float)) and not isinstance(captured_at, bool):
         age = now - captured_at
-    plan = plan_reap(conn, snapshot, age, now=now, max_snapshot_age_s=max_snapshot_age_s)
+    plan = plan_reap(conn, snapshot, age, now=now, max_snapshot_age_s=max_snapshot_age_s, snapshot_at=captured_at)
     if plan["status"] != "ok":
         return dict(plan, dry_run=True)
     return {"status": "ok", "dry_run": True, "would_reap": ol.reap(conn, plan["candidates"], now=now),

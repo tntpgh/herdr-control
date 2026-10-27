@@ -121,7 +121,7 @@ c.close()
 _, c = fresh()
 ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, S("a"), now=T0)
 snapshot = {"w9:p9": {"pane_id": "w9:p9", "birth": "term_other"}}
-plan = olr.plan_reap(c, snapshot, snapshot_age_s=1, now=T0 + 10)
+plan = olr.plan_reap(c, snapshot, snapshot_age_s=1, now=T0 + 10, snapshot_at=T0 + 5)
 case("probe_genuinely_dead_pane_is_candidate: status=ok",
      plan["status"] == "ok")
 case("probe_genuinely_dead_pane_is_candidate: one pane-gone candidate",
@@ -288,6 +288,47 @@ t = olr.reap_tick(c, PL(("w1:p1", "term_newowner", "/synthetic/sessions/someone-
 case("recycled_pane_id_with_other_session_is_candidate",
      [o["pane"] for o in t["would_reap"]] == ["w1:p1"] and t["held"] == [])
 c.close()
+
+# ---- claimed-after-snapshot hazard (§3a, DESIGN-reap.md PROOF §R1): a pane
+# that spawns and claims AFTER the snapshot was captured must never become a
+# candidate, even though its pane id is absent from that snapshot. ----
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, DIG_A, now=T0 + 2)  # claimed AFTER captured_at below
+t = olr.reap_tick(c, PL(("w9:p9", "term_other", "/synthetic/other.jsonl")), captured_at=T0, now=T0 + 10)
+case("claimed_after_snapshot_is_held: would_reap empty",
+     t["status"] == "ok" and t["would_reap"] == [])
+case("claimed_after_snapshot_is_held: held claimed_after_snapshot",
+     [h["reason"] for h in t["held"]] == ["claimed_after_snapshot"])
+c.close()
+
+# A lease acquired BEFORE the snapshot was captured, with its pane genuinely
+# absent, is still a real candidate -- the hold isn't a blanket no-op.
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, DIG_A, now=T0 - 5)  # claimed BEFORE captured_at
+t = olr.reap_tick(c, PL(("w9:p9", "term_other", "/synthetic/other.jsonl")), captured_at=T0, now=T0 + 10)
+case("claimed_before_snapshot_is_still_a_candidate",
+     [o["pane"] for o in t["would_reap"]] == ["w1:p1"] and t["held"] == [])
+c.close()
+
+# A tie (acquired_at == captured_at) is held too: the comparison is `>=`, not
+# `>`, so a claim racing the exact snapshot instant fails safe.
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, DIG_A, now=T0)
+t = olr.reap_tick(c, PL(("w9:p9", "term_other", "/synthetic/other.jsonl")), captured_at=T0, now=T0 + 10)
+case("claimed_exactly_at_snapshot_is_held",
+     t["would_reap"] == [] and [h["reason"] for h in t["held"]] == ["claimed_after_snapshot"])
+c.close()
+
+# A direct plan_reap() caller that passes no snapshot_at at all hits the
+# fail-safe arm: an unknown capture time holds rather than guesses.
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, DIG_A, now=T0)
+plan = olr.plan_reap(c, {"w9:p9": {"pane_id": "w9:p9", "birth": "term_other"}}, snapshot_age_s=1, now=T0 + 10)
+case("plan_reap_without_snapshot_at_holds_fail_safe",
+     plan["status"] == "ok" and plan["candidates"] == []
+     and [h["reason"] for h in plan["held"]] == ["claimed_after_snapshot"])
+c.close()
+
 
 # ---- dry-run tick on a dead pane: reports, writes NOTHING (read-only conn) ----
 path, c = fresh()
