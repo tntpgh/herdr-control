@@ -133,6 +133,20 @@ html[data-view=ship] #overview-view{display:none}
 .room-pin[data-station=qualitygate]{top:83%}
 .room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
 .hull>.room,.room-list>.room{border-top:3px solid var(--accent)}
+/* r7 review (tmp/in/REVIEW-r7.md item 3): showing all 5 full room cards
+   stacked (1198px tall) is still too much on screen even with the overlap
+   fixed. Only one room's full card is visible in .room-list at a time --
+   ui.js picks the default (most attention, ties broken by task count then
+   station order) and marks it .selected; clicking a .room-pin's #room-<id>
+   anchor switches via :target, a real browser navigation, no JS/input
+   involved (Ship renders no <input>/<button>/<form> anywhere -- check.js
+   asserts this). .room-list is only ever present when hasArt (the art +
+   pins exist to pick a room from); the plain theme's .hull has no pins, so
+   every room stays visible there, unaffected by this rule. */
+.room-list>.room{display:none}
+.room-list>.room.selected{display:grid}
+.room-list:has(.room:target)>.room{display:none}
+.room-list:has(.room:target)>.room:target{display:grid}
 .room-head{display:flex;gap:10px;align-items:flex-start}
 .room-head h3{margin:0 0 2px;font-size:14px}
 .room-place{font-size:12px;color:var(--muted);margin:0}
