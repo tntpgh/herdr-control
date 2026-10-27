@@ -35,7 +35,16 @@ details.navgroup[open]>summary::before{content:"\25BE  "}
 .prefs{position:relative;font-size:13px}
 .prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
 .prefs>summary::-webkit-details-marker{display:none}
-.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:230px;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
+/* r17 fix (tmp/in/FIX-r17.md item 2, from independent review r9 section 3
+   "Mobile", carried forward from before 65b4f0d, now addressed): a flat
+   230px min-width on a popup anchored to .prefs (itself mid-header's flex
+   row, not flush to the viewport edge) overflows any viewport narrower
+   than ~246px regardless of which side it's anchored to -- the mobile
+   override only changes left vs right anchoring, never the floor itself.
+   min(230px, calc(100vw - 16px)) keeps the 230px floor everywhere it
+   fits and clamps to the viewport minus a small margin everywhere it
+   doesn't, so it can never exceed the viewport at any width. */
+.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:min(230px,calc(100vw - 16px));padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
 .prefs-body label{display:flex;gap:8px;align-items:center}
 .prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
 html:not([data-js]) .prefs,html:not([data-js]) .viewbar{display:none}
@@ -202,17 +211,27 @@ html[data-view=ship] #overview-view{display:none}
 .ship-art{position:relative;overflow:hidden;aspect-ratio:998/808;border-radius:10px;border:2px solid var(--brass);
   background-color:var(--surface-2);background-size:153.9078% 126.7327%;background-position:0% 42.5926%}
 /* r16 fix (tmp/in/FIX-r16.md item 1): real title/tagline text laid
-   directly over .ship-art's own top ~12% -- the conductor's own
-   real-Chromium observation of this exact crop is that that band is
-   empty space/planet, not baked text or character content, so no flat
-   mask is needed here (unlike .ship-mask-row below, which covers actual
-   baked pixels). Left-anchored and width-capped well under .room-pin's
-   own right:4%;width:26% column (max-width:62% leaves a wide margin) so
-   the two can share the same vertical band -- Bridge's own pin sits at
-   top:9.90%, inside this same ~12% zone -- without colliding
-   horizontally. White text + a strong shadow for contrast against
-   whatever part of the sky/planet art sits underneath (unlike the
-   deleted .ship-hero-text, there's no flat-colour mask backing it here). */
+   directly over .ship-art's own top ~12%.
+
+   r17 fix (tmp/in/REVIEW-r9.md section 4, independent review of 4a9c900):
+   r16's comment here claimed that band was clear of baked content -- a
+   mistaken by-eye read, not a computed one. Direct visual comparison in
+   the reference confirmed a second, smaller baked "BEBOP / WORK MAKES A
+   GOOD CREW." caption sits right underneath the real .ship-art-title
+   text, source y~155-200, mapped into the r15 crop's 808px box via the
+   same (y-92)/808*100 formula used for every other station offset in
+   this file: new_y = (155-92)/808*100 .. (200-92)/808*100 ~= 7.8% .. 13.4%
+   of the box. FIX-r17.md's chosen fix (of the two the review offered):
+   mask just that caption the same way .ship-mask-row already masks the
+   baked per-room status pills, rather than re-cropping (which would move
+   every .ship-mask-row/.room-pin offset again) or dropping the real HTML
+   title (which the review flagged would still need a visually-hidden h2
+   for screen readers -- more moving parts for the same result). Sized
+   generously past the computed 7.8-13.4% band (same "generous rather
+   than tight" margin this file already uses for every mask) and to the
+   left where the caption sits, well under .ship-art-title's own
+   max-width:62% reach so neither undershoots the other. */
+.ship-mask-caption{top:6%;left:0;width:58%;height:9%}
 .ship-art-title{position:absolute;z-index:2;top:0;left:0;max-width:62%;padding:10px 14px;color:#fff;
   text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
 .ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
