@@ -4,10 +4,10 @@ name: owner-lease
 # plus the inert result-availability primitive (lib/result_availability.py).
 on:
   pull_request:
-    paths: ["lib/owner_lease.py", "lib/owner_lease_delivery.py", "verify-owner-lease.py", "owner-dispatch-issue.py", "verify-owner-lease-delivery.py", "remote-mcp/publisher.py", "lib/result_availability.py", "verify-result-availability.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/private_sqlite.py", "owner-dispatch.py", "owner-lease-claim.py", "verify-owner-dispatch.py", "verify-owner-dispatch-standing.py", ".github/workflows/owner-lease.yml", "verify-deploy-launcher-compat.sh", "launchd/agent-lib.sh", "config.sh"]
+    paths: ["lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/owner_lease_reap.py", "verify-owner-lease.py", "verify-owner-lease-reap-wiring.py", "owner-dispatch-issue.py", "verify-owner-lease-delivery.py", "remote-mcp/publisher.py", "lib/result_availability.py", "verify-result-availability.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/private_sqlite.py", "owner-dispatch.py", "owner-lease-claim.py", "verify-owner-dispatch.py", "verify-owner-dispatch-standing.py", ".github/workflows/owner-lease.yml", "verify-deploy-launcher-compat.sh", "launchd/agent-lib.sh", "config.sh"]
   push:
     branches: [main]
-    paths: ["lib/owner_lease.py", "lib/owner_lease_delivery.py", "verify-owner-lease.py", "owner-dispatch-issue.py", "verify-owner-lease-delivery.py", "remote-mcp/publisher.py", "lib/result_availability.py", "verify-result-availability.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/private_sqlite.py", "owner-dispatch.py", "owner-lease-claim.py", "verify-owner-dispatch.py", "verify-owner-dispatch-standing.py", ".github/workflows/owner-lease.yml", "verify-deploy-launcher-compat.sh", "launchd/agent-lib.sh", "config.sh"]
+    paths: ["lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/owner_lease_reap.py", "verify-owner-lease.py", "verify-owner-lease-reap-wiring.py", "owner-dispatch-issue.py", "verify-owner-lease-delivery.py", "remote-mcp/publisher.py", "lib/result_availability.py", "verify-result-availability.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/private_sqlite.py", "owner-dispatch.py", "owner-lease-claim.py", "verify-owner-dispatch.py", "verify-owner-dispatch-standing.py", ".github/workflows/owner-lease.yml", "verify-deploy-launcher-compat.sh", "launchd/agent-lib.sh", "config.sh"]
 
 permissions:
   contents: read
@@ -25,6 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 verify-owner-lease.py
+      - run: python3 verify-owner-lease-reap-wiring.py
       - run: python3 verify-owner-lease-delivery.py
       - run: python3 verify-result-availability.py
       - run: python3 verify-owner-dispatch.py
