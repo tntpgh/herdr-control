@@ -1406,6 +1406,159 @@ console.log("E2E_RESOLUTIONS:" + JSON.stringify(resolutions));
     && ok "e2e: the hook's own poll observed approved_awaiting_completion and resolved the exact binding approved=true" \
     || bad "e2e poll did not resolve approved via the real bound resolver: $e2e_out"
 
+  printf '== TS shim: fix/deferred-denial-delivery -- a refusal resolves the REAL bound resolver as terminal DENIED, carrying the reason ==\n'
+  # Mirrors the e2e approval test above but for a REFUSAL: herdr-select.sh's
+  # own `_refuse_bound` helper calls exactly this CLI
+  # (lib/prompt-occurrence.py refuse-bound) whenever enforcement holds a
+  # deferred request. Proves: (1) the poll resolves approved=false with the
+  # EXACT declared reason, not the generic "bound approval timed out" it
+  # fell back to before this fix (herdr-control, 2026-10-26: lanes froze on
+  # 881c0d82/2d40e7d2/8230d929/b1c2710a); (2) a second refuse-bound for the
+  # same occurrence is a no-op -- exactly-once terminal delivery, never a
+  # second declined event; (3) a stale/replayed identity that was never
+  # proposed is a safe no-op, never an error; (4) two concurrent request
+  # ids in one pane resolve independently, no cross-binding; (5) an
+  # occurrence the real conductor already approved is protected --
+  # refuse-bound never overwrites a genuine approval.
+  deny_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" \
+    E2E_DB="$SHIM/state/registry.sqlite3" E2E_PY="$here/lib/prompt-occurrence.py" \
+    SHIM_WT="$SHIM/wt" E2E_CPANE="$CPANE" E2E_CBIRTH="$CBIRTH" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+function propose(callId, requestId, name) {
+  const input = { path: process.env.SHIM_WT + "/" + name, content: "x" };
+  const json = JSON.stringify(input);
+  const resolutions = [];
+  const ret = handlers["tool_approval_requested"]({
+    toolName: "write", toolCallId: callId, sessionId: "session-" + callId,
+    requestId, bindingProtocol: "omp.tool-approval-binding.v1",
+    argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true,
+  }, { resolveToolApproval: r => { resolutions.push(r); return true; }, sessionManager: { getSessionId: () => "session-" + callId } });
+  return { ret, resolutions };
+}
+function seenRowFor(callId) {
+  const q = Bun.spawnSync(["sqlite3", process.env.E2E_DB,
+    "SELECT payload FROM events WHERE type=\x27prompt_occ_seen\x27 AND task_id=\x27shimtask\x27 AND json_extract(payload,\x27$.tool_call_id\x27)=\x27" + callId + "\x27;"]);
+  return JSON.parse(q.stdout.toString().trim().split("\n")[0]);
+}
+function refuseBound(seenRow, reason) {
+  const r = Bun.spawnSync(["python3", process.env.E2E_PY, "refuse-bound",
+    "--db", process.env.E2E_DB, "--run", seenRow.run_id, "--task", seenRow.task_id,
+    "--approval-request-id", seenRow.approval_request_id, "--core-arguments-digest", seenRow.core_arguments_digest,
+    "--tool-call-id", seenRow.tool_call_id, "--reason", reason]);
+  return r.stdout.toString().trim();
+}
+function occState(seenRow) {
+  const r = Bun.spawnSync(["python3", process.env.E2E_PY, "state",
+    "--db", process.env.E2E_DB, "--run", seenRow.run_id, "--task", seenRow.task_id,
+    "--pane", seenRow.pane_id, "--birth", seenRow.pane_birth,
+    "--session", seenRow.native_session, "--call-id", seenRow.tool_call_id]);
+  return JSON.parse(r.stdout.toString().trim());
+}
+
+// (1) denial delivered, with the exact reason.
+const d1 = propose("call-e2e-deny-1", "request-e2e-deny-1", "e2e-deny-1.md");
+await new Promise(r => setTimeout(r, 1200));
+console.log("D1_RETURN:" + JSON.stringify(d1.ret));
+console.log("D1_STILL_UNRESOLVED:" + JSON.stringify(d1.resolutions));
+const d1Seen = seenRowFor("call-e2e-deny-1");
+const d1Refuse = refuseBound(d1Seen, "credential-value access remains human-only (synthetic test)");
+console.log("D1_REFUSE:" + d1Refuse);
+for (let waited = 0; waited < 6000 && d1.resolutions.length === 0; waited += 200) {
+  await new Promise(r => setTimeout(r, 200));
+}
+console.log("D1_RESOLUTIONS:" + JSON.stringify(d1.resolutions));
+
+// (2) exactly-once: a second refuse-bound for the same occurrence must
+// never land a second declined event or change the recorded reason.
+const d1Refuse2 = refuseBound(d1Seen, "a different later reason must never land");
+console.log("D1_REFUSE_AGAIN:" + d1Refuse2);
+const d1Key = JSON.parse(d1Refuse).occ_key;
+const d1CountQ = Bun.spawnSync(["sqlite3", process.env.E2E_DB,
+  "SELECT count(*) FROM events WHERE type=\x27prompt_occ_declined\x27 AND task_id=\x27shimtask\x27 AND json_extract(payload,\x27$.occ_key\x27)=\x27" + d1Key + "\x27;"]);
+console.log("D1_DECLINED_COUNT:" + d1CountQ.stdout.toString().trim());
+
+// (3) stale/replayed: an identity that was never proposed is a safe no-op.
+const staleRefuse = refuseBound({
+  run_id: d1Seen.run_id, task_id: d1Seen.task_id,
+  approval_request_id: "request-never-proposed", core_arguments_digest: "sha256:" + "0".repeat(64),
+  tool_call_id: "call-never-proposed",
+}, "stale replay");
+console.log("STALE_REFUSE:" + staleRefuse);
+
+// (4) two concurrent request ids in the same pane resolve independently.
+const dA = propose("call-e2e-deny-A", "request-e2e-deny-A", "e2e-deny-A.md");
+const dB = propose("call-e2e-deny-B", "request-e2e-deny-B", "e2e-deny-B.md");
+await new Promise(r => setTimeout(r, 1200));
+const seenA = seenRowFor("call-e2e-deny-A");
+const seenB = seenRowFor("call-e2e-deny-B");
+refuseBound(seenA, "A is refused");
+for (let waited = 0; waited < 6000 && dA.resolutions.length === 0; waited += 200) {
+  await new Promise(r => setTimeout(r, 200));
+}
+console.log("CONCURRENT_A_RESOLUTIONS:" + JSON.stringify(dA.resolutions));
+console.log("CONCURRENT_B_STILL_UNRESOLVED:" + JSON.stringify(dB.resolutions));
+console.log("CONCURRENT_B_STATE:" + JSON.stringify(occState(seenB)));
+
+// (5) an occurrence the real conductor already approved is protected.
+const dC = propose("call-e2e-deny-approved", "request-e2e-deny-approved", "e2e-deny-approved.md");
+await new Promise(r => setTimeout(r, 1200));
+const seenC = seenRowFor("call-e2e-deny-approved");
+const approveC = Bun.spawnSync(["python3", process.env.E2E_PY, "authorize-bound",
+  "--db", process.env.E2E_DB, "--run", seenC.run_id, "--task", seenC.task_id,
+  "--pane", seenC.pane_id, "--birth", seenC.pane_birth,
+  "--session", seenC.native_session, "--call-id", seenC.tool_call_id,
+  "--approval-request-id", seenC.approval_request_id, "--core-arguments-digest", seenC.core_arguments_digest,
+  "--worktree", process.env.SHIM_WT, "--conductor-pane", process.env.E2E_CPANE,
+  "--conductor-birth", process.env.E2E_CBIRTH, "--approval-id", "approval-e2e-deny-approved",
+  "--choice", "Approve", "--authority", "conductor", "--decided-by", "test-conductor",
+  "--review-reason", "e2e test", "--review-category", "branch-work", "--reviewer", "test",
+  "--audit-text", "e2e authorize-bound", "--expect-payload-sha", seenC.payload_sha256]);
+console.log("APPROVED_C_AUTHORIZE:" + approveC.stdout.toString().trim());
+const refuseC = refuseBound(seenC, "must never override an approval");
+console.log("APPROVED_C_REFUSE:" + refuseC);
+console.log("APPROVED_C_STATE:" + JSON.stringify(occState(seenC)));
+' 2>&1)"
+  printf '%s' "$deny_out" | grep -q 'D1_STILL_UNRESOLVED:\[\]' \
+    && ok "deny-e2e: still unresolved while only 'requested' is on record" \
+    || bad "deny-e2e resolved too early: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'D1_REFUSE:{"occ_key"' \
+    && ok "deny-e2e: refuse-bound accepted the exact identity" \
+    || bad "deny-e2e refuse-bound did not land: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'D1_RESOLUTIONS:\[{"bindingProtocol":"omp.tool-approval-binding.v1","requestId":"request-e2e-deny-1","sessionId":"session-call-e2e-deny-1","toolCallId":"call-e2e-deny-1","toolName":"write","argumentsDigest":"sha256:[0-9a-f]*","approved":false,"reason":"credential-value access remains human-only (synthetic test)"}\]' \
+    && ok "deny-e2e: the hook's own poll resolved approved=false carrying the EXACT declared refusal reason, not a generic timeout" \
+    || bad "deny-e2e poll did not deliver the terminal DENIED with its real reason: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'D1_REFUSE_AGAIN:{"occ_key":[^}]*"written": "already-resolved"}' \
+    && ok "deny-e2e: a second refuse-bound for the same occurrence is a no-op" \
+    || bad "deny-e2e second refuse-bound did not report already-resolved: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'D1_DECLINED_COUNT:1' \
+    && ok "deny-e2e: exactly one declined event ever lands for the occurrence (exactly-once terminal delivery)" \
+    || bad "deny-e2e declined event was duplicated: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'STALE_REFUSE:{"written": "no-such-occurrence"}' \
+    && ok "deny-e2e: a stale/replayed identity that was never proposed is a safe no-op" \
+    || bad "deny-e2e stale replay was not refused safely: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'CONCURRENT_A_RESOLUTIONS:\[{"bindingProtocol":"omp.tool-approval-binding.v1","requestId":"request-e2e-deny-A","sessionId":"session-call-e2e-deny-A","toolCallId":"call-e2e-deny-A","toolName":"write","argumentsDigest":"sha256:[0-9a-f]*","approved":false,"reason":"A is refused"}\]' \
+    && ok "deny-e2e: concurrent request A resolves on its own exact identity" \
+    || bad "deny-e2e concurrent A did not resolve correctly: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'CONCURRENT_B_STILL_UNRESOLVED:\[\]' \
+    && ok "deny-e2e: refusing A never resolves B (no cross-binding)" \
+    || bad "deny-e2e refusing A wrongly resolved B: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'CONCURRENT_B_STATE:{.*"lifecycle":"requested"' \
+    && ok "deny-e2e: B's registry lifecycle is untouched by A's refusal" \
+    || bad "deny-e2e B's lifecycle was touched by A's refusal: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'APPROVED_C_AUTHORIZE:{.*"written": "authorized"' \
+    && ok "deny-e2e: the real conductor's authorize-bound landed for C" \
+    || bad "deny-e2e setup: authorize-bound for C did not land: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'APPROVED_C_REFUSE:{"occ_key":[^}]*"written": "already-resolved"}' \
+    && ok "deny-e2e: refuse-bound never overrides an occurrence the real conductor already approved" \
+    || bad "deny-e2e refuse-bound overrode a genuine approval: $deny_out"
+  printf '%s' "$deny_out" | grep -q 'APPROVED_C_STATE:{.*"lifecycle":"approved_awaiting_completion"' \
+    && ok "deny-e2e: C's lifecycle stays approved_awaiting_completion, never flipped to declined" \
+    || bad "deny-e2e C's lifecycle was flipped away from approved: $deny_out"
+
+
   printf '== TS shim: every envelope is ACKED, and no report enters the prompt ==\n'
   # History matters here, because these assertions were pointed the wrong way
   # for two releases. 0fbece0 delivered the report through pi.sendMessage and
