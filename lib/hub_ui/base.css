@@ -275,8 +275,21 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
   .prefs-body{left:0;right:auto}
   main{padding:12px 10px 48px}
   table{display:block;overflow-x:auto}
+  /* REVIEW-r7.md item 5: .room-pin/.ship-mask are position:absolute, so
+     they contribute nothing to .ship-art's height; with the img hidden and
+     aspect-ratio cancelled at this breakpoint, .ship-art has no other
+     in-flow content and collapses to 0 height -- every percentage top:%
+     then resolves against 0, stacking all 12 elements at one point. Hide
+     them alongside the image, same precedent as the old (now-removed)
+     .ship-art .room{position:static} mobile override did for room cards
+     before the r6 redesign. */
   .ship-art{aspect-ratio:auto;border:0;background:none}
-  .ship-art>img{display:none}
+  .ship-art>img,.room-pin,.ship-mask{display:none}
+  /* with .room-pin hidden, #room-<id> :target links no longer exist on
+     this breakpoint -- the only way to reach a non-default room. Revert to
+     every room visible, stacked (the pre-progressive-disclosure behaviour,
+     desktop-only as of r7), so the room list stays reachable on mobile. */
+  .room-list>.room{display:grid!important}
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
 }
