@@ -1,0 +1,171 @@
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:var(--info)}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,[tabindex]:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+main:focus{outline:none}
+.skip{position:absolute;left:-999px;top:0;z-index:10;background:var(--accent);color:var(--bg);padding:.5em .8em;font-weight:700}
+.skip:focus{left:.5em}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* header + nav */
+header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 20px;border-bottom:2px solid var(--brass);background:var(--surface)}
+header .brand{font-size:16px;letter-spacing:.04em}
+header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
+header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent}
+header nav a:hover{color:var(--fg)}
+header nav a.on{color:var(--fg);border-bottom-color:var(--accent)}
+.navgroup{display:inline-flex;flex-wrap:wrap;gap:4px 12px;align-items:center;padding-left:12px;border-left:1px solid var(--border)}
+.navlabel{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.hdr-meta{margin-left:auto}
+.prefs{position:relative;font-size:13px}
+.prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
+.prefs>summary::-webkit-details-marker{display:none}
+.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:230px;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
+.prefs-body label{display:flex;gap:8px;align-items:center}
+.prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
+html:not([data-js]) .prefs,html:not([data-js]) .viewbar{display:none}
+
+main{max-width:1150px;margin:0 auto;padding:16px 20px 60px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+h3{font-size:14px;margin:14px 0 6px}
+table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:table}
+td,th{padding:8px 10px;border-top:1px solid var(--border);vertical-align:top;text-align:left} tr:first-child td,tr:first-child th{border-top:0}
+th{color:var(--muted);font-weight:600;font-size:12px}
+.pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);white-space:nowrap;display:inline-block}
+.hot .pill,.pill.hot{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.bad{color:var(--bad);border-color:var(--bad);border-width:2px;font-weight:600}
+.pill.run{color:var(--info);border-color:var(--info)}
+.age{color:var(--muted);white-space:nowrap;text-align:right} .dim{color:var(--muted)} small{color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;text-decoration:none;color:inherit;display:block}
+a.card:hover{border-color:var(--info)}
+.card .n{font-size:28px;font-weight:700;line-height:1.1} .card .t{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+.card.hot{border-color:var(--accent);border-width:2px;border-left-width:6px} .card .s{font-size:12px;color:var(--muted);margin-top:6px}
+iframe{width:100%;height:720px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
+iframe.dframe{height:calc(100vh - 190px);min-height:560px}
+.dhead{margin:10px 0 8px}
+details.hist{margin-top:22px;border-top:1px solid var(--border);padding-top:6px}
+details.hist>summary{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);cursor:pointer;padding:6px 0;list-style:none}
+details.hist>summary::-webkit-details-marker{display:none}
+details.hist>summary::before{content:"\25B8  ";color:var(--accent)}
+details.hist[open]>summary::before{content:"\25BE  "}
+details.hist>summary:hover{color:var(--fg)}
+details.hist>table{margin-top:8px}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word}
+button{font:inherit}
+button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid var(--info);background:transparent;color:var(--info);cursor:pointer} button.decide:hover{background:var(--info);color:var(--bg)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--bad)} .dot.ok{background:var(--ok)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;font-weight:600;color:var(--fg);text-decoration:none}
+.chips a.chip small{font-weight:400;color:var(--muted)}
+.chips a.chip:hover,.chips a.chip.on{border-color:var(--info)}
+.chips a.chip.on{background:var(--surface-2);box-shadow:inset 0 -2px 0 var(--info)}
+.chips a.chip.hot{border-color:var(--bad);border-style:dashed}
+input[type=text],input:not([type]),textarea{background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+form button[type=submit]{background:var(--surface-2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+li.done{color:var(--muted)}
+
+/* crew emblem (decoration; hidden from assistive tech) */
+.crew-slot:empty{display:none}
+.crew-slot{float:right;margin:0 0 8px 12px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.flavour{display:none;font-style:italic;font-size:12px;color:var(--muted);margin:2px 0 0}
+html[data-flavour] .flavour{display:block}
+
+/* layout toggle on / */
+.viewbar{display:inline-flex;gap:14px;align-items:center;border:1px solid var(--border);border-radius:8px;padding:4px 12px 6px;margin:0 0 8px}
+.viewbar legend{font-size:11px;color:var(--muted);padding:0 4px}
+.viewbar label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+.viewbar input{accent-color:var(--accent)}
+#ship-view{display:none}
+html[data-view=ship] #ship-view{display:block}
+html[data-view=ship] #overview-view{display:none}
+
+/* Ship (layout B) */
+.ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
+.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
+.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,24%);gap:12px;align-items:start}
+.hull{display:grid;gap:8px;grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-areas:"bridge lounge bounty" "workshop workshop kennel" "hangar cargo cargo";
+  padding:14px;background:var(--surface);border:2px solid var(--brass);border-radius:150px 22px 22px 150px/100px 22px 22px 100px}
+.room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:8px;align-content:start}
+.room[data-station=bridge]{grid-area:bridge;border-top:3px solid var(--accent)}
+.room[data-station=lounge]{grid-area:lounge}
+.room[data-station=workshop]{grid-area:workshop}
+.room[data-station=kennel]{grid-area:kennel}
+.room[data-station=hangar]{grid-area:hangar}
+.room[data-station=cargo]{grid-area:cargo}
+.room[data-station=bounty]{grid-area:bounty;border:2px solid var(--brass)}
+.room.outside{background:transparent;border:2px dashed var(--border);border-radius:14px}
+.room-head{display:flex;gap:10px;align-items:flex-start}
+.room-head h3{margin:0 0 2px;font-size:14px}
+.room-place{font-size:12px;color:var(--muted);margin:0}
+.room-status,.room-extra{font-size:13px;margin:0}
+.room-extra{padding-top:6px;border-top:1px dashed var(--border)}
+.room-extra ul{margin:4px 0 0;padding-left:18px}
+.wcards{display:grid;gap:8px}
+.wcard{background:var(--surface);border:2px solid var(--border);border-left-width:6px;border-radius:8px;padding:8px 10px;min-width:0}
+.wcard h4{margin:0 0 4px;font:600 12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-word}
+.wcard p{margin:3px 0;font-size:12.5px}
+.wmeta{color:var(--muted);font-size:12px}
+.badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--brass)}
+.badge.unrec{border:2px dashed var(--bad)}
+
+/* state chips + card borders: shape + icon + words, never colour alone */
+.st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}
+.st[data-d=executing]{color:var(--accent)}
+.st[data-d=unconfirmed]{color:var(--muted);border-style:dotted;font-style:italic}
+.st[data-d=starting]{color:var(--info);border-style:dotted}
+.st[data-d=blocked]{color:var(--warn);border-width:3px}
+.st[data-d=stalled]{color:var(--warn);border-style:dashed;border-width:3px}
+.st[data-d=in_review]{color:var(--info)}
+.st[data-d=done_with_proof]{color:var(--bg);background:var(--ok);border-color:var(--ok)}
+.st[data-d=closed]{color:var(--muted);border-width:1px}
+.st[data-d=failed]{color:var(--bg);background:var(--bad);border-color:var(--bad)}
+.st[data-d=cancelled]{color:var(--muted);border-width:1px;text-decoration:line-through}
+.st[data-d=lost],.st[data-d=gone]{color:var(--bad);border-style:dotted}
+.st[data-d=unknown]{color:var(--bad);border-style:dashed}
+.wcard[data-d=executing]{border-color:var(--accent)}
+.wcard[data-d=unconfirmed]{border-style:dotted;background:var(--bg)}
+.wcard[data-d=blocked]{border-color:var(--warn)}
+.wcard[data-d=stalled]{border-color:var(--warn);border-style:dashed}
+.wcard[data-d=in_review]{border-color:var(--info)}
+.wcard[data-d=done_with_proof]{border-color:var(--ok)}
+.wcard[data-d=failed]{border-color:var(--bad);border-width:3px;border-left-width:6px}
+.wcard[data-d=lost],.wcard[data-d=gone]{border-color:var(--bad);border-style:dotted}
+.wcard[data-d=unknown]{border-color:var(--bad);border-style:dashed}
+.wcard[data-d=unconfirmed] .sprite,.wcard[data-d=lost] .sprite,.wcard[data-d=gone] .sprite{filter:grayscale(1);opacity:.6}
+
+/* Loops = flight plan: each loop a leg with cadence and last fix */
+main[data-view=loops] table tr td:first-child{width:1%;white-space:nowrap}
+main[data-view=loops] h2:first-of-type+table tr{background-image:linear-gradient(var(--brass),var(--brass));background-size:2px 100%;background-repeat:no-repeat;background-position:18px 0}
+main[data-view=loops] h2:first-of-type+table td:first-child{padding-left:30px}
+main[data-view=loops] small{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* Timeline = flight log: monospace entries, sequence and time as the log margin */
+main[data-view=timeline] table{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+main[data-view=timeline] table td:nth-child(1),main[data-view=timeline] table td:nth-child(2){white-space:nowrap;color:var(--muted);border-right:1px dashed var(--border)}
+main[data-view=timeline] table td.age{text-align:left}
+
+/* motion: only .anim sprites move; .anim is only set for executing work with herdr live */
+@keyframes sp-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+.sprite{flex:none;display:block}
+.sprite.anim .sp-fig{animation:sp-bob 1.4s ease-in-out infinite}
+html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{animation:none!important;transition:none!important}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+@media (max-width:1000px){
+  .ship{grid-template-columns:1fr}
+  .hull{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"bridge lounge" "bounty bounty" "workshop workshop" "kennel hangar" "cargo cargo";border-radius:60px 18px 18px 60px/40px 18px 18px 40px}
+}
+@media (max-width:640px){
+  header{padding:10px 12px}
+  .hdr-meta{margin-left:0}
+  .prefs-body{left:0;right:auto}
+  main{padding:12px 10px 48px}
+  table{display:block;overflow-x:auto}
+  .hull{grid-template-columns:1fr;grid-template-areas:"bridge" "bounty" "lounge" "workshop" "kennel" "hangar" "cargo";border-radius:18px;padding:8px}
+  .crew-slot{float:none}
+  iframe.dframe{height:80vh;min-height:420px}
+}

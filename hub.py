@@ -74,6 +74,7 @@ from record_store import NotClaimable, claim_and_update  # noqa: E402
 import herdr_live  # noqa: E402
 import conductor_prompt as _cp  # noqa: E402
 from form_theme import force_dark  # noqa: E402
+import hub_ui  # noqa: E402  (presentation only: chrome, stylesheet, themes, Ship view)
 from form_schema import validate_answers  # noqa: E402
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
@@ -3420,43 +3421,6 @@ def _drift_label(r: dict) -> str:
     return f"{r['repo']} {r['deployed']}→{r['main']} ({_minutes_label(m)})"
 
 
-STYLE = """
- :root{color-scheme:dark}
- body{margin:0;background:#0f1115;color:#e6e9ef;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
- header{display:flex;gap:18px;align-items:center;padding:14px 20px;border-bottom:1px solid #272c37;background:#171a21}
- header b{font-size:16px} header a{color:#9aa3b2;text-decoration:none} header a.on{color:#e6e9ef;border-bottom:2px solid #e08a4a}
- main{max-width:1150px;margin:0 auto;padding:16px 20px 60px}
- h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b2;margin:22px 0 8px}
- table{width:100%;border-collapse:collapse;background:#171a21;border:1px solid #272c37;border-radius:10px;overflow:hidden}
- td{padding:8px 10px;border-top:1px solid #272c37;vertical-align:top} tr:first-child td{border-top:0}
- .pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid #272c37;color:#9aa3b2;white-space:nowrap}
- .hot .pill,.pill.hot{color:#1a1206;background:#e08a4a;border-color:#e08a4a} .pill.ok{color:#6fd39a;border-color:#6fd39a}
- .pill.bad{color:#ff7a7a;border-color:#ff7a7a} .pill.run{color:#6aa6ff;border-color:#6aa6ff}
- .age{color:#9aa3b2;white-space:nowrap;text-align:right} .dim{color:#9aa3b2} small{color:#9aa3b2} a{color:#6aa6ff}
- .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
- .card{background:#171a21;border:1px solid #272c37;border-radius:12px;padding:14px 16px;text-decoration:none;color:inherit;display:block}
- .card .n{font-size:28px;font-weight:700;line-height:1.1} .card .t{color:#9aa3b2;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
- .card.hot{border-color:#e08a4a} .card .s{font-size:12px;color:#9aa3b2;margin-top:6px}
- iframe{width:100%;height:720px;border:1px solid #272c37;border-radius:12px;background:#fff}
- iframe.dframe{height:calc(100vh - 190px);min-height:560px}
- .dhead{margin:10px 0 8px}
- details.hist{margin-top:22px;border-top:1px solid #272c37;padding-top:6px}
- details.hist>summary{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b2;cursor:pointer;padding:6px 0;list-style:none}
- details.hist>summary::-webkit-details-marker{display:none}
- details.hist>summary::before{content:"\\25B8  ";color:#e08a4a}
- details.hist[open]>summary::before{content:"\\25BE  "}
- details.hist>summary:hover{color:#e6e9ef}
- details.hist>table{margin-top:8px}
- pre{background:#0c0e13;border:1px solid #272c37;border-radius:8px;padding:10px;overflow:auto;font-size:12px}
- button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid #6aa6ff;background:transparent;color:#6aa6ff;cursor:pointer} button.decide:hover{background:#6aa6ff;color:#0b1020}
- .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:#ff7a7a} .dot.ok{background:#6fd39a}
- .chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
- .chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid #272c37;border-radius:999px;font-size:12px;font-weight:600;color:#9fb6d0;text-decoration:none}
- .chips a.chip small{font-weight:400;color:#6b7a8d}
- .chips a.chip:hover{border-color:#6aa6ff;color:#cfe0f5}
- .chips a.chip.on{border-color:#6aa6ff;color:#cfe0f5;background:#11161d}
- .chips a.chip.hot{border-color:#ff7a7a} .chips a.chip.hot small{color:#ff9d9d}
-"""
 NAV = [("/", "overview"), ("/projects", "projects"), ("/owners", "owners"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 # ---- SCOPE: one hub, many projects ------------------------------------------
@@ -5035,16 +4999,9 @@ def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "", j
     `scope` is carried into the meta-refresh URL and the json link. Without it
     a scoped page silently reset to the whole fleet on its own 15s refresh —
     a filter that undoes itself while you read is worse than no filter.
-    `json_extra` is appended to the json link only (e.g. /timeline's window)."""
-    nav = " ".join(f"<a href='{p}' class='{'on' if p == path else ''}'>{n}</a>" for p, n in NAV)
-    q = f"?repo={urllib.parse.quote(scope)}" if scope else ""
-    meta = (f"<meta http-equiv=refresh content='{refresh};url={path}{q}'>" if refresh else "")
-    label = f"refresh {refresh}s" if refresh else "reloads only on change"
-    return (f"<!doctype html><html lang=en><head><meta charset=utf-8>{meta}"
-            f"<title>{_esc(title)}</title><style>{STYLE}</style></head><body>"
-            f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>{label} · "
-            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}{_esc(json_extra)}'>json</a>"
-            f"</span></header><main>{body}</main></body></html>")
+    `json_extra` is appended to the json link only (e.g. /timeline's window).
+    The look (head, nav, stylesheet, themes) lives in lib/hub_ui."""
+    return hub_ui.chrome(title, path, body, NAV, refresh=refresh, scope=scope, json_extra=json_extra)
 
 
 # Terrence, 2026-09-05: "the form kept refreshing before I could make full
@@ -5219,7 +5176,8 @@ def render_overview(scope: str = "") -> str:
                                   ("no prior-week data" if cst.get("present") else "cost-report.py has not run"))),
          bool(cst.get("error")) or bool(cst.get("alerts"))),
     ]
-    body = scope_chips(h_all, "/", scope) + "<div class=cards>" + "".join(
+    chips = scope_chips(h_all, "/", scope)
+    body = "<div class=cards>" + "".join(
         f"<a class='card {'hot' if hot else ''}' href='{href}'><div class=t>{t}</div><div class=n>{n}</div><div class=s>{_esc(sub)}</div></a>"
         for href, n, t, sub, hot in cards) + "</div>"
     body += "<h2>Needs attention</h2><table>" + task_rows(h.get("attention", [])) + "</table>"
@@ -5232,7 +5190,8 @@ def render_overview(scope: str = "") -> str:
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
             f"<br><small>{_esc(x['url'])}</small></td><td class=age>{_age(x.get('created_at'))}</td></tr>" for x in f["open"]) + "</table>"
-    return page("hub", "/", body, scope=scope)
+    snapshot = hub_ui.ship_snapshot(h, f, pd, lo, live_data().get("connected", False), time.time())
+    return page("hub", "/", hub_ui.home(chips, body, snapshot), scope=scope)
 
 
 def _live_rows(scope: str = "") -> str:

@@ -1,0 +1,21 @@
+{
+  "name": "Plain dark",
+  "presentation_only": "Greyscale, no characters, no place names. Same states, same words, same controls as every other theme.",
+  "palette": {
+    "--bg": "#0d0d0d",
+    "--surface": "#161616",
+    "--surface-2": "#1f1f1f",
+    "--fg": "#f2f2f2",
+    "--muted": "#cfcfcf",
+    "--accent": "#ffffff",
+    "--brass": "#e0e0e0",
+    "--border": "#8a8a8a",
+    "--ok": "#f2f2f2",
+    "--warn": "#f2f2f2",
+    "--bad": "#f2f2f2",
+    "--info": "#f2f2f2"
+  },
+  "characters": {},
+  "stations": {},
+  "panels": {}
+}
