@@ -92,12 +92,19 @@ html[data-view=ship] #overview-view{display:none}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
 .hull,.room-list{display:grid;gap:10px}
-/* the approved reference image, cropped to its left (ship) region with CSS
-   only -- the file is the untouched 1536x1024 PNG; 998/1536=.6497, so the
-   crop container is 998/1024 and the img is shown at 1536/998=153.9% width,
-   left-aligned, so only the left ship cutaway is visible. */
+/* the approved reference image, cropped to its left (ship) region --
+   object-fit:cover scales the (untouched) 1536x1024 PNG to fill the
+   container exactly (no gaps, no manual width math to get wrong), cropped
+   from object-position's anchor; 0 0 keeps the top-left corner (the ship
+   cutaway), cropping off the right portion (Big Shot art, not used here).
+   Replaced a manual `width:153.9%` calc (998/1536=.6497 crop ratio) that
+   the conductor's browser measure of 9d7c9bf showed left a ~160px gap on
+   the right and a band above the image -- this worker could not reproduce
+   or instrument the exact cause (no browser tool); object-fit:cover is the
+   browser-native, spec-guaranteed way to fill a box from an image without
+   that risk. */
 .ship-art{position:relative;overflow:hidden;aspect-ratio:998/1024;border-radius:10px;border:2px solid var(--brass);background:var(--surface-2)}
-.ship-art>img{position:absolute;left:0;top:0;width:153.9%;max-width:none;display:block}
+.ship-art>img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:0 0;display:block}
 /* r6 review (tmp/in/REVIEW-r6.md, real Chromium render): the reference PNG
    has its own baked-in UI inside this crop -- a Ship/Projects/Bounties nav
    strip across the top, a status pill per room on the right ("Working",
@@ -118,33 +125,36 @@ html[data-view=ship] #overview-view{display:none}
    mask read as a sidebar "gutter" beside the art rather than badges
    sitting on the room rows -- real art showed on the left 74%, a flat
    strip on the right 26% for the whole height, with no visual tie back to
-   each room. Five per-row patches instead, each only tall enough to cover
-   that row's baked status pill, same top:% as the matching pin so the
-   patch sits directly behind it (pin+patch read as one small badge pinned
-   to that row), with real art visible between rows above/below. */
-.ship-mask-row{top:0;right:0;width:26%;height:13%}
-.ship-mask-row[data-station=bridge]{top:5%}
-.ship-mask-row[data-station=projectdeck]{top:23%}
-.ship-mask-row[data-station=buildbay]{top:41%}
-.ship-mask-row[data-station=scout]{top:59%}
-.ship-mask-row[data-station=qualitygate]{top:77%}
+   each room. Five per-row patches instead, same top:% as the matching pin
+   so the patch sits directly behind it. Conductor's measure of 5cca9aa
+   (screenshot desktop-1440-scout.png) found one still leaking -- Build
+   Bay's baked "Waiting for approval" pill visible past the patch's right
+   edge -- so each patch is wider (26% -> 32%) and taller (13% -> 16%,
+   nearly the full ~15.6% row band) than before, erring toward full
+   coverage of the baked pixels over a tidy gap between rows. */
+.ship-mask-row{top:0;right:0;width:32%;height:16%}
+.ship-mask-row[data-station=bridge]{top:8.8%}
+.ship-mask-row[data-station=projectdeck]{top:24.4%}
+.ship-mask-row[data-station=buildbay]{top:40%}
+.ship-mask-row[data-station=scout]{top:55.6%}
+.ship-mask-row[data-station=qualitygate]{top:71.2%}
 /* Small, real hotspots over the masked status-card zone -- one per room,
    non-overlapping (each confined to its own row band), linking to the
    matching .room card's real status below. Position percentages are the
    same by-eye estimate as the old room-card tops, re-centred per row;
    still unverified pixel-for-pixel (no browser/screenshot tool). */
-.room-pin{position:absolute;z-index:2;right:2%;width:22%;display:flex;flex-direction:column;align-items:center;gap:2px;
+.room-pin{position:absolute;z-index:2;right:4%;width:26%;display:flex;flex-direction:column;align-items:center;gap:2px;
   background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 2px;text-decoration:none;
   color:var(--fg);font-size:11px;text-align:center;line-height:1.25}
 .room-pin:hover,.room-pin:focus-visible{border-color:var(--accent)}
 .room-pin.urgent{border-color:var(--warn);color:var(--warn)}
 .room-pin .pin-count{font-weight:700;color:var(--accent)}
 .room-pin.urgent .pin-count{color:var(--warn)}
-.room-pin[data-station=bridge]{top:11%}
-.room-pin[data-station=projectdeck]{top:29%}
-.room-pin[data-station=buildbay]{top:47%}
-.room-pin[data-station=scout]{top:65%}
-.room-pin[data-station=qualitygate]{top:83%}
+.room-pin[data-station=bridge]{top:16.8%}
+.room-pin[data-station=projectdeck]{top:32.4%}
+.room-pin[data-station=buildbay]{top:48%}
+.room-pin[data-station=scout]{top:63.6%}
+.room-pin[data-station=qualitygate]{top:79.2%}
 .room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
 .hull>.room,.room-list>.room{border-top:3px solid var(--accent)}
 /* r7 review (tmp/in/REVIEW-r7.md item 3): showing all 5 full room cards
