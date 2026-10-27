@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """verify-owner-lease-reap-wiring.py — offline synthetic proofs for
-lib/owner_lease_reap.plan_reap(). Real SQLite files, no registry/panes/network.
+lib/owner_lease_reap (plan_reap, snapshot_from_pane_list, reap_tick).
+Real SQLite files and synthetic `herdr pane list` payloads; no
+registry/panes/network.
 Prints OK/FAIL per case; exit 1 on any FAIL.
 
   TMPDIR=tmp/test-tmp python3 verify-owner-lease-reap-wiring.py
 """
 import hashlib
+import json
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 
@@ -184,6 +188,128 @@ for bad_age in (math.nan, math.inf, -math.inf):
     plan = olr.plan_reap(c, {}, snapshot_age_s=bad_age, now=T0 + 10)
     case(f"probe_nan_age_skips: snapshot_age_s={bad_age!r} skips",
          plan["status"] == "skip" and plan["reason"] == "stale_snapshot")
+c.close()
+
+# ---- session-digest parity: corroboration must derive lease digests exactly as
+# their producer (remote-mcp/publisher.owner_session_digest) does; a drift would
+# turn every herdr-restart birth reissue into a "different session" candidate.
+import importlib.util  # noqa: E402
+_spec = importlib.util.spec_from_file_location(
+    "publisher_digest_parity", os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote-mcp", "publisher.py"))
+_pub = importlib.util.module_from_spec(_spec)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote-mcp"))
+_spec.loader.exec_module(_pub)
+case("session_digest_matches_publisher_owner_session_digest",
+     olr._session_digest("kb", "/synthetic/s.jsonl") == _pub.owner_session_digest("kb", {"agent_session": "/synthetic/s.jsonl"}))
+
+# ================= `herdr pane list` payload -> dry-run reap_tick =================
+SESS_A = "/synthetic/sessions/holder-a.jsonl"
+DIG_A = olr._session_digest("kb", SESS_A)
+
+
+def PL(*panes, envelope=True):
+    """Synthetic `herdr pane list` JSON: (pane_id, terminal_id, agent_session|None)."""
+    rows = [{"pane_id": p, "terminal_id": b, **({"agent_session": {"value": s}} if s is not None else {})}
+            for p, b, s in panes]
+    return json.dumps({"result": {"panes": rows}} if envelope else {"panes": rows})
+
+
+def held_lease(digest=DIG_A):
+    _, c = fresh()
+    ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, digest, now=T0)
+    return c
+
+
+def counts(c):
+    return tuple(c.execute(q).fetchone()[0] for q in (
+        "SELECT COUNT(*) FROM owner_leases WHERE released_at IS NULL",
+        "SELECT COUNT(*) FROM owner_events", "SELECT COUNT(*) FROM owner_requests"))
+
+
+# ---- parse: both documented envelopes, agent_session.value extracted ----
+snap = olr.snapshot_from_pane_list(PL(("w1:p1", "term_abc123", SESS_A)))
+case("pane_list_parses_result_envelope",
+     snap == {"w1:p1": {"pane_id": "w1:p1", "birth": "term_abc123", "agent_session": SESS_A}})
+case("pane_list_parses_bare_panes_envelope",
+     olr.snapshot_from_pane_list(PL(("w1:p1", "term_abc123", None), envelope=False))
+     == {"w1:p1": {"pane_id": "w1:p1", "birth": "term_abc123", "agent_session": ""}})
+
+# ---- unparseable payload: whole tick skips, never a partial live set ----
+c = held_lease()
+before = counts(c)
+for name, payload in (("invalid JSON", "{not json"), ("no panes key", '{"result":{}}'),
+                      ("panes not a list", '{"result":{"panes":{}}}'),
+                      ("non-object entry", '{"result":{"panes":["w1:p1"]}}'),
+                      ("duplicate pane id", PL(("w1:p1", "term_abc123", SESS_A), ("w1:p1", "term_other", SESS_A))),
+                      ("non-herdr pane id", PL(("pane_fake", "term_abc123", SESS_A)))):
+    t = olr.reap_tick(c, payload, captured_at=T0 + 9, now=T0 + 10)
+    case(f"pane_list_unparseable_skips: {name}",
+         t["status"] == "skip" and t["reason"] == "malformed_snapshot" and t["dry_run"] is True)
+case("pane_list_unparseable_skips: lease rows/events untouched, holder live",
+     counts(c) == before and ol._live(c, "kb", T0 + 10) is not None)
+c.close()
+
+# ---- probe missing / stale / unknown freshness ----
+c = held_lease()
+gone = PL(("w9:p9", "term_other", "/synthetic/other.jsonl"))
+for name, payload, cap, reason in (("probe did not run", None, T0 + 9, "probe_unavailable"),
+                                   ("captured_at unknown", gone, None, "stale_snapshot"),
+                                   ("captured_at too old", gone, T0 + 10 - olr.DEFAULT_MAX_SNAPSHOT_AGE_S - 1, "stale_snapshot"),
+                                   ("captured_at in the future", gone, T0 + 11, "stale_snapshot"),
+                                   ("captured_at is a bool", gone, True, "stale_snapshot")):
+    t = olr.reap_tick(c, payload, captured_at=cap, now=T0 + 10)
+    case(f"reap_tick_fails_closed: {name}", t["status"] == "skip" and t["reason"] == reason)
+c.close()
+
+# ---- herdr restart: same pane id + same agent session under a reissued birth ----
+c = held_lease()
+t = olr.reap_tick(c, PL(("w1:p1", "term_afterrestart", SESS_A)), captured_at=T0 + 9, now=T0 + 10)
+case("birth_reissued_is_held_not_reaped",
+     t["status"] == "ok" and t["would_reap"] == [] and [h["reason"] for h in t["held"]] == ["birth_reissued"])
+c.close()
+
+# ---- same pane id, new birth, agent session missing on either side -> uncertain ----
+c = held_lease()
+t = olr.reap_tick(c, PL(("w1:p1", "term_afterrestart", None)), captured_at=T0 + 9, now=T0 + 10)
+case("identity_uncertain_when_live_session_missing",
+     t["would_reap"] == [] and [h["reason"] for h in t["held"]] == ["identity_uncertain"])
+c.close()
+_, c = fresh()
+ol.acquire(c, "kb", "w1:p1", "term_abc123", TTL, T0)  # pre-v3 style lease: no session digest
+t = olr.reap_tick(c, PL(("w1:p1", "term_afterrestart", SESS_A)), captured_at=T0 + 9, now=T0 + 10)
+case("identity_uncertain_when_lease_digest_missing",
+     t["would_reap"] == [] and [h["reason"] for h in t["held"]] == ["identity_uncertain"])
+c.close()
+
+# ---- pane id recycled to a DIFFERENT agent session -> holder genuinely gone ----
+c = held_lease()
+t = olr.reap_tick(c, PL(("w1:p1", "term_newowner", "/synthetic/sessions/someone-else.jsonl")),
+                  captured_at=T0 + 9, now=T0 + 10)
+case("recycled_pane_id_with_other_session_is_candidate",
+     [o["pane"] for o in t["would_reap"]] == ["w1:p1"] and t["held"] == [])
+c.close()
+
+# ---- dry-run tick on a dead pane: reports, writes NOTHING (read-only conn) ----
+path, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, DIG_A, now=T0)
+c.close()
+ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+before = counts(ro)
+t = olr.reap_tick(ro, gone, captured_at=T0 + 9, now=T0 + 10)
+case("dry_run_tick_reports_would_reap",
+     t["status"] == "ok" and t["dry_run"] is True and len(t["would_reap"]) == 1
+     and t["would_reap"][0]["dry_run"] is True and t["would_reap"][0]["released"] is False
+     and t["would_reap"][0]["reason"] == "pane-gone")
+case("dry_run_tick_runs_on_read_only_connection_and_writes_nothing",
+     counts(ro) == before and ol._live(ro, "kb", T0 + 10) is not None)
+ro.close()
+
+# ---- rollback: a disabled registry still reports (observation is read-only) ----
+c = held_lease()
+ol.disable(c, T0 + 5)
+t = olr.reap_tick(c, gone, captured_at=T0 + 9, now=T0 + 10)
+case("disabled_registry_still_observes_dry_run",
+     t["status"] == "ok" and len(t["would_reap"]) == 1 and ol._live(c, "kb", T0 + 10) is not None)
 c.close()
 
 print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing of {TOTAL[0]}")
