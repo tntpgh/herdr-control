@@ -283,10 +283,14 @@ def _epoch(iso) -> float | None:
         return None
 
 
-def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connected: bool, now: float) -> dict:
+def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connected: bool, now: float,
+                   synthetic: bool = False) -> dict:
     """Everything the Ship view draws, from cache values render_overview()
     already read. Field lists are allow-lists: no form token, port, worktree
-    path or conductor id leaves this function."""
+    path or conductor id leaves this function. `synthetic` is
+    hub.PREVIEW_SYNTHETIC, true only under prototype/hub-preview/preview.py's
+    fixture data (tmp/in/FIX-r14b.md item 4) -- never true against the live
+    registry."""
     tasks = h.get("tasks") or []
     shown, hidden_finished = [], 0
     for t in tasks:
@@ -338,9 +342,18 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
     lps = loops.get("loops") or []
     bad_loops = [x.get("name", "").split(" \u2014 ")[0] for x in lps
                  if x.get("stale") or x.get("outcome") not in ("ok", "success", "healthy")]
+    # r14b fix (tmp/in/FIX-r14b.md item 4): DISPLAY["executing"]["label"] is
+    # "Working (herdr live)" -- true for real production data (display_of()
+    # only reaches "executing" for a task whose OWN state_source is a
+    # confirmed-live herdr read), but under preview/synthetic fixtures that
+    # "live" marking is itself invented by fixtures.py, not a real
+    # connection. Swap just that one label so every call site that reads
+    # S.display[key].label (room cards, pins, feed chips all go through it)
+    # gets the honest word for free.
+    display = dict(DISPLAY, executing=dict(DISPLAY["executing"], label="Working (synthetic)")) if synthetic else DISPLAY
     return {"generated_at": dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "live_connected": bool(live_connected), "error": h.get("error"),
-            "stations": STATIONS, "display": DISPLAY, "tasks": rows,
+            "live_connected": bool(live_connected), "synthetic": bool(synthetic), "error": h.get("error"),
+            "stations": STATIONS, "display": display, "tasks": rows,
             "hidden_finished": hidden_finished, "capped": capped,
             "attention_registry": len(h.get("attention") or []),
             "unrecognized": [r for r in rows if r["station"] is None],
@@ -351,11 +364,20 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
 
 def home(chips: str, overview_body: str, snapshot: dict) -> str:
     """`/`: Ship (B, default with JS) and Overview (A, the server-rendered
-    page, always present and the only view without JS)."""
-    return (chips
+    page, always present and the only view without JS). r14b fix
+    (tmp/in/FIX-r14b.md item 7): repo chips and the Ship/Overview layout
+    radio used to render inline above Ship, crowding the primary route
+    alongside the room list, suggestions, maintenance and four feeds.
+    Both are chrome (outside renderShip()'s own output, so check.js's
+    form/button/input ban in prototype/hub-preview/check.js:45 does not
+    reach them) and both are secondary to "what does Ship need me to see
+    right now" -- collapsed behind one closed-by-default More section."""
+    return ("<details class=chrome-more><summary>More</summary>"
+            + chips
             + "<fieldset class=viewbar><legend>Layout</legend>"
               "<label><input type=radio name=hub-view value=ship> Ship</label>"
               "<label><input type=radio name=hub-view value=overview> Overview</label></fieldset>"
+            + "</details>"
             + "<section id=ship-view aria-labelledby=ship-h><h2 id=ship-h>Ship</h2><div id=ship-body></div></section>"
             + f"<section id=overview-view aria-label=Overview>{overview_body}</section>"
             + f"<script type=application/json id=ship-data>{_script_json(snapshot)}</script>")

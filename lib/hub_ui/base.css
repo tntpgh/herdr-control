@@ -30,6 +30,16 @@ details.navgroup[open]>summary::before{content:"\25BE  "}
 .prefs-body label{display:flex;gap:8px;align-items:center}
 .prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
 html:not([data-js]) .prefs,html:not([data-js]) .viewbar{display:none}
+/* r14b fix (tmp/in/FIX-r14b.md item 7): repo chips + the Ship/Overview
+   layout radio moved into a collapsed-by-default section (lib/hub_ui/
+   __init__.py home()) so the primary route reads as ship + feeds, not a
+   stack of controls above it. Same visual language as details.navgroup. */
+details.chrome-more{margin:0 0 10px;font-size:13px}
+details.chrome-more>summary{cursor:pointer;color:var(--muted);list-style:none;text-transform:uppercase;letter-spacing:.08em;font-size:11px}
+details.chrome-more>summary::-webkit-details-marker{display:none}
+details.chrome-more>summary::before{content:"\25B8  ";color:var(--accent)}
+details.chrome-more[open]>summary::before{content:"\25BE  "}
+details.chrome-more>*{margin-top:8px}
 
 main{max-width:1150px;margin:0 auto;padding:16px 20px 60px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
@@ -90,26 +100,80 @@ html[data-view=ship] #overview-view{display:none}
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
-/* r13 fix (tmp/in/FIX-r13.md item 1, conductor real-Chromium measure of
-   65b4f0d): the r12 hero cropped exactly the image's baked nav/title/badge
-   strip (y:0-~70px of 1024) -- that whole band IS baked UI text, full
-   width, no clean illustration-only strip exists there to crop instead.
-   Taller crop (y:0-~340px) + a flat-colour .ship-hero-mask over the
-   baked-UI portion (top 32%, ~109 image px -- generous margin over the
-   ~70-90px .ship-mask-top estimate below) puts the real title/tagline
-   there instead, with no collision with baked text, while the untouched
-   taller hero shows genuine Bridge-room illustration -- "more graphics...
-   including the top area" without baking/faking anything. Same precedent
-   as .ship-mask-row over .ship-art below. */
-.ship-hero{position:relative;overflow:hidden;aspect-ratio:1536/340;border-radius:10px;
+/* r14b fix (tmp/in/FIX-r14b.md item 4): distinct from .ship-alert's error
+   red -- this is a mode indicator, not a problem. */
+.synthetic-banner{border-color:var(--warn);background:var(--surface-2);text-align:center;letter-spacing:.03em}
+/* r14b fix (tmp/in/FIX-r14b.md item 8, same round as FIX-r14.md item 1):
+   the r14 fix (shrinking to a thin hull/starfield sliver, see history
+   below) satisfied "never a copy of a room row" but gave up on "taller...
+   coherent illustrated scene" -- this round's explicit ask is for BOTH at
+   once. .ship-art already uses the entire left column (x:0-998 of the
+   1536x1024 ship.png) at full height, so there is no region in that half
+   the hero can show without duplicating a room row; the only area never
+   shown anywhere else in the UI is the right half (the Big Shot/bounty
+   board illustration, x:998-1536), and within it, the only sub-rectangle
+   free of baked UI text (checked by re-reading the full reference image:
+   "BIG SHOT BOUNTY BOARD" sits to its left, "PUNCH & JUDY" captions sit
+   to its right) is the TV-framed character portrait itself, roughly
+   x:[1210,1390] y:[100,220] of the source image -- picked with a 15-20px
+   inward margin from both text edges since this worker has no browser to
+   verify the crop and would rather show slightly less of the portrait
+   than risk exposing baked text again. Cropping an interior rectangle
+   (not anchored to an image edge/corner) needs explicit background-size/
+   position percentages, not background-size:cover (cover only crops from
+   an edge): for a source N x M image and a target crop x0,y0,w,h,
+   background-size is (N/w)% (M/h)% and background-position is
+   (x0/(N-w))% (y0/(M-h))% -- derived here for N=1536,M=1024,x0=1210,
+   y0=100,w=180,h=120: size 853.3% 853.3%, position 89.2% 11.1%. The box's
+   own aspect-ratio is set to the crop's own w:h (180/120) so neither axis
+   distorts. This is a genuinely different, non-room-row illustration, and
+   tall (920px hull width / 1.5 ~= 613px) per the "taller" ask -- flagged
+   in FIX-r14b-NOTES.md as unverified-by-browser pixel bounds, the single
+   highest-risk guess in this round.
+
+   History: r13's hero (aspect-ratio 1536/340, mask over top 32%) showed
+   the SAME Bridge/Jet strip .ship-art shows as its own first room row --
+   both crops start from image origin (0,0). r14 shrank it to a thin
+   hull/starfield sliver (1536/170) to stop the duplication; this round
+   replaces that with the portrait crop above instead. */
+.ship-hero{position:relative;overflow:hidden;aspect-ratio:180/120;border-radius:10px;
   border:2px solid var(--brass);margin:0 0 12px;background:var(--surface-2);
-  background-size:cover;background-position:0 0}
-.ship-hero-mask{position:absolute;top:0;left:0;right:0;height:32%;background:var(--surface-2);z-index:1}
-.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg)}
+  background-size:853.3% 853.3%;background-position:89.2% 11.1%}
+.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg);
+  background:linear-gradient(rgba(0,0,0,.55),rgba(0,0,0,0) 70%)}
 .ship-hero-text h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .ship-hero-text p{margin:2px 0 0;font-size:11px;color:var(--muted)}
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
-.hull,.room-list{display:grid;gap:10px}
+/* r14b fix (tmp/in/FIX-r14b.md item 6): an expanded feed stayed confined
+   to the 35% side-rail column, leaving the 65% hull column empty beside
+   it -- "dead area". While any feed is open, drop to a single column so
+   the open feed (and the rest of .side-rail) gets the full row width;
+   .hull reflows below it rather than sitting empty beside it. Same
+   :has()-driven reflow precedent as .room-list:has(.room:target) below. */
+.ship:has(.feed-panel[open]){grid-template-columns:1fr}
+.room-list{display:grid;gap:10px}
+/* r14 fix (tmp/in/FIX-r14.md item 2/3, conductor real-Chromium measure of
+   abe6fd3): background-size:cover is spec-guaranteed to leave zero gap --
+   switching .ship-art to it in r13 did not change what the conductor
+   measured (.room-pin still outside .ship-art's own measured box; ~80px
+   band still inside the frame), which only makes sense if .ship-art's
+   OWN box was never actually narrow-and-fully-covered in the first place,
+   but something WIDER than the art's intended aspect-ratio box. The one
+   thing both r9's <img> attempt and r13's background-image attempt share:
+   .ship-art has always been a CSS Grid item (.hull was `display:grid` with
+   no explicit grid-template-columns, an implicit auto-sized column) with
+   zero in-flow children of its own (masks/pins are all position:absolute,
+   contributing nothing to intrinsic/content sizing) -- auto-track sizing
+   combined with aspect-ratio on a content-empty grid item is exactly the
+   kind of interaction this worker cannot verify without a browser. .hull
+   never needed grid for its own sake (it only ever stacks exactly 2
+   children vertically); removing the grid entirely and using plain block
+   flow + margin-bottom removes that whole class of ambiguity -- a block
+   box always takes its full containing-block width, no track-sizing
+   algorithm involved. */
+.hull{display:block}
+.hull>.ship-art,.hull>.room{margin-bottom:10px}
+.hull>.room:last-child{margin-bottom:0}
 /* r13 fix (tmp/in/FIX-r13.md item 2): conductor's real-Chromium measure of
    65b4f0d showed .room-pin still sitting in a gutter right of the art
    (same symptom as the r9 round's residual ~70px band, never actually
@@ -236,6 +300,7 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 .feed-panel>summary::before{content:"\25B8  ";color:var(--accent)}
 .feed-panel[open]>summary::before{content:"\25BE  "}
 .feed-count{display:inline-block;min-width:16px;padding:0 5px;margin:0 2px;border-radius:999px;background:var(--surface);border:1px solid var(--brass);font-size:11px;text-align:center}
+.feed-source{margin:4px 0 0;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
 .feed-list{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
 .feed-list li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:12.5px;padding-top:6px;border-top:1px solid var(--border)}
 .feed-list li:first-child{padding-top:0;border-top:none}
@@ -256,6 +321,12 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 .ship-more>summary::-webkit-details-marker{display:none}
 .ship-more>summary::before{content:"\25B8  ";color:var(--accent)}
 .ship-more[open]>summary::before{content:"\25BE  "}
+.side-more{margin:10px 0 0;font-size:12.5px}
+.side-more>summary{cursor:pointer;color:var(--muted);list-style:none}
+.side-more>summary::-webkit-details-marker{display:none}
+.side-more>summary::before{content:"\25B8  ";color:var(--accent)}
+.side-more[open]>summary::before{content:"\25BE  "}
+.side-more>*{margin-top:8px}
 
 /* state chips + card borders: shape + icon + words, never colour alone */
 .st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}

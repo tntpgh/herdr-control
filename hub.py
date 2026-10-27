@@ -81,6 +81,12 @@ DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr"))
 REGISTRY = Path(os.environ.get("HERDR_RUN_REGISTRY", STATE / "runs/registry.sqlite3"))
 FORMS_DIR = STATE / "forms"
+# r14b fix (tmp/in/FIX-r14b.md item 4): prototype/hub-preview/fixtures.py
+# sets this True after swapping every cache/live reader for synthetic demo
+# data, so the Ship view can show a real SYNTHETIC/DEMO DATA banner and
+# stop claiming "(herdr live)" on mock status -- the production hub never
+# touches this, so it stays False there.
+PREVIEW_SYNTHETIC = False
 KB_DEPLOY = Path(os.environ.get("KB_DEPLOY", Path.home() / "Code/kb-deploy"))
 KB_PYTHON = Path(os.environ.get("KB_PYTHON", Path.home() / "Code/knowledge-base/.venv/bin/python3"))
 SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurber.com")
@@ -5190,7 +5196,7 @@ def render_overview(scope: str = "") -> str:
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
             f"<br><small>{_esc(x['url'])}</small></td><td class=age>{_age(x.get('created_at'))}</td></tr>" for x in f["open"]) + "</table>"
-    snapshot = hub_ui.ship_snapshot(h, f, pd, lo, live_data().get("connected", False), time.time())
+    snapshot = hub_ui.ship_snapshot(h, f, pd, lo, live_data().get("connected", False), time.time(), PREVIEW_SYNTHETIC)
     return page("hub", "/", hub_ui.home(chips, body, snapshot), scope=scope)
 
 

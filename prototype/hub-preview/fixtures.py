@@ -230,6 +230,7 @@ def install(hub, now: float, tmp: Path, herdr_down: bool = False, registry_error
         hub.CACHES[k] = fixed(v)
     lv = live(now, herdr_down)
     hub.live_data = lambda: lv
+    hub.PREVIEW_SYNTHETIC = True
     hub.slo_data = lambda: {"p50": 240, "p90": 1800, "p99": 5400, "samples": 9,
                             "wake_total": 20, "wake_submitted": 19, "wake_rate_pct": 95.0}
     hub.timeline_data = timeline(now)
