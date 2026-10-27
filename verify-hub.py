@@ -28,6 +28,7 @@ spec.loader.exec_module(hub)
 
 import owner_dispatch_auth as oda  # noqa: E402 -- lib/ is on sys.path once hub.py has executed
 import owner_lease as ol  # noqa: E402
+import hub_ui  # noqa: E402
 
 NOW = dt.datetime(2026, 9, 7, 14, tzinfo=dt.timezone.utc)
 CANARY = "private-credential-must-not-appear"
@@ -2749,7 +2750,7 @@ class ContentSecurityPolicy(ReaderFixture):
                 base = f"http://127.0.0.1:{server.server_port}"
                 for path in paths:
                     with urllib.request.urlopen(base + path, timeout=10) as response:
-                        out[path] = (response.status, response.headers.get("content-security-policy"))
+                        out[path] = (response.status, response.headers.get("content-security-policy"), response.read())
             finally:
                 server.shutdown()
                 server.server_close()
@@ -2758,24 +2759,57 @@ class ContentSecurityPolicy(ReaderFixture):
 
     def test_html_pages_carry_a_csp_with_no_external_origin(self):
         responses = self.fetch(("/", "/decisions", "/loops", "/kb", "/links", "/projects"))
-        for path, (status, csp) in responses.items():
+        for path, (status, csp, body) in responses.items():
             with self.subTest(path=path):
                 self.assertEqual(status, 200)
                 self.assertIsNotNone(csp, f"{path} served HTML with no Content-Security-Policy header")
                 self.assertIn("default-src 'self'", csp)
                 self.assertIn("script-src 'self' 'unsafe-inline'", csp)
                 self.assertIn("style-src 'self' 'unsafe-inline'", csp)
-                self.assertIn("img-src 'self' data:", csp)
+                self.assertIn("img-src 'self'", csp)
+                self.assertNotIn("data:", csp)
                 # the /decisions iframe (serve_stored_form) is same-origin only
                 self.assertIn("frame-src 'self'", csp)
                 self.assertNotRegex(csp, r"https?://|\*")
+                self.assertNotIn(b"data:image/png;base64", body,
+                                  f"{path} still inlines the ship-art payload")
+                # r4 review (tmp/in/REVIEW-r4.md item 4): these pages used to
+                # weigh ~2.9MB each (the inlined ship.png). A real page body
+                # (nav/theme CSS/JS/ship-snapshot JSON, no art) is a few tens
+                # of KB; 200KB is a generous ceiling that still catches a
+                # regression back to inlining the ~2.1MB asset.
+                self.assertLess(len(body), 200_000,
+                                 f"{path} is {len(body)} bytes -- looks like the art is inlined again")
 
     def test_json_and_plaintext_responses_carry_no_csp(self):
         responses = self.fetch(("/?json=1", "/links?json=1", "/kb?json=1"))
-        for path, (status, csp) in responses.items():
+        for path, (status, csp, _body) in responses.items():
             with self.subTest(path=path):
                 self.assertEqual(status, 200)
                 self.assertIsNone(csp, f"{path} is not HTML and should not carry a CSP header")
+
+    def test_ship_art_served_same_origin_with_long_cache(self):
+        urls = list(hub_ui.STATIC_ASSETS)
+        self.assertTrue(urls, "no ship.png registered in hub_ui.STATIC_ASSETS")
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
+        with patch.dict(hub.CACHES, caches):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                for url in urls:
+                    with self.subTest(url=url):
+                        with urllib.request.urlopen(base + url, timeout=10) as response:
+                            body = response.read()
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.headers.get("content-type"), "image/png")
+                        self.assertIn("immutable", response.headers.get("cache-control", ""))
+                        self.assertEqual(body, hub_ui.STATIC_ASSETS[url][0])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=10)
 
 
 if __name__ == "__main__":

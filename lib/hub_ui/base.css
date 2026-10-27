@@ -15,8 +15,13 @@ header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
 header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent}
 header nav a:hover{color:var(--fg)}
 header nav a.on{color:var(--fg);border-bottom-color:var(--accent)}
-.navgroup{display:inline-flex;flex-wrap:wrap;gap:4px 12px;align-items:center;padding-left:12px;border-left:1px solid var(--border)}
-.navlabel{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+details.navgroup{position:relative;padding-left:12px;border-left:1px solid var(--border);font-size:13px}
+details.navgroup>summary{cursor:pointer;color:var(--muted);list-style:none;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+details.navgroup>summary::-webkit-details-marker{display:none}
+details.navgroup>summary::before{content:"\25B8  ";color:var(--accent)}
+details.navgroup[open]>summary::before{content:"\25BE  "}
+.navgroup-body{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;margin-top:4px}
+.nav-disabled{color:var(--muted);opacity:.55;cursor:not-allowed;border-bottom:2px dotted var(--border);padding:2px 0}
 .hdr-meta{margin-left:auto}
 .prefs{position:relative;font-size:13px}
 .prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
@@ -85,7 +90,7 @@ html[data-view=ship] #overview-view{display:none}
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
-.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,28%);gap:16px;align-items:start}
+.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
 .hull{display:grid;gap:10px}
 /* the approved reference image, cropped to its left (ship) region with CSS
    only -- the file is the untouched 1536x1024 PNG; 998/1536=.6497, so the
@@ -134,6 +139,11 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 /* bottom bar: "needs your call", slim -- replaces the old dense head line */
 .ship-bottom{margin:14px 0 0;padding:8px 12px;display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:13px}
 .ship-bottom strong{color:var(--accent)}
+.ship-more{margin:6px 0 0;font-size:12.5px}
+.ship-more>summary{cursor:pointer;color:var(--muted);list-style:none}
+.ship-more>summary::-webkit-details-marker{display:none}
+.ship-more>summary::before{content:"\25B8  ";color:var(--accent)}
+.ship-more[open]>summary::before{content:"\25BE  "}
 
 /* state chips + card borders: shape + icon + words, never colour alone */
 .st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}

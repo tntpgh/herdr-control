@@ -3421,7 +3421,7 @@ def _drift_label(r: dict) -> str:
     return f"{r['repo']} {r['deployed']}→{r['main']} ({_minutes_label(m)})"
 
 
-NAV = [("/", "overview"), ("/projects", "projects"), ("/owners", "owners"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
+NAV = [("/", "ship"), ("/projects", "projects"), ("/owners", "owners"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 # ---- SCOPE: one hub, many projects ------------------------------------------
 # Every task in the registry already carries the repo it belongs to, and the
@@ -5928,6 +5928,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
+        if path in hub_ui.STATIC_ASSETS:
+            # Content-addressed (the URL's hash segment is the asset's own
+            # sha256 prefix, hub_ui.__init__.py), GET-only, no CACHES touched,
+            # no query handling -- safe to cache forever unlike every other
+            # response here, which _send() marks no-store unconditionally.
+            data, ctype = hub_ui.STATIC_ASSETS[path]
+            self.send_response(200)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(data)))
+            self.send_header("cache-control", "public, max-age=31536000, immutable")
+            self.send_header("content-security-policy", self._CSP)
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/healthz":
             return self._send(200, "text/plain", b"ok")
         if path == "/api/summary":
@@ -6139,14 +6153,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # CSP: inline <script>/<style> is how every page here renders (no bundler,
     # no CDN); 'unsafe-inline' only covers script/style, nothing else is
-    # allowed to be inline or remote. img-src allows data: for the Ship
-    # view's ship-art backdrop (lib/hub_ui's bebop theme.json#ship_image,
-    # read from an on-disk PNG and base64-inlined -- same convention as
-    # BASE_CSS/UI_JS, never fetched, no external host). frame-src 'self' is
-    # only for the /decisions same-origin iframe (serve_stored_form); no
-    # external origin appears anywhere in this policy.
+    # allowed to be inline or remote. img-src is 'self' only -- r4 review
+    # (tmp/in/REVIEW-r4.md item 4): the Ship view's ship-art backdrop used to
+    # be a data: URI inlined on every page; it is now served same-origin from
+    # /static/ship-<hash>.png (hub_ui.STATIC_ASSETS), so data: is no longer
+    # needed anywhere in this policy. frame-src 'self' is only for the
+    # /decisions same-origin iframe (serve_stored_form); no external origin
+    # or non-'self' scheme appears anywhere in this policy.
     _CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self'; "
             "frame-src 'self'; base-uri 'self'; form-action 'self'")
 
     def _send(self, code: int, ctype: str, body: bytes):

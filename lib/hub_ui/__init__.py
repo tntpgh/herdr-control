@@ -19,8 +19,8 @@ values hub.py already holds.
 """
 from __future__ import annotations
 
-import base64
 import datetime as dt
+import hashlib
 import html
 import json
 import re
@@ -83,6 +83,12 @@ PANELS = {"/": "overview", "/projects": "projects", "/decisions": "decisions", "
           "/timeline": "timeline", "/herdr": "herdr", "/kb": "kb", "/owners": "owners",
           "/links": "links", "/search": "search"}
 DIAGNOSTICS = ("/herdr", "/owners", "/kb", "/links", "/search")
+# r4 review (tmp/in/REVIEW-r4.md item 3): the reference's top nav is exactly
+# 4 tabs (Ship/Projects/Bounties/Decisions). Every other page (DIAGNOSTICS
+# plus /loops and /timeline) moves into the closed-by-default disclosure in
+# chrome(); "Bounties" has no backing route -- it renders disabled with its
+# real reason, never a page that silently 404s or a fake working link.
+PRIMARY_NAV = ("/", "/projects", "/decisions")
 REQUIRED_PALETTE = ("--bg", "--surface", "--surface-2", "--fg", "--muted", "--accent",
                     "--brass", "--border", "--ok", "--warn", "--bad", "--info")
 _THEME_ID = re.compile(r"[a-z][a-z0-9-]{0,31}")
@@ -121,10 +127,20 @@ THEMES, THEME_PROBLEMS = load_themes()
 # theme folder -- not generated, not re-encoded. Only a theme that ships its
 # own ship.png gets the art backdrop; plain has none, by design (no
 # drawings in plain mode, same as the sprite characters it also omits).
+# Served from its own same-origin, content-addressed route (hub.py do_GET)
+# instead of inlined as a data: URI in every page's #hub-themes JSON --
+# r4 review (tmp/in/REVIEW-r4.md item 4): inlining put 2.9MB on every one
+# of the 14 HTML routes, re-sent on every meta-refresh. The URL's hash
+# segment is the asset's own content hash, so Cache-Control can be
+# `immutable`: the URL only changes when the PNG does.
+STATIC_ASSETS: dict[str, tuple[bytes, str]] = {}
 for _tid, _t in THEMES.items():
     _ship_png = HERE / "themes" / _tid / "ship.png"
     if _ship_png.is_file():
-        _t["ship_image"] = "data:image/png;base64," + base64.b64encode(_ship_png.read_bytes()).decode("ascii")
+        _bytes = _ship_png.read_bytes()
+        _url = f"/static/ship-{hashlib.sha256(_bytes).hexdigest()[:8]}.png"
+        STATIC_ASSETS[_url] = (_bytes, "image/png")
+        _t["ship_image"] = _url
 # Inlined into every page, so comments are stripped: page-level checks look
 # for status words in the HTML, and a comment must not be able to match one.
 BASE_CSS = re.sub(r"/\*.*?\*/", "", (HERE / "base.css").read_text(), flags=re.S)
@@ -170,8 +186,20 @@ def chrome(title: str, path: str, body: str, nav, refresh: int = 15, scope: str 
     def link(p: str, n: str) -> str:
         on = p == path
         return f"<a href='{p}' class='{'on' if on else ''}'{' aria-current=page' if on else ''}>{n}</a>"
-    main_nav = " ".join(link(p, n) for p, n in nav if p not in DIAGNOSTICS)
-    diag_nav = " ".join(link(p, n) for p, n in nav if p in DIAGNOSTICS)
+    nav_by_path = dict(nav)
+    other = [(p, n) for p, n in nav if p not in PRIMARY_NAV]
+    # Ship / Projects / [Bounties, disabled] / Decisions, in that order --
+    # bounties has no backing route (no bounty-board data source wired),
+    # so it is a disabled label with its real reason, never a dead link.
+    main_nav = (
+        link("/", nav_by_path.get("/", "ship"))
+        + link("/projects", nav_by_path.get("/projects", "projects"))
+        + "<span class=nav-disabled aria-disabled=true title='No bounty-board data source wired yet'>"
+          "bounties<span class=sr-only> \u2014 no bounty-board data source wired yet</span></span>"
+        + link("/decisions", nav_by_path.get("/decisions", "decisions"))
+    )
+    diag_nav = " ".join(link(p, n) for p, n in other)
+    diag_open = " open" if any(p == path for p, _ in other) else ""
     options = "".join(f"<option value='{_esc(tid)}'>{_esc(t.get('name') or tid)}</option>" for tid, t in THEMES.items())
     problems = (f"<p class=dim>Themes skipped: {_esc('; '.join(THEME_PROBLEMS))}</p>" if THEME_PROBLEMS else "")
     prefs = ("<details class=prefs><summary>Display</summary><div class=prefs-body>"
@@ -187,7 +215,8 @@ def chrome(title: str, path: str, body: str, nav, refresh: int = 15, scope: str 
             + f"<style>{_theme_css()}{BASE_CSS}</style></head><body>"
             "<a class=skip href='#main'>Skip to content</a>"
             f"<header><b class=brand>hub</b><nav aria-label='Hub pages'>{main_nav}"
-            f"<span class=navgroup><span class=navlabel>diagnostics</span> {diag_nav}</span></nav>"
+            f"<details class=navgroup{diag_open}><summary class=navlabel>more pages</summary>"
+            f"<nav class=navgroup-body aria-label='More hub pages'>{diag_nav}</nav></details></nav>"
             f"<span class='dim hdr-meta'>{label} · <a href='{json_href}'>json</a></span>{prefs}</header>"
             f"<main id=main tabindex=-1 data-view='{_esc(panel or path.strip('/'))}'>"
             f"<div class=crew-slot data-panel='{_esc(panel)}' aria-hidden=true></div>{body}</main>"
