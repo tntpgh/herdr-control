@@ -41,6 +41,20 @@ ok('expired forms never read as approved', h.indexOf('not approved, not declined
 ok('suggestions are proposal-only', h.indexOf('Proposal-only. Nothing is dispatched from here') !== -1);
 ok('hidden finished count shown', h.indexOf('finished more than a day ago not shown') !== -1);
 ok('no approve/deny/dispatch control in Ship', !/<(form|button|input)\b/.test(h));
+// r5 review (tmp/in/REVIEW-r5.md item 3): the headline used to count ONLY
+// open decisions, so "Needs your call: 0 -- nothing needs you" rendered
+// even with a blocked task, if there were zero open decisions. Fails on
+// cd1eb3d (headline is 0 even though live.json has 7 attention-worthy
+// tasks), passes after.
+var noDecisions = JSON.parse(JSON.stringify(live));
+noDecisions.decisions.open = [];
+var attnTaskCount = noDecisions.tasks.filter(function (t) { return (noDecisions.display[t.display] || {}).attention; }).length;
+var hNoDec = HubUI.renderShip(noDecisions, themes.bebop, {});
+var headline = (hNoDec.match(/<strong>Needs your call: (\d+)<\/strong>/) || [])[1];
+ok('r5: zero open decisions but a blocked task still needs a call', attnTaskCount > 0 && headline === String(attnTaskCount));
+ok('r5: headline never says "nothing needs you" while a task has attention', hNoDec.indexOf('nothing needs you') === -1);
+ok('r5: attention states named next to the headline, not only behind ship-more',
+  hNoDec.split('<details class="ship-more"')[0].indexOf('blocked') !== -1);
 ok('registry error: nothing drawn, says why', HubUI.renderShip(regerr, themes.bebop, {}).indexOf('Registry unavailable') === 0 ||
   HubUI.renderShip(regerr, themes.bebop, {}).indexOf('Registry unavailable') > 0);
 var evil = JSON.parse(JSON.stringify(live));
