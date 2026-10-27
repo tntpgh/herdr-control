@@ -6137,11 +6137,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", "0")
         self.end_headers()
 
+    # CSP: inline <script>/<style> is how every page here renders (no bundler,
+    # no CDN); 'unsafe-inline' only covers script/style, nothing else is
+    # allowed to be inline or remote. frame-src 'self' is only for the
+    # /decisions same-origin iframe (serve_stored_form); no external origin
+    # appears anywhere in this policy.
+    _CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self'; "
+            "frame-src 'self'; base-uri 'self'; form-action 'self'")
+
     def _send(self, code: int, ctype: str, body: bytes):
         self.send_response(code)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(body)))
         self.send_header("cache-control", "no-store")
+        if ctype.startswith("text/html"):
+            self.send_header("content-security-policy", self._CSP)
         self.end_headers()
         self.wfile.write(body)
 

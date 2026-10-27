@@ -2725,5 +2725,57 @@ class OwnersView(unittest.TestCase):
         self.assertEqual(result.get("out", {}).get("status"), "unavailable:unreadable", result)
 
 
+class ContentSecurityPolicy(ReaderFixture):
+    """hub.py's HTML responses carry a Content-Security-Policy with no
+    external origin anywhere in it (every page's inline <script>/<style>
+    comes from hub_ui, never a CDN), and it still permits the /decisions
+    same-origin iframe (serve_stored_form) and the inline script/style the
+    chrome itself needs. Non-HTML responses (json/plain) carry no CSP --
+    nothing there is rendered, so nothing there needs constraining."""
+
+    def fetch(self, paths):
+        empty_loops = {"loops": [], "suggestions": [], "findings": [], "gates": [], "dismissed": 0}
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
+        caches.update(herdr=Mock(get=lambda: {"attention": [], "tasks": [], "max_event_seq": 0}),
+                      forms=Mock(get=lambda: {"open_count": 0, "open": [], "history": []}),
+                      portal=Mock(get=lambda: {"open": [], "open_count": 0}),
+                      links=Mock(get=lambda: {"surfaces": []}), loops=Mock(get=lambda: empty_loops))
+        out = {}
+        with patch.dict(hub.CACHES, caches), patch.object(hub, "live_data", lambda: {"connected": True}):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                for path in paths:
+                    with urllib.request.urlopen(base + path, timeout=10) as response:
+                        out[path] = (response.status, response.headers.get("content-security-policy"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=10)
+        return out
+
+    def test_html_pages_carry_a_csp_with_no_external_origin(self):
+        responses = self.fetch(("/", "/decisions", "/loops", "/kb", "/links", "/projects"))
+        for path, (status, csp) in responses.items():
+            with self.subTest(path=path):
+                self.assertEqual(status, 200)
+                self.assertIsNotNone(csp, f"{path} served HTML with no Content-Security-Policy header")
+                self.assertIn("default-src 'self'", csp)
+                self.assertIn("script-src 'self' 'unsafe-inline'", csp)
+                self.assertIn("style-src 'self' 'unsafe-inline'", csp)
+                # the /decisions iframe (serve_stored_form) is same-origin only
+                self.assertIn("frame-src 'self'", csp)
+                self.assertNotRegex(csp, r"https?://|\*|data:")
+
+    def test_json_and_plaintext_responses_carry_no_csp(self):
+        responses = self.fetch(("/?json=1", "/links?json=1", "/kb?json=1"))
+        for path, (status, csp) in responses.items():
+            with self.subTest(path=path):
+                self.assertEqual(status, 200)
+                self.assertIsNone(csp, f"{path} is not HTML and should not carry a CSP header")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

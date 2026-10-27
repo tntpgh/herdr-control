@@ -135,6 +135,11 @@ def owners(now: float) -> dict:
                        {"label": "demo-infra-owner", "registered": None, "project": None, "lease": None,
                         "queue_lane": False, "grants": []}],
             "sources": {"owners": "ok", "leases": "ok", "queue": "ok", "grants": "ok"},
+            # 6a1fc62 added an escalations reader (hub.py owners_data()) after this
+            # fixture file was authored on 2bebd5d's baseline; "ok"/empty keeps the
+            # fixture's semantics (every source readable, nothing logged) rather than
+            # silently exercising a code path this fixture never meant to cover.
+            "escalations": {"status": "ok", "count": 0, "latest": []},
             "queue_supervisor_enabled": False}
 
 
