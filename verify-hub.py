@@ -2765,9 +2765,10 @@ class ContentSecurityPolicy(ReaderFixture):
                 self.assertIn("default-src 'self'", csp)
                 self.assertIn("script-src 'self' 'unsafe-inline'", csp)
                 self.assertIn("style-src 'self' 'unsafe-inline'", csp)
+                self.assertIn("img-src 'self' data:", csp)
                 # the /decisions iframe (serve_stored_form) is same-origin only
                 self.assertIn("frame-src 'self'", csp)
-                self.assertNotRegex(csp, r"https?://|\*|data:")
+                self.assertNotRegex(csp, r"https?://|\*")
 
     def test_json_and_plaintext_responses_carry_no_csp(self):
         responses = self.fetch(("/?json=1", "/links?json=1", "/kb?json=1"))

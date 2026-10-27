@@ -6139,11 +6139,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # CSP: inline <script>/<style> is how every page here renders (no bundler,
     # no CDN); 'unsafe-inline' only covers script/style, nothing else is
-    # allowed to be inline or remote. frame-src 'self' is only for the
-    # /decisions same-origin iframe (serve_stored_form); no external origin
-    # appears anywhere in this policy.
+    # allowed to be inline or remote. img-src allows data: for the Ship
+    # view's ship-art backdrop (lib/hub_ui's bebop theme.json#ship_image,
+    # read from an on-disk PNG and base64-inlined -- same convention as
+    # BASE_CSS/UI_JS, never fetched, no external host). frame-src 'self' is
+    # only for the /decisions same-origin iframe (serve_stored_form); no
+    # external origin appears anywhere in this policy.
     _CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "frame-src 'self'; base-uri 'self'; form-action 'self'")
 
     def _send(self, code: int, ctype: str, body: bytes):

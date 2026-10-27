@@ -85,32 +85,55 @@ html[data-view=ship] #overview-view{display:none}
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
-.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,24%);gap:12px;align-items:start}
-.hull{display:grid;gap:8px;grid-template-columns:repeat(3,minmax(0,1fr));
-  grid-template-areas:"bridge lounge bounty" "workshop workshop kennel" "hangar cargo cargo";
-  padding:14px;background:var(--surface);border:2px solid var(--brass);border-radius:150px 22px 22px 150px/100px 22px 22px 100px}
-.room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:8px;align-content:start}
-.room[data-station=bridge]{grid-area:bridge;border-top:3px solid var(--accent)}
-.room[data-station=lounge]{grid-area:lounge}
-.room[data-station=workshop]{grid-area:workshop}
-.room[data-station=kennel]{grid-area:kennel}
-.room[data-station=hangar]{grid-area:hangar}
-.room[data-station=cargo]{grid-area:cargo}
-.room[data-station=bounty]{grid-area:bounty;border:2px solid var(--brass)}
-.room.outside{background:transparent;border:2px dashed var(--border);border-radius:14px}
+.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,28%);gap:16px;align-items:start}
+.hull{display:grid;gap:10px}
+/* the approved reference image, cropped to its left (ship) region with CSS
+   only -- the file is the untouched 1536x1024 PNG; 998/1536=.6497, so the
+   crop container is 998/1024 and the img is shown at 1536/998=153.9% width,
+   left-aligned, so only the left ship cutaway is visible. */
+.ship-art{position:relative;overflow:hidden;aspect-ratio:998/1024;border-radius:10px;border:2px solid var(--brass);background:var(--surface-2)}
+.ship-art>img{position:absolute;left:0;top:0;width:153.9%;max-width:none;display:block}
+.ship-art .room{position:absolute;left:4%;width:56%;z-index:2;background:rgba(15,22,38,.88);box-shadow:0 2px 10px rgba(0,0,0,.4)}
+/* Room positions are read off the reference image by eye (percent of the
+   crop container's height), not measured by any render of this page --
+   see tmp/VISUAL-COMPARE.md "known gap". */
+.ship-art .room[data-station=bridge]{top:5%}
+.ship-art .room[data-station=projectdeck]{top:25%}
+.ship-art .room[data-station=buildbay]{top:45%}
+.ship-art .room[data-station=scout]{top:63%}
+.ship-art .room[data-station=qualitygate]{top:81%}
+.room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
+.hull>.room{border-top:3px solid var(--accent)}
 .room-head{display:flex;gap:10px;align-items:flex-start}
 .room-head h3{margin:0 0 2px;font-size:14px}
 .room-place{font-size:12px;color:var(--muted);margin:0}
 .room-status,.room-extra{font-size:13px;margin:0}
 .room-extra{padding-top:6px;border-top:1px dashed var(--border)}
 .room-extra ul{margin:4px 0 0;padding-left:18px}
-.wcards{display:grid;gap:8px}
+details.room-cards{margin:0}
+details.room-cards>summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none;padding:2px 0}
+details.room-cards>summary::-webkit-details-marker{display:none}
+details.room-cards>summary::before{content:"\25B8  ";color:var(--accent)}
+details.room-cards[open]>summary::before{content:"\25BE  "}
+.wcards{display:grid;gap:8px;margin-top:6px}
 .wcard{background:var(--surface);border:2px solid var(--border);border-left-width:6px;border-radius:8px;padding:8px 10px;min-width:0}
 .wcard h4{margin:0 0 4px;font:600 12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-word}
 .wcard p{margin:3px 0;font-size:12.5px}
 .wmeta{color:var(--muted);font-size:12px}
 .badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--brass)}
 .badge.unrec{border:2px dashed var(--bad)}
+/* right rail: Big Shot (suggestions) + Maintenance Log (unrecognized), the
+   reference's right-column cards -- same real data, never fabricated. */
+.side-rail{display:grid;gap:12px}
+.side-panel{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px}
+.side-panel h3{margin:0 0 8px;font-size:13px}
+.sidecard{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;margin:0 0 8px}
+.sidecard:last-child{margin-bottom:0}
+.sidecard h4{margin:0 0 4px;font-size:13px}
+.sidecard p{margin:3px 0;font-size:12.5px}
+/* bottom bar: "needs your call", slim -- replaces the old dense head line */
+.ship-bottom{margin:14px 0 0;padding:8px 12px;display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:13px}
+.ship-bottom strong{color:var(--accent)}
 
 /* state chips + card borders: shape + icon + words, never colour alone */
 .st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}
@@ -152,12 +175,16 @@ main[data-view=timeline] table td.age{text-align:left}
 @keyframes sp-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
 .sprite{flex:none;display:block}
 .sprite.anim .sp-fig{animation:sp-bob 1.4s ease-in-out infinite}
+/* when the ship-art backdrop replaces the per-room sprite, the room badge
+   itself pulses for an executing station instead (same keyframe, same
+   reduced-motion/herdr-down rules below still stop it). */
+.room.anim{animation:sp-bob 1.4s ease-in-out infinite}
 html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{animation:none!important;transition:none!important}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 
 @media (max-width:1000px){
   .ship{grid-template-columns:1fr}
-  .hull{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"bridge lounge" "bounty bounty" "workshop workshop" "kennel hangar" "cargo cargo";border-radius:60px 18px 18px 60px/40px 18px 18px 40px}
+  .ship-art .room{width:60%}
 }
 @media (max-width:640px){
   header{padding:10px 12px}
@@ -165,7 +192,9 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
   .prefs-body{left:0;right:auto}
   main{padding:12px 10px 48px}
   table{display:block;overflow-x:auto}
-  .hull{grid-template-columns:1fr;grid-template-areas:"bridge" "bounty" "lounge" "workshop" "kennel" "hangar" "cargo";border-radius:18px;padding:8px}
+  .ship-art{aspect-ratio:auto;border:0;background:none}
+  .ship-art>img{display:none}
+  .ship-art .room{position:static;width:auto;margin-bottom:8px}
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
 }

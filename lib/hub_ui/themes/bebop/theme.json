@@ -59,14 +59,11 @@
                  "flavour": ["Back in our day jobs had names."] }
   },
   "stations": {
-    "bridge":   { "place": "Bridge",                    "who": "jet" },
-    "lounge":   { "place": "Lounge",                    "who": "faye" },
-    "workshop": { "place": "Ed's terminal nook",        "who": "ed" },
-    "kennel":   { "place": "Ein's corner",              "who": "ein" },
-    "hangar":   { "place": "Hangar, Swordfish bay",     "who": "spike" },
-    "cargo":    { "place": "Cargo hold",                "who": "old-guys" },
-    "bounty":   { "place": "Big Shot on the lounge screen", "who": "bigshot" },
-    "dock":     { "place": "Review dock, outside the hull", "who": "vicious" }
+    "bridge":      { "place": "Bridge",      "who": "jet" },
+    "projectdeck": { "place": "Project Deck", "who": "spike" },
+    "buildbay":    { "place": "Build Bay",   "who": "ed" },
+    "scout":       { "place": "Scout Desk",  "who": "faye" },
+    "qualitygate": { "place": "Quality Gate \u2014 Ein & Vicious", "who": "ein" }
   },
   "panels": {
     "overview": "jet", "projects": "spike", "decisions": "jet", "loops": "jet",

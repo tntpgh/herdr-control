@@ -184,7 +184,8 @@ def main() -> int:
     check("stored-source blocked says unconfirmed", "Unconfirmed" in words["debug:fix/flaky-timer"])
     check("stale stored state named", "Registry still says running" in words["design:design/settings-page"])
     check("completed without proof says so", "No proof on file" in words["mechanical:chore/rename-sweep"])
-    check("unrecognized label lands in cargo", [t["station"] for t in ship["tasks"] if t["label"] == "hotfix-ad-hoc"] == ["cargo"])
+    check("unrecognized label has no station (shown in Maintenance log, not a 6th room)",
+          [t["station"] for t in ship["tasks"] if t["label"] == "hotfix-ad-hoc"] == [None])
     check("finished >24h hidden and counted", ship["hidden_finished"] == 1 and "implement:feat/old-thing" not in got)
     check("/ html carries no form token", "preview-token-not-real" not in home)
     dhome = (OUT / "down" / down["/"]["file"]).read_text()

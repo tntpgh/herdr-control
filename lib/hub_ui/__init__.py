@@ -19,6 +19,7 @@ values hub.py already holds.
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import html
 import json
@@ -38,17 +39,21 @@ JOB_LABELS = {"plan": "Planning", "architect": "Architecture", "review": "Review
               "debug": "Debug", "code": "Code", "docs": "Docs", "explore": "Explore",
               "research": "Research", "quick": "Quick check", "mechanical": "Mechanical sweep"}
 
-# Ship stations. Labels are the plain heading; a theme adds a place name and a
-# crew member underneath, never instead.
+# Ship stations: the 5 rooms of T's approved reference (Bridge/Project Deck/
+# Build Bay/Scout Desk/Quality Gate). Labels are the plain heading; a theme
+# adds a place name and a crew member underneath, never instead. Quality
+# Gate folds Ein's quick/mechanical checks and Vicious's independent review
+# into one room, per the approved layout -- review's literalness (state
+# still comes only from hub.py's own data) is unaffected by which room
+# draws it. Tasks whose job has no station (job_of() fell back to
+# "unrecognized") get station=None and are not drawn as a 6th room; they
+# surface, by label, in the Maintenance side panel instead (ui.js).
 STATIONS = (
-    {"id": "bridge", "label": "Planning and decisions", "jobs": ["plan", "architect"], "shows": ["decisions"]},
-    {"id": "lounge", "label": "Research", "jobs": ["research", "explore"], "shows": []},
-    {"id": "workshop", "label": "Design and build", "jobs": ["design", "implement", "code", "docs"], "shows": []},
-    {"id": "kennel", "label": "Quick checks and sweeps", "jobs": ["quick", "mechanical"], "shows": []},
-    {"id": "hangar", "label": "Debugging and projects", "jobs": ["debug"], "shows": ["projects"]},
-    {"id": "cargo", "label": "Unrecognized job class", "jobs": [], "shows": ["unrecognized"]},
-    {"id": "bounty", "label": "Suggestions (proposal-only)", "jobs": [], "shows": ["suggestions"]},
-    {"id": "dock", "label": "Independent review", "jobs": ["review", "deep-review"], "shows": [], "outside": True},
+    {"id": "bridge", "label": "Bridge", "jobs": ["plan", "architect"], "shows": ["decisions"]},
+    {"id": "projectdeck", "label": "Project Deck", "jobs": ["debug"], "shows": ["projects"]},
+    {"id": "buildbay", "label": "Build Bay", "jobs": ["design", "implement", "code", "docs"], "shows": []},
+    {"id": "scout", "label": "Scout Desk", "jobs": ["research", "explore"], "shows": []},
+    {"id": "qualitygate", "label": "Quality Gate", "jobs": ["quick", "mechanical", "review", "deep-review"], "shows": []},
 )
 
 # Display states. `attention` mirrors hub.ATTENTION (blocked/stalled/ready_review)
@@ -112,6 +117,14 @@ def load_themes(root: Path = HERE / "themes") -> tuple[dict, list[str]]:
 
 
 THEMES, THEME_PROBLEMS = load_themes()
+# The approved reference image (T, 2026-10-27), copied verbatim into the
+# theme folder -- not generated, not re-encoded. Only a theme that ships its
+# own ship.png gets the art backdrop; plain has none, by design (no
+# drawings in plain mode, same as the sprite characters it also omits).
+for _tid, _t in THEMES.items():
+    _ship_png = HERE / "themes" / _tid / "ship.png"
+    if _ship_png.is_file():
+        _t["ship_image"] = "data:image/png;base64," + base64.b64encode(_ship_png.read_bytes()).decode("ascii")
 # Inlined into every page, so comments are stripped: page-level checks look
 # for status words in the HTML, and a comment must not be able to match one.
 BASE_CSS = re.sub(r"/\*.*?\*/", "", (HERE / "base.css").read_text(), flags=re.S)
@@ -132,7 +145,7 @@ def _theme_css() -> str:
 
 def _client_themes() -> dict:
     """What ui.js needs per theme: names and drawings, never the palette (CSS has it)."""
-    keep = ("name", "sprite_style", "characters", "stations", "panels")
+    keep = ("name", "sprite_style", "characters", "stations", "panels", "ship_image")
     return {tid: {k: t.get(k) for k in keep if t.get(k) is not None} for tid, t in THEMES.items()}
 
 
@@ -190,11 +203,11 @@ def job_of(label) -> str:
     return head if ":" in str(label or "") and head in JOB_CLASSES else "unrecognized"
 
 
-def station_of(job: str) -> str:
+def station_of(job: str) -> str | None:
     for st in STATIONS:
         if job in st["jobs"]:
             return st["id"]
-    return "cargo"
+    return None
 
 
 def display_of(t: dict) -> tuple[str, str]:
@@ -284,7 +297,7 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
     suggestions = [{"kind": s.get("kind"), "text": str(s.get("text") or "")[:240],
                     "status": sugg_words.get((s.get("decision") or {}).get("state"), "No decision yet.")}
                    for s in (loops.get("suggestions") or [])
-                   if (s.get("decision") or {}).get("state") != "dismissed"][:6]
+                   if (s.get("decision") or {}).get("state") != "dismissed"][:3]
     lps = loops.get("loops") or []
     bad_loops = [x.get("name", "").split(" \u2014 ")[0] for x in lps
                  if x.get("stale") or x.get("outcome") not in ("ok", "success", "healthy")]
@@ -293,6 +306,7 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
             "stations": STATIONS, "display": DISPLAY, "tasks": rows,
             "hidden_finished": hidden_finished, "capped": capped,
             "attention_registry": len(h.get("attention") or []),
+            "unrecognized": [r for r in rows if r["station"] is None],
             "projects": sorted(projects.values(), key=lambda p: (-p["attention"], p["name"])),
             "decisions": decisions, "suggestions": suggestions,
             "loops": {"total": len(lps), "bad": bad_loops}}
