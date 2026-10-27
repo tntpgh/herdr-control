@@ -4935,10 +4935,30 @@ fi
 : > "$_rr_log"
 _rr_shaped="$(HERDR_CP_DEBUG_LOG="$_rr_log" conductor_reserved_reason 'KB_API_KEY="sk-live-9f8e7d6c5b4a39281706"')"
 total=$((total + 1))
-if [ "$_rr_shaped" = 'credential-value access remains human-only' ] && grep -q ' rule=cred-shaped-value ' "$_rr_log"; then
+if [ "$_rr_shaped" = 'credential-value access remains human-only' ] && grep -q ' rule=cred-shaped-value$' "$_rr_log"; then
   printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: names cred-shaped-value (second branch, unmodified structure)" "reserved"
 else
   printf 'FAIL  %-52s => got=[%s] log=[%s]\n' "HERDR_CP_DEBUG_LOG set: names cred-shaped-value (second branch, unmodified structure)" "$_rr_shaped" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+# S1 fix (fix/cp-debuglog-redact): cred-shaped-value's trigger IS the literal
+# secret, so the log line for that rule must never carry cmd=; every other
+# rule's cmd= is a path/keyword match, not a secret, so only this one is bare.
+total=$((total + 1))
+if ! grep -qF 'sk-live-9f8e7d6c5b4a39281706' "$_rr_log"; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: cred-shaped-value log omits the literal secret value" "redacted"
+else
+  printf 'FAIL  %-52s => log=[%s]\n' "HERDR_CP_DEBUG_LOG set: cred-shaped-value log omits the literal secret value" "$(cat "$_rr_log" 2>/dev/null)"
+  failed=$((failed + 1))
+fi
+# Same fix: the log is created/appended under umask 077 (owner-only), matching
+# every other on-disk store in this repo (engineering-ledger.sh, private_sqlite.py).
+_rr_mode="$(stat -f %Lp "$_rr_log" 2>/dev/null || stat -c %a "$_rr_log" 2>/dev/null)"
+total=$((total + 1))
+if [ "$_rr_mode" = '600' ]; then
+  printf 'PASS  %-52s => %-9s\n' "HERDR_CP_DEBUG_LOG set: log file mode is 600 (owner-only)" "mode=$_rr_mode"
+else
+  printf 'FAIL  %-52s => mode=[%s]\n' "HERDR_CP_DEBUG_LOG set: log file mode is 600 (owner-only)" "$_rr_mode"
   failed=$((failed + 1))
 fi
 : > "$_rr_log"
