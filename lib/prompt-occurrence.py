@@ -757,6 +757,86 @@ def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pa
         conn.close()
 
 
+def refuse_bound(db_path: str, *, run_id: str, task_id: str, approval_request_id: str,
+                  core_arguments_digest: str, tool_call_id: str, reason: str,
+                  now: float | None = None) -> dict:
+    """Deliver a terminal DENIED for a deferred bound approval request that
+    herdr-select.sh is refusing outright -- enforcement held, a reservation
+    fired, the bound command classified deny, caller/task identity changed,
+    or any other pre-resolution exit inside its `--approval-request-id`
+    branch. Without this the hook's poll (agent-hooks/omp-herdr-control.ts
+    onApprovalRequested) sees nothing but lifecycle `requested` and sits
+    until its own 60-minute timeout, discarding the real refusal reason
+    (herdr-control, 2026-10-26: 881c0d82/2d40e7d2/8230d929/b1c2710a).
+
+    Needs only what the refused request itself already named -- run/task
+    plus the (approval_request_id, core_arguments_digest, tool_call_id)
+    triple record_seen persisted when the hook proposed it -- never
+    conductor/caller authority: the caller here IS the enforcement engine
+    recording its own verdict, not impersonating a human's. Same
+    BEGIN IMMEDIATE identity-then-closed check as authorize_bound, so a
+    stale or replayed call for an occurrence that does not exist, is
+    already declined, or was already approved by the real conductor is a
+    safe no-op -- this never overwrites an existing resolution and never
+    races a genuine approval into a denial or vice versa."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT run_id FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if not task or task[0] != run_id:
+            conn.rollback()
+            return {"written": "no-such-task"}
+        row = conn.execute(
+            "SELECT payload FROM events WHERE run_id=? AND task_id=? AND type='prompt_occ_seen' "
+            "AND json_extract(payload,'$.approval_request_id')=? "
+            "AND json_extract(payload,'$.core_arguments_digest')=? "
+            "AND json_extract(payload,'$.tool_call_id')=? LIMIT 1",
+            (run_id, task_id, approval_request_id, core_arguments_digest, tool_call_id),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return {"written": "no-such-occurrence"}
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"written": "request_malformed"}
+        key = payload.get("occ_key")
+        if not isinstance(key, str) or not key:
+            conn.rollback()
+            return {"written": "request_malformed"}
+        closed = conn.execute(
+            "SELECT 1 FROM events WHERE run_id=? AND task_id=? "
+            "AND json_extract(payload,'$.occ_key')=? "
+            "AND type IN ('prompt_occ_authorized','prompt_occ_mismatch','prompt_occ_completed',"
+            "'prompt_occ_declined','prompt_occ_withdrawn') LIMIT 1",
+            (run_id, task_id, key),
+        ).fetchone()
+        if closed:
+            conn.rollback()
+            return {"occ_key": key, "written": "already-resolved"}
+        stamp = _now_iso(now)
+        at_ms = int((now if now is not None else time.time()) * 1000)
+        conn.execute(
+            "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
+            (f"prompt_occ_declined_{key}", run_id, task_id, "prompt_occ_declined", stamp,
+             json.dumps({"occ_key": key, "reason": reason, "at_ms": at_ms},
+                        sort_keys=True, separators=(",", ":"))),
+        )
+        conn.commit()
+        _drop_proposal(db_path, key)
+        _drop_command_cache(db_path, key)
+        return {"occ_key": key, "written": "declined"}
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"written": "duplicate"}
+    finally:
+        conn.close()
+
+
+
 def _resolve(db_path: str, kind: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
              native_session: str, tool_call_id: str, detail: dict | None = None,
              now: float | None = None) -> dict:
@@ -858,7 +938,7 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
                 "occ_key": key, "tool": None, "input_digest": None,
                 "display": "unknown", "screen_prompt_id": "", "mismatch": False,
                 "authorization": "none", "decided_by": None, "lifecycle": "unknown",
-                "identity_verified": False, "unresolved_reason": None,
+                "identity_verified": False, "unresolved_reason": None, "resolution_reason": None,
                 "first_seen_seq": None, "first_seen_at": None, "last_seq": sequence,
                 "last_at": occurred_at,
             }
@@ -950,6 +1030,9 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
                     rec["unresolved_reason"] = "completed_without_approval"
                 else:
                     rec["lifecycle"] = LIFECYCLE_BY_RESOLUTION[typ]
+                    _reason = payload.get("reason")
+                    if isinstance(_reason, str) and _reason:
+                        rec["resolution_reason"] = _reason
 
     # M1 (Main review, dc6a55d): identity_verified was computed but nothing
     # enforced it — "safe only if every consumer refuses keys when
@@ -1391,6 +1474,13 @@ def main(argv: list[str]) -> int:
                  "review-category", "reviewer", "audit-text", "expect-payload-sha"):
         s.add_argument("--" + name, required=True)
 
+    s = sub.add_parser("refuse-bound")
+    s.add_argument("--db", required=True)
+    s.add_argument("--run", dest="run_id", required=True)
+    s.add_argument("--task", dest="task_id", required=True)
+    for name in ("approval-request-id", "core-arguments-digest", "tool-call-id", "reason"):
+        s.add_argument("--" + name, required=True)
+
     for name in ("completed", "declined", "withdrawn"):
         s = sub.add_parser(name)
         _add_identity_args(s)
@@ -1496,6 +1586,11 @@ def main(argv: list[str]) -> int:
                                   review_reason=args.review_reason, review_category=args.review_category,
                                   reviewer=args.reviewer, audit_text=args.audit_text,
                                   expect_payload_sha=args.expect_payload_sha)
+        elif args.cmd == "refuse-bound":
+            out = refuse_bound(args.db, run_id=args.run_id, task_id=args.task_id,
+                               approval_request_id=args.approval_request_id,
+                               core_arguments_digest=args.core_arguments_digest,
+                               tool_call_id=args.tool_call_id, reason=args.reason)
         elif args.cmd == "completed":
             out = record_completed(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,
