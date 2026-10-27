@@ -63,7 +63,7 @@ def plan_reap(conn, pane_snapshot, snapshot_age_s, now=None,
         if not isinstance(pane_id, str) or not isinstance(record, dict):
             return {"status": "skip", "reason": "malformed_snapshot"}
         birth = record.get("birth")
-        if not isinstance(birth, str) or not ol.BIRTH_RE.match(birth):
+        if not isinstance(birth, str) or not ol.BIRTH_RE.fullmatch(birth):
             return {"status": "skip", "reason": "unknown_birth"}
     if not isinstance(snapshot_age_s, (int, float)) or isinstance(snapshot_age_s, bool):
         return {"status": "skip", "reason": "stale_snapshot"}

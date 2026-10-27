@@ -156,6 +156,23 @@ case("probe_whitespace_birth_skips_whole_tick: holder still live",
      ol._live(c, "kb", T0 + 10) is not None)
 c.close()
 
+# ---- probe_trailing_newline_birth_skips_whole_tick ----
+# A live, unexpired holder whose pane record has a birth equal to the real
+# birth PLUS one trailing newline is not the real birth: `$` in Python's re
+# matches before a trailing \n, so BIRTH_RE.match() would wrongly accept it.
+# fullmatch() must reject it and skip the WHOLE tick.
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, S("a"), now=T0)
+snapshot = {"w1:p1": {"pane_id": "w1:p1", "birth": "term_abc123\n"}}
+plan = olr.plan_reap(c, snapshot, snapshot_age_s=1, now=T0 + 10)
+case("probe_trailing_newline_birth_skips_whole_tick: status=skip",
+     plan["status"] == "skip")
+case("probe_trailing_newline_birth_skips_whole_tick: reason=unknown_birth",
+     plan.get("reason") == "unknown_birth")
+case("probe_trailing_newline_birth_skips_whole_tick: holder still live",
+     ol._live(c, "kb", T0 + 10) is not None)
+c.close()
+
 # ---- probe_nan_age_skips ----
 # NaN fails every ordered comparison, so a naive `< 0 or > max` check lets it
 # through. inf/-inf must also skip (they already did under the old
