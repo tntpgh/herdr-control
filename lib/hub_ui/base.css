@@ -90,6 +90,30 @@ html[data-view=ship] #overview-view{display:none}
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
+/* r12 iteration (tmp/in/ITERATE-r12.md item 1, T 21:22 "needs... more of
+   its graphics, from the first one, including the top area"): the Ship
+   view used to mask away the top strip of the real ship.png art entirely
+   (.ship-mask-top, hiding the baked header/nav band inside .ship-art's own
+   crop). This banner reuses that SAME real asset -- no new graphic, the
+   repo has exactly one ship image per theme (lib/hub_ui/themes/<id>/ship.png) -- but at
+   FULL image width (not the 998px-wide .ship-art crop) so it spans the
+   whole Ship column like the reference's header strip does, showing the
+   real starfield/hull art as a decorative backdrop behind real DOM text
+   (theme name + theme.json's tagline field, not baked pixels, not a new
+   fake nav -- the real functional nav already lives in <header> above).
+   aspect-ratio 1536/100 keeps object-fit:cover showing only the image's
+   top ~9.8% (matching .ship-mask-top's own estimate of that band's real
+   height), the same "generous, by-eye, unverified pixel-for-pixel"
+   caveat as every other crop % in this file (no browser tool). */
+.ship-hero{position:relative;overflow:hidden;aspect-ratio:1536/100;border-radius:10px;
+  border:2px solid var(--brass);margin:0 0 12px;background:var(--surface-2);
+  background-size:cover;background-position:0 0;display:flex;align-items:center}
+.ship-hero::before{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,rgba(0,0,0,.6),rgba(0,0,0,.08) 55%)}
+.ship-hero-text{position:relative;z-index:1;padding:0 18px;color:#f3efe4;
+  text-shadow:0 1px 3px rgba(0,0,0,.85)}
+.ship-hero-text h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
+.ship-hero-text p{margin:2px 0 0;font-size:11px;opacity:.85}
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
 .hull,.room-list{display:grid;gap:10px}
 /* the approved reference image, cropped to its left (ship) region --
@@ -206,6 +230,29 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 .sidecard:last-child{margin-bottom:0}
 .sidecard h4{margin:0 0 4px;font-size:13px}
 .sidecard p{margin:3px 0;font-size:12.5px}
+/* r12 addendum (tmp/in/ITERATE-r12-ADDENDUM.md items 5-7): compact,
+   collapsed-by-default feeds in the side rail. <details> gives keyboard
+   operation and instant (reduced-motion-safe, nothing to animate)
+   open/close for free; aria-expanded is synced in ui.js's DOM-wiring
+   section since <details> doesn't expose it natively. */
+.feed-panel{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px}
+.feed-panel>summary{cursor:pointer;list-style:none;font-size:13px;font-weight:700}
+.feed-panel>summary::-webkit-details-marker{display:none}
+.feed-panel>summary::before{content:"\25B8  ";color:var(--accent)}
+.feed-panel[open]>summary::before{content:"\25BE  "}
+.feed-count{display:inline-block;min-width:16px;padding:0 5px;margin:0 2px;border-radius:999px;background:var(--surface);border:1px solid var(--brass);font-size:11px;text-align:center}
+.feed-list{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
+.feed-list li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:12.5px;padding-top:6px;border-top:1px solid var(--border)}
+.feed-list li:first-child{padding-top:0;border-top:none}
+.feed-label{font-weight:600;word-break:break-word}
+.feed-meta{margin-left:auto;white-space:nowrap}
+/* r12 iteration item 2: give "Needs your call" the same visual weight as
+   the reference's alert icon + bordered button -- still a <p>/<a>, no new
+   control. */
+.call-chip{font-weight:600}
+.call-chip.urgent strong{color:var(--bad)}
+.call-btn{border:1px solid var(--brass);border-radius:6px;padding:2px 10px;text-decoration:none;color:var(--fg)}
+.call-btn:hover{border-color:var(--accent);color:var(--accent)}
 /* bottom bar: "needs your call", slim -- replaces the old dense head line */
 .ship-bottom{margin:14px 0 0;padding:8px 12px;display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:13px}
 .ship-bottom strong{color:var(--accent)}

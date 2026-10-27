@@ -1,6 +1,7 @@
 {
   "name": "Bebop",
   "presentation_only": "Palette, place names, crew drawings and captions only. Station membership, state names and every status word are canonical (lib/hub_ui/__init__.py) and cannot be changed by a theme.",
+  "tagline": "Work makes a good crew.",
   "palette": {
     "--bg": "#0f1626",
     "--surface": "#18223a",

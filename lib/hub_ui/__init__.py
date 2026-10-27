@@ -161,7 +161,7 @@ def _theme_css() -> str:
 
 def _client_themes() -> dict:
     """What ui.js needs per theme: names and drawings, never the palette (CSS has it)."""
-    keep = ("name", "sprite_style", "characters", "stations", "panels", "ship_image")
+    keep = ("name", "tagline", "sprite_style", "characters", "stations", "panels", "ship_image")
     return {tid: {k: t.get(k) for k in keep if t.get(k) is not None} for tid, t in THEMES.items()}
 
 
@@ -315,9 +315,17 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
         p["tasks"] += 1
         p["attention"] += DISPLAY[r["display"]]["attention"]
     history = forms.get("history") or []
+    # r12 addendum (tmp/in/ITERATE-r12-ADDENDUM.md item 5): small slice of
+    # forms["history"] for the Ship Decisions feed -- the same source the
+    # real Decisions page's own History panel already reads (hub.py
+    # render_decisions, ~line 5365); allow-listed the same way `open` is.
+    recent_closed = sorted(history, key=lambda f: f.get("answered_at") or f.get("created_at") or "", reverse=True)[:5]
     decisions = {
         "open": [{"title": f.get("title") or f.get("id"), "created_at": f.get("created_at"),
                   "expires_at": f.get("expires_at")} for f in (forms.get("open") or [])],
+        "recent_closed": [{"title": f.get("title") or f.get("id"), "status": f.get("status"),
+                           "created_at": f.get("created_at"), "answered_at": f.get("answered_at")}
+                          for f in recent_closed],
         "expired_recent": sum(1 for f in history if f.get("status") in ("expired", "gone")),
         "portal_open": portal.get("open_count", 0), "portal_error": bool(portal.get("error")),
     }
