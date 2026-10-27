@@ -10,6 +10,15 @@ main:focus{outline:none}
 
 /* header + nav */
 header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 20px;border-bottom:2px solid var(--brass);background:var(--surface)}
+/* r15 fix (tmp/in/FIX-r15.md item 3, conductor measure at 260px: "nav
+   chips overflow"): flex items default to min-width:auto, which floors
+   their shrinkability at their own content's intrinsic width even inside
+   a flex-wrap:wrap parent -- flex-wrap only controls line breaks BETWEEN
+   items, not how narrow any one item itself can go. header and its nav
+   are the most likely source (several nav links in a row); min-width:0
+   only changes how far something is ALLOWED to shrink, never its size
+   when there is room, so this is safe at any width. */
+header,header nav,main,.ship,.hull,.side-rail,.chips{min-width:0}
 header .brand{font-size:16px;letter-spacing:.04em}
 header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
 header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent}
@@ -73,7 +82,7 @@ button{font:inherit}
 button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid var(--info);background:transparent;color:var(--info);cursor:pointer} button.decide:hover{background:var(--info);color:var(--bg)}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--bad)} .dot.ok{background:var(--ok)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
-.chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;font-weight:600;color:var(--fg);text-decoration:none}
+.chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;font-weight:600;color:var(--fg);text-decoration:none;min-width:0;max-width:100%;overflow-wrap:anywhere}
 .chips a.chip small{font-weight:400;color:var(--muted)}
 .chips a.chip:hover,.chips a.chip.on{border-color:var(--info)}
 .chips a.chip.on{background:var(--surface-2);box-shadow:inset 0 -2px 0 var(--info)}
@@ -99,48 +108,49 @@ html[data-view=ship] #overview-view{display:none}
 
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
-.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
+.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600;overflow-wrap:anywhere}
 /* r14b fix (tmp/in/FIX-r14b.md item 4): distinct from .ship-alert's error
    red -- this is a mode indicator, not a problem. */
 .synthetic-banner{border-color:var(--warn);background:var(--surface-2);text-align:center;letter-spacing:.03em}
-/* r14b fix (tmp/in/FIX-r14b.md item 8, same round as FIX-r14.md item 1):
-   the r14 fix (shrinking to a thin hull/starfield sliver, see history
-   below) satisfied "never a copy of a room row" but gave up on "taller...
-   coherent illustrated scene" -- this round's explicit ask is for BOTH at
-   once. .ship-art already uses the entire left column (x:0-998 of the
-   1536x1024 ship.png) at full height, so there is no region in that half
-   the hero can show without duplicating a room row; the only area never
-   shown anywhere else in the UI is the right half (the Big Shot/bounty
-   board illustration, x:998-1536), and within it, the only sub-rectangle
-   free of baked UI text (checked by re-reading the full reference image:
-   "BIG SHOT BOUNTY BOARD" sits to its left, "PUNCH & JUDY" captions sit
-   to its right) is the TV-framed character portrait itself, roughly
-   x:[1210,1390] y:[100,220] of the source image -- picked with a 15-20px
-   inward margin from both text edges since this worker has no browser to
-   verify the crop and would rather show slightly less of the portrait
-   than risk exposing baked text again. Cropping an interior rectangle
-   (not anchored to an image edge/corner) needs explicit background-size/
-   position percentages, not background-size:cover (cover only crops from
-   an edge): for a source N x M image and a target crop x0,y0,w,h,
-   background-size is (N/w)% (M/h)% and background-position is
-   (x0/(N-w))% (y0/(M-h))% -- derived here for N=1536,M=1024,x0=1210,
-   y0=100,w=180,h=120: size 853.3% 853.3%, position 89.2% 11.1%. The box's
-   own aspect-ratio is set to the crop's own w:h (180/120) so neither axis
-   distorts. This is a genuinely different, non-room-row illustration, and
-   tall (920px hull width / 1.5 ~= 613px) per the "taller" ask -- flagged
-   in FIX-r14b-NOTES.md as unverified-by-browser pixel bounds, the single
-   highest-risk guess in this round.
+/* r15 fix (tmp/in/FIX-r15.md item 1, conductor real-Chromium measure of
+   fc09734): the r14b portrait crop (180x120 source -> 920x613 box, a
+   ~5.1x magnification) was "a massively upscaled, pixelated close-up of
+   two character faces... never crop faces". Conductor's own fix
+   direction: a wide establishing strip from the reference's top area, at
+   native/near-native resolution (<=~1.25x), fixed sensible height
+   (~260-320px desktop) -- i.e. show the image at (close to) its own
+   scale, not zoomed into a small sub-rectangle.
 
-   History: r13's hero (aspect-ratio 1536/340, mask over top 32%) showed
-   the SAME Bridge/Jet strip .ship-art shows as its own first room row --
-   both crops start from image origin (0,0). r14 shrank it to a thin
-   hull/starfield sliver (1536/170) to stop the duplication; this round
-   replaces that with the portrait crop above instead. */
-.ship-hero{position:relative;overflow:hidden;aspect-ratio:180/120;border-radius:10px;
+   aspect-ratio:920/280 approximates a ~280px-tall hero at the ~920px
+   desktop hull-column width (scales proportionally at other widths,
+   rather than a literal fixed px height that would look wrong once the
+   column narrows -- tmp/in/FIX-r15.md item 3 also wants art to scale with
+   width, not stay a fixed size). That box aspect (3.29:1) is wider than
+   the source image's own 1536:1024 (1.5:1), so background-size:cover is
+   WIDTH-constrained: it shows the image's full 1536px width at whatever
+   scale fits the box width (0.599x at 920px -- a DOWNSCALE, never an
+   upscale, so no pixelation at any hero width up to the image's own
+   1536px). At that scale a 280px-tall box reveals the top ~468 source
+   px (280 / (1024*0.599) * 1024) -- background-position:0 0 anchors to
+   the image's actual top-left corner, same real exterior-hull/starfield
+   content r13/r14's full-width heroes showed (the top area the conductor
+   is now asking for by name), not the Big Shot portrait crop.
+
+   .ship-hero-mask returns (removed in r14b when the crop had no baked
+   text in view) to cover the baked nav/title band, sized against the
+   NEW ~468px-tall visible window: ~110 baked-nav source px / 468 visible
+   ~= 23.5%, rounded up to 25% for margin (same by-eye-estimate caveat as
+   every other mask height in this file -- this worker has no browser).
+   Yes, this crop overlaps some of what .ship-art shows below it (both
+   read from the image's same top-left region) -- FIX-r15.md does not list
+   that as a FAIL item this round, only pixelation/faces, so the
+   conductor's priority this round is native resolution over zero overlap;
+   flagged in FIX-r15-NOTES.md in case the next pass disagrees. */
+.ship-hero{position:relative;overflow:hidden;aspect-ratio:920/280;border-radius:10px;
   border:2px solid var(--brass);margin:0 0 12px;background:var(--surface-2);
-  background-size:853.3% 853.3%;background-position:89.2% 11.1%}
-.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg);
-  background:linear-gradient(rgba(0,0,0,.55),rgba(0,0,0,0) 70%)}
+  background-size:cover;background-position:0 0}
+.ship-hero-mask{position:absolute;top:0;left:0;right:0;height:25%;background:var(--surface-2);z-index:1}
+.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg)}
 .ship-hero-text h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .ship-hero-text p{margin:2px 0 0;font-size:11px;color:var(--muted)}
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
@@ -174,53 +184,51 @@ html[data-view=ship] #overview-view{display:none}
 .hull{display:block}
 .hull>.ship-art,.hull>.room{margin-bottom:10px}
 .hull>.room:last-child{margin-bottom:0}
-/* r13 fix (tmp/in/FIX-r13.md item 2): conductor's real-Chromium measure of
-   65b4f0d showed .room-pin still sitting in a gutter right of the art
-   (same symptom as the r9 round's residual ~70px band, never actually
-   closed) -- the <img object-fit:cover> swap in that round did not
-   reliably fill .ship-art's box in a real browser despite being
-   spec-correct on paper. This round's own .ship-hero (background-image +
-   background-size:cover, no <img> at all) was independently measured as
-   filling its own box with no gap in the SAME screenshot set -- switching
-   .ship-art to the identical technique instead of guessing at a third
-   unverified approach. The approved reference image, cropped to its left
-   (ship) region: object-position 0 0 keeps the top-left corner (the ship
-   cutaway), cropping off the right portion (Big Shot art, not used here). */
-.ship-art{position:relative;overflow:hidden;aspect-ratio:998/1024;border-radius:10px;border:2px solid var(--brass);
-  background-color:var(--surface-2);background-size:cover;background-position:0 0}
-/* r6 review (tmp/in/REVIEW-r6.md, real Chromium render): the reference PNG
-   has its own baked-in UI inside this crop -- a Ship/Projects/Bounties nav
-   strip across the top, a status pill per room on the right ("Working",
-   "Queued", ...) and a "Needs your call" bar across the bottom. None of it
-   is real: it is pixels, not DOM, so it can never reflect live state and
-   must not be visible. These three panels mask it with a flat colour
-   (matching the art container's own background, not the page's, so the
-   seam is invisible); the real per-room data renders as .room-pin below,
-   bound to live S.tasks/S.display, not painted text. Y/X fractions are
-   read off the reference image by eye (same caveat as the room positions
-   below), generous rather than tight so a few px of true content can never
-   show through. */
+/* r15 fix (tmp/in/FIX-r15.md item 2, conductor real-Chromium measure of
+   fc09734: "~70px band still sits above the ship art inside its frame...
+   remove it"). background-size:cover is spec-guaranteed to leave no gap,
+   so the ~70px the conductor keeps measuring was never an actual
+   rendering gap -- it was .ship-mask-top itself: an intentional flat-
+   colour patch covering the baked nav/title band (r6), which reads as
+   "empty space" once there's nothing else nearby explaining it. r13's
+   fix (tmp/in/FIX-r13.md item 2) switched the TECHNIQUE (<img> ->
+   background-image) but never addressed this; r14's fix (grid -> block)
+   addressed the gutter (item 2) but not this band (item 3 was still
+   open). The actual fix: stop covering the baked band with a mask and
+   instead crop it OUT of what .ship-art shows at all, the same way the
+   r15 hero above skips it via background-position.
+
+   Unlike the hero, .ship-art's own cover is WIDTH-constrained (box aspect
+   998:1024 is narrower per-column than the image's 1536:1024, so cover
+   fills the full HEIGHT and crops only width) -- there is no vertical
+   background-position slack to use for a simple top-anchor shift. Needs
+   the same interior-rectangle crop math as the r14b hero attempt: for
+   source N x M and crop x0,y0,w,h, background-size is (N/w)% (M/h)% and
+   background-position is (x0/(N-w))% (y0/(M-h))%. Crop: x0=0 (left-
+   anchored, same as before), y0=92 (skip the ~90-110px baked nav band,
+   same by-eye estimate .ship-mask-top used), w=998 (unchanged), y1=900
+   (also skip the baked bottom "Needs your call" bar .ship-mask-bottom
+   used to cover, so that mask goes too) -> h=808. Computed (not hand-
+   rounded) with python3: size 153.9078% 126.7327%, position 0% 42.5926%,
+   aspect-ratio 998/808.
+
+   Both .ship-mask-top and .ship-mask-bottom are removed (their content is
+   now simply never shown, not covered); .ship-mask-row/.room-pin per-
+   station top:% values are re-derived against the NEW 808px-tall box
+   (old_img_y = old_pct/100*1024; new_pct = (old_img_y - 92) / 808 * 100)
+   -- also computed with python3, not by hand, given 10 values. Bridge's
+   mask-row came out -0.23% (now clamped to 0%, it was already sitting at
+   almost exactly the new crop's top edge). .ship-mask-row's own height
+   also rescales: 16% * (1024/808) ~= 20.28%. */
+.ship-art{position:relative;overflow:hidden;aspect-ratio:998/808;border-radius:10px;border:2px solid var(--brass);
+  background-color:var(--surface-2);background-size:153.9078% 126.7327%;background-position:0% 42.5926%}
 .ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
-.ship-mask-top{top:0;left:0;right:0;height:9%}
-.ship-mask-bottom{bottom:0;left:0;right:0;height:13%}
-/* conductor browser measure of 9d7c9bf (not a numbered REVIEW-*.md this
-   round): one continuous full-height side
-   mask read as a sidebar "gutter" beside the art rather than badges
-   sitting on the room rows -- real art showed on the left 74%, a flat
-   strip on the right 26% for the whole height, with no visual tie back to
-   each room. Five per-row patches instead, same top:% as the matching pin
-   so the patch sits directly behind it. Conductor's measure of 5cca9aa
-   (screenshot desktop-1440-scout.png) found one still leaking -- Build
-   Bay's baked "Waiting for approval" pill visible past the patch's right
-   edge -- so each patch is wider (26% -> 32%) and taller (13% -> 16%,
-   nearly the full ~15.6% row band) than before, erring toward full
-   coverage of the baked pixels over a tidy gap between rows. */
-.ship-mask-row{top:0;right:0;width:32%;height:16%}
-.ship-mask-row[data-station=bridge]{top:8.8%}
-.ship-mask-row[data-station=projectdeck]{top:24.4%}
-.ship-mask-row[data-station=buildbay]{top:40%}
-.ship-mask-row[data-station=scout]{top:55.6%}
-.ship-mask-row[data-station=qualitygate]{top:71.2%}
+.ship-mask-row{top:0;right:0;width:32%;height:20.28%}
+.ship-mask-row[data-station=bridge]{top:0%}
+.ship-mask-row[data-station=projectdeck]{top:19.54%}
+.ship-mask-row[data-station=buildbay]{top:39.31%}
+.ship-mask-row[data-station=scout]{top:59.08%}
+.ship-mask-row[data-station=qualitygate]{top:78.85%}
 /* Small, real hotspots over the masked status-card zone -- one per room,
    non-overlapping (each confined to its own row band), linking to the
    matching .room card's real status below. Position percentages are the
@@ -233,11 +241,11 @@ html[data-view=ship] #overview-view{display:none}
 .room-pin.urgent{border-color:var(--warn);color:var(--warn)}
 .room-pin .pin-count{font-weight:700;color:var(--accent)}
 .room-pin.urgent .pin-count{color:var(--warn)}
-.room-pin[data-station=bridge]{top:16.8%}
-.room-pin[data-station=projectdeck]{top:32.4%}
-.room-pin[data-station=buildbay]{top:48%}
-.room-pin[data-station=scout]{top:63.6%}
-.room-pin[data-station=qualitygate]{top:79.2%}
+.room-pin[data-station=bridge]{top:9.90%}
+.room-pin[data-station=projectdeck]{top:29.68%}
+.room-pin[data-station=buildbay]{top:49.45%}
+.room-pin[data-station=scout]{top:69.22%}
+.room-pin[data-station=qualitygate]{top:88.99%}
 .room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
 .hull>.room,.room-list>.room{border-top:3px solid var(--accent)}
 /* r7 review (tmp/in/REVIEW-r7.md item 3): showing all 5 full room cards
@@ -388,21 +396,18 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
   .prefs-body{left:0;right:auto}
   main{padding:12px 10px 48px}
   table{display:block;overflow-x:auto}
-  /* REVIEW-r7.md item 5: .room-pin/.ship-mask are position:absolute, so
-     they contribute nothing to .ship-art's height; with the img hidden and
-     aspect-ratio cancelled at this breakpoint, .ship-art has no other
-     in-flow content and collapses to 0 height -- every percentage top:%
-     then resolves against 0, stacking all 12 elements at one point. Hide
-     them alongside the image, same precedent as the old (now-removed)
-     .ship-art .room{position:static} mobile override did for room cards
-     before the r6 redesign. */
-  .ship-art{aspect-ratio:auto;border:0;background:none}
-  .room-pin,.ship-mask{display:none}
-  /* with .room-pin hidden, #room-<id> :target links no longer exist on
-     this breakpoint -- the only way to reach a non-default room. Revert to
-     every room visible, stacked (the pre-progressive-disclosure behaviour,
-     desktop-only as of r7), so the room list stays reachable on mobile. */
-  .room-list>.room{display:grid!important}
+  /* r15 fix (tmp/in/FIX-r15.md item 3, conductor real-Chromium measure at
+     260px): this block used to cancel .ship-art's aspect-ratio and hide
+     .room-pin/.ship-mask at <=640px (REVIEW-r7.md item 5's reasoning:
+     without aspect-ratio and with no in-flow content, .ship-art collapsed
+     to 0 height, so pins/masks had to go too, and every room was forced
+     visible to keep rooms reachable without pins). The conductor now
+     wants the art to scale WITH its container at any width instead of
+     disappearing -- aspect-ratio already does that on its own; removing
+     the override is the whole fix. Pins/masks and progressive disclosure
+     (.room-list>.room) now stay exactly as they are on desktop, just at a
+     narrower rendered width -- all their CSS is percentage-based, so it
+     scales with the box rather than assuming a fixed size. */
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
 }
