@@ -108,51 +108,30 @@ html[data-view=ship] #overview-view{display:none}
 
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
-.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600;overflow-wrap:anywhere}
+/* r16 fix (tmp/in/FIX-r16.md item 2, conductor real-Chromium measure of
+   e2e53c8 at both 960 and 260): banner text still ran past the right
+   edge despite r15's overflow-wrap:anywhere -- at a width that clips at
+   960px too (not just narrow 260), the likely cause was never the TEXT
+   failing to wrap inside a correctly-sized box, it was the box itself:
+   a plain <p> with no explicit width should fill its containing block,
+   but r15's .ship-hero (aspect-ratio:920/280, no max-width) sat directly
+   above it and is the prime suspect for pushing the page wider than the
+   viewport generally. That hero is deleted this round (item 1); belt and
+   suspenders, .ship-alert also gets an explicit width/max-width:100% so
+   it can never inherit intrinsic sizing from anywhere above it again. */
+.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600;width:100%;max-width:100%;overflow-wrap:anywhere}
 /* r14b fix (tmp/in/FIX-r14b.md item 4): distinct from .ship-alert's error
    red -- this is a mode indicator, not a problem. */
 .synthetic-banner{border-color:var(--warn);background:var(--surface-2);text-align:center;letter-spacing:.03em}
-/* r15 fix (tmp/in/FIX-r15.md item 1, conductor real-Chromium measure of
-   fc09734): the r14b portrait crop (180x120 source -> 920x613 box, a
-   ~5.1x magnification) was "a massively upscaled, pixelated close-up of
-   two character faces... never crop faces". Conductor's own fix
-   direction: a wide establishing strip from the reference's top area, at
-   native/near-native resolution (<=~1.25x), fixed sensible height
-   (~260-320px desktop) -- i.e. show the image at (close to) its own
-   scale, not zoomed into a small sub-rectangle.
-
-   aspect-ratio:920/280 approximates a ~280px-tall hero at the ~920px
-   desktop hull-column width (scales proportionally at other widths,
-   rather than a literal fixed px height that would look wrong once the
-   column narrows -- tmp/in/FIX-r15.md item 3 also wants art to scale with
-   width, not stay a fixed size). That box aspect (3.29:1) is wider than
-   the source image's own 1536:1024 (1.5:1), so background-size:cover is
-   WIDTH-constrained: it shows the image's full 1536px width at whatever
-   scale fits the box width (0.599x at 920px -- a DOWNSCALE, never an
-   upscale, so no pixelation at any hero width up to the image's own
-   1536px). At that scale a 280px-tall box reveals the top ~468 source
-   px (280 / (1024*0.599) * 1024) -- background-position:0 0 anchors to
-   the image's actual top-left corner, same real exterior-hull/starfield
-   content r13/r14's full-width heroes showed (the top area the conductor
-   is now asking for by name), not the Big Shot portrait crop.
-
-   .ship-hero-mask returns (removed in r14b when the crop had no baked
-   text in view) to cover the baked nav/title band, sized against the
-   NEW ~468px-tall visible window: ~110 baked-nav source px / 468 visible
-   ~= 23.5%, rounded up to 25% for margin (same by-eye-estimate caveat as
-   every other mask height in this file -- this worker has no browser).
-   Yes, this crop overlaps some of what .ship-art shows below it (both
-   read from the image's same top-left region) -- FIX-r15.md does not list
-   that as a FAIL item this round, only pixelation/faces, so the
-   conductor's priority this round is native resolution over zero overlap;
-   flagged in FIX-r15-NOTES.md in case the next pass disagrees. */
-.ship-hero{position:relative;overflow:hidden;aspect-ratio:920/280;border-radius:10px;
-  border:2px solid var(--brass);margin:0 0 12px;background:var(--surface-2);
-  background-size:cover;background-position:0 0}
-.ship-hero-mask{position:absolute;top:0;left:0;right:0;height:25%;background:var(--surface-2);z-index:1}
-.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg)}
-.ship-hero-text h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
-.ship-hero-text p{margin:2px 0 0;font-size:11px;color:var(--muted)}
+/* r16 fix (tmp/in/FIX-r16.md item 1, conductor real-Chromium measure of
+   e2e53c8): the r15 hero was sharp (no longer pixelated) but still showed
+   the same Bridge + Project Deck strip .ship-art shows directly below,
+   now also carrying baked fake task cards that read as live status -- a
+   worse flavour of the same duplication complaint r14 first raised.
+   Conductor's own fix is structural: delete the separate hero entirely
+   and put the real title/tagline onto .ship-art's own top ~12% instead
+   (one image on the page, not two competing crops of the same asset) --
+   see .ship-art-title below, next to .ship-art's own rule. */
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
 /* r14b fix (tmp/in/FIX-r14b.md item 6): an expanded feed stayed confined
    to the 35% side-rail column, leaving the 65% hull column empty beside
@@ -222,6 +201,22 @@ html[data-view=ship] #overview-view{display:none}
    also rescales: 16% * (1024/808) ~= 20.28%. */
 .ship-art{position:relative;overflow:hidden;aspect-ratio:998/808;border-radius:10px;border:2px solid var(--brass);
   background-color:var(--surface-2);background-size:153.9078% 126.7327%;background-position:0% 42.5926%}
+/* r16 fix (tmp/in/FIX-r16.md item 1): real title/tagline text laid
+   directly over .ship-art's own top ~12% -- the conductor's own
+   real-Chromium observation of this exact crop is that that band is
+   empty space/planet, not baked text or character content, so no flat
+   mask is needed here (unlike .ship-mask-row below, which covers actual
+   baked pixels). Left-anchored and width-capped well under .room-pin's
+   own right:4%;width:26% column (max-width:62% leaves a wide margin) so
+   the two can share the same vertical band -- Bridge's own pin sits at
+   top:9.90%, inside this same ~12% zone -- without colliding
+   horizontally. White text + a strong shadow for contrast against
+   whatever part of the sky/planet art sits underneath (unlike the
+   deleted .ship-hero-text, there's no flat-colour mask backing it here). */
+.ship-art-title{position:absolute;z-index:2;top:0;left:0;max-width:62%;padding:10px 14px;color:#fff;
+  text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
+.ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
+.ship-art-title p{margin:2px 0 0;font-size:11px}
 .ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
 .ship-mask-row{top:0;right:0;width:32%;height:20.28%}
 .ship-mask-row[data-station=bridge]{top:0%}
@@ -404,10 +399,27 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
      visible to keep rooms reachable without pins). The conductor now
      wants the art to scale WITH its container at any width instead of
      disappearing -- aspect-ratio already does that on its own; removing
-     the override is the whole fix. Pins/masks and progressive disclosure
-     (.room-list>.room) now stay exactly as they are on desktop, just at a
-     narrower rendered width -- all their CSS is percentage-based, so it
-     scales with the box rather than assuming a fixed size. */
+     the override is the whole fix. .ship-art itself, .ship-art-title and
+     .ship-mask-row are untouched by this block -- all percentage-based,
+     all scale with the box.
+
+     r16 fix (tmp/in/FIX-r16.md item 3, conductor real-Chromium measure of
+     e2e53c8 at 260px): .room-pin's own content (icon+label+count,
+     fixed-px font-size/padding, not percentage-based) does NOT shrink
+     proportionally with the box the way its top:% position does -- the
+     absolute-px GAP between two consecutive top:% positions shrinks as
+     the box narrows (shorter box height at the same aspect ratio), so at
+     260px a pin's own near-constant height (conductor measured 39-53px)
+     exceeds the shrunk gap and pins start overlapping each other. Rather
+     than shrinking pin text/padding to fit an unknown-in-advance
+     threshold (no browser to test the exact cutoff), hide pins at the
+     same already-established <=640px breakpoint and force every room
+     visible in .room-list so rooms stay reachable without them -- the
+     conductor's own suggested fix ("rely on the room cards below"). The
+     art image itself, including the new title text, stays visible and
+     scaling; only the interactive pin overlay goes away. */
+  .room-pin{display:none}
+  .room-list>.room{display:grid!important}
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
 }
