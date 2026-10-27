@@ -23,10 +23,15 @@ handling anywhere in the v26e/v26f launcher text.
 Before `exec`, in the hand-authored `omp` wrapper, between the
 `offline_overlay` readability check and `args=("$@")`: refuse to start (exit
 78, clear per-variable message) if any variable in the classification table
-below is set and non-empty. Contract pinned at
-`tests/fixtures/launcher-env-guard.v26g.sh`; `verify-launcher-release.sh`
+below is **set at all**, including explicitly empty (e.g.
+`CLAUDE_CONFIG_DIR=""`) -- an explicitly-empty `CLAUDE_CONFIG_DIR` resolves
+to the process cwd rather than the default `~/.claude` (table below), so a
+non-empty-only test would miss that exact bypass (v26h-r2 MEDIUM fix, issue
+#362). Contract
+pinned at `tests/fixtures/launcher-env-guard.v26g.sh`; `verify-launcher-release.sh`
 check 6 verifies an installed release's `omp` carries this exact block,
-digest-matched, running before the argv scan.
+digest-matched, running before the argv scan; check 6b statically confirms
+the pinned contract tests presence (`${!env_var+x}`), not value.
 
 ### Classification: every env var that changes a config, extension, plugin,
 ### profile, or memory-storage path
@@ -66,10 +71,11 @@ per `config-usage.md` §1), and `MNEMOPI_DATA_DIR`
    digest-matches `tests/fixtures/launcher-env-guard.v26g.sh`, and precedes
    the argv-allowlist scan.
 2. The release's `omp` refuses to start (exit 78, naming the offending
-   variable) when any REFUSE-listed variable above is non-empty, and starts
-   normally with a clean environment or any ALLOWED variable set. Proof
-   pattern: `tmp/verify-env-guard-proof.sh` in this worktree (never run
-   against the installed release directly; built from the pinned fixture).
+   variable) when any REFUSE-listed variable above is set, including set to
+   the empty string, and starts normally with a clean environment or any
+   ALLOWED variable set. Proof pattern: `tmp/verify-env-guard-proof.sh` in
+   this worktree (never run against the installed release directly; built
+   from the pinned fixture).
 3. `BASH_ENV` / `ENV` are unset before any shell the launcher or its spawned
    workers start non-interactively (see `docs/design/launcher-env-guard.md`
    for the threat and exact handling).

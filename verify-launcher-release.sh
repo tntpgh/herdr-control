@@ -86,7 +86,7 @@ n="$(grep -c -- "$label" "$omp")"
 # precede the argv-allowlist scan -- otherwise a caller can smuggle an
 # overlay path past the allowlist through the environment instead of argv.
 guard_fixture="$here/tests/fixtures/launcher-env-guard.v26g.sh"
-guard_fixture_sha=b5192ce9510895be69c1dc76b23dc218feeb470b6a5b0c3f465f68ee61f64793
+guard_fixture_sha=a600b2183c675e46d433676100b9b9e36356afd20f821549466da0afb460da95
 guard_block_of() { awk '/^for env_var in /,/^done$/' "$1" 2>/dev/null; }
 guard_shape_ok() { case "$1" in 'for env_var in '*'PI_CONFIG_FILES'*'done') return 0 ;; *) return 1 ;; esac; }
 digest_of() { printf '%s\n' "$1" | shasum -a 256 | awk '{print $1}'; }
@@ -94,6 +94,22 @@ fixture_guard="$(guard_block_of "$guard_fixture")"
 [ -n "$fixture_guard" ] && guard_shape_ok "$fixture_guard" && [ "$(digest_of "$fixture_guard")" = "$guard_fixture_sha" ] \
   && ok "env-guard fixture present, shape ok, digest pinned ($guard_fixture_sha)" \
   || bad "env-guard fixture missing/empty/wrong shape/digest mismatch: $guard_fixture"
+# 6b. v26h-r2 MEDIUM fix (issue #362): the guard must refuse when a listed
+# variable is DEFINED, not only when it is non-empty -- an explicitly-empty
+# CLAUDE_CONFIG_DIR resolves to the process cwd rather than the default
+# ~/.claude (docs/operations/launcher-release-notes.md), so a
+# `[ -z "$v" ]`-shaped non-empty-only test misses that exact bypass.
+# Static shape check only (fixture text, no execution with env vars set --
+# a prior guard-smoke attempt with real env vars set was refused by herdr
+# as human-only and is not repackaged here): the pinned contract must use
+# the existence test `${!env_var+x}` (expands to `x` iff SET, regardless of
+# value -- so `VAR=""` is refused same as `VAR=anything`), not a value test
+# like `${!env_var:-}` (misses `VAR=""`).
+if printf '%s' "$fixture_guard" | grep -q '{!env_var+x}' && ! printf '%s' "$fixture_guard" | grep -q '{!env_var:-}'; then
+  ok "fixture case: guard tests variable PRESENCE, so VAR=\"\" is refused (not only non-empty)"
+else
+  bad "fixture guard tests non-empty only -- a refused variable set to the empty string (e.g. CLAUDE_CONFIG_DIR=\"\") would bypass the guard"
+fi
 rel_guard="$(guard_block_of "$omp")"
 if [ -n "$rel_guard" ] && guard_shape_ok "$rel_guard"; then
   [ "$(digest_of "$rel_guard")" = "$guard_fixture_sha" ] \
