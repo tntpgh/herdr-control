@@ -24,6 +24,7 @@ the standing-grant restart rule's exact `release_reason == "expired"` check
 """
 from __future__ import annotations
 
+import math
 import time
 
 import owner_lease as ol
@@ -62,11 +63,11 @@ def plan_reap(conn, pane_snapshot, snapshot_age_s, now=None,
         if not isinstance(pane_id, str) or not isinstance(record, dict):
             return {"status": "skip", "reason": "malformed_snapshot"}
         birth = record.get("birth")
-        if not isinstance(birth, str) or not birth:
+        if not isinstance(birth, str) or not ol.BIRTH_RE.match(birth):
             return {"status": "skip", "reason": "unknown_birth"}
     if not isinstance(snapshot_age_s, (int, float)) or isinstance(snapshot_age_s, bool):
         return {"status": "skip", "reason": "stale_snapshot"}
-    if snapshot_age_s < 0 or snapshot_age_s > max_snapshot_age_s:
+    if not (math.isfinite(snapshot_age_s) and 0 <= snapshot_age_s <= max_snapshot_age_s):
         return {"status": "skip", "reason": "stale_snapshot"}
 
     now = time.time() if now is None else now

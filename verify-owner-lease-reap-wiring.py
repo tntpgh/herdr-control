@@ -6,6 +6,7 @@ Prints OK/FAIL per case; exit 1 on any FAIL.
   TMPDIR=tmp/test-tmp python3 verify-owner-lease-reap-wiring.py
 """
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -137,6 +138,35 @@ ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, S("a"), now=T0)
 plan = olr.plan_reap(c, {}, snapshot_age_s=1, now=T0 + TTL + 1)
 case("probe_genuinely_dead_pane_is_candidate: expired lease excluded from candidates",
      plan["status"] == "ok" and plan["candidates"] == [])
+c.close()
+
+# ---- probe_whitespace_birth_skips_whole_tick ----
+# A live, unexpired holder whose pane record has a whitespace-only (non-empty
+# but malformed) birth is not the real birth: it must skip the WHOLE tick,
+# not be treated as "known" just because the string is truthy.
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, S("a"), now=T0)
+snapshot = {"w1:p1": {"pane_id": "w1:p1", "birth": "   "}}
+plan = olr.plan_reap(c, snapshot, snapshot_age_s=1, now=T0 + 10)
+case("probe_whitespace_birth_skips_whole_tick: status=skip",
+     plan["status"] == "skip")
+case("probe_whitespace_birth_skips_whole_tick: reason=unknown_birth",
+     plan.get("reason") == "unknown_birth")
+case("probe_whitespace_birth_skips_whole_tick: holder still live",
+     ol._live(c, "kb", T0 + 10) is not None)
+c.close()
+
+# ---- probe_nan_age_skips ----
+# NaN fails every ordered comparison, so a naive `< 0 or > max` check lets it
+# through. inf/-inf must also skip (they already did under the old
+# comparison, but math.isfinite() makes the intent explicit and covers both
+# in one guard).
+_, c = fresh()
+ol.claim_initial(c, "kb", "w1:p1", "term_abc123", TTL, S("a"), now=T0)
+for bad_age in (math.nan, math.inf, -math.inf):
+    plan = olr.plan_reap(c, {}, snapshot_age_s=bad_age, now=T0 + 10)
+    case(f"probe_nan_age_skips: snapshot_age_s={bad_age!r} skips",
+         plan["status"] == "skip" and plan["reason"] == "stale_snapshot")
 c.close()
 
 print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing of {TOTAL[0]}")
