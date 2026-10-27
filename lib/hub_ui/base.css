@@ -113,7 +113,21 @@ html[data-view=ship] #overview-view{display:none}
 .ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
 .ship-mask-top{top:0;left:0;right:0;height:9%}
 .ship-mask-bottom{bottom:0;left:0;right:0;height:13%}
-.ship-mask-side{top:9%;bottom:13%;right:0;width:26%}
+/* conductor browser measure of 9d7c9bf (not a numbered REVIEW-*.md this
+   round): one continuous full-height side
+   mask read as a sidebar "gutter" beside the art rather than badges
+   sitting on the room rows -- real art showed on the left 74%, a flat
+   strip on the right 26% for the whole height, with no visual tie back to
+   each room. Five per-row patches instead, each only tall enough to cover
+   that row's baked status pill, same top:% as the matching pin so the
+   patch sits directly behind it (pin+patch read as one small badge pinned
+   to that row), with real art visible between rows above/below. */
+.ship-mask-row{top:0;right:0;width:26%;height:13%}
+.ship-mask-row[data-station=bridge]{top:5%}
+.ship-mask-row[data-station=projectdeck]{top:23%}
+.ship-mask-row[data-station=buildbay]{top:41%}
+.ship-mask-row[data-station=scout]{top:59%}
+.ship-mask-row[data-station=qualitygate]{top:77%}
 /* Small, real hotspots over the masked status-card zone -- one per room,
    non-overlapping (each confined to its own row band), linking to the
    matching .room card's real status below. Position percentages are the
@@ -143,10 +157,18 @@ html[data-view=ship] #overview-view{display:none}
    asserts this). .room-list is only ever present when hasArt (the art +
    pins exist to pick a room from); the plain theme's .hull has no pins, so
    every room stays visible there, unaffected by this rule. */
-.room-list>.room{display:none}
-.room-list>.room.selected{display:grid}
-.room-list:has(.room:target)>.room{display:none}
-.room-list:has(.room:target)>.room:target{display:grid}
+/* !important: conductor's browser measure of 9d7c9bf showed all 5 rooms
+   still visible (at load, and with #room-buildbay active) despite the
+   specificity of .room-list>.room (0,2,0) already outranking .room's own
+   display:grid (0,1,0) on paper. Unable to reproduce or instrument this in
+   a real browser (no browser tool available to this worker); !important
+   removes any possible ambiguity about which display value wins, rather
+   than leave a rule this worker cannot verify depending on cascade
+   subtlety it cannot test. */
+.room-list>.room{display:none!important}
+.room-list>.room.selected{display:grid!important}
+.room-list:has(.room:target)>.room{display:none!important}
+.room-list:has(.room:target)>.room:target{display:grid!important}
 .room-head{display:flex;gap:10px;align-items:flex-start}
 .room-head h3{margin:0 0 2px;font-size:14px}
 .room-place{font-size:12px;color:var(--muted);margin:0}
@@ -245,7 +267,6 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
   table{display:block;overflow-x:auto}
   .ship-art{aspect-ratio:auto;border:0;background:none}
   .ship-art>img{display:none}
-  .ship-art .room{position:static;width:auto;margin-bottom:8px}
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
 }
