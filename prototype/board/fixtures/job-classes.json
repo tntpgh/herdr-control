@@ -1,0 +1,22 @@
+{
+  "source": "lib/agent-profiles.sh:135 KNOWN_JOB_CLASSES; tiers from lib/agent-profiles.sh:182-217 model_for_agent (omp column)",
+  "classes": [
+    { "id": "plan",        "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "architect",   "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "design",      "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "deep-review", "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "review",      "tier": "standard-high", "model_hint": "sonnet:high" },
+    { "id": "implement",   "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "debug",       "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "code",        "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "docs",        "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "research",    "tier": "standard",      "model_hint": "sonnet:medium (default row)" },
+    { "id": "explore",     "tier": "fast",          "model_hint": "haiku:low" },
+    { "id": "quick",       "tier": "fast",          "model_hint": "haiku:low" },
+    { "id": "mechanical",  "tier": "fast",          "model_hint": "haiku:low" }
+  ],
+  "unrecognized": {
+    "is_class": false,
+    "note": "Any other string. Not a job class. Secrets withheld (fail-closed, lib/agent-profiles.sh:140-143); model falls to the default row."
+  }
+}

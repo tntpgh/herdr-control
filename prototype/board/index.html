@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; img-src data:">
+<title>herdr control board — prototype (synthetic data)</title>
+<link rel="stylesheet" href="board.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to board</a>
+<header class="topbar">
+  <h1>herdr control board <span class="proto">prototype · synthetic data · read-only</span></h1>
+  <div class="controls">
+    <fieldset class="layout-pick">
+      <legend>View</legend>
+      <label><input type="radio" name="layout" value="ship" checked> Ship (B)</label>
+      <label><input type="radio" name="layout" value="overview"> Captain overview (A)</label>
+    </fieldset>
+    <fieldset>
+      <legend>Display</legend>
+      <label><input type="checkbox" id="opt-plain"> Plain dark mode</label>
+      <label><input type="checkbox" id="opt-reduce"> Reduce motion</label>
+      <label><input type="checkbox" id="opt-flavour"> Flavour text</label>
+    </fieldset>
+  </div>
+</header>
+<p class="banner" role="note">Synthetic snapshot as of <time id="asof"></time>. Nothing on this page can approve, deny, dispatch or publish. The look is a draft, not a final design.</p>
+<p class="errors" id="errors" role="alert" hidden></p>
+<main id="main">
+  <section id="ship" aria-labelledby="ship-h">
+    <h2 id="ship-h" tabindex="-1">The ship — crew at their stations</h2>
+    <div id="ship-body"></div>
+  </section>
+  <section id="overview" aria-labelledby="overview-h" hidden>
+    <h2 id="overview-h" tabindex="-1">Captain's overview</h2>
+    <div id="overview-body"></div>
+  </section>
+  <section id="drawer" aria-labelledby="drawer-h" hidden></section>
+  <section id="decision" aria-labelledby="decision-h" hidden></section>
+  <section id="gbp" aria-labelledby="gbp-h">
+    <h2 id="gbp-h">Business Profile drafts</h2>
+    <div id="gbp-body"></div>
+  </section>
+  <section id="bounties" aria-labelledby="bounties-h">
+    <h2 id="bounties-h">Bounty board</h2>
+    <div id="bounties-body"></div>
+  </section>
+  <section id="legend" aria-labelledby="legend-h">
+    <h2 id="legend-h">Badges and states</h2>
+    <div id="legend-body"></div>
+  </section>
+</main>
+<!-- inline-data:begin (generated from fixtures/*.json and themes/*/theme.json by sync.py; do not edit by hand) -->
+<script type="application/json" id="data-board" data-src="fixtures/board.json">
+{
+  "synthetic": true,
+  "generated_at": "2026-10-26T20:00:00Z",
+  "note": "Synthetic snapshot. Every project, lane, worker and number here is made up. Ages are measured from generated_at, not the wall clock.",
+  "projects": [
+    {
+      "id": "orchard-api",
+      "name": "orchard-api (synthetic)",
+      "summary": "Checkout refactor under way; one release waiting on a live check.",
+      "lead": "orchestrator@orchard-api (synthetic pane)",
+      "lanes": [
+        {
+          "id": "checkout-refactor",
+          "name": "Checkout refactor",
+          "kind": "build",
+          "cost_today_usd": 4.31,
+          "cards": [
+            { "id": "c1", "label": "implement:checkout/split-cart", "job_class": "implement",
+              "engine": { "kind": "task", "state": "running", "source": "live", "updated_at": "2026-10-26T19:58:00Z" },
+              "cost_today_usd": 1.84 },
+            { "id": "c2", "label": "code:checkout/tax-rounding", "job_class": "code",
+              "engine": { "kind": "owner_request", "state": "queued", "updated_at": "2026-10-26T19:51:00Z" },
+              "queue_position": 2 },
+            { "id": "c3", "label": "debug:checkout/flaky-total", "job_class": "debug",
+              "function_badges": ["debugger"],
+              "engine": { "kind": "task", "state": "running", "source": "stored", "updated_at": "2026-10-26T19:38:00Z" },
+              "cost_today_usd": 0.92 },
+            { "id": "c4", "label": "review:checkout/split-cart", "job_class": "review",
+              "engine": { "kind": "task", "state": "ready_review", "source": "live", "updated_at": "2026-10-26T19:55:00Z" },
+              "review_of": "synthetic PR #12 (open)", "cost_today_usd": 1.55 }
+          ]
+        },
+        {
+          "id": "release-watch",
+          "name": "Release watch",
+          "kind": "release",
+          "function_badges": ["release_watch"],
+          "cost_today_usd": 0.47,
+          "cards": [
+            { "id": "c5", "label": "plan:release/v2.3-synthetic", "job_class": "plan",
+              "function_badges": ["release_watch"],
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T19:20:00Z",
+                          "closure_reason": "shipped", "closure_proof": ".handoffs/PROOF.md#release-v2-3" },
+              "deploy": { "required": true, "verified": false, "note": "Deployed to the synthetic staging host; no live check has run." } },
+            { "id": "c6", "label": "quick:release/smoke-v2.2", "job_class": "quick",
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T17:05:00Z",
+                          "closure_reason": "shipped", "closure_proof": ".handoffs/PROOF.md#smoke-v2-2" },
+              "deploy": { "required": true, "verified": true, "note": "Live check passed: health endpoint returned 200 (synthetic)." } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lighthouse-docs",
+      "name": "lighthouse-docs (synthetic)",
+      "summary": "One decision waiting on you; archive sweep timed out and one check failed.",
+      "lead": "orchestrator@lighthouse-docs (synthetic pane)",
+      "lanes": [
+        {
+          "id": "docs-refresh",
+          "name": "Docs refresh",
+          "kind": "build",
+          "cost_today_usd": 2.06,
+          "cards": [
+            { "id": "c7", "label": "docs:guide/onboarding-synthetic", "job_class": "docs",
+              "engine": { "kind": "task", "state": "blocked", "source": "live", "updated_at": "2026-10-26T19:57:00Z" },
+              "decision_id": "d1", "cost_today_usd": 0.71 },
+            { "id": "c8", "label": "research:guide/source-survey", "job_class": "research",
+              "engine": { "kind": "owner_request", "state": "held", "updated_at": "2026-10-26T18:40:00Z" },
+              "hold": { "by": "the project conductor (synthetic)", "reason": "Waiting for the docs outline to be frozen first." } },
+            { "id": "c9", "label": "explore:guide/link-audit", "job_class": "explore",
+              "engine": { "kind": "task", "state": "stalled", "source": "live", "updated_at": "2026-10-26T19:30:00Z" },
+              "owes": "Wrote ANSWER.md 30 minutes ago; the conductor has not acknowledged it.", "cost_today_usd": 0.18 }
+          ]
+        },
+        {
+          "id": "archive-sweep",
+          "name": "Archive sweep",
+          "kind": "maintenance",
+          "cost_today_usd": 0.33,
+          "cards": [
+            { "id": "c10", "label": "mechanical:archive/old-worktrees", "job_class": "mechanical",
+              "engine": { "kind": "owner_request", "state": "timeout", "updated_at": "2026-10-26T18:00:00Z" },
+              "decision_id": "d2" },
+            { "id": "c11", "label": "triage:archive/broken-links", "job_class": "triage",
+              "engine": { "kind": "task", "state": "failed", "source": "stored", "updated_at": "2026-10-26T18:45:00Z" },
+              "failure": "Verify script exited 1: 2 of 14 checks failed (synthetic).", "cost_today_usd": 0.33 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbor-ledger",
+      "name": "harbor-ledger (synthetic)",
+      "summary": "Auth hardening: one request denied, design work running.",
+      "lead": "orchestrator@harbor-ledger (synthetic pane)",
+      "lanes": [
+        {
+          "id": "auth-hardening",
+          "name": "Auth hardening",
+          "kind": "build",
+          "cost_today_usd": 6.12,
+          "cards": [
+            { "id": "c12", "label": "deep-review:auth/session-rotation", "job_class": "deep-review",
+              "engine": { "kind": "dispatch_auth", "state": "denied", "updated_at": "2026-10-26T19:40:00Z" },
+              "decision_id": "d3", "cost_today_usd": 2.40 },
+            { "id": "c13", "label": "architect:auth/token-store", "job_class": "architect",
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T16:10:00Z",
+                          "closure_reason": "handed_off_to:implement", "closure_proof": null },
+              "decision_id": "d4", "cost_today_usd": 1.95 },
+            { "id": "c14", "label": "design:auth/login-screen", "job_class": "design",
+              "engine": { "kind": "task", "state": "running", "source": "live", "updated_at": "2026-10-26T19:59:00Z" },
+              "cost_today_usd": 1.12 },
+            { "id": "c15", "label": "implement:auth/legacy-cookie", "job_class": "implement",
+              "engine": { "kind": "task", "state": "cancelled", "source": "stored", "updated_at": "2026-10-26T15:00:00Z",
+                          "closure_reason": "canceled" },
+              "cost_today_usd": 0.65 }
+          ]
+        }
+      ]
+    }
+  ]
+}
+</script>
+<script type="application/json" id="data-decisions" data-src="fixtures/decisions.json">
+{
+  "synthetic": true,
+  "note": "Shapes follow hub.py form rows (status open|answered|cancelled|expired|gone). Request text is shown verbatim. This board cannot answer anything.",
+  "decisions": [
+    {
+      "id": "d1",
+      "card_id": "c7",
+      "status": "open",
+      "requested_at": "2026-10-26T19:57:00Z",
+      "expires_at": "2026-10-26T21:57:00Z",
+      "request_text": "Allow tool: write\n  path: docs/guides/onboarding-synthetic.md\n  reason: file is outside the task's declared writes\n\n[Approve]  [Deny]",
+      "answer": null,
+      "answered_at": null,
+      "answered_via": null
+    },
+    {
+      "id": "d2",
+      "card_id": "c10",
+      "status": "expired",
+      "requested_at": "2026-10-26T16:00:00Z",
+      "expires_at": "2026-10-26T18:00:00Z",
+      "request_text": "Archive 6 worktrees older than 30 days in lighthouse-docs (synthetic)?\n  each one has no unpushed commits\n\n[Approve]  [Deny]",
+      "answer": null,
+      "answered_at": null,
+      "answered_via": null
+    },
+    {
+      "id": "d3",
+      "card_id": "c12",
+      "status": "answered",
+      "requested_at": "2026-10-26T19:31:00Z",
+      "expires_at": "2026-10-26T21:31:00Z",
+      "request_text": "Allow tool: bash\n  command: cat ../shared-config/session-keys.example\n  reason: read a file outside the worktree\n\n[Approve]  [Deny]",
+      "answer": "deny",
+      "answer_note": "Reads outside the worktree. Use the fixture copy instead.",
+      "answered_at": "2026-10-26T19:40:00Z",
+      "answered_via": "hub"
+    },
+    {
+      "id": "d4",
+      "card_id": "c13",
+      "status": "answered",
+      "requested_at": "2026-10-26T15:30:00Z",
+      "expires_at": "2026-10-26T17:30:00Z",
+      "request_text": "Hand the token-store design to an implement worker?\n  design doc: docs/token-store-synthetic.md\n\n[Approve]  [Deny]",
+      "answer": "approve",
+      "answer_note": "",
+      "answered_at": "2026-10-26T16:05:00Z",
+      "answered_via": "dashboard"
+    }
+  ]
+}
+</script>
+<script type="application/json" id="data-job-classes" data-src="fixtures/job-classes.json">
+{
+  "source": "lib/agent-profiles.sh:135 KNOWN_JOB_CLASSES; tiers from lib/agent-profiles.sh:182-217 model_for_agent (omp column)",
+  "classes": [
+    { "id": "plan",        "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "architect",   "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "design",      "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "deep-review", "tier": "deep",          "model_hint": "opus:high" },
+    { "id": "review",      "tier": "standard-high", "model_hint": "sonnet:high" },
+    { "id": "implement",   "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "debug",       "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "code",        "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "docs",        "tier": "standard",      "model_hint": "sonnet:medium" },
+    { "id": "research",    "tier": "standard",      "model_hint": "sonnet:medium (default row)" },
+    { "id": "explore",     "tier": "fast",          "model_hint": "haiku:low" },
+    { "id": "quick",       "tier": "fast",          "model_hint": "haiku:low" },
+    { "id": "mechanical",  "tier": "fast",          "model_hint": "haiku:low" }
+  ],
+  "unrecognized": {
+    "is_class": false,
+    "note": "Any other string. Not a job class. Secrets withheld (fail-closed, lib/agent-profiles.sh:140-143); model falls to the default row."
+  }
+}
+</script>
+<script type="application/json" id="data-gbp-drafts" data-src="fixtures/gbp-drafts.json">
+{
+  "synthetic": true,
+  "note": "Google Business Profile post drafts. Synthetic text, no real listing, client, street or photo. Nothing here can publish.",
+  "review_statuses": ["draft", "needs_review", "approved_for_publish", "published_unverified"],
+  "drafts": [
+    {
+      "id": "g1",
+      "lane": "listing_story",
+      "title": "A light-filled three-bedroom in Maple Terrace (synthetic)",
+      "copy": "Morning sun in the kitchen, a fenced yard, and a five-minute walk to the park. Open house this Saturday, 1-3 pm. (Synthetic draft: no real listing.)",
+      "image": { "suggestion": "Wide shot of the kitchen at morning light", "rights_status": "owned", "rights_note": "Shot by the team photographer under a work-for-hire agreement (synthetic)." },
+      "source": { "name": "Synthetic listing fixture LS-0001", "freshness": { "result": "pass", "detail": "Listing still marked active in the fixture.", "checked_on": "2026-10-26" } },
+      "proposed_publish_date": "2026-10-28",
+      "review_status": "needs_review"
+    },
+    {
+      "id": "g2",
+      "lane": "team_update",
+      "title": "Welcome to our new transaction coordinator (synthetic)",
+      "copy": "Our team grew this month. A new coordinator now keeps every closing date on track so clients get one clear point of contact. (Synthetic draft: no real person.)",
+      "image": { "suggestion": "Group photo at the office front desk", "rights_status": "needs_release", "rights_note": "People are identifiable; a signed photo release is not on file." },
+      "source": { "name": "Synthetic team roster fixture", "freshness": { "result": "pass", "detail": "Roster entry dated this month.", "checked_on": "2026-10-25" } },
+      "proposed_publish_date": "2026-10-30",
+      "review_status": "approved_for_publish"
+    },
+    {
+      "id": "g3",
+      "lane": "guide",
+      "title": "Five things to check before a home inspection (synthetic)",
+      "copy": "Clear access to the furnace and electrical panel, test every smoke detector, and keep a list of past repairs handy. Full checklist in the guide. (Synthetic draft.)",
+      "image": { "suggestion": "Close-up of a checklist on a clipboard", "rights_status": "unconfirmed", "rights_note": "Stock image; licence not confirmed for business-profile use." },
+      "source": { "name": "Synthetic guide page G-07", "freshness": { "result": "stale", "detail": "Guide last edited 14 months ago; one item references a retired form.", "checked_on": "2026-10-24" } },
+      "proposed_publish_date": "2026-10-22",
+      "review_status": "published_unverified",
+      "published_note": "Marked published on 2026-10-22; nobody has confirmed the post is live on the profile."
+    }
+  ]
+}
+</script>
+<script type="application/json" id="data-bounties" data-src="fixtures/bounties.json">
+{
+  "synthetic": true,
+  "note": "Bounty cards describe work and the evidence that closes it. No money, rewards, points or revenue — and nothing is earned by approving anything.",
+  "statuses": ["open", "in_progress", "awaiting_evidence", "verified"],
+  "bounties": [
+    {
+      "id": "b1",
+      "kind": "build",
+      "objective": "Remove the duplicate alert path so each synthetic checkout error raises exactly one alert.",
+      "owner": "orchestrator@orchard-api (synthetic pane) — project lead",
+      "function": "debug",
+      "status": "open",
+      "evidence_needed": "Verify-script output over 24 hours showing one alert per error event, plus the merged PR and its merge sha.",
+      "verified_completion": { "verified": false, "by": null, "proof": null, "note": "Not started." }
+    },
+    {
+      "id": "b2",
+      "kind": "archive",
+      "objective": "Archive lighthouse-docs worktrees older than 30 days that hold no unpushed work (synthetic).",
+      "owner": "orchestrator@lighthouse-docs (synthetic pane) — project lead",
+      "function": "mechanical",
+      "status": "awaiting_evidence",
+      "evidence_needed": "Before/after worktree listing and the archive manifest showing every archived branch exists on the remote.",
+      "verified_completion": { "verified": false, "by": null, "proof": null, "note": "Evidence submitted; nobody has checked it yet." }
+    }
+  ]
+}
+</script>
+<script type="application/json" id="data-theme-bebop" data-src="themes/bebop/theme.json">
+{
+  "id": "bebop",
+  "name": "Bebop (private theme)",
+  "presentation_only": "Characters and badges are decoration. They never change permissions, ownership, approval paths or state meaning.",
+  "palette": {
+    "--bg": "#0f1626",
+    "--surface": "#18223a",
+    "--surface-2": "#212d48",
+    "--fg": "#e9e4d8",
+    "--muted": "#b3ab98",
+    "--accent": "#d9a441",
+    "--brass": "#c29d66",
+    "--border": "#3a4866",
+    "--ok": "#86c79a",
+    "--warn": "#e2b84f",
+    "--bad": "#f08a7c",
+    "--info": "#94b6ec"
+  },
+  "sprite_style": {
+    "note": "Look is NOT final: Terrence is choosing between two root mockups. Swap these knobs (or the per-character sprite params) to restyle without touching board.js.",
+    "outline": "#0b1222",
+    "outline_width": 1.5,
+    "head_radius": 9,
+    "corner_radius": 4,
+    "frame": "#a8875a",
+    "frame_fill": "#212d48"
+  },
+  "characters": {
+    "jet":     { "name": "Jet",     "role": "Captain — top conductor",
+                 "look": "Jet Black: bald, black beard, cybernetic left arm, dark jacket",
+                 "sprite": { "body": "human", "build": "broad", "hair": "bald", "hair_color": "#1c1714", "skin": "#c08a5c", "coat": "#2b3445", "shirt": "#e9dcc0", "accent": "#9aa3ad", "extras": ["beard", "metal_arm"] },
+                 "flavour": ["Ship's steady. Mostly.", "Somebody check the release before I check the bonsai."] },
+    "spike":   { "name": "Spike",   "role": "Project lead",
+                 "look": "Spike Spiegel: fluffy dark-green hair, blue suit, yellow shirt, thin black tie",
+                 "sprite": { "body": "human", "build": "tall", "hair": "fluffy", "hair_color": "#1e4a3c", "skin": "#efcfae", "coat": "#2c4f9e", "shirt": "#e8c547", "accent": "#111111", "extras": ["tie"] },
+                 "flavour": ["Stretching before the next bug.", "Lazy until the stack trace gets interesting."] },
+    "faye":    { "name": "Faye",    "role": "Research and opportunities",
+                 "look": "Faye Valentine: purple-black bob, yellow headband, yellow top, red accents",
+                 "sprite": { "body": "human", "build": "slim", "hair": "bob", "hair_color": "#3d2a5c", "skin": "#f2d4b6", "coat": "#f2c230", "shirt": "#f2c230", "accent": "#f2c230", "extras": ["headband", "red_trim"] },
+                 "flavour": ["Three sources, two stale, one keeper.", "I read the fine print so you don't have to."] },
+    "ed":      { "name": "Ed",      "role": "Design and build",
+                 "look": "Radical Edward: spiky red-orange hair, goggles on forehead, white shirt, dark skin",
+                 "sprite": { "body": "human", "build": "thin", "hair": "spiky", "hair_color": "#c8501e", "skin": "#8a5a3a", "coat": "#f5f2ea", "shirt": "#f5f2ea", "accent": "#7d8a99", "extras": ["goggles"] },
+                 "flavour": ["Ed made a branch! Ed made... two branches.", "Compiling at the speed of cartwheels."] },
+    "ein":     { "name": "Ein",     "role": "QA and test",
+                 "look": "Ein: Pembroke Welsh corgi, tan back, white chest, big upright ears",
+                 "sprite": { "body": "dog", "hair": "none", "hair_color": "#c98a3e", "skin": "#c98a3e", "coat": "#f7f0e2", "shirt": "#c98a3e", "accent": "#c0392b", "extras": ["collar"] },
+                 "flavour": ["Sniffed every log line. One smelled off.", "Good boy. Green tests."] },
+    "vicious": { "name": "Vicious", "role": "Independent adversarial review",
+                 "look": "Vicious: long silver hair, long black coat, crow on his shoulder, katana",
+                 "sprite": { "body": "human", "build": "tall", "hair": "long", "hair_color": "#d5d9de", "skin": "#efe2d4", "coat": "#16161c", "shirt": "#16161c", "accent": "#c9ccd1", "extras": ["crow", "katana"] },
+                 "flavour": ["Every line is guilty until reviewed.", "The crow has notes."] }
+  },
+  "guests": {
+    "bigshot":  { "name": "Big Shot",      "role": "Guest — presents new bounty cards",
+                  "look": "Punch from the Big Shot show: cowboy hat, big mustache, western shirt",
+                  "plain_text": "Bounty board",
+                  "appears_for": ["panel:bounties"],
+                  "sprite": { "body": "human", "build": "broad", "hair": "cowboy_hat", "hair_color": "#8a5a2b", "facial": "#2a1d14", "skin": "#d9a877", "coat": "#5a3b25", "shirt": "#e9dcc0", "accent": "#b08d57", "extras": ["mustache"] },
+                  "flavour": ["New card on the board — evidence or it didn't happen."] },
+    "old-guys": { "name": "The three old guys", "role": "Guest cameo — maintenance and archive work",
+                  "look": "Antonio, Carlos and Jobim: three old men in hats, side by side",
+                  "plain_text": "Maintenance / archive",
+                  "appears_for": ["lane:maintenance", "bounty:archive"],
+                  "sprite": { "body": "trio", "hair": "cap", "hair_color": "#5a5248", "skin": "#c9a27e", "coat": "#6b6255", "shirt": "#d8cfbf", "accent": "#e8e4dc", "extras": ["beard"] },
+                  "flavour": ["Back in our day we archived by hand. Uphill."] }
+  },
+  "job_classes": {
+    "plan":        { "character": "jet",     "badge": "Planning" },
+    "architect":   { "character": "jet",     "badge": "Architecture" },
+    "design":      { "character": "ed",      "badge": "Design" },
+    "deep-review": { "character": "vicious", "badge": "Deep review" },
+    "implement":   { "character": "ed",      "badge": "Build" },
+    "debug":       { "character": "spike",   "badge": "Debugger" },
+    "code":        { "character": "ed",      "badge": "Code" },
+    "docs":        { "character": "ed",      "badge": "Docs" },
+    "review":      { "character": "vicious", "badge": "Review" },
+    "explore":     { "character": "faye",    "badge": "Explore" },
+    "quick":       { "character": "ein",     "badge": "Quick check" },
+    "mechanical":  { "character": "ein",     "badge": "Mechanical sweep" },
+    "research":    { "character": "faye",    "badge": "Research" }
+  },
+  "unrecognized": { "character": null, "badge": "Unrecognized job class" },
+  "function_badges": {
+    "captain":       { "character": "jet",   "badge": "Captain" },
+    "release_watch": { "character": "jet",   "badge": "Release watch" },
+    "project_lead":  { "character": "spike", "badge": "Project lead" },
+    "debugger":      { "character": "spike", "badge": "Debugger" }
+  },
+  "panels": {
+    "overview":   "jet",
+    "decisions":  "jet",
+    "gbp_drafts": "faye",
+    "bounties":   "bigshot"
+  },
+  "stations": [
+    { "id": "bridge",   "area": "bridge",   "name": "Bridge",                         "character": "jet",     "job_classes": ["plan", "architect"], "function_badges": ["captain", "release_watch"], "shows": ["decisions"] },
+    { "id": "lounge",   "area": "lounge",   "name": "Lounge",                         "character": "faye",    "job_classes": ["research", "explore"], "shows": ["gbp"] },
+    { "id": "workshop", "area": "workshop", "name": "Ed's terminal nook",             "character": "ed",      "job_classes": ["design", "implement", "code", "docs"] },
+    { "id": "kennel",   "area": "kennel",   "name": "Ein's corner — QA",              "character": "ein",     "job_classes": ["quick", "mechanical"] },
+    { "id": "hangar",   "area": "hangar",   "name": "Hangar — Swordfish bay",         "character": "spike",   "job_classes": ["debug"], "function_badges": ["project_lead", "debugger"], "shows": ["leads"] },
+    { "id": "cargo",    "area": "cargo",    "name": "Cargo hold",                     "character": null, "guest": "old-guys", "job_classes": [], "shows": ["unrecognized", "maintenance"] },
+    { "id": "bounty",   "area": "bounty",   "name": "Big Shot on the lounge screen",  "character": null, "guest": "bigshot", "job_classes": [], "shows": ["bounties"] },
+    { "id": "dock",     "area": "dock",     "name": "Review dock — outside the hull", "character": "vicious", "job_classes": ["review", "deep-review"], "outside": true, "note": "Independent: not crew and not under the captain." }
+  ]
+}
+</script>
+<script type="application/json" id="data-theme-plain" data-src="themes/plain/theme.json">
+{
+  "id": "plain",
+  "name": "Plain dark (high contrast, no characters)",
+  "presentation_only": "Text labels only. Same states, same meanings, same (absent) approval paths as every other theme.",
+  "palette": {
+    "--bg": "#0d0d0d",
+    "--surface": "#161616",
+    "--surface-2": "#1f1f1f",
+    "--fg": "#f2f2f2",
+    "--muted": "#cfcfcf",
+    "--accent": "#ffffff",
+    "--brass": "#e0e0e0",
+    "--border": "#8a8a8a",
+    "--ok": "#f2f2f2",
+    "--warn": "#f2f2f2",
+    "--bad": "#f2f2f2",
+    "--info": "#f2f2f2"
+  },
+  "characters": {},
+  "guests": {
+    "bigshot":  { "name": "Bounty board", "role": "New bounty cards", "plain_text": "Bounty board", "appears_for": ["panel:bounties"], "sprite": null, "flavour": [] },
+    "old-guys": { "name": "Maintenance", "role": "Maintenance and archive work", "plain_text": "Maintenance / archive", "appears_for": ["lane:maintenance", "bounty:archive"], "sprite": null, "flavour": [] }
+  },
+  "job_classes": {
+    "plan":        { "character": null, "badge": "Planning" },
+    "architect":   { "character": null, "badge": "Architecture" },
+    "design":      { "character": null, "badge": "Design" },
+    "deep-review": { "character": null, "badge": "Deep review" },
+    "implement":   { "character": null, "badge": "Build" },
+    "debug":       { "character": null, "badge": "Debugger" },
+    "code":        { "character": null, "badge": "Code" },
+    "docs":        { "character": null, "badge": "Docs" },
+    "review":      { "character": null, "badge": "Review" },
+    "explore":     { "character": null, "badge": "Explore" },
+    "quick":       { "character": null, "badge": "Quick check" },
+    "mechanical":  { "character": null, "badge": "Mechanical sweep" },
+    "research":    { "character": null, "badge": "Research" }
+  },
+  "unrecognized": { "character": null, "badge": "Unrecognized job class" },
+  "function_badges": {
+    "captain":       { "character": null, "badge": "Captain" },
+    "release_watch": { "character": null, "badge": "Release watch" },
+    "project_lead":  { "character": null, "badge": "Project lead" },
+    "debugger":      { "character": null, "badge": "Debugger" }
+  },
+  "panels": {
+    "overview":   null,
+    "decisions":  null,
+    "gbp_drafts": null,
+    "bounties":   null
+  },
+  "stations": [
+    { "id": "bridge",   "area": "bridge",   "name": "Planning and release (captain)",       "character": null, "job_classes": ["plan", "architect"], "function_badges": ["captain", "release_watch"], "shows": ["decisions"] },
+    { "id": "lounge",   "area": "lounge",   "name": "Research and drafts",                  "character": null, "job_classes": ["research", "explore"], "shows": ["gbp"] },
+    { "id": "workshop", "area": "workshop", "name": "Design and build",                     "character": null, "job_classes": ["design", "implement", "code", "docs"] },
+    { "id": "kennel",   "area": "kennel",   "name": "QA and test",                          "character": null, "job_classes": ["quick", "mechanical"] },
+    { "id": "hangar",   "area": "hangar",   "name": "Project leads and debugging",          "character": null, "job_classes": ["debug"], "function_badges": ["project_lead", "debugger"], "shows": ["leads"] },
+    { "id": "cargo",    "area": "cargo",    "name": "Unrecognized jobs and maintenance",    "character": null, "guest": "old-guys", "job_classes": [], "shows": ["unrecognized", "maintenance"] },
+    { "id": "bounty",   "area": "bounty",   "name": "Bounty board",                         "character": null, "guest": "bigshot", "job_classes": [], "shows": ["bounties"] },
+    { "id": "dock",     "area": "dock",     "name": "Independent review (outside the crew)", "character": null, "job_classes": ["review", "deep-review"], "outside": true, "note": "Independent: not crew and not under the captain." }
+  ]
+}
+</script>
+<!-- inline-data:end -->
+<script src="board.js"></script>
+</body>
+</html>
