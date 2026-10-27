@@ -1993,8 +1993,18 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
               return;
             }
             if (lifecycle.startsWith("resolved:")) {
+              // The registry's declared reason (lib/prompt-occurrence.py
+              // refuse-bound's `reason` detail, folded into
+              // resolution_reason by fold_task) is the actual enforcement
+              // text -- "credential-value access remains human-only", a
+              // classify_command verdict, etc. The bare lifecycle string
+              // ("resolved:declined") is only the fallback for a
+              // resolution that never carried one (the ordinary
+              // conductor-Deny path, record_completed/withdrawn).
+              const declaredReason = typeof state?.resolution_reason === "string" && state.resolution_reason
+                ? state.resolution_reason : lifecycle;
               resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
-                argumentsDigest: coreDigest, approved: false, reason: lifecycle });
+                argumentsDigest: coreDigest, approved: false, reason: declaredReason });
               return;
             }
             if (Date.now() < deadline) launchBoundApprovalPoll(poll, denyPollFailure, 500);
