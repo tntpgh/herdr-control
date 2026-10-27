@@ -90,45 +90,40 @@ html[data-view=ship] #overview-view{display:none}
 /* Ship (layout B) */
 .ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
 .ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600}
-/* r12 iteration (tmp/in/ITERATE-r12.md item 1, T 21:22 "needs... more of
-   its graphics, from the first one, including the top area"): the Ship
-   view used to mask away the top strip of the real ship.png art entirely
-   (.ship-mask-top, hiding the baked header/nav band inside .ship-art's own
-   crop). This banner reuses that SAME real asset -- no new graphic, the
-   repo has exactly one ship image per theme (lib/hub_ui/themes/<id>/ship.png) -- but at
-   FULL image width (not the 998px-wide .ship-art crop) so it spans the
-   whole Ship column like the reference's header strip does, showing the
-   real starfield/hull art as a decorative backdrop behind real DOM text
-   (theme name + theme.json's tagline field, not baked pixels, not a new
-   fake nav -- the real functional nav already lives in <header> above).
-   aspect-ratio 1536/100 keeps object-fit:cover showing only the image's
-   top ~9.8% (matching .ship-mask-top's own estimate of that band's real
-   height), the same "generous, by-eye, unverified pixel-for-pixel"
-   caveat as every other crop % in this file (no browser tool). */
-.ship-hero{position:relative;overflow:hidden;aspect-ratio:1536/100;border-radius:10px;
+/* r13 fix (tmp/in/FIX-r13.md item 1, conductor real-Chromium measure of
+   65b4f0d): the r12 hero cropped exactly the image's baked nav/title/badge
+   strip (y:0-~70px of 1024) -- that whole band IS baked UI text, full
+   width, no clean illustration-only strip exists there to crop instead.
+   Taller crop (y:0-~340px) + a flat-colour .ship-hero-mask over the
+   baked-UI portion (top 32%, ~109 image px -- generous margin over the
+   ~70-90px .ship-mask-top estimate below) puts the real title/tagline
+   there instead, with no collision with baked text, while the untouched
+   taller hero shows genuine Bridge-room illustration -- "more graphics...
+   including the top area" without baking/faking anything. Same precedent
+   as .ship-mask-row over .ship-art below. */
+.ship-hero{position:relative;overflow:hidden;aspect-ratio:1536/340;border-radius:10px;
   border:2px solid var(--brass);margin:0 0 12px;background:var(--surface-2);
-  background-size:cover;background-position:0 0;display:flex;align-items:center}
-.ship-hero::before{content:"";position:absolute;inset:0;
-  background:linear-gradient(90deg,rgba(0,0,0,.6),rgba(0,0,0,.08) 55%)}
-.ship-hero-text{position:relative;z-index:1;padding:0 18px;color:#f3efe4;
-  text-shadow:0 1px 3px rgba(0,0,0,.85)}
+  background-size:cover;background-position:0 0}
+.ship-hero-mask{position:absolute;top:0;left:0;right:0;height:32%;background:var(--surface-2);z-index:1}
+.ship-hero-text{position:relative;z-index:2;padding:10px 18px;color:var(--fg)}
 .ship-hero-text h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
-.ship-hero-text p{margin:2px 0 0;font-size:11px;opacity:.85}
+.ship-hero-text p{margin:2px 0 0;font-size:11px;color:var(--muted)}
 .ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
 .hull,.room-list{display:grid;gap:10px}
-/* the approved reference image, cropped to its left (ship) region --
-   object-fit:cover scales the (untouched) 1536x1024 PNG to fill the
-   container exactly (no gaps, no manual width math to get wrong), cropped
-   from object-position's anchor; 0 0 keeps the top-left corner (the ship
-   cutaway), cropping off the right portion (Big Shot art, not used here).
-   Replaced a manual `width:153.9%` calc (998/1536=.6497 crop ratio) that
-   the conductor's browser measure of 9d7c9bf showed left a ~160px gap on
-   the right and a band above the image -- this worker could not reproduce
-   or instrument the exact cause (no browser tool); object-fit:cover is the
-   browser-native, spec-guaranteed way to fill a box from an image without
-   that risk. */
-.ship-art{position:relative;overflow:hidden;aspect-ratio:998/1024;border-radius:10px;border:2px solid var(--brass);background:var(--surface-2)}
-.ship-art>img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:0 0;display:block}
+/* r13 fix (tmp/in/FIX-r13.md item 2): conductor's real-Chromium measure of
+   65b4f0d showed .room-pin still sitting in a gutter right of the art
+   (same symptom as the r9 round's residual ~70px band, never actually
+   closed) -- the <img object-fit:cover> swap in that round did not
+   reliably fill .ship-art's box in a real browser despite being
+   spec-correct on paper. This round's own .ship-hero (background-image +
+   background-size:cover, no <img> at all) was independently measured as
+   filling its own box with no gap in the SAME screenshot set -- switching
+   .ship-art to the identical technique instead of guessing at a third
+   unverified approach. The approved reference image, cropped to its left
+   (ship) region: object-position 0 0 keeps the top-left corner (the ship
+   cutaway), cropping off the right portion (Big Shot art, not used here). */
+.ship-art{position:relative;overflow:hidden;aspect-ratio:998/1024;border-radius:10px;border:2px solid var(--brass);
+  background-color:var(--surface-2);background-size:cover;background-position:0 0}
 /* r6 review (tmp/in/REVIEW-r6.md, real Chromium render): the reference PNG
    has its own baked-in UI inside this crop -- a Ship/Projects/Bounties nav
    strip across the top, a status pill per room on the right ("Working",
@@ -331,7 +326,7 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
      .ship-art .room{position:static} mobile override did for room cards
      before the r6 redesign. */
   .ship-art{aspect-ratio:auto;border:0;background:none}
-  .ship-art>img,.room-pin,.ship-mask{display:none}
+  .room-pin,.ship-mask{display:none}
   /* with .room-pin hidden, #room-<id> :target links no longer exist on
      this breakpoint -- the only way to reach a non-default room. Revert to
      every room visible, stacked (the pre-progressive-disclosure behaviour,

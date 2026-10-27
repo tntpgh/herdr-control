@@ -32,7 +32,9 @@ var hp = HubUI.renderShip(live, themes.plain, { reduce: false });
 ok('plain theme: no drawings', hp.indexOf('<svg') === -1);
 ok('plain theme: same state labels', live.tasks.every(function (t) { return hp.indexOf(esc(live.display[t.display].label)) !== -1; }));
 ok('bebop theme: ship art drawn (same-origin static route, not inlined)',
-  h.indexOf('class="ship-art"') !== -1 && /<img src="\/static\/ship-[0-9a-f]{8}\.png"/.test(h) && h.indexOf('data:image/png;base64') === -1);
+  h.indexOf('class="ship-art"') !== -1 &&
+  /(<img src="\/static\/ship-[0-9a-f]{8}\.png"|background-image:url\(\/static\/ship-[0-9a-f]{8}\.png\))/.test(h) &&
+  h.indexOf('data:image/png;base64') === -1);
 var maint = h.split('<h3>Maintenance log')[1] || '';
 ok('unrecognized task sits in the maintenance panel', maint.indexOf('hotfix-ad-hoc') !== -1);
 ok('unrecognized badge shown', maint.indexOf('badge unrec') !== -1);
