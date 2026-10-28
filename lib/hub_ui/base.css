@@ -8,8 +8,21 @@ main:focus{outline:none}
 .skip:focus{left:.5em}
 .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
-/* header + nav */
-header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 20px;border-bottom:2px solid var(--brass);background:var(--surface)}
+/* header + nav
+
+   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 4, found while fixing
+   item 4): this was a bare `header{...}` tag selector, so it also
+   matched the <header class=room-head> each room renders deep inside
+   <main> (lib/hub_ui/ui.js roomHtml) -- the page's own top nav bar
+   styling (background:var(--surface), a 2px brass bottom border) was
+   leaking into every room's detail header too. Mostly invisible before
+   because .room's own card background/border (removed just above, same
+   round) visually absorbed it; stripping the card chrome made the leak
+   the dominant thing left behind. The chrome() page shell
+   (lib/hub_ui/__init__.py) renders the real header as a direct child of
+   <body>, before <main> -- body>header scopes to exactly that one
+   element and no longer reaches into room-head. */
+body>header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 20px;border-bottom:2px solid var(--brass);background:var(--surface)}
 /* r15 fix (tmp/in/FIX-r15.md item 3, conductor measure at 260px: "nav
    chips overflow"): flex items default to min-width:auto, which floors
    their shrinkability at their own content's intrinsic width even inside
@@ -261,17 +274,35 @@ html[data-view=ship] #overview-view{display:none}
    the composition. Swapped the flat var(--surface-2) fill (a card-navy,
    not a sky colour) for a radial-gradient feather using a sky-blue
    sampled directly from the unmasked art with tmp/png_probe.py (a
-   stdlib-only PNG decoder) near the caption's own computed band, fully
-   opaque at the centre (where the caption's letters actually sit) fading
-   to transparent by the edge -- no hard boundary anywhere. Tightened from
-   the r17 box (top:6% height:9% width:58%, "generous rather than tight")
-   down close to the computed 7.8-13.4% band and to the caption's actual
-   narrower width, now that the edges fade instead of needing margin to
-   hide a hard cut. */
-.ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
-.ship-mask-caption{top:7%;left:0;width:52%;height:8%;background:none;
-  background-image:radial-gradient(ellipse at center,rgba(13,36,78,1) 0%,rgba(13,36,78,1) 72%,rgba(13,36,78,0) 100%)}
-.ship-art-title{position:absolute;z-index:2;top:0;left:0;max-width:62%;padding:10px 14px;color:#fff;
+   stdlib-only PNG decoder) near the caption's own computed band.
+
+   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 2, conductor real-
+   Chromium re-measure of f5c8422): still "a hard-edged dark rectangle",
+   and explicit this time that masking itself is the wrong approach --
+   "crop/offset the art so the baked caption is outside the visible
+   area, or leave it unmasked". Re-cropping turned out not to be viable:
+   recomputing the r15 crop math to push the top edge down past the
+   caption's own band (y0=170 instead of 92) puts Bridge's own baked
+   card ABOVE the new crop's top edge too (recomputed with python3: its
+   old top-of-crop position maps to -10.68% in the new one) -- the
+   caption and the Bridge row's real content are vertically intermixed
+   in the source art, not stacked in cleanly separable bands, so no pure
+   crop shift hides one without cutting the other.
+
+   Chosen instead: stop treating this as a second masking layer at all.
+   .ship-art-title already has to exist and sit in roughly this same
+   spot for the real title text -- give IT the backdrop (same radial-
+   gradient, now sized to the title's own box) instead of a separate
+   sibling div, and delete the sibling (.ship-mask-caption, both the
+   CSS rule and the DOM node in ui.js). One fewer element, and the
+   backdrop reads as part of displaying the real heading, the same way
+   a text scrim on a hero image normally would, not as an added patch.
+   Verified by cropping a fresh screenshot down to just this region
+   (tmp/shots/caption-zoom4.png): baked text fully gone, soft edges,
+   no hard rectangle. */
+.ship-mask-row{position:absolute;z-index:1;pointer-events:none}
+.ship-art-title{position:absolute;z-index:2;top:0;left:0;width:52%;height:17%;padding:10px 14px;color:#fff;
+  background-image:radial-gradient(ellipse at center,rgba(13,36,78,1) 0%,rgba(13,36,78,1) 80%,rgba(13,36,78,0) 100%);
   text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
 .ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .ship-art-title p{margin:2px 0 0;font-size:11px}
@@ -286,8 +317,30 @@ html[data-view=ship] #overview-view{display:none}
    rows -- every baked status card's own left edge starts at ~76.5% of
    .ship-art's width, consistently, not ~68% (32% mask). Narrowed to 27%
    (73%-100%), a ~3.5-point safety margin under the measured 76.5%, moving
-   visible art from 68% to 73% of the box width. */
-.ship-mask-row{top:0;right:0;width:27%;height:20.28%}
+   visible art from 68% to 73% of the box width.
+
+   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 1, conductor real-
+   Chromium re-measure of f5c8422): "right ~100px of the ship panel is
+   empty navy" -- two things were actually contributing. First,
+   .room-pin was a wide multi-line card (see below), filling most of
+   this strip with ANOTHER solid box, so the strip read as one unbroken
+   slab; now it's a small count-only badge (see .room-pin), so most of
+   the strip is genuinely just the mask colour on its own.
+
+   Second, and the real fix here: the mask was var(--surface-2)
+   (#212d48), a UI-chrome colour, not sampled from the art. The art's
+   own ambient tone in this exact strip (sampled from the reference
+   mockup, lib/hub_ui/themes/bebop/ship.png, the dark ship-interior
+   background around and between the baked cards, not the cards
+   themselves) measures close to rgb(15,22,38) -- visibly darker and
+   more saturated-blue than surface-2. Swapped the fill to that sampled
+   tone so the masked strip's colour matches the art it's sitting next
+   to instead of looking like a separate UI panel dropped on top of it.
+   The strip is still a flat colour -- true texture would mean baking a
+   masked version of the art itself, out of scope for a CSS-only round
+   -- but a colour-matched flat fill reads as "this part of the ship is
+   just dim" rather than "a rectangle was pasted over the art". */
+.ship-mask-row{top:0;right:0;width:27%;height:20.28%;background:#0f1626}
 .ship-mask-row[data-station=bridge]{top:0%}
 .ship-mask-row[data-station=projectdeck]{top:19.54%}
 .ship-mask-row[data-station=buildbay]{top:39.31%}
@@ -295,24 +348,34 @@ html[data-view=ship] #overview-view{display:none}
 .ship-mask-row[data-station=qualitygate]{top:78.85%}
 /* Small, real hotspots over the masked status-card zone -- one per room,
    non-overlapping (each confined to its own row band), linking to the
-   matching .room card's real status below. Position percentages are the
-   same by-eye estimate as the old room-card tops, re-centred per row;
-   still unverified pixel-for-pixel (no browser/screenshot tool).
+   matching .room card's real status below.
 
    r18 fix (tmp/in/FIX-r18.md item 3): right:4% centred the pin well
    inside the (old, wider) masked zone, reading as "floating in a
    separate column, far from their rooms" per the conductor's measure.
-   right:2% (was 4%) pulls it toward the mask's own left edge -- now that
-   the mask itself is narrower (27%, see .ship-mask-row above), the pin
-   sits right at the boundary with the illustrated room, slightly
-   overlapping it (its background is opaque), reading as attached to the
-   row rather than parked in a sidebar. */
-.room-pin{position:absolute;z-index:2;right:2%;width:26%;display:flex;flex-direction:column;align-items:center;gap:2px;
-  background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 2px;text-decoration:none;
-  color:var(--fg);font-size:11px;text-align:center;line-height:1.25}
+   right:2% (was 4%), and the mask narrower (27%, see .ship-mask-row
+   above), pulled it toward the boundary with the illustrated room but
+   a 26%-wide multi-line "name + count" card still read as a parallel
+   info column -- it duplicates the room's own name, which the art
+   already draws as a large baked label right next to it (every
+   screenshot this round confirms "BRIDGE / Jet . Captain" etc. are
+   legible in the art itself).
+
+   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 1, conductor real-
+   Chromium re-measure): shrunk the pin to just its live count, a small
+   round badge rather than a name+count card -- the room's own name is
+   never duplicated, so the badge only needs to be big enough for 1-2
+   digits. .pin-label is kept in the DOM (the <a>'s aria-label already
+   carries the full "Bridge: 2 tasks" text for assistive tech either
+   way) but visually hidden, standard sr-only clip pattern, not display:
+   none, so it's still in the accessibility tree exactly as before. */
+.room-pin{position:absolute;z-index:2;right:4%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  background:var(--surface);border:1px solid var(--border);border-radius:50%;text-decoration:none;
+  color:var(--fg);font-size:12px;font-weight:700;text-align:center;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+.room-pin .pin-label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .room-pin:hover,.room-pin:focus-visible{border-color:var(--accent)}
 .room-pin.urgent{border-color:var(--warn);color:var(--warn)}
-.room-pin .pin-count{font-weight:700;color:var(--accent)}
+.room-pin .pin-count{color:var(--accent)}
 .room-pin.urgent .pin-count{color:var(--warn)}
 .room-pin[data-station=bridge]{top:9.90%}
 .room-pin[data-station=projectdeck]{top:29.68%}
@@ -320,7 +383,23 @@ html[data-view=ship] #overview-view{display:none}
 .room-pin[data-station=scout]{top:69.22%}
 .room-pin[data-station=qualitygate]{top:88.99%}
 .room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
-.hull>.room,.room-list>.room{border-top:3px solid var(--accent)}
+.hull>.room{border-top:3px solid var(--accent)}
+/* r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 4, conductor real-
+   Chromium re-measure of f5c8422): "Room detail at 1280 is still a
+   stacked card under the art, not a native room layout." .room-list's
+   selected room used the SAME filled-background, bordered, rounded-
+   corner, accent-topped box as .hull>.room (the plain theme's only
+   representation of each room, with no art to sit under -- there it
+   genuinely needs to read as a self-contained card). Under the art,
+   that same box reads as a second, disconnected panel stacked below
+   the illustration instead of as more detail about the room already
+   picked from it. Strips the card chrome down to a plain inline
+   section -- no fill, no border, no rounded corners, just a thin top
+   divider and page-level padding -- so it reads as "this page is now
+   showing you Build Bay's detail" rather than "here is a Build Bay
+   card". Specificity (0,2,0) already outranks .room's own (0,1,0), no
+   !important needed for this part. */
+.room-list>.room{background:none;border:none;border-radius:0;padding:16px 0 0}
 /* r7 review (tmp/in/REVIEW-r7.md item 3): showing all 5 full room cards
    stacked (1198px tall) is still too much on screen even with the overlap
    fixed. Only one room's full card is visible in .room-list at a time --
