@@ -396,6 +396,7 @@ def main() -> int:
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    bind_live_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
@@ -1950,6 +1951,260 @@ def issue_cases(base: Path) -> None:
          dec_default["rec"] == rec
          and odi.window(dec_default, now) == dec_default["answered_at"] + rec["grant_window_s"]
          and odi.MAX_WINDOW_S == 3600 and odi.KEYS == frozen.KEYS and odi.SUCCESSOR_KEYS == frozen_successor.SUCCESSOR_KEYS)
+    lc.close()
+
+def bind_live_cases(base: Path) -> None:
+    """owner-dispatch-issue.py --bind-live-generation (r12,
+    tmp/out/r12/ANSWER-r12.md): a THIRD issuance mode, for a lease that is
+    ALREADY live at generation N held by exactly the registry's current
+    identity. Never calls claim_initial/claim_successor -- binds a fresh
+    single-use grant to the live lease without claiming, renewing, or
+    bumping it. Also proves (FROZEN COMPAT, ffa64cc) that this round did
+    not change the initial/successor/standing paths' own behavior."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("odissue_bl", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    PANE2, SESS2 = ("w93:p9", "term_kb2bindlive"), hashlib.sha256(b"kb-session-2-bindlive").hexdigest()
+    HOLD2 = {"pane_id": PANE2[0], "pane_birth": PANE2[1], "session_digest": SESS2}
+    reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    reg_ok2 = {KB: (*PANE2, SESS2)}.get
+    body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
+    lease_exp_iso = ol._iso(T0 + TTL)
+    n = [0]
+
+    def setup(max_open=1, live=True, lease_ttl=None):
+        n[0] += 1
+        d = base / f"c{n[0]}"; d.mkdir(mode=0o700)
+        lc, av, roots, lease_db = env(d); av.close()
+        lc.execute("UPDATE owner_projects SET max_open=? WHERE label=?", (max_open, KB))
+        if live:
+            if lease_ttl is None:
+                acquire(lc, KB)  # -> gen 1, live until T0+TTL
+            else:
+                ol.acquire(lc, KB, PANE[KB][0], PANE[KB][1], lease_ttl, T0, session_digest=SESS[KB])
+        os.chmod(lease_db, 0o600)
+        adb = d / "auth.db"
+        c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); c.close(); os.chmod(adb, 0o600)
+        rq = d / "req"; rq.mkdir(); (rq / "req.txt").write_bytes(body)
+        (d / "state" / "forms").mkdir(parents=True)
+        proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+        return d, lc, lease_db, adb, rq, roots, proj
+
+    def decision(d, proj, bind_gen=1, over=None, answers=None, status="answered", answered_at=None, grant_window_s=1800):
+        rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1, "expected_holder": dict(HOLD),
+               "expected_generation": bind_gen, "lease_ttl_s": TTL, "request_id": f"bl-{n[0]}",
+               "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"],
+               "auth_id": f"auth-bl-{n[0]}", "grant_window_s": grant_window_s, "bind_live_generation": bind_gen}
+        rec.update(over or {})
+        emb = odi.approval_bytes(rec)
+        fid = f"20261028T1800{n[0] % 100:02d}-91{n[0] % 100:02d}"
+        html = odi.render_form(rec)
+        ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
+        row = {"id": fid, "status": status, "answers": ans, "answered_at": int((T0 - 60) * 1000) if answered_at is None else answered_at}
+        (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
+        (d / "state" / "forms" / f"{fid}.json").write_text(json.dumps(row))
+        return fid, rec, hashlib.sha256(emb).hexdigest()
+
+    KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+    real_root = odi.STATE_ROOT
+
+    def run(d, lease_db, adb, rq, fid, resolve=reg_ok, t=None):
+        E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+             "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)}
+        odi.STATE_ROOT = os.path.realpath(d / "state")
+        saved = {k: os.environ.get(k) for k in KEYS_ENV}
+        for k in saved: os.environ.pop(k, None)
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odi.main(["--form-id", fid, "--request-dir", str(rq)], resolve=resolve, now=T0 if t is None else t)
+        finally:
+            odi.STATE_ROOT = real_root
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    def q(adb, sql):
+        c = sqlite3.connect(str(adb)); r = c.execute(sql).fetchall(); c.close(); return r
+
+    def nothing_written(adb, lc, lease_rows_before=1):
+        return (q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+                and lc.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0] == lease_rows_before)
+
+    # 0. happy path: grant issued, lease provably untouched (no claim/renewal)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: issues against an already-live same-holder lease, no claim/renewal",
+         got == (0, f"issued:{rec['auth_id']}:gen1")
+         and lc.execute("SELECT generation, expires_at FROM owner_leases WHERE label=?", (KB,)).fetchone() == (1, lease_exp_iso))
+    lc.close()
+
+    # 1. different holder
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, resolve=reg_ok2)
+    case("BIND-LIVE: different holder refused, nothing written", got == (2, "refused:identity_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 2. stale generation (record claims live gen 2; lease is actually gen 1)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=2)
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: stale generation refused, nothing written", got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 3. expired lease between form and issue -- refused, NEVER renewed/rebound
+    # (short lease TTL, well inside the default grant window, so this exercises
+    # ONLY the lease-expiry path, never the unrelated approval-window-expiry one)
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    short_exp_iso = ol._iso(T0 + 600)
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, t=T0 + 700)
+    case("BIND-LIVE: lease expired between form and issue -> refused, not renewed/rebound, nothing written",
+         got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc)
+         and lc.execute("SELECT generation, expires_at, released_at FROM owner_leases WHERE label=?", (KB,)).fetchone() == (1, short_exp_iso, None))
+    lc.close()
+
+    # 4. reused auth_id
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid1, rec1, _ = decision(d, proj, bind_gen=1, over={"auth_id": "auth-bl-reused"})
+    first = run(d, ldb, adb, rq, fid1)
+    fid2, rec2, _ = decision(d, proj, bind_gen=1, over={"auth_id": "auth-bl-reused"})
+    second = run(d, ldb, adb, rq, fid2, t=T0 + 1)
+    case("BIND-LIVE: reused auth_id refused on replay, exactly one grant row total",
+         first == (0, "issued:auth-bl-reused:gen1") and second == (2, "refused:approval_already_used")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(1,)])
+    lc.close()
+
+    # 5. body hash mismatch (tampered after form was built)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    (rq / "req.txt").write_bytes(b"TAMPERED\n")
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: body hash mismatch refused, nothing written", got == (2, "refused:request_sha_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 6. standing-scope confusion: a bind-live record is refused by the STANDING validator (disjoint schema)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    standing_refused = False
+    try:
+        odi.validate_standing_approval(rec)
+    except odi.Refused:
+        standing_refused = True
+    case("BIND-LIVE: a bind-live record is refused by validate_standing_approval (disjoint schema)", standing_refused)
+    lc.close()
+
+    # 7. build-form refuses a bind-live request against the wrong live generation
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    out_path = d / "form.html"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = odi.build_main(["--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                             "--request-id", "r1", "--auth-id", "auth-build-bl-1", "--out", str(out_path),
+                             "--manifest", "result.md", "--bind-live-generation", "2", "--lease-db", ldb],
+                            resolve=reg_ok, now=T0)
+    case("BIND-LIVE: build-form refuses the wrong live generation, no file written",
+         rc == 2 and buf.getvalue().strip() == "refused:live_generation_unresolved" and not out_path.exists())
+    lc.close()
+
+    # 8. grant_window_s pushing the grant's own expiry past the live lease's own expiry
+    # (short lease TTL again -- MAX_WINDOW_S equals this module's default lease TTL,
+    # so a short-TTL lease is required to get daylight between the two expiries)
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    fid, rec, asha = decision(d, proj, bind_gen=1, grant_window_s=1800)  # answered_at(T0-60)+1800 = T0+1740 > lease exp T0+600
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: grant expiry capped at lease expiry -- refused (post-claim classification) when it would exceed it",
+         got == (5, "claimed_not_issued:grant_exceeds_lease_expiry") and nothing_written(adb, lc))
+    lc.close()
+
+    # 9. (tmp/in/r12/PACKET-ADDENDUM.md) ONLY an expired lease exists -- no live
+    # generation at all, no resume has happened. Neither build-form nor the issue
+    # path may perform or infer a recovery; both must simply refuse.
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    expired_now = T0 + 700  # 100s after the gen-1 lease's own expiry; no resume performed
+    out_path = d / "expired-only-form.html"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = odi.build_main(["--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                             "--request-id", "r-expired-only", "--auth-id", "auth-build-expired-only",
+                             "--out", str(out_path), "--manifest", "result.md",
+                             "--bind-live-generation", "1", "--lease-db", ldb],
+                            resolve=reg_ok, now=expired_now)
+    case("BIND-LIVE (ADDENDUM): build-form against an only-expired lease (no resume done) refuses, no file written -- never infers recovery",
+         rc == 2 and buf.getvalue().strip() == "refused:live_generation_unresolved" and not out_path.exists())
+    # and independently: a record built some other way (bypassing build-form) naming
+    # the now-expired generation is ALSO refused by the issue path itself, never silently
+    # resumed/claimed/rebound -- owner-dispatch-issue.py has no code path that calls
+    # owner-lease-resume.py or ol.acquire() at all (confirmed by source: neither name
+    # appears anywhere in owner-dispatch-issue.py).
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, t=expired_now)
+    case("BIND-LIVE (ADDENDUM): issue against an only-expired lease also refuses, nothing written -- never infers recovery",
+         got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc))
+    case("BIND-LIVE (ADDENDUM): owner-dispatch-issue.py source never names the resume tool or acquire() -- recovery is structurally unreachable from this file, not just behaviorally refused",
+         "owner-lease-resume" not in Path(HERE / "owner-dispatch-issue.py").read_text()
+         and "ol.acquire(" not in Path(HERE / "owner-dispatch-issue.py").read_text())
+    lc.close()
+
+    # --- FROZEN COMPAT (ffa64cc): r12 added a disjoint third mode; the initial/successor/standing
+    # paths this worktree already had at ffa64cc (before any r12 code) are byte-identical in schema
+    # and behavior -- never touched by this round's edit.
+    frozen = _frozen_gen1_module(ref="ffa64cc")
+    d, lc, ldb, adb, rq, roots, proj = setup(live=False)
+    classic_rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1,
+                   "expected_holder": dict(HOLD), "expected_generation": 1, "lease_ttl_s": TTL,
+                   "request_id": "classic-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+                   "manifest": ["result.md"], "auth_id": "auth-classic-1", "grant_window_s": 1800}
+    case("FROZEN COMPAT (ffa64cc): classic initial-claim KEYS/approval_bytes/render_form byte-identical",
+         odi.KEYS == frozen.KEYS
+         and odi.approval_bytes(classic_rec) == frozen.approval_bytes(classic_rec)
+         and odi.render_form(classic_rec) == frozen.render_form(classic_rec)
+         and odi.validate_approval(classic_rec) == frozen.validate_approval(classic_rec))
+    successor_rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1,
+                     "expected_holder": dict(HOLD2), "expected_generation": 2, "lease_ttl_s": TTL,
+                     "expected_prev_generation": 1, "expected_prev_holder": dict(HOLD),
+                     "request_id": "successor-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+                     "manifest": ["result.md"], "auth_id": "auth-successor-1", "grant_window_s": 1800}
+    case("FROZEN COMPAT (ffa64cc): SUCCESSOR_KEYS/approval_bytes/render_form byte-identical",
+         odi.SUCCESSOR_KEYS == frozen.SUCCESSOR_KEYS
+         and odi.approval_bytes(successor_rec) == frozen.approval_bytes(successor_rec)
+         and odi.render_form(successor_rec) == frozen.render_form(successor_rec)
+         and odi.validate_approval(successor_rec) == frozen.validate_approval(successor_rec))
+    standing_rec = {"protocol": odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj,
+                    "expected_holder": dict(HOLD), "expected_generation": 1,
+                    "queue_sha256": hashlib.sha256(b"q").hexdigest(),
+                    "queue_items": [{"id": "i1", "request_sha256": hashlib.sha256(body).hexdigest(),
+                                     "manifest": ["result.md"], "cost_cents": None, "action": "dispatch"}],
+                    "item_cap": 5, "spend_cap_cents": 0, "auth_id": "auth-standing-1", "standing_window_s": 1800}
+
+    def _safe_validate_standing(mod, rec):
+        try:
+            return ("ok", mod.validate_standing_approval(rec))
+        except mod.Refused as exc:
+            return ("refused", str(exc))
+    case("FROZEN COMPAT (ffa64cc): STANDING_KEYS/STANDING_PROTOCOL/validate_standing_approval byte-identical",
+         odi.STANDING_KEYS == frozen.STANDING_KEYS and odi.STANDING_PROTOCOL == frozen.STANDING_PROTOCOL
+         and _safe_validate_standing(odi, standing_rec) == _safe_validate_standing(frozen, standing_rec))
+    # the initial claim CODE PATH itself (ol.claim_initial, via odi.main()) is untouched by r12 --
+    # confirmed end to end: issue a classic gen-1 grant (no bind_live_generation key at all) through
+    # the CURRENT module and check it behaves exactly as issue_cases()'s own happy path already does.
+    classic_emb = odi.approval_bytes(classic_rec)
+    classic_fid = "20261028T180099-9199"
+    (d / "state" / "forms" / f"{classic_fid}.html").write_bytes(odi.render_form(classic_rec))
+    (d / "state" / "forms" / f"{classic_fid}.json").write_text(json.dumps(
+        {"id": classic_fid, "status": "answered",
+         "answers": {"decision": "approve", "approval_sha256": hashlib.sha256(classic_emb).hexdigest()},
+         "answered_at": int((T0 - 60) * 1000)}))
+    got = run(d, ldb, adb, rq, classic_fid)
+    case("FROZEN COMPAT (ffa64cc): classic initial-claim still issues end to end via claim_initial, unchanged",
+         got == (0, "issued:auth-classic-1:gen1"))
     lc.close()
 
 
