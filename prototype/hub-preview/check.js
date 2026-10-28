@@ -35,9 +35,21 @@ ok('bebop theme: ship art drawn (same-origin static route, not inlined)',
   h.indexOf('class="ship-art"') !== -1 &&
   /(<img src="\/static\/ship-[0-9a-f]{8}\.png"|background-image:url\(\/static\/ship-[0-9a-f]{8}\.png\))/.test(h) &&
   h.indexOf('data:image/png;base64') === -1);
-var maint = h.split('<h3>Maintenance log')[1] || '';
-ok('unrecognized task sits in the maintenance panel', maint.indexOf('hotfix-ad-hoc') !== -1);
-ok('unrecognized badge shown', maint.indexOf('badge unrec') !== -1);
+// r19 fix (tmp/in/r19/R19-BOUNTY-MOTION.md + R19-AMEND-SPA.md): the old
+// sidebar "Maintenance log" (same S.unrecognized rows) is now the inline
+// "Bounty board" section instead -- same underlying data, real card()
+// markup, now also carrying owner/proof/cleared-or-open per card.
+var bounty = h.split('class="bounty-board"')[1] || '';
+ok('unrecognized task sits in the bounty board', bounty.indexOf('hotfix-ad-hoc') !== -1);
+ok('unrecognized badge shown', bounty.indexOf('badge unrec') !== -1);
+ok('bounty board cites its real source', bounty.indexOf('Source: herdr task registry') !== -1);
+ok('bounty cards show owner + proof-or-unverified', /Owner: .+ \u00B7 Proof: /.test(bounty));
+// r19 amendment 2 (tmp/in/r19/R19-AMEND-ESCALATION.md): the real
+// per-task escalation source (feat/loop-escalation's state file) is not
+// shipped yet, so every task card says so honestly -- no invented
+// model/attempt-count/hold values, same count as task cards overall.
+ok('escalation honesty line present at least once', h.indexOf('Escalation: tracking not enabled') !== -1);
+ok('no invented escalation model/attempt data anywhere', !/current model|attempt \d|escalation reason:/i.test(h));
 ok('open decisions listed', live.decisions.open.every(function (f) { return h.indexOf(esc(f.title)) !== -1; }));
 ok('expired forms never read as approved', h.indexOf('not approved, not declined') !== -1);
 ok('suggestions are proposal-only', h.indexOf('Proposal-only. Nothing is dispatched from here') !== -1);

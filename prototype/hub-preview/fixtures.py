@@ -29,9 +29,9 @@ def _task(now, n, label, repo, state, source, ago_s, pane, **kw):
     return t
 
 
-def tasks(now: float) -> list[dict]:
+def tasks(now: float, bounty_empty: bool = False) -> list[dict]:
     T = lambda *a, **k: _task(now, *a, **k)  # noqa: E731
-    return [
+    rows = [
         T(1, "implement:feat/login-form", "demo-app", "running", "live", 40, "w1:p1"),
         T(2, "code:fix/null-guard", "demo-app", "running", "stored", 900, "w1:p2"),
         T(3, "plan:plan/q4-roadmap", "demo-infra", "blocked", "live", 600, "w2:p1"),
@@ -52,13 +52,28 @@ def tasks(now: float) -> list[dict]:
         T(15, "implement:feat/export-csv", "demo-app", "gone", "live", 1800, "w6:p3", stored="running"),
         T(16, "implement:feat/old-thing", "demo-app", "completed", "registry", 3 * 86400, "w7:p1",
           closure_reason="shipped", closure_proof=".handoffs/PROOF.md#old-thing"),
+        # r19 (tmp/in/r19/R19-BOUNTY-MOTION.md): two more unrecognized
+        # (no job-class prefix) tasks so the bounty board's preview can
+        # show a Cleared card with real proof text and a Stale card, not
+        # just the one always-open hotfix-ad-hoc row above.
+        T(17, "triage-urgent-oncall", "demo-app", "completed", "registry", 4500, "w7:p2",
+          closure_reason="shipped", closure_proof=".handoffs/PROOF.md#oncall-fix"),
+        T(18, "sweep-dead-branches", "demo-infra", "blocked", "live", 2100, "w7:p3", stored="running"),
     ]
+    if bounty_empty:
+        # r19 amendment 2 evidence (R19-BOUNTY-MOTION.md "truthful empty
+        # state"): drop every unrecognized (colonless-label) row -- the
+        # same job_of() rule __init__.py's ship_snapshot() uses -- so the
+        # bounty board's real empty-state code path can be screenshotted,
+        # not just read in source.
+        rows = [t for t in rows if ":" in t["label"]]
+    return rows
 
 
-def herdr(now: float, err: bool = False) -> dict:
+def herdr(now: float, err: bool = False, bounty_empty: bool = False) -> dict:
     if err:
         return {"error": "registry not found: /demo/registry.sqlite3", "tasks": [], "attention": [], "events": [], "checkpoints": []}
-    ts = tasks(now)
+    ts = tasks(now, bounty_empty)
     attention = [t for t in ts if t["state"] in ("blocked", "stalled", "ready_review")]
     events = [
         {"sequence": 412, "type": "state_changed", "task_id": "task_demo_03", "occurred_at": _iso(now, 600),
@@ -217,9 +232,9 @@ FORM_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8><title>Dem
 </main></body></html>"""
 
 
-def install(hub, now: float, tmp: Path, herdr_down: bool = False, registry_error: bool = False) -> None:
+def install(hub, now: float, tmp: Path, herdr_down: bool = False, registry_error: bool = False, bounty_empty: bool = False) -> None:
     fixed = lambda v: SimpleNamespace(get=lambda: v, peek=lambda: v)  # noqa: E731
-    data = {"herdr": herdr(now, registry_error), "forms": forms(now), "search": search(now), "kb": kb(now),
+    data = {"herdr": herdr(now, registry_error, bounty_empty), "forms": forms(now), "search": search(now), "kb": kb(now),
             "links": links(now), "loops": loops(now), "debt": debt(now),
             "portal": {"open": [], "open_count": 0, "error": None},
             "deploy_drift": deploy_drift(now), "cost": cost(now), "projects": projects(now), "owners": owners(now)}

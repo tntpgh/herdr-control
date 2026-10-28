@@ -177,15 +177,21 @@ def main() -> int:
               "quick:chore/lint-pass": "done_with_proof", "mechanical:chore/rename-sweep": "closed",
               "docs:docs/runbook": "failed", "explore:explore/cache-options": "lost",
               "hotfix-ad-hoc": "executing", "architect:arch/event-bus": "cancelled",
-              "implement:feat/export-csv": "gone"}
+              "implement:feat/export-csv": "gone",
+              "triage-urgent-oncall": "done_with_proof", "sweep-dead-branches": "blocked"}
     got = {t["label"]: t["display"] for t in ship["tasks"]}
     check("display state per fixture task", got == expect, {k: (expect.get(k), got.get(k)) for k in set(got) | set(expect) if expect.get(k) != got.get(k)})
     words = {t["label"]: t["words"] for t in ship["tasks"]}
     check("stored-source blocked says unconfirmed", "Unconfirmed" in words["debug:fix/flaky-timer"])
     check("stale stored state named", "Registry still says running" in words["design:design/settings-page"])
     check("completed without proof says so", "No proof on file" in words["mechanical:chore/rename-sweep"])
-    check("unrecognized label has no station (shown in Maintenance log, not a 6th room)",
+    check("unrecognized label has no station (shown in the inline Bounty board, not a 6th room)",
           [t["station"] for t in ship["tasks"] if t["label"] == "hotfix-ad-hoc"] == [None])
+    # r19 fix (tmp/in/r19/R19-AMEND-SPA.md): the disabled "bounties" nav
+    # span this repo used to carry is gone -- T wants the board inline on
+    # Ship, not behind any tab, enabled or not.
+    check("no bounties nav tab, disabled or otherwise", "nav-disabled" not in home and ">bounties<" not in home)
+    check("bounty board renders inline on Ship", "class=\"bounty-board\"" in home)
     check("finished >24h hidden and counted", ship["hidden_finished"] == 1 and "implement:feat/old-thing" not in got)
     check("/ html carries no form token", "preview-token-not-real" not in home)
     dhome = (OUT / "down" / down["/"]["file"]).read_text()

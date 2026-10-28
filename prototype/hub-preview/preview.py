@@ -119,6 +119,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, help="default 8611 (new) / 8612 (baseline)")
     ap.add_argument("--herdr-down", action="store_true")
     ap.add_argument("--registry-error", action="store_true")
+    ap.add_argument("--bounty-empty", action="store_true",
+                     help="r19 evidence: drop every unrecognized-label fixture task so the "
+                          "bounty board's real empty state can be screenshotted")
     ap.add_argument("--now", type=float, help="fixture clock (epoch s); default: now")
     ap.add_argument("--snapshot", type=Path, help="render every page into this dir, then exit")
     a = ap.parse_args()
@@ -129,7 +132,8 @@ def main() -> int:
     hub = load_hub(a.baseline, tmp)
     if not str(hub.REGISTRY).startswith(str(tmp)) or not str(hub.FORMS_DIR).startswith(str(tmp)):
         raise SystemExit(f"refusing: hub state paths escaped the sandbox ({hub.REGISTRY}, {hub.FORMS_DIR})")
-    fixtures.install(hub, a.now or time.time(), tmp, herdr_down=a.herdr_down, registry_error=a.registry_error)
+    fixtures.install(hub, a.now or time.time(), tmp, herdr_down=a.herdr_down, registry_error=a.registry_error,
+                      bounty_empty=a.bounty_empty)
     if a.snapshot:
         server = make_server(hub, 0)
         threading.Thread(target=server.serve_forever, daemon=True).start()

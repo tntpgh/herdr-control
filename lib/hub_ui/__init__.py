@@ -83,11 +83,14 @@ PANELS = {"/": "overview", "/projects": "projects", "/decisions": "decisions", "
           "/timeline": "timeline", "/herdr": "herdr", "/kb": "kb", "/owners": "owners",
           "/links": "links", "/search": "search"}
 DIAGNOSTICS = ("/herdr", "/owners", "/kb", "/links", "/search")
-# r4 review (tmp/in/REVIEW-r4.md item 3): the reference's top nav is exactly
-# 4 tabs (Ship/Projects/Bounties/Decisions). Every other page (DIAGNOSTICS
-# plus /loops and /timeline) moves into the closed-by-default disclosure in
-# chrome(); "Bounties" has no backing route -- it renders disabled with its
-# real reason, never a page that silently 404s or a fake working link.
+# r4 review (tmp/in/REVIEW-r4.md item 3): the reference's top nav is 3 tabs
+# (Ship/Projects/Decisions). Every other page (DIAGNOSTICS plus /loops and
+# /timeline) moves into the closed-by-default disclosure in chrome().
+#
+# r19 fix (tmp/in/r19/R19-AMEND-SPA.md): a 4th "Bounties" tab was planned
+# here and briefly rendered disabled (no backing route yet); T's amendment
+# put the bounty board inline on Ship instead of behind a tab, so there is
+# no 4th nav entry to wire or keep disabled.
 PRIMARY_NAV = ("/", "/projects", "/decisions")
 REQUIRED_PALETTE = ("--bg", "--surface", "--surface-2", "--fg", "--muted", "--accent",
                     "--brass", "--border", "--ok", "--warn", "--bad", "--info")
@@ -188,14 +191,17 @@ def chrome(title: str, path: str, body: str, nav, refresh: int = 15, scope: str 
         return f"<a href='{p}' class='{'on' if on else ''}'{' aria-current=page' if on else ''}>{n}</a>"
     nav_by_path = dict(nav)
     other = [(p, n) for p, n in nav if p not in PRIMARY_NAV]
-    # Ship / Projects / [Bounties, disabled] / Decisions, in that order --
-    # bounties has no backing route (no bounty-board data source wired),
-    # so it is a disabled label with its real reason, never a dead link.
+    # Ship / Projects / Decisions, in that order.
+    #
+    # r19 fix (tmp/in/r19/R19-AMEND-SPA.md, T's exact words: "i dont want
+    # it on a tab, i want the dashboard closer to a one page SPA"): the
+    # disabled "bounties" tab this comment used to describe is removed
+    # entirely rather than enabled -- the bounty board now lives inline on
+    # Ship itself (renderShip()'s own bounty-board section), not behind a
+    # nav entry at all.
     main_nav = (
         link("/", nav_by_path.get("/", "ship"))
         + link("/projects", nav_by_path.get("/projects", "projects"))
-        + "<span class=nav-disabled aria-disabled=true title='No bounty-board data source wired yet'>"
-          "bounties<span class=sr-only> \u2014 no bounty-board data source wired yet</span></span>"
         + link("/decisions", nav_by_path.get("/decisions", "decisions"))
     )
     diag_nav = " ".join(link(p, n) for p, n in other)
@@ -312,7 +318,15 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
                      "state": t.get("state"), "source": t.get("state_source"),
                      "repo": str(t.get("repo") or "").rsplit("/", 1)[-1],
                      "project": t.get("project") or str(t.get("repo") or "").rsplit("/", 1)[-1],
-                     "pane": t.get("pane_id"), "updated_at": t.get("updated_at")})
+                     "pane": t.get("pane_id"), "updated_at": t.get("updated_at"),
+                     # r19 addendum (tmp/in/r19/R19-BOUNTY-MOTION.md section A):
+                     # the bounty board needs the same closure_reason/proof
+                     # herdr_data() already joins onto every task (see its own
+                     # comment, hub.py ~line 930) and state_stale (hub.py's own
+                     # derive()-vs-stored divergence flag) -- both were computed
+                     # all along, just never copied past this loop before.
+                     "closure_reason": t.get("closure_reason"), "closure_proof": t.get("closure_proof"),
+                     "state_stale": bool(t.get("state_stale"))})
     projects: dict = {}
     for r in rows:
         p = projects.setdefault(r["project"], {"name": r["project"], "tasks": 0, "attention": 0})

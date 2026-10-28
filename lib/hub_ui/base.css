@@ -43,7 +43,14 @@ body>header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:
 header,header nav,main,.ship,.hull,.side-rail,.chips,.room-head,.wcards,.ship-bottom,.call-chip{min-width:0}
 header .brand{font-size:16px;letter-spacing:.04em}
 header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
-header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent}
+/* r19 motion fix (tmp/in/r19/MOTION-SPEC.md: "Tabs 160ms ease-out
+   color/opacity, 2px indicator"): header nav a.on's border-bottom-color
+   already WAS the 2px indicator (r4/r15), just with no transition -- the
+   underline used to snap instantly. transition only; killed globally for
+   html[data-reduce]/prefers-reduced-motion by the existing blanket rule
+   below, same as everything else motion adds this round. */
+header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent;
+  transition:color 160ms ease-out,border-bottom-color 160ms ease-out}
 header nav a:hover{color:var(--fg)}
 header nav a.on{color:var(--fg);border-bottom-color:var(--accent)}
 details.navgroup{position:relative;padding-left:12px;border-left:1px solid var(--border);font-size:13px}
@@ -52,7 +59,9 @@ details.navgroup>summary::-webkit-details-marker{display:none}
 details.navgroup>summary::before{content:"\25B8  ";color:var(--accent)}
 details.navgroup[open]>summary::before{content:"\25BE  "}
 .navgroup-body{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;margin-top:4px}
-.nav-disabled{color:var(--muted);opacity:.55;cursor:not-allowed;border-bottom:2px dotted var(--border);padding:2px 0}
+/* r19 fix (tmp/in/r19/R19-AMEND-SPA.md): .nav-disabled styled the old
+   disabled "bounties" tab span, now removed -- the bounty board moved
+   inline, no disabled nav entry left to style. */
 .hdr-meta{margin-left:auto}
 .prefs{position:relative;font-size:13px}
 .prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
@@ -433,6 +442,25 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 .side-more[open]>summary::before{content:"\25BE  "}
 .side-more>*{margin-top:8px}
 
+/* r19 (tmp/in/r19/R19-BOUNTY-MOTION.md + R19-AMEND-SPA.md): inline bounty
+   board, same visual language as .side-panel/.feed-panel -- not a new
+   component family, just those two patterns combined (summary card +
+   <details> disclosure of real .wcard rows, same card() markup the room
+   list already uses). */
+.bounty-board{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:14px 0 0}
+.bounty-board h3{margin:0 0 6px;font-size:14px;display:flex;align-items:center;gap:8px}
+.bounty-portrait{display:inline-flex;flex:0 0 auto}
+.bounty-portrait svg{display:block}
+.bounty-list{margin:8px 0 0;font-size:12.5px}
+.bounty-list>summary{cursor:pointer;color:var(--muted);list-style:none;font-weight:600}
+.bounty-list>summary::-webkit-details-marker{display:none}
+.bounty-list>summary::before{content:"\25B8  ";color:var(--accent)}
+.bounty-list[open]>summary::before{content:"\25BE  "}
+.bounty-list>.wcards{margin-top:8px}
+.badge.open{color:var(--warn);border-color:var(--warn)}
+.badge.cleared{color:var(--bg);background:var(--ok);border-color:var(--ok)}
+.badge.stale{border:2px dashed var(--warn);color:var(--warn)}
+
 /* state chips + card borders: shape + icon + words, never colour alone */
 .st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}
 .st[data-d=executing]{color:var(--accent)}
@@ -477,6 +505,64 @@ main[data-view=timeline] table td.age{text-align:left}
    pin pulses for an executing station instead (same keyframe, same
    reduced-motion/herdr-down rules below still stop it). */
 .room-pin.anim{animation:sp-bob 1.4s ease-in-out infinite}
+/* r19 motion (tmp/in/r19/MOTION-SPEC.md): ambient, non-informational
+   layers drawn over the one ship.png raster -- starfield drift, console
+   glow, optional scanline. Each uses animation (never transition, since
+   nothing about them changes state) so the existing reduce-motion kill
+   switch below stops all three identically. .ship-ambient's own box is
+   position:absolute, inset:0, inherits .ship-art's overflow:hidden crop,
+   pointer-events:none so it never intercepts clicks on the room pins
+   painted after it in DOM order. */
+.ship-ambient{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.ship-ambient::before,.ship-ambient::after{content:"";position:absolute;inset:-20%}
+@keyframes ship-starfield{0%{background-position:0 0}100%{background-position:-400px 300px}}
+.ship-ambient::before{
+  background-image:radial-gradient(1.5px 1.5px at 20% 30%,var(--fg) 0,transparent 100%),
+    radial-gradient(1.5px 1.5px at 60% 70%,var(--fg) 0,transparent 100%),
+    radial-gradient(1px 1px at 80% 15%,var(--fg) 0,transparent 100%),
+    radial-gradient(1px 1px at 40% 85%,var(--fg) 0,transparent 100%);
+  background-size:400px 300px;opacity:.12;animation:ship-starfield 52s linear infinite}
+@keyframes ship-console-glow{0%,100%{opacity:.08}50%{opacity:.16}}
+.ship-ambient::after{
+  background:radial-gradient(120px 90px at 72% 60%,var(--accent) 0,transparent 70%);
+  opacity:.08;animation:ship-console-glow 6s ease-in-out infinite}
+/* scanline: optional per spec, dropped entirely under 640px (fewer
+   layers on mobile, transform/opacity only, see the 640px block below). */
+.ship-scanline{position:absolute;left:0;right:0;height:2px;background:var(--fg);opacity:.05;
+  animation:ship-scanline 21s linear infinite}
+@keyframes ship-scanline{0%{top:-2px;opacity:0}5%{opacity:.05}95%{opacity:.05}100%{top:100%;opacity:0}}
+/* r19 motion fix (MOTION-SPEC.md: "Feed/disclosure 200-240ms cubic-bezier
+   open reveal, preserve DOM/scroll/selected-tab, no whole-board-size
+   animation"): every <details> in this file opens its content as the
+   element right after <summary> (feed-panel/room-cards/bounty-list/
+   side-more/ship-more/prefs/navgroup-body/chrome-more) -- one rule covers
+   all of them instead of near-duplicates per class. Opacity+transform
+   only, so nothing about the board's own size animates; closing stays
+   instant (<details> has no native close-transition hook to use). */
+@keyframes disclosure-reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+details[open]>summary+*{animation:disclosure-reveal 220ms cubic-bezier(.2,.8,.2,1)}
+/* r19 motion fix (MOTION-SPEC.md: "status transitions... start cue once,
+   steady running, completion reveal once, failure stays static, no
+   endless pulse"): ui.js/HubUI never DOM-patches a single chip in place,
+   it re-renders the whole Ship HTML each poll tick, so a fresh element
+   for a given data-d value IS the real transition moment in this
+   architecture; animation-iteration-count:1 (the "1" above is already
+   the default, named here for clarity) keeps it from looping -- the
+   endless case is .room-pin.anim above, which is for ongoing "something
+   is executing" presence, not a status-change cue, and already loops
+   only while S.live_connected && !prefs.reduce via ui.js's own moving
+   flag. failed/lost/gone/unknown/cancelled get no entrance keyframe at
+   all here: static is the acceptance criterion, not an oversight. */
+@keyframes status-start{0%{opacity:.4;transform:scale(.88)}100%{opacity:1;transform:scale(1)}}
+@keyframes status-complete{0%{opacity:.4;transform:scale(.9)}60%{opacity:1;transform:scale(1.05)}100%{opacity:1;transform:scale(1)}}
+.st[data-d=executing]{animation:status-start 350ms ease-out 1}
+.st[data-d=done_with_proof]{animation:status-complete 450ms ease-out 1}
+/* r19 motion fix (MOTION-SPEC.md "Pause offscreen/hidden-tab via
+   observers"): only the two looping ambient layers pause -- the one-shot
+   status/disclosure animations above are already finished long before a
+   tab switch or scroll could matter, nothing to pause there. */
+html[data-hidden] .ship-ambient,html[data-hidden] .ship-scanline,
+.ship-art.offscreen .ship-ambient,.ship-art.offscreen .ship-scanline{animation-play-state:paused}
 html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{animation:none!important;transition:none!important}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 
@@ -525,4 +611,8 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
   .room-list>.room{display:grid!important}
   .crew-slot{float:none}
   iframe.dframe{height:80vh;min-height:420px}
+  /* r19 motion fix (MOTION-SPEC.md "Mobile: fewer layers, transform/
+     opacity only, no looping blur/filter"): drop the scanline layer
+     entirely below 640px, same already-established pin breakpoint. */
+  .ship-scanline{display:none}
 }
