@@ -832,6 +832,20 @@ def holder_tuple(conn, label, now=None):
     return (cur[1], cur[2], cur[6], cur[3])
 
 
+def live_expiry(conn, label, now=None) -> float | None:
+    """Epoch-seconds expires_at of the label's live lease, or None when
+    there is none. Read-only. R12/owner-dispatch-issue.py's bind-live-
+    generation mode uses this to refuse issuing a grant whose own window
+    would outlive the lease it is bound to (ANSWER-r12.md: "expiry <=
+    lease expiry") -- the module's own ISO strings are always produced by
+    _iso() (fixed %Y-%m-%dT%H:%M:%S.%fZ, UTC), so parsing with the exact
+    inverse of that format is safe for every row this module itself wrote."""
+    cur = _live(conn, label, time.time() if now is None else now)
+    if not cur:
+        return None
+    return datetime.strptime(cur[5], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
+
+
 def _q(items):
     return ",".join("?" * len(items))
 
