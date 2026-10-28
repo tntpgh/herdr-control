@@ -267,64 +267,37 @@ html[data-view=ship] #overview-view{display:none}
    directly on the new, fully-real right edge of the art (see below). */
 .ship-art{position:relative;overflow:hidden;aspect-ratio:728.54/808;border-radius:10px;border:2px solid var(--brass);
   background-color:var(--surface-2);background-size:210.8326% 126.7327%;background-position:0% 42.5926%}
-/* r16 fix (tmp/in/FIX-r16.md item 1): real title/tagline text laid
-   directly over .ship-art's own top ~12%.
+/* r16-r18c fix history (.ship-art-title, now removed entirely -- see
+   below): a real HTML title/tagline was laid over .ship-art's own top
+   ~12% (r16) once a second baked "BEBOP / WORK MAKES A GOOD CREW."
+   caption was found sitting right underneath it (r17, source y~155-200,
+   mapped via (y-92)/808*100 like every other station offset in this
+   file: ~7.8%-13.4% of the box). Went through a flat-colour mask (r17),
+   a colour-matched radial-gradient feather (r18), and finally merging
+   that gradient directly onto .ship-art-title's own backdrop instead of
+   a separate masking sibling (r18b) -- each round still left an opaque
+   (or near-opaque) panel painted over part of the art.
 
-   r17 fix (tmp/in/REVIEW-r9.md section 4, independent review of 4a9c900):
-   r16's comment here claimed that band was clear of baked content -- a
-   mistaken by-eye read, not a computed one. Direct visual comparison in
-   the reference confirmed a second, smaller baked "BEBOP / WORK MAKES A
-   GOOD CREW." caption sits right underneath the real .ship-art-title
-   text, source y~155-200, mapped into the r15 crop's 808px box via the
-   same (y-92)/808*100 formula used for every other station offset in
-   this file: new_y = (155-92)/808*100 .. (200-92)/808*100 ~= 7.8% .. 13.4%
-   of the box. FIX-r17.md's chosen fix (of the two the review offered):
-   mask just that caption the same way .ship-mask-row already masks the
-   baked per-room status pills, rather than re-cropping (which would move
-   every .ship-mask-row/.room-pin offset again) or dropping the real HTML
-   title (which the review flagged would still need a visually-hidden h2
-   for screen readers -- more moving parts for the same result).
+   r18d fix (tmp/in/r18d/MEASURE-fd05edd.md item 2, conductor real-
+   Chromium re-measure of fd05edd): "a solid navy panel painted over the
+   top-left of the art... that is a mask over the baked caption... no
+   opaque overlay on the art. Use the native art (original top graphic
+   visible)." Tried dropping just the backdrop first (keeping the real
+   HTML h2/p with only a text-shadow, no fill) and screenshotted the
+   result (tmp/shots/title-zoom1.png): the real "BEBOP / Work makes a
+   good crew." text sat directly on top of the baked "BEBOP / WORK MAKES
+   A GOOD CREW." caption a few pixels below it -- two near-identical
+   captions stacked, reading as a rendering glitch, not a fix.
 
-   r18 fix (tmp/in/FIX-r18-correction.md item 1, conductor real-Chromium
-   measure of 6a75769 against a freshly-restarted preview, corrected
-   shots tmp/in/r17bshots/ -- the caption itself IS covered now, but as "a
-   hard-edged dark rectangle across the sky... soften it to blend... match
-   colour, feather edges or size it tightly". Per owner direction
-   (tmp/in/OWNER-r18.md): do not keep stacking flat patches that degrade
-   the composition. Swapped the flat var(--surface-2) fill (a card-navy,
-   not a sky colour) for a radial-gradient feather using a sky-blue
-   sampled directly from the unmasked art with tmp/png_probe.py (a
-   stdlib-only PNG decoder) near the caption's own computed band.
-
-   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 2, conductor real-
-   Chromium re-measure of f5c8422): still "a hard-edged dark rectangle",
-   and explicit this time that masking itself is the wrong approach --
-   "crop/offset the art so the baked caption is outside the visible
-   area, or leave it unmasked". Re-cropping turned out not to be viable:
-   recomputing the r15 crop math to push the top edge down past the
-   caption's own band (y0=170 instead of 92) puts Bridge's own baked
-   card ABOVE the new crop's top edge too (recomputed with python3: its
-   old top-of-crop position maps to -10.68% in the new one) -- the
-   caption and the Bridge row's real content are vertically intermixed
-   in the source art, not stacked in cleanly separable bands, so no pure
-   crop shift hides one without cutting the other.
-
-   Chosen instead: stop treating this as a second masking layer at all.
-   .ship-art-title already has to exist and sit in roughly this same
-   spot for the real title text -- give IT the backdrop (same radial-
-   gradient, now sized to the title's own box) instead of a separate
-   sibling div, and delete the sibling (.ship-mask-caption, both the
-   CSS rule and the DOM node in ui.js). One fewer element, and the
-   backdrop reads as part of displaying the real heading, the same way
-   a text scrim on a hero image normally would, not as an added patch.
-   Verified by cropping a fresh screenshot down to just this region
-   (tmp/shots/caption-zoom4.png): baked text fully gone, soft edges,
-   no hard rectangle. */
-.ship-art-title{position:absolute;z-index:2;top:0;left:0;width:52%;height:17%;padding:10px 14px;color:#fff;
-  background-image:radial-gradient(ellipse at center,rgba(13,36,78,1) 0%,rgba(13,36,78,1) 80%,rgba(13,36,78,0) 100%);
-  text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
-.ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
-.ship-art-title p{margin:2px 0 0;font-size:11px}
+   The real HTML title was never needed for anything other than showing
+   this exact text, which the art already shows natively once nothing is
+   painted over it. Deleted .ship-art-title (the CSS rule and the
+   <div><h2>/<p> ui.js rendered inside .ship-art) entirely instead of
+   re-trying a fourth overlay variant. theme.name/theme.tagline move to
+   an aria-label on .ship-art itself (role="img") so the text stays in
+   the accessibility tree exactly as before -- the only thing that
+   changes is that sighted users now see the art's own native title
+   instead of a duplicate HTML one, opaque or not. */
 /* r18/r18b fix history (.ship-mask-row, now removed -- see .ship-art's
    own r18c comment above for why): "the art occupies only about 60
    percent of its box with the room pins floating in a separate right
