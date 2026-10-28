@@ -69,7 +69,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 
 import owner_lease as ol  # noqa: E402
-import private_sqlite  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -86,7 +85,7 @@ def main(argv=None) -> int:
         return 4
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
     try:
-        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_projects")
+        conn = ol.open_and_migrate(db, require_table="owner_projects")
     except ValueError as exc:
         print(f"refused:{exc}")
         return 4

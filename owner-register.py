@@ -9,13 +9,20 @@ most load-bearing write in the whole activation and gets exactly the same
 refusal posture as owner-lease-claim.py).
 
 Refuses unless HERDR_OWNER_LEASE_WRITER=1 and HERDR_OWNER_LEASE_DB names an
-EXISTING, already-migrated DB (owner_projects table present; this script
-never creates or migrates the DB — lib/private_sqlite.open_private only ever
-opens one). Refuses a label whose registry row (pane_id/pane_birth/session
-digest) is not resolvable — mirrors owner-lease-claim.py's own
-registry_resolver() gate: a label can never be mapped to a project unless
-something is actually running in that pane right now, same as the lease
-claim it feeds.
+EXISTING private DB (owner_projects table present; never CREATES one --
+ol.open_and_migrate(db, require_table="owner_projects") still refuses
+db_not_migrated for a path with no owner_projects table at all). R17: this
+script DOES migrate it in place first (ol.open_and_migrate(), the shared
+open path every owner_lease writer CLI now uses) -- a store that predates
+owner_schema_version (R17's live defect: owner_projects already had
+max_open but not unregistered_at, and nobody had ever called migrate()
+against it) is brought up to the current schema on open, preserving every
+existing row/lease untouched; migrate() is additive-only (ADD COLUMN /
+versioned table rebuilds that copy rows forward), never destructive.
+Refuses a label whose registry row (pane_id/pane_birth/session digest) is
+not resolvable — mirrors owner-lease-claim.py's own registry_resolver()
+gate: a label can never be mapped to a project unless something is
+actually running in that pane right now, same as the lease claim it feeds.
 
 --dry-run prints the exact row (label, project, max_open, registered_at)
 without writing it, and is still subject to every refusal above (a dry-run
@@ -73,7 +80,6 @@ sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
-import private_sqlite  # noqa: E402
 
 
 def _rollback_line(db: str, label: str, delete_will_be_refused: bool) -> str:
@@ -108,7 +114,7 @@ def main(argv=None, resolve=None) -> int:
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
     try:
-        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_projects")
+        conn = ol.open_and_migrate(db, require_table="owner_projects")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
         return 4

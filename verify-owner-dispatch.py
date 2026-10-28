@@ -21,6 +21,7 @@ import owner_dispatch as od  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
 import json  # noqa: E402
 import owner_lease as ol  # noqa: E402
+import owner_lease_renew as olr  # noqa: E402
 import result_availability as ra  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import sqlite3  # noqa: E402
@@ -388,6 +389,7 @@ def main() -> int:
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     register_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    register_pretracking_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     unregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     reregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
@@ -786,6 +788,132 @@ def register_cases(base: Path) -> None:
          and lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
                         (AR,)).fetchone() == before_ar)
     lc.close()
+
+
+def register_pretracking_cases(base: Path) -> None:
+    """R17 live defect: the live store's owner_projects/owner_leases were
+    created by code that predates owner_schema_version entirely (v1+v2+v3
+    applied by an OLDER codebase, no CREATE TABLE owner_schema_version ever
+    run) -- every production writer opened it via
+    private_sqlite.open_private(db, ol.connect, ...) and NEVER called
+    migrate() at all, so owner-register.py crashed with
+    'sqlite3.OperationalError: no such column: unregistered_at' the first
+    time anyone actually registered a label against it (owner-register.py:144
+    -> owner_lease.register_owner -> owner_lease.py:351, pre-fix line
+    numbers). This builds that EXACT shape (NOT verify-owner-lease.py's own
+    v1_db() fixture, which explicitly creates and seeds owner_schema_version
+    at version 1 -- that is the already-tracked case; this one has no
+    owner_schema_version table at all) and drives it through the real CLI,
+    proving the R17 addendum's four properties end to end."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("orc_pt", HERE / "owner-register.py")
+    orc = importlib.util.module_from_spec(spec); spec.loader.exec_module(orc)
+
+    def pretracking_db() -> str:
+        fd, path = tempfile.mkstemp(suffix=".sqlite3", dir=base)
+        os.close(fd)
+        d = sqlite3.connect(path, isolation_level=None)
+        for v in (1, 2, 3):
+            for stmt in ol.MIGRATIONS[v]:
+                d.execute(stmt)
+        reg_at, acq_at, exp_at = ol._iso(T0 - 3600), ol._iso(T0 - 1800), ol._iso(T0 + 3600)
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("kb", "tntpgh/knowledge-base", reg_at))
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("tos", "tntpgh/thurber-os", reg_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L1", "kb", "w1:p1", "term_kb", acq_at, acq_at, exp_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L2", "tos", "w1:p2", "term_tos", acq_at, acq_at, exp_at))
+        d.close()
+        os.chmod(path, 0o600)
+        return path
+
+    db = pretracking_db()
+    raw = lambda: sqlite3.connect(db)
+    tables_before = lambda c: {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    case("R17 fixture: no owner_schema_version table exists before any open",
+         "owner_schema_version" not in tables_before(raw()))
+    projects_full = lambda c: c.execute("SELECT * FROM owner_projects ORDER BY label").fetchall()
+    leases_full = lambda c: c.execute(
+        "SELECT lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,released_at,"
+        "release_reason,session_digest FROM owner_leases ORDER BY lease_id").fetchall()
+    pre_conn = raw()
+    pre_projects = projects_full(pre_conn)  # (label, project, registered_at, max_open) -- v3 shape, 4 cols
+    pre_leases = leases_full(pre_conn)
+    pre_conn.close()
+
+    NEW = "tourguide"
+    NEW_RESOLVE = {NEW: ("w5:p5", "term_tg1", hashlib.sha256(b"tg-session-1").hexdigest())}
+
+    def run(dry_run):
+        os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=db)
+        argv = ["--label", NEW, "--project", "tntpgh/tourguide"]
+        if dry_run:
+            argv.append("--dry-run")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = orc.main(argv, resolve=NEW_RESOLVE.get)
+        finally:
+            os.environ.pop("HERDR_OWNER_LEASE_WRITER", None)
+            os.environ.pop("HERDR_OWNER_LEASE_DB", None)
+        return rc, buf.getvalue().strip()
+
+    # (a) dry-run: schema migrates (open_and_migrate runs on every open) but
+    # NO business row is written -- kb/tos stay byte-identical (mod the new
+    # NULL columns ADD COLUMN appends) and tourguide is NOT inserted.
+    rc, out = run(dry_run=True)
+    post_dry = raw()
+    cols_after_dry = {r[1] for r in post_dry.execute("PRAGMA table_info(owner_projects)").fetchall()}
+    case("R17 (a): dry-run against the pre-tracking store succeeds (no crash)", rc == 0 and "dry-run:" in out)
+    case("R17 (a): dry-run still migrates the schema as a side effect (infra, not business data)",
+         {"unregistered_at", "lifecycle_end_at", "unregister_token"} <= cols_after_dry)
+    case("R17 (a): dry-run writes NO business row -- kb/tos untouched, tourguide absent",
+         [r[:4] for r in projects_full(post_dry)] == pre_projects
+         and all(r[4:] == (None, None, None) for r in projects_full(post_dry))  # new cols NULL for pre-existing rows
+         and leases_full(post_dry) == pre_leases
+         and post_dry.execute("SELECT 1 FROM owner_projects WHERE label=?", (NEW,)).fetchone() is None)
+    post_dry.close()
+
+    # (b) migration itself: atomic, FK-checked, idempotent.
+    mig_conn = raw()
+    case("R17 (b): migrated to SCHEMA_VERSION, only v4/v5 newly tracked (v1-v3 were inferred, not re-applied)",
+         [r[0] for r in mig_conn.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5]
+         and mig_conn.execute("PRAGMA foreign_key_check").fetchall() == [])
+    case("R17 (b): re-migrating the same (now-tracked) store is a no-op",
+         ol.migrate(mig_conn) == 5
+         and [r[0] for r in mig_conn.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5])
+    mig_conn.close()
+
+    # (c) + real register: existing rows byte-preserved across the real write too.
+    rc, out = run(dry_run=False)
+    post_apply = raw()
+    case("R17: real register against the pre-tracking store succeeds (the original live crash)",
+         rc == 0 and out.splitlines()[0] == f"registered:{NEW}:tntpgh/tourguide")
+    case("R17 (c): kb/tos rows stay byte-preserved across the real write (only tourguide is new)",
+         [r for r in projects_full(post_apply) if r[0] != NEW] ==
+         [(lbl, proj, reg, mo, None, None, None) for (lbl, proj, reg, mo) in pre_projects]
+         and leases_full(post_apply) == pre_leases)
+    case("R17: tourguide registered with no lifecycle bound/token (CLI exposes neither flag)",
+         post_apply.execute("SELECT lifecycle_end_at, unregister_token FROM owner_projects WHERE label=?",
+                            (NEW,)).fetchone() == (None, None))
+
+    # (d) migrated-but-unbounded rows stay fail-closed: no silent seeding.
+    case("R17 (d): renew_due on a migrated label with an active lease and no bound -> no_lifecycle_bound",
+         olr.renew_due(post_apply, "kb", ("w1:p1", "term_kb", ""), now=T0 + 10) == "no_lifecycle_bound")
+    case("R17 (d): unregister_owner on a migrated label with no token -> Unauthorized, never silently allowed",
+         raises(lambda: ol.unregister_owner(post_apply, "kb", "any-token", now=T0 + 10, dry_run=False),
+                ol.Unauthorized))
+    post_apply.close()
+
+
+def raises(fn, exc):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
 
 
 def unregister_cases(base: Path) -> None:

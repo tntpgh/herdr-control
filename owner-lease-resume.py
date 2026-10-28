@@ -81,7 +81,6 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as oled  # noqa: E402
-import private_sqlite  # noqa: E402
 
 
 def main(argv=None, resolve=None, now=None) -> int:
@@ -106,7 +105,7 @@ def main(argv=None, resolve=None, now=None) -> int:
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
     try:
-        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_leases")
+        conn = ol.open_and_migrate(db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
         return 4

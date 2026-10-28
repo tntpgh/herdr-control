@@ -70,6 +70,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import private_sqlite
+
 SCHEMA_VERSION = 5
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
@@ -254,25 +256,76 @@ MIGRATIONS = {
 }
 
 
+def _infer_pre_tracking_version(conn: sqlite3.Connection) -> int:
+    """R17: the live store already had tables shaped like v1-v3 (owner_projects
+    with max_open, owner_leases with session_digest) WITHOUT owner_schema_version
+    ever existing -- that table, and the whole incremental MIGRATIONS scheme,
+    did not exist yet when this store's tables were first created; nobody ever
+    called migrate() against it even once. COALESCE(MAX(version),0) therefore
+    reads 0 on a store that is NOT actually empty, and blindly running v1's
+    bare `CREATE TABLE owner_projects (...)` (no IF NOT EXISTS; none of these
+    statements have one, by design -- a silent no-op on mismatch would be
+    worse than a loud crash) raises 'table owner_projects already exists'.
+
+    Infers the real starting version by introspecting the columns/tables each
+    version's own migration would have created, instead of trusting a version
+    counter that may simply never have been written. A genuinely fresh,
+    empty database (no owner_projects table at all) returns 0, unchanged from
+    before -- this only changes behavior for a store that already has tables
+    migrate() itself did not create. Not persisted: re-run every time migrate()
+    sees cur==0, which is correct and idempotent by construction (same inputs,
+    same answer) rather than fabricating an applied_at timestamp for history
+    this process never observed."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "owner_projects" not in tables:
+        return 0
+    proj_cols = {r[1] for r in conn.execute("PRAGMA table_info(owner_projects)").fetchall()}
+    if "unregister_token" in proj_cols and "lifecycle_end_at" in proj_cols:
+        return 5
+    if "unregistered_at" in proj_cols:
+        return 4
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(owner_leases)").fetchall()} if "owner_leases" in tables else set()
+    if "session_digest" in lease_cols:
+        return 3
+    if "max_open" in proj_cols:
+        return 2
+    return 1
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending versioned migrations atomically. Returns the schema version.
 
     FKs are off for the duration (table rebuilds need it; the pragma is a no-op
-    inside a transaction) and every FK is checked before COMMIT."""
+    inside a transaction) and every FK is checked before COMMIT -- but ONLY
+    when a migration actually ran this call (R17: open_and_migrate() now
+    runs migrate() on every CLI open, including a store already at
+    SCHEMA_VERSION; checking FKs unconditionally on every no-op open would
+    crash on a database that has ANY transient FK-violating row for reasons
+    unrelated to migration -- e.g. verify-owner-dispatch.py's
+    lease_writer_cases() deliberately parks one, via PRAGMA foreign_keys=OFF
+    on a separate connection, to test a 'request history with no lease'
+    refusal path. A check here would be testing THAT row, not this call's
+    own migration work, which did none. Any future version bump still gets
+    checked -- the guard is on 'did cur change this call', not 'never
+    again')."""
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
         cur = conn.execute("SELECT COALESCE(MAX(version),0) FROM owner_schema_version").fetchone()[0]
+        if cur == 0:
+            cur = _infer_pre_tracking_version(conn)
+        start = cur
         for v in sorted(MIGRATIONS):
             if v > cur:
                 for stmt in MIGRATIONS[v]:
                     conn.execute(stmt)
                 conn.execute("INSERT INTO owner_schema_version VALUES (?,?)", (v, _iso(time.time())))
                 cur = v
-        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if bad:
-            raise sqlite3.IntegrityError(f"migration left {len(bad)} foreign-key violation(s): {bad[:3]}")
+        if cur != start:
+            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                raise sqlite3.IntegrityError(f"migration left {len(bad)} foreign-key violation(s): {bad[:3]}")
         conn.execute("COMMIT")
         return cur
     except BaseException:
@@ -280,6 +333,52 @@ def migrate(conn: sqlite3.Connection) -> int:
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def open_and_migrate(path: str, require_table: str = "") -> sqlite3.Connection:
+    """R17: the ONE shared open path every owner_lease-backed WRITER CLI must
+    use instead of calling private_sqlite.open_private(path, ol.connect, ...)
+    directly -- owner-register.py did exactly that and never called migrate(),
+    crashing on the live store ('no such column: unregistered_at'); every
+    other owner_lease writer (owner-dispatch-issue.py, owner-dispatch.py,
+    owner-lease-claim.py, owner-lease-reregister.py, owner-lease-resume.py,
+    owner-lease-unregister.py, queue-supervisor.py) turned out to have the
+    SAME gap, not just the one CLI first reported. Not used by
+    owner-lease-reap.py, which opens read-only by design (mode=ro) and must
+    never attempt a schema write; and not pushed into
+    private_sqlite.open_private() itself, which is generic (also used by
+    lib/owner_dispatch_auth.py's own, unrelated migration scheme) and must
+    not assume every caller wants an owner_lease migration.
+
+    Runs migrate() on EVERY open -- including a --dry-run CLI invocation,
+    which still calls this (none of the dry-run flags live below this open
+    call; register_owner()/unregister_owner()/reregister_owner() are only
+    EVER called on an already-open, already-current connection). Deliberate,
+    not an oversight (R17 addendum (a)): migration is schema-infrastructure,
+    orthogonal to the business-level preview/apply distinction every dry-run
+    flag in this file governs -- no dry-run output anywhere reads or reports
+    unregistered_at/lifecycle_end_at/unregister_token's CURRENT stored value
+    (owner-register.py's dry-run path prints back the CLI's own arguments,
+    never a row read), so migrating never changes what a dry-run reports.
+    It is also provably additive-only (nullable ADD COLUMN / versioned
+    table-rebuild-by-copy, one atomic transaction, PRAGMA foreign_key_check
+    before COMMIT -- see migrate()) and idempotent (a second call is a
+    no-op: COALESCE(MAX(version),0) then reads the real tracked version).
+    Gating migration behind --apply would reintroduce exactly R17's own
+    bug shape one column later: a dry-run path that happens not to touch a
+    new column stays silently "fine" while --apply crashes the first time
+    anyone actually runs it against an unmigrated store -- the asymmetry
+    IS the defect, not a safety property worth preserving. A permanent
+    regression (verify-owner-lease.py) proves the schema migrates on a
+    dry-run call while every BUSINESS row/lease/token stays byte-identical
+    (the only kind of 'no write' a dry-run was ever supposed to promise)."""
+    conn = private_sqlite.open_private(path, connect, require_table=require_table)
+    try:
+        migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _event(conn, now, label, kind, ref="", generation=None, detail=""):

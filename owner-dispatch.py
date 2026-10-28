@@ -42,7 +42,6 @@ import owner_dispatch as od  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
-import private_sqlite  # noqa: E402
 import result_availability as ra  # noqa: E402
 
 
@@ -93,7 +92,7 @@ def main(argv=None, send=None, resolve=None) -> int:
         send = send or make_send(publisher.DELIVER)
         resolve = resolve or publisher.registry_resolver
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_and_migrate(lease_db, require_table="owner_leases")
     except ValueError as exc:
         store.close()
         avail.close()

@@ -64,7 +64,6 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
-import private_sqlite  # noqa: E402
 import queue_supervisor as qs  # noqa: E402
 
 PROTOCOL = "owner-dispatch-approval/2"
@@ -564,7 +563,7 @@ def build_main(argv, resolve=None) -> int:
             print("refused:lease_db_required_for_successor")
             return 2
         try:
-            plconn = private_sqlite.open_private(a.lease_db, ol.connect, require_table="owner_leases")
+            plconn = ol.open_and_migrate(a.lease_db, require_table="owner_leases")
         except ValueError as exc:
             print(f"refused:lease_{exc}")
             return 4
@@ -656,7 +655,7 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_and_migrate(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
         return 4
@@ -745,7 +744,7 @@ def main(argv=None, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_and_migrate(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
         return 4
