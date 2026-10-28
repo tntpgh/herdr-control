@@ -580,10 +580,21 @@ def build_main(argv, resolve=None, now=None) -> int:
     at build time (refused:live_generation_unresolved otherwise), and
     re-confirmed again at issue time (ANSWER-r12.md) since build and issue
     are separated by a human answering the form. Claims nothing either way.
+    Exactly one of --request-id (free-form) or --queue-item-id ID (R12e,
+    tmp/in/r12/QUEUE-RID.md) is required: --queue-item-id derives
+    request_id = queue_supervisor.rid_for(label, ID) BEFORE the approval
+    bytes are hashed, so the signed form shows the canonical queue rid --
+    a grant meant for queue-supervisor.py's tick_lane() can then never be
+    built with a request_id that diverges from what the queue will later
+    present to oda.consume(), the gap tmp/out/r12/REPORT-r12d-queue-rid.md
+    reported. oda.consume()/consume_standing()'s own equality checks are
+    untouched by this: request_id is still an opaque string to them.
     Serves nothing and records nothing."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
-    for a in ("--label", "--project", "--request-dir", "--request-name", "--request-id", "--auth-id", "--out"):
+    for a in ("--label", "--project", "--request-dir", "--request-name", "--auth-id", "--out"):
         ap.add_argument(a, required=True)
+    ap.add_argument("--request-id")
+    ap.add_argument("--queue-item-id")
     ap.add_argument("--manifest", action="append", required=True)
     ap.add_argument("--lease-ttl-s", type=int, default=1800)
     ap.add_argument("--grant-window-s", type=int, default=1800)
@@ -591,6 +602,13 @@ def build_main(argv, resolve=None, now=None) -> int:
     ap.add_argument("--bind-live-generation", type=int, default=0)
     ap.add_argument("--lease-db")
     a = ap.parse_args(argv)
+    if a.request_id is not None and a.queue_item_id is not None:
+        print("refused:request_id_and_queue_item_id_mutually_exclusive")
+        return 2
+    if a.request_id is None and a.queue_item_id is None:
+        print("refused:request_id_or_queue_item_id_required")
+        return 2
+    request_id = a.request_id if a.request_id is not None else qs.rid_for(a.label, a.queue_item_id)
     clock = (lambda: now) if now is not None else time.time
     if a.expected_prev_generation < 0:
         print("refused:expected_prev_generation_negative")
@@ -658,7 +676,7 @@ def build_main(argv, resolve=None, now=None) -> int:
     rec = {"protocol": PROTOCOL, "owner_label": a.label, "project": a.project, "max_open": 1,
            "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
            "expected_generation": a.bind_live_generation if a.bind_live_generation else a.expected_prev_generation + 1,
-           "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id,
+           "lease_ttl_s": a.lease_ttl_s, "request_id": request_id,
            "request_name": a.request_name, "request_sha256": oda.body_sha256(data), "manifest": a.manifest,
            "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
     if a.expected_prev_generation >= 1:
