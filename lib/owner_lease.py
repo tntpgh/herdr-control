@@ -150,6 +150,19 @@ class AlreadyUnregistered(Exception):
     reregister.py is the deliberate, explicit, authorized recovery path."""
 
 
+class SchemaMigrationRequired(Exception):
+    """R17b: a WRITE-capable open (open_rw_checked()) refused because the
+    store's schema is behind SCHEMA_VERSION. No writer CLI migrates
+    implicitly anymore (R17's own open_and_migrate() did, and the review
+    that uncovered it (--dry-run silently migrating a live store) is why
+    this exists) -- owner-lease-migrate.py is the one explicit, auditable
+    path a schema actually advances through now. `cur`/`target` let the
+    caller print the exact owner-lease-migrate.py invocation."""
+    def __init__(self, cur: int, target: int):
+        self.cur, self.target = cur, target
+        super().__init__(f"schema at v{cur}, need v{target}")
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -159,6 +172,14 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def connect_ro(path: str) -> sqlite3.Connection:
+    """R17b: the read-only connector for dry-run/refused/validation-failure
+    CLI paths and owner-lease-migrate.py's default plan mode -- sqlite
+    mode=ro URI, same pattern owner-lease-reap.py already used. Any write
+    attempt fails at SQLite itself, not by caller discipline."""
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3, isolation_level=None)
 
 
 MIGRATIONS = {
@@ -294,20 +315,16 @@ def _infer_pre_tracking_version(conn: sqlite3.Connection) -> int:
 
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending versioned migrations atomically. Returns the schema version.
+    The ONLY caller now is owner-lease-migrate.py --apply (R17b): no CLI
+    open path calls this implicitly anymore -- see open_rw_checked()/open_ro().
 
     FKs are off for the duration (table rebuilds need it; the pragma is a no-op
     inside a transaction) and every FK is checked before COMMIT -- but ONLY
-    when a migration actually ran this call (R17: open_and_migrate() now
-    runs migrate() on every CLI open, including a store already at
-    SCHEMA_VERSION; checking FKs unconditionally on every no-op open would
-    crash on a database that has ANY transient FK-violating row for reasons
-    unrelated to migration -- e.g. verify-owner-dispatch.py's
-    lease_writer_cases() deliberately parks one, via PRAGMA foreign_keys=OFF
-    on a separate connection, to test a 'request history with no lease'
-    refusal path. A check here would be testing THAT row, not this call's
-    own migration work, which did none. Any future version bump still gets
-    checked -- the guard is on 'did cur change this call', not 'never
-    again')."""
+    when a migration actually ran this call (checking FKs on an already-
+    current store that merely has a transient, migration-unrelated FK
+    violation -- e.g. a test fixture built with PRAGMA foreign_keys=OFF --
+    would reject something that isn't this call's problem; a future version
+    bump still gets checked, since 'cur != start' stays true for that)."""
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -335,50 +352,66 @@ def migrate(conn: sqlite3.Connection) -> int:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
-def open_and_migrate(path: str, require_table: str = "") -> sqlite3.Connection:
-    """R17: the ONE shared open path every owner_lease-backed WRITER CLI must
-    use instead of calling private_sqlite.open_private(path, ol.connect, ...)
-    directly -- owner-register.py did exactly that and never called migrate(),
-    crashing on the live store ('no such column: unregistered_at'); every
-    other owner_lease writer (owner-dispatch-issue.py, owner-dispatch.py,
-    owner-lease-claim.py, owner-lease-reregister.py, owner-lease-resume.py,
-    owner-lease-unregister.py, queue-supervisor.py) turned out to have the
-    SAME gap, not just the one CLI first reported. Not used by
-    owner-lease-reap.py, which opens read-only by design (mode=ro) and must
-    never attempt a schema write; and not pushed into
-    private_sqlite.open_private() itself, which is generic (also used by
-    lib/owner_dispatch_auth.py's own, unrelated migration scheme) and must
-    not assume every caller wants an owner_lease migration.
+def current_version(conn: sqlite3.Connection) -> int:
+    """R17b: read-only-safe version probe -- works on a mode=ro connection
+    (no CREATE TABLE, unlike migrate()'s own tracking-table bootstrap).
+    Checks owner_schema_version's existence via sqlite_master first (SELECT
+    against a table that doesn't exist would raise OperationalError, which
+    a read-only caller has no transaction to roll back from); falls back to
+    _infer_pre_tracking_version() exactly like migrate() does when cur==0,
+    or when the table itself is simply absent."""
+    has_tracking = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_schema_version'").fetchone()
+    if has_tracking:
+        cur = conn.execute("SELECT COALESCE(MAX(version),0) FROM owner_schema_version").fetchone()[0]
+        if cur > 0:
+            return cur
+    return _infer_pre_tracking_version(conn)
 
-    Runs migrate() on EVERY open -- including a --dry-run CLI invocation,
-    which still calls this (none of the dry-run flags live below this open
-    call; register_owner()/unregister_owner()/reregister_owner() are only
-    EVER called on an already-open, already-current connection). Deliberate,
-    not an oversight (R17 addendum (a)): migration is schema-infrastructure,
-    orthogonal to the business-level preview/apply distinction every dry-run
-    flag in this file governs -- no dry-run output anywhere reads or reports
-    unregistered_at/lifecycle_end_at/unregister_token's CURRENT stored value
-    (owner-register.py's dry-run path prints back the CLI's own arguments,
-    never a row read), so migrating never changes what a dry-run reports.
-    It is also provably additive-only (nullable ADD COLUMN / versioned
-    table-rebuild-by-copy, one atomic transaction, PRAGMA foreign_key_check
-    before COMMIT -- see migrate()) and idempotent (a second call is a
-    no-op: COALESCE(MAX(version),0) then reads the real tracked version).
-    Gating migration behind --apply would reintroduce exactly R17's own
-    bug shape one column later: a dry-run path that happens not to touch a
-    new column stays silently "fine" while --apply crashes the first time
-    anyone actually runs it against an unmigrated store -- the asymmetry
-    IS the defect, not a safety property worth preserving. A permanent
-    regression (verify-owner-lease.py) proves the schema migrates on a
-    dry-run call while every BUSINESS row/lease/token stays byte-identical
-    (the only kind of 'no write' a dry-run was ever supposed to promise)."""
-    conn = private_sqlite.open_private(path, connect, require_table=require_table)
+
+def schema_status(conn: sqlite3.Connection) -> tuple[int, int]:
+    """(current_version, SCHEMA_VERSION) -- read-only safe."""
+    return current_version(conn), SCHEMA_VERSION
+
+
+def open_ro(path: str, require_table: str = "") -> sqlite3.Connection:
+    """R17b: the read-only open for dry-run / refused / validation-failure
+    CLI paths. Never migrates (can't -- sqlite mode=ro rejects any write at
+    the engine level, not by caller discipline), so schema_status() is the
+    only way these paths learn whether a migration is pending, to report
+    it rather than silently (or crashingly) acting on a stale schema."""
+    return private_sqlite.open_private(path, connect_ro, require_table=require_table)
+
+
+def open_rw_checked(path: str, require_table: str = "") -> sqlite3.Connection:
+    """R17b: the ONE shared WRITE-capable open path every owner_lease writer
+    CLI (owner-register.py, owner-dispatch-issue.py, owner-dispatch.py,
+    owner-lease-claim.py, owner-lease-reregister.py, owner-lease-resume.py,
+    owner-lease-unregister.py, queue-supervisor.py) uses instead of calling
+    private_sqlite.open_private(path, ol.connect, ...) directly. Replaces
+    R17's open_and_migrate(), which migrated on EVERY open including a
+    --dry-run call -- rejected on review (REVIEW-r17): "zero business-row
+    writes" is not the same promise as read-only, and a dry-run silently
+    advancing schema_version was a real, unwanted write. This function
+    NEVER migrates, and checks the schema version via a READ-ONLY probe
+    FIRST (sqlite mode=ro -- same discipline as open_ro()/owner-lease-
+    reap.py): a read-write connection is only ever opened once the schema
+    is confirmed current. If the store is behind SCHEMA_VERSION it raises
+    SchemaMigrationRequired(cur, SCHEMA_VERSION) without ever opening
+    read-write -- the caller prints refused:schema_migration_required and
+    names owner-lease-migrate.py, the one explicit, auditable, backed-up
+    path a schema now advances through. Not used by owner-lease-reap.py
+    (read-only by design); not pushed into private_sqlite.open_private()
+    itself, which is generic (also used by lib/owner_dispatch_auth.py's
+    own, unrelated migration scheme)."""
+    probe = private_sqlite.open_private(path, connect_ro, require_table=require_table)
     try:
-        migrate(conn)
-    except BaseException:
-        conn.close()
-        raise
-    return conn
+        cur = current_version(probe)
+    finally:
+        probe.close()
+    if cur < SCHEMA_VERSION:
+        raise SchemaMigrationRequired(cur, SCHEMA_VERSION)
+    return private_sqlite.open_private(path, connect, require_table=require_table)
 
 
 def _event(conn, now, label, kind, ref="", generation=None, detail=""):

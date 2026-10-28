@@ -9,16 +9,17 @@ most load-bearing write in the whole activation and gets exactly the same
 refusal posture as owner-lease-claim.py).
 
 Refuses unless HERDR_OWNER_LEASE_WRITER=1 and HERDR_OWNER_LEASE_DB names an
-EXISTING private DB (owner_projects table present; never CREATES one --
-ol.open_and_migrate(db, require_table="owner_projects") still refuses
-db_not_migrated for a path with no owner_projects table at all). R17: this
-script DOES migrate it in place first (ol.open_and_migrate(), the shared
-open path every owner_lease writer CLI now uses) -- a store that predates
-owner_schema_version (R17's live defect: owner_projects already had
-max_open but not unregistered_at, and nobody had ever called migrate()
-against it) is brought up to the current schema on open, preserving every
-existing row/lease untouched; migrate() is additive-only (ADD COLUMN /
-versioned table rebuilds that copy rows forward), never destructive.
+EXISTING private DB (owner_projects table present; never CREATES one).
+R17b: this script NEVER migrates the schema. --dry-run opens read-only
+(ol.open_ro(), sqlite mode=ro) and reports `schema_pending:<cur>-><target>`
+if the store is behind, alongside the row it would write -- the engine
+itself rejects any write attempt, not caller discipline. The real write
+path (ol.open_rw_checked()) refuses `schema_migration_required:<cur>-><target>`
+before opening for write if the store is behind -- never advances the
+schema as a side effect of a register call. owner-lease-migrate.py is the
+one explicit, backed-up path a schema now advances through (R17b; R17's
+open_and_migrate(), which migrated on every open including --dry-run, was
+rejected on review: "zero business-row writes" is not read-only).
 Refuses a label whose registry row (pane_id/pane_birth/session digest) is
 not resolvable — mirrors owner-lease-claim.py's own registry_resolver()
 gate: a label can never be mapped to a project unless something is
@@ -113,11 +114,29 @@ def main(argv=None, resolve=None) -> int:
         return 4
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
-    try:
-        conn = ol.open_and_migrate(db, require_table="owner_projects")
-    except ValueError as exc:
-        print(f"refused:lease_{exc}")
-        return 4
+
+    # R17b: the DB open is the ONLY thing that differs between dry-run and
+    # a real write -- dry-run opens read-only (sqlite mode=ro) and NEVER
+    # migrates; the real write path refuses schema_migration_required
+    # instead of migrating implicitly. Everything else below runs in the
+    # SAME order as before this fix (permission/open check, THEN resolve,
+    # THEN canonical_project, THEN max_open) so a non-DB validation failure
+    # on an unresolvable/invalid label never masks a DB-permission refusal.
+    if a.dry_run:
+        try:
+            conn = ol.open_ro(db, require_table="owner_projects")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
+    else:
+        try:
+            conn = ol.open_rw_checked(db, require_table="owner_projects")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
+        except ol.SchemaMigrationRequired as exc:
+            print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {db} --apply")
+            return 4
     try:
         if resolve is None:
             import publisher  # noqa: E402
@@ -134,7 +153,11 @@ def main(argv=None, resolve=None) -> int:
         if not isinstance(a.max_open, int) or not 1 <= a.max_open <= ol.MAX_OPEN_LIMIT:
             print(f"refused:max_open_out_of_range:1..{ol.MAX_OPEN_LIMIT}")
             return 2
+
         if a.dry_run:
+            cur, target = ol.schema_status(conn)
+            if cur < target:
+                print(f"schema_pending:{cur}->{target} (owner-lease-migrate.py --db {db} --apply)")
             iso = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             end_iso = (datetime.fromtimestamp(a.lifecycle_end, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                       if a.lifecycle_end is not None else None)
@@ -146,6 +169,7 @@ def main(argv=None, resolve=None) -> int:
                 (a.label, a.label)).fetchone())
             print(_rollback_line(db, a.label, refused_delete))
             return 0
+
         try:
             proj = ol.register_owner(conn, a.label, a.project, a.max_open, lifecycle_end_at=a.lifecycle_end,
                                      unregister_token=a.unregister_token)

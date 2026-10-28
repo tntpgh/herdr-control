@@ -563,9 +563,12 @@ def build_main(argv, resolve=None) -> int:
             print("refused:lease_db_required_for_successor")
             return 2
         try:
-            plconn = ol.open_and_migrate(a.lease_db, require_table="owner_leases")
+            plconn = ol.open_rw_checked(a.lease_db, require_table="owner_leases")
         except ValueError as exc:
             print(f"refused:lease_{exc}")
+            return 4
+        except ol.SchemaMigrationRequired as exc:
+            print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {a.lease_db} --apply")
             return 4
         try:
             prow = plconn.execute(
@@ -655,9 +658,12 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = ol.open_and_migrate(lease_db, require_table="owner_leases")
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
         return 4
     try:
         store = oda.open_store(auth_db)
@@ -744,9 +750,12 @@ def main(argv=None, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = ol.open_and_migrate(lease_db, require_table="owner_leases")
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
         return 4
     try:
         store = oda.open_store(auth_db)

@@ -66,14 +66,48 @@ def main(argv=None) -> int:
         print("refused:flags_off")
         return 4
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
+
+    if not a.apply:
+        # R17b: dry-run opens read-only, never migrates.
+        try:
+            conn = ol.open_ro(db, require_table="owner_projects")
+        except ValueError as exc:
+            print(f"refused:{exc}")
+            return 4
+        try:
+            cur, target = ol.schema_status(conn)
+            if cur < target:
+                print(f"schema_pending:{cur}->{target} (owner-lease-migrate.py --db {db} --apply) -- "
+                      f"would_reregister cannot be confirmed until migrated")
+                return 0
+            result = ol.reregister_owner(conn, a.label, a.project, a.token, a.new_token, a.lifecycle_end,
+                                         now=time.time(), dry_run=True)
+        except ol.InvalidOwner as exc:
+            print(f"refused:owner_project_mismatch:{exc}")
+            return 2
+        except ol.Unauthorized as exc:
+            print(f"refused:unauthorized:{exc}")
+            return 2
+        except ValueError as exc:
+            print(f"refused:invalid_input:{exc}")
+            return 2
+        finally:
+            conn.close()
+        print(f"dry-run:{result}:{a.label}")
+        return 0
+
+    # R17b: --apply never migrates implicitly either.
     try:
-        conn = ol.open_and_migrate(db, require_table="owner_projects")
+        conn = ol.open_rw_checked(db, require_table="owner_projects")
     except ValueError as exc:
         print(f"refused:{exc}")
         return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {db} --apply")
+        return 4
     try:
         result = ol.reregister_owner(conn, a.label, a.project, a.token, a.new_token, a.lifecycle_end,
-                                     now=time.time(), dry_run=not a.apply)
+                                     now=time.time(), dry_run=False)
     except ol.InvalidOwner as exc:
         print(f"refused:owner_project_mismatch:{exc}")
         return 2
@@ -85,8 +119,7 @@ def main(argv=None) -> int:
         return 2
     finally:
         conn.close()
-    mode = "apply" if a.apply else "dry-run"
-    print(f"{mode}:{result}:{a.label}")
+    print(f"apply:{result}:{a.label}")
     if result == "race_lost":
         return 2
     return 0

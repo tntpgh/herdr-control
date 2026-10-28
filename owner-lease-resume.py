@@ -104,11 +104,22 @@ def main(argv=None, resolve=None, now=None) -> int:
 
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
-    try:
-        conn = ol.open_and_migrate(db, require_table="owner_leases")
-    except ValueError as exc:
-        print(f"refused:lease_{exc}")
-        return 4
+    if a.apply:
+        try:
+            conn = ol.open_rw_checked(db, require_table="owner_leases")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
+        except ol.SchemaMigrationRequired as exc:
+            print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {db} --apply")
+            return 4
+    else:
+        # R17b: without --apply this never migrates, never writes -- read-only open.
+        try:
+            conn = ol.open_ro(db, require_table="owner_leases")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
 
     if resolve is None:
         import publisher  # noqa: E402
@@ -121,6 +132,12 @@ def main(argv=None, resolve=None, now=None) -> int:
     pane, birth, digest = reg
 
     try:
+        if not a.apply:
+            cur_v, target_v = ol.schema_status(conn)
+            if cur_v < target_v:
+                print(f"schema_pending:{cur_v}->{target_v} (owner-lease-migrate.py --db {db} --apply) -- "
+                      f"plan cannot be confirmed until migrated")
+                return 0
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (a.label,)).fetchone():
             print("refused:owner_project_unmapped")
             return 2
