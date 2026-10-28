@@ -17,8 +17,17 @@ header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 
    items, not how narrow any one item itself can go. header and its nav
    are the most likely source (several nav links in a row); min-width:0
    only changes how far something is ALLOWED to shrink, never its size
-   when there is room, so this is safe at any width. */
-header,header nav,main,.ship,.hull,.side-rail,.chips{min-width:0}
+   when there is room, so this is safe at any width.
+
+   r18 fix (tmp/in/FIX-r18.md item 2, conductor real-Chromium measure of
+   6a75769 at 375: "SYNTHETIC banner, room cards text, Needs-your-call
+   line cut at the right edge"). Same bug, same fix, wider net: .room
+   itself already had min-width:0 (r7), but its own children
+   (.room-head's flex row, .wcards' grid of task cards) are ALSO
+   flex/grid items one level down that need the same floor removed, and
+   .ship-bottom (the "Needs your call" bar, display:flex) and its
+   .call-chip child were never covered at all. */
+header,header nav,main,.ship,.hull,.side-rail,.chips,.room-head,.wcards,.ship-bottom,.call-chip{min-width:0}
 header .brand{font-size:16px;letter-spacing:.04em}
 header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
 header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent}
@@ -36,17 +45,32 @@ details.navgroup[open]>summary::before{content:"\25BE  "}
 .prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
 .prefs>summary::-webkit-details-marker{display:none}
 /* r17 fix (tmp/in/FIX-r17.md item 2, from independent review r9 section 3
-   "Mobile", carried forward from before 65b4f0d, now addressed): a flat
-   230px min-width on a popup anchored to .prefs (itself mid-header's flex
-   row, not flush to the viewport edge) overflows any viewport narrower
-   than ~246px regardless of which side it's anchored to -- the mobile
-   override only changes left vs right anchoring, never the floor itself.
-   min(230px, calc(100vw - 16px)) keeps the 230px floor everywhere it
-   fits and clamps to the viewport minus a small margin everywhere it
-   doesn't, so it can never exceed the viewport at any width. */
-.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:min(230px,calc(100vw - 16px));padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
+   "Mobile", carried forward from before 65b4f0d): a flat 230px min-width
+   on a popup anchored to .prefs (itself mid-header's flex row, not flush
+   to the viewport edge) overflows any viewport narrower than ~246px
+   regardless of which side it's anchored to -- the mobile override only
+   changes left vs right anchoring, never the floor itself.
+
+   r18 fix (tmp/in/FIX-r18.md item 2 + tmp/in/SHOTS.md's own
+   scrollWidth/innerWidth acceptance test, re-measured this round with a
+   same-origin iframe harness, tmp/measure-harness.py, since plain
+   headless --window-size screenshots don't honour width=device-width
+   reliably for this check): r17's min(230px, calc(100vw - 16px)) was
+   still applied to min-width, which only ever sets a FLOOR -- it can
+   never stop the box from growing WIDER than that if its content (the
+   theme <select>'s own option text) needs more room, so the box kept
+   overflowing exactly as before, just with smaller numbers. The actual
+   cap has to be max-width, which the spec guarantees wins over min-width
+   whenever the two conflict: min-width:230px (floor, unchanged, keeps it
+   comfortable on anything wider) plus max-width:calc(100vw - 16px)
+   (ceiling, new) so a narrow viewport always wins regardless of content.
+   min-width:0 on the body/select/label so the select itself can still
+   shrink inside that capped box instead of forcing it wider again. */
+.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:230px;
+  max-width:calc(100vw - 16px);padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
+.prefs-body,.prefs-body label,.prefs-body select{min-width:0}
 .prefs-body label{display:flex;gap:8px;align-items:center}
-.prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
+.prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px;max-width:100%}
 html:not([data-js]) .prefs,html:not([data-js]) .viewbar{display:none}
 /* r14b fix (tmp/in/FIX-r14b.md item 7): repo chips + the Ship/Overview
    layout radio moved into a collapsed-by-default section (lib/hub_ui/
@@ -226,18 +250,44 @@ html[data-view=ship] #overview-view{display:none}
    baked per-room status pills, rather than re-cropping (which would move
    every .ship-mask-row/.room-pin offset again) or dropping the real HTML
    title (which the review flagged would still need a visually-hidden h2
-   for screen readers -- more moving parts for the same result). Sized
-   generously past the computed 7.8-13.4% band (same "generous rather
-   than tight" margin this file already uses for every mask) and to the
-   left where the caption sits, well under .ship-art-title's own
-   max-width:62% reach so neither undershoots the other. */
-.ship-mask-caption{top:6%;left:0;width:58%;height:9%}
+   for screen readers -- more moving parts for the same result).
+
+   r18 fix (tmp/in/FIX-r18-correction.md item 1, conductor real-Chromium
+   measure of 6a75769 against a freshly-restarted preview, corrected
+   shots tmp/in/r17bshots/ -- the caption itself IS covered now, but as "a
+   hard-edged dark rectangle across the sky... soften it to blend... match
+   colour, feather edges or size it tightly". Per owner direction
+   (tmp/in/OWNER-r18.md): do not keep stacking flat patches that degrade
+   the composition. Swapped the flat var(--surface-2) fill (a card-navy,
+   not a sky colour) for a radial-gradient feather using a sky-blue
+   sampled directly from the unmasked art with tmp/png_probe.py (a
+   stdlib-only PNG decoder) near the caption's own computed band, fully
+   opaque at the centre (where the caption's letters actually sit) fading
+   to transparent by the edge -- no hard boundary anywhere. Tightened from
+   the r17 box (top:6% height:9% width:58%, "generous rather than tight")
+   down close to the computed 7.8-13.4% band and to the caption's actual
+   narrower width, now that the edges fade instead of needing margin to
+   hide a hard cut. */
+.ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
+.ship-mask-caption{top:7%;left:0;width:52%;height:8%;background:none;
+  background-image:radial-gradient(ellipse at center,rgba(13,36,78,1) 0%,rgba(13,36,78,1) 72%,rgba(13,36,78,0) 100%)}
 .ship-art-title{position:absolute;z-index:2;top:0;left:0;max-width:62%;padding:10px 14px;color:#fff;
   text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
 .ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .ship-art-title p{margin:2px 0 0;font-size:11px}
-.ship-mask{position:absolute;z-index:1;background:var(--surface-2);pointer-events:none}
-.ship-mask-row{top:0;right:0;width:32%;height:20.28%}
+/* r18 fix (tmp/in/FIX-r18.md item 3, conductor real-Chromium measure of
+   6a75769 at 1280, corrected shots tmp/in/r17bshots/): "the art occupies
+   only about 60 percent of its box with the room pins floating in a
+   separate right column, far from their rooms" -- the 32% mask-row width
+   (r8's own widening, in reaction to a real leak back then) was measured
+   directly this round rather than inherited on faith: probed the
+   unmasked reference image at the current r15 crop with tmp/png_probe.py
+   (a stdlib-only PNG decoder, no installs) across Bridge/Build Bay/Scout
+   rows -- every baked status card's own left edge starts at ~76.5% of
+   .ship-art's width, consistently, not ~68% (32% mask). Narrowed to 27%
+   (73%-100%), a ~3.5-point safety margin under the measured 76.5%, moving
+   visible art from 68% to 73% of the box width. */
+.ship-mask-row{top:0;right:0;width:27%;height:20.28%}
 .ship-mask-row[data-station=bridge]{top:0%}
 .ship-mask-row[data-station=projectdeck]{top:19.54%}
 .ship-mask-row[data-station=buildbay]{top:39.31%}
@@ -247,8 +297,17 @@ html[data-view=ship] #overview-view{display:none}
    non-overlapping (each confined to its own row band), linking to the
    matching .room card's real status below. Position percentages are the
    same by-eye estimate as the old room-card tops, re-centred per row;
-   still unverified pixel-for-pixel (no browser/screenshot tool). */
-.room-pin{position:absolute;z-index:2;right:4%;width:26%;display:flex;flex-direction:column;align-items:center;gap:2px;
+   still unverified pixel-for-pixel (no browser/screenshot tool).
+
+   r18 fix (tmp/in/FIX-r18.md item 3): right:4% centred the pin well
+   inside the (old, wider) masked zone, reading as "floating in a
+   separate column, far from their rooms" per the conductor's measure.
+   right:2% (was 4%) pulls it toward the mask's own left edge -- now that
+   the mask itself is narrower (27%, see .ship-mask-row above), the pin
+   sits right at the boundary with the illustrated room, slightly
+   overlapping it (its background is opaque), reading as attached to the
+   row rather than parked in a sidebar. */
+.room-pin{position:absolute;z-index:2;right:2%;width:26%;display:flex;flex-direction:column;align-items:center;gap:2px;
   background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 2px;text-decoration:none;
   color:var(--fg);font-size:11px;text-align:center;line-height:1.25}
 .room-pin:hover,.room-pin:focus-visible{border-color:var(--accent)}
@@ -331,7 +390,7 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 /* r12 iteration item 2: give "Needs your call" the same visual weight as
    the reference's alert icon + bordered button -- still a <p>/<a>, no new
    control. */
-.call-chip{font-weight:600}
+.call-chip{font-weight:600;overflow-wrap:anywhere}
 .call-chip.urgent strong{color:var(--bad)}
 .call-btn{border:1px solid var(--brass);border-radius:6px;padding:2px 10px;text-decoration:none;color:var(--fg)}
 .call-btn:hover{border-color:var(--accent);color:var(--accent)}
