@@ -21,10 +21,24 @@ claim it feeds.
 without writing it, and is still subject to every refusal above (a dry-run
 of a refused call reports the refusal, not a fake preview).
 
-Exit: 0 registered (or dry-run); 2 refused (typed reason); 4 config.
-Rollback: lib/owner_lease.py has no unregister_owner() — register_owner()
-is intentionally append-only/idempotent like every other write in this
-contract. Undo a mistaken registration with
+Exit: 0 registered (or dry-run); 2 refused (typed reason, including
+AlreadyUnregistered -- r15/F2: a plain re-run of this script on a label
+owner-lease-unregister.py has already turned off REFUSES rather than
+silently clearing unregistered_at and discarding whatever token/bound was
+just supplied; owner-lease-reregister.py is the real, explicit, authorized
+recovery path, see its own docstring); 4 config.
+Rollback: owner-lease-unregister.py (R12-RENEWAL.md) is the supported
+per-label rollback -- releases any live lease and sets
+owner_projects.unregistered_at (schema v4), returning the label to legacy
+delivery under the per-label gate, refusing while open owner_requests
+exist. It never DELETEs the owner_projects row either (lib/owner_lease.py's
+unregister_owner() never attempts one). The row's raw DELETE path below
+remains available for a same-run typo before anything else references the
+label, but is no longer the primary rollback once a lease or request
+exists. register_owner() itself remains intentionally append-only/
+idempotent; this is a separate, later rollback script, not a change to
+register_owner()'s own contract. For a same-run typo before any lease or
+request references the label, the raw DELETE still works too:
     DELETE FROM owner_projects WHERE label=?
 run directly against the configured HERDR_OWNER_LEASE_DB, before any lease
 or request references the label — owner_leases/owner_requests both FOREIGN
@@ -33,7 +47,8 @@ connection here) refuses that DELETE once anything does. This script prints
 that exact rollback line after every successful registration and dry-run
 (REVIEW.md round-2 Minor: including the idempotent re-registration of an
 already-active, already-leased label, by which point the DELETE is
-guaranteed to be refused). Once the DELETE is refused: the real procedure is
+guaranteed to be refused). Once the DELETE is refused: owner-lease-unregister.py
+is the real per-label procedure (above); the global, non-destructive fallback is
 lib/owner_lease.py's own disable(conn) — a single non-destructive
 `UPDATE owner_state SET enabled=0`, so every mutation fails closed while
 every table, grant and the owner_events/owner_requests/owner_dispatch_auth
@@ -79,6 +94,12 @@ def main(argv=None, resolve=None) -> int:
     ap.add_argument("--label", required=True)
     ap.add_argument("--project", required=True)
     ap.add_argument("--max-open", type=int, default=ol.DEFAULT_MAX_OPEN)
+    ap.add_argument("--lifecycle-end", type=float, default=None,
+                    help="ABSOLUTE epoch seconds (R13-BOUNDS.md); owner_lease_renew.py never renews a label "
+                         "with no bound recorded here, and never renews past it")
+    ap.add_argument("--unregister-token", default=None,
+                    help="the authorization owner-lease-unregister.py will require verbatim; a label "
+                         "registered with none can never be unregistered through that script")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if os.environ.get("HERDR_OWNER_LEASE_WRITER") != "1":
@@ -109,15 +130,22 @@ def main(argv=None, resolve=None) -> int:
             return 2
         if a.dry_run:
             iso = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            end_iso = (datetime.fromtimestamp(a.lifecycle_end, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                      if a.lifecycle_end is not None else None)
             print(f"dry-run:owner_projects(label={a.label!r}, project={proj!r}, "
-                  f"registered_at={iso!r}, max_open={a.max_open})")
+                  f"registered_at={iso!r}, max_open={a.max_open}, lifecycle_end_at={end_iso!r}, "
+                  f"unregister_token={'<set>' if a.unregister_token else None})")
             refused_delete = bool(conn.execute(
                 "SELECT 1 FROM owner_leases WHERE label=? UNION SELECT 1 FROM owner_requests WHERE label=? LIMIT 1",
                 (a.label, a.label)).fetchone())
             print(_rollback_line(db, a.label, refused_delete))
             return 0
         try:
-            proj = ol.register_owner(conn, a.label, a.project, a.max_open)
+            proj = ol.register_owner(conn, a.label, a.project, a.max_open, lifecycle_end_at=a.lifecycle_end,
+                                     unregister_token=a.unregister_token)
+        except ol.AlreadyUnregistered as exc:
+            print(f"refused:AlreadyUnregistered:{exc}")
+            return 2
         except (ol.InvalidOwner, ol.Disabled, ValueError) as exc:
             print(f"refused:{type(exc).__name__}")
             return 2

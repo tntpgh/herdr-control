@@ -63,13 +63,14 @@ live pane set (herdr pane list). Clock is the caller's `now` (UTC seconds).
 """
 from __future__ import annotations
 
+import hmac
 import re
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
 MAX_TTL_S = 86_400
@@ -125,6 +126,26 @@ class InvalidTransition(ValueError):
 
 class Disabled(Exception):
     """Owner leasing is disabled (rolled back); mutations fail closed."""
+
+
+class OpenRequests(Exception):
+    """unregister_owner() refused: open (non-terminal) owner_requests exist
+    for the label, in any generation."""
+
+
+class Unauthorized(Exception):
+    """unregister_owner() refused: missing/mismatched unregister_token, or
+    the caller's (generation, pane_id, pane_birth) does not match the
+    label's current live lease (R13-BOUNDS.md)."""
+
+
+class AlreadyUnregistered(Exception):
+    """register_owner() refused: the (label, project) row already exists
+    and is unregistered (unregistered_at set) -- r15/F2: a plain
+    re-registration must never silently clear that and resume as if
+    nothing had happened, discarding whatever token/bound the caller
+    supplied. reregister_owner() (lib/owner_lease.py) / owner-lease-
+    reregister.py is the deliberate, explicit, authorized recovery path."""
 
 
 def _iso(ts: float) -> str:
@@ -200,6 +221,36 @@ MIGRATIONS = {
     3: [
         "ALTER TABLE owner_leases ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''",
     ],
+    # v4: per-label rollback (R12-RENEWAL.md). unregistered_at is nullable
+    # and defaults NULL for every existing row -- a plain ADD COLUMN, no
+    # table rebuild, no FK involved. NULL = registered (unchanged meaning
+    # for every pre-v4 row); non-NULL = unregister_owner() has run and the
+    # per-label gate's registered() (lib/owner_lease_delivery.py) must
+    # treat the label as never-registered again. The row itself is still
+    # never deleted: FK-protected the moment a lease or request exists, and
+    # unregister_owner() never attempts a DELETE.
+    4: [
+        "ALTER TABLE owner_projects ADD COLUMN unregistered_at TEXT",
+    ],
+    # v5: bounded renewal + authorized unregister (R13-BOUNDS.md). Both
+    # nullable, both recorded ONLY at register_owner() time ("at approval"),
+    # never updated afterward by this file -- extending a label's lifecycle
+    # or rotating its token is a deliberate separate decision, not built
+    # here because R13 did not ask for it.
+    #   lifecycle_end_at  ABSOLUTE bound (owner_lease_renew.py: renew_due()
+    #     refuses -- "no_lifecycle_bound" -- for any label where this is
+    #     NULL; once set, a renewal's effective TTL is clamped so
+    #     expires_at never crosses it, and once now >= it renewal stops
+    #     entirely ("lifecycle_ended") -- the label then fails closed on
+    #     its own existing TTL, exactly like any other unrenewed lease.
+    #   unregister_token  the "approval/token argument bound to the label"
+    #     unregister_owner() requires verbatim (hmac.compare_digest) before
+    #     doing anything else, including before the idempotent
+    #     already-unregistered check -- a wrong token learns nothing.
+    5: [
+        "ALTER TABLE owner_projects ADD COLUMN lifecycle_end_at TEXT",
+        "ALTER TABLE owner_projects ADD COLUMN unregister_token TEXT",
+    ],
 }
 
 
@@ -268,10 +319,27 @@ def _check_holder(pane_id, pane_birth):
     _check(BIRTH_RE, pane_birth, "pane birth")
 
 
-def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_OPEN, now: float | None = None) -> str:
+def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_OPEN, now: float | None = None,
+                   lifecycle_end_at: float | None = None, unregister_token: str | None = None) -> str:
     """Map label <-> canonical project with its queue policy. Idempotent for the
     same pair; any other overlap (label to another project, project to another
-    label) is refused."""
+    label) is refused.
+
+    lifecycle_end_at (R13-BOUNDS.md): an ABSOLUTE epoch-seconds bound
+    recorded ONLY on first insert -- owner_lease_renew.py's renew_due()
+    refuses to renew a label with no bound set at all, and clamps/stops at
+    this one once it is. unregister_token: the authorization
+    unregister_owner() requires verbatim. Neither is touched by an
+    idempotent re-registration of the SAME (label, project) pair -- set
+    once at approval, not silently replaced by a later call.
+
+    r15/F2: if the (label, project) row already exists and is unregistered
+    (unregistered_at set), this function REFUSES (AlreadyUnregistered)
+    rather than silently clearing that and resuming as if nothing had
+    happened -- a plain re-run of owner-register.py after an unregister
+    must never discard whatever token/bound the caller just supplied by
+    pretending to succeed. reregister_owner() is the deliberate, explicit,
+    authorized recovery path."""
     now = time.time() if now is None else now
     if not isinstance(label, str) or not LABEL_RE.match(label):
         raise InvalidOwner(f"invalid owner label {label!r}")
@@ -280,14 +348,151 @@ def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_O
     proj = canonical_project(project)
 
     def body():
-        row = conn.execute("SELECT label, project FROM owner_projects WHERE label=? OR project=?", (label, proj)).fetchall()
-        if row == [(label, proj)]:
+        rows = conn.execute("SELECT label, project, unregistered_at FROM owner_projects WHERE label=? OR project=?",
+                            (label, proj)).fetchall()
+        exact = [r for r in rows if (r[0], r[1]) == (label, proj)]
+        if exact:
+            if exact[0][2] is not None:
+                raise AlreadyUnregistered(f"{label} -> {proj} was unregistered at {exact[0][2]}; "
+                                          "use owner-lease-reregister.py to restore it explicitly")
             return proj
-        if row:
-            raise InvalidOwner(f"{label} -> {proj} conflicts with existing {row}")
-        conn.execute("INSERT INTO owner_projects VALUES (?,?,?,?)", (label, proj, _iso(now), max_open))
+        if rows:
+            raise InvalidOwner(f"{label} -> {proj} conflicts with existing {[(r[0], r[1]) for r in rows]}")
+        conn.execute("INSERT INTO owner_projects(label,project,registered_at,max_open,lifecycle_end_at,unregister_token) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (label, proj, _iso(now), max_open, _iso(lifecycle_end_at) if lifecycle_end_at is not None else None,
+                      unregister_token))
         _event(conn, now, label, "registered", proj)
         return proj
+
+    return _tx(conn, body)
+
+
+def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id: str = "", pane_birth: str = "",
+                     now: float | None = None, dry_run: bool = True) -> str:
+    """Per-label rollback (R12/R13-BOUNDS.md): voluntarily release any live
+    lease, then mark the owner_projects row unregistered (unregistered_at
+    set) -- DeliveryGate.registered() (lib/owner_lease_delivery.py) then
+    sees the label as never-registered again, returning it to the
+    per-label gate's legacy delivery path. The row itself is still never
+    deleted (FK-protected the moment a lease or request exists; this
+    function never attempts a DELETE) -- this is a soft per-label disable.
+
+    Authorization (R13-BOUNDS.md), checked FIRST, before even the
+    idempotent already-unregistered short-circuit (a wrong token learns
+    nothing): `token` must exactly match (hmac.compare_digest)
+    owner_projects.unregister_token, recorded only at register_owner() time
+    -- a label registered with no token can NEVER be unregistered through
+    this function (fail closed, no fallback). If the label currently has a
+    LIVE lease, (generation, pane_id, pane_birth) must additionally match
+    it exactly (same fence shape as release()) -- unregistering an
+    ACTIVELY-held label without the caller proving it knows that exact
+    live state is refused. No live lease -> nothing to fence against, the
+    token check alone is the authorization for that case.
+
+    Dry-run by default (reap()'s own convention): every check below still
+    runs and can still refuse (InvalidOwner/Unauthorized/OpenRequests),
+    only the final mutation is skipped, so a dry-run of a refused call
+    reports the SAME refusal a real run would. Idempotent:
+    already-unregistered is a silent no-op ('already_unregistered') in
+    both modes. Refuses (OpenRequests) while any OPEN owner_requests exist
+    for the label, in ANY generation -- those are still-unresolved
+    deliveries/replies that unregistering must never make silently
+    unreachable."""
+    now = time.time() if now is None else now
+    row = conn.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                       (label,)).fetchone()
+    if not row:
+        raise InvalidOwner(f"{label} is not a registered owner")
+    stored_token = row[1]
+    if not stored_token or not hmac.compare_digest(stored_token, token or ""):
+        raise Unauthorized(f"{label}: token mismatch")
+    if row[0] is not None:
+        return "already_unregistered"
+    cur = _live(conn, label, now)
+    if cur and (cur[3], cur[1], cur[2]) != (generation, pane_id, pane_birth):
+        raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
+    open_n = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                          (label, *OPEN)).fetchone()[0]
+    if open_n:
+        raise OpenRequests(f"{label}: {open_n} open owner_requests")
+    if dry_run:
+        return "would_unregister"
+
+    def body():
+        cur2 = _live(conn, label, now)
+        if cur2:
+            lease_id, _pane, _birth, gen, _renewed, _expires, _sess = cur2
+            conn.execute("UPDATE owner_leases SET released_at=?, release_reason='unregistered' WHERE lease_id=?",
+                         (_iso(now), lease_id))
+            _event(conn, now, label, "released", lease_id, gen, "unregistered")
+        conn.execute("UPDATE owner_projects SET unregistered_at=? WHERE label=?", (_iso(now), label))
+        _event(conn, now, label, "unregistered")
+        return "unregistered"
+
+    return _tx(conn, body)
+
+
+def reregister_owner(conn, label: str, project: str, old_token: str, new_token: str, lifecycle_end_at: float,
+                     now: float | None = None, dry_run: bool = True) -> str:
+    """r15/F2's explicit, authorized recovery path for a label unregister_owner()
+    has already turned off: clears unregistered_at, replacing BOTH
+    unregister_token and lifecycle_end_at with freshly-supplied values --
+    NEVER inherits the old ones (a stale token or an already-elapsed bound
+    would make the restored label either unrecoverable again or already
+    renewal-dead). Authorization is the SAME model as unregister_owner():
+    `old_token` must match (hmac.compare_digest) the row's CURRENT
+    unregister_token (unregister_owner() never clears it, only
+    unregistered_at, so the original approval credential is exactly what
+    proves the caller may restore it). `project` must match the row's
+    canonical project exactly -- this is a restore, never a silent
+    re-pointing of the label to a different project.
+
+    r16/F3: the advisory read above is OUTSIDE any transaction (same as
+    every other check in this function), but the actual write is a
+    CONDITIONAL UPDATE re-keyed on the EXACT `(unregistered_at IS NOT
+    NULL, unregister_token == <the stored_token this call just read>)`
+    pair -- not a fresh re-read. A concurrent reregister_owner() call
+    that already committed a DIFFERENT token in the window between this
+    call's advisory read and its own `_tx()` makes the WHERE clause match
+    nothing (`rowcount == 0`) -> `"race_lost"`, nothing written, never
+    silently overwriting the other caller's already-reported success.
+    Only one of two racing callers can ever see `"reregistered"`.
+
+    Never creates or revives a lease: this is a owner_projects-row-only
+    update; leases still come only from the normal acquire()/claim_*()
+    path, same as every other registration here. Dry-run by default
+    (every other writer in this module's own convention); every refusal
+    check below still runs in both modes."""
+    now = time.time() if now is None else now
+    proj = canonical_project(project)
+    row = conn.execute("SELECT project, unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                       (label,)).fetchone()
+    if not row:
+        raise InvalidOwner(f"{label} is not a registered owner")
+    if row[0] != proj:
+        raise InvalidOwner(f"{label} is registered to {row[0]!r}, not {proj!r}")
+    stored_token = row[2]
+    if not stored_token or not hmac.compare_digest(stored_token, old_token or ""):
+        raise Unauthorized(f"{label}: token mismatch")
+    if row[1] is None:
+        return "not_unregistered"
+    if not isinstance(lifecycle_end_at, (int, float)) or isinstance(lifecycle_end_at, bool) or lifecycle_end_at <= now:
+        raise ValueError("lifecycle_end_at must be a future epoch-seconds value")
+    if not new_token:
+        raise ValueError("new_token must be non-empty")
+    if dry_run:
+        return "would_reregister"
+
+    def body():
+        cur2 = conn.execute(
+            "UPDATE owner_projects SET unregistered_at=NULL, unregister_token=?, lifecycle_end_at=? "
+            "WHERE label=? AND unregistered_at IS NOT NULL AND unregister_token=?",
+            (new_token, _iso(lifecycle_end_at), label, stored_token))
+        if cur2.rowcount == 0:
+            return "race_lost"
+        _event(conn, now, label, "reregistered", proj)
+        return "reregistered"
 
     return _tx(conn, body)
 
