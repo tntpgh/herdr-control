@@ -69,7 +69,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 
 import owner_lease as ol  # noqa: E402
-import private_sqlite  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -85,14 +84,48 @@ def main(argv=None) -> int:
         print("refused:flags_off")
         return 4
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
+
+    if not a.apply:
+        # R17b: dry-run opens read-only, never migrates.
+        try:
+            conn = ol.open_ro(db, require_table="owner_projects")
+        except ValueError as exc:
+            print(f"refused:{exc}")
+            return 4
+        try:
+            cur, target = ol.schema_status(conn)
+            if cur < target:
+                print(f"schema_pending:{cur}->{target} (owner-lease-migrate.py --db {db} --apply) -- "
+                      f"would_unregister cannot be confirmed until migrated")
+                return 0
+            result = ol.unregister_owner(conn, a.label, a.token, generation=a.generation, pane_id=a.pane_id,
+                                         pane_birth=a.pane_birth, now=time.time(), dry_run=True)
+        except ol.InvalidOwner as exc:
+            print(f"refused:owner_project_unmapped:{exc}")
+            return 2
+        except ol.Unauthorized as exc:
+            print(f"refused:unauthorized:{exc}")
+            return 2
+        except ol.OpenRequests as exc:
+            print(f"refused:open_requests:{exc}")
+            return 2
+        finally:
+            conn.close()
+        print(f"dry-run:{result}:{a.label}")
+        return 0
+
+    # R17b: --apply never migrates implicitly either.
     try:
-        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_projects")
+        conn = ol.open_rw_checked(db, require_table="owner_projects")
     except ValueError as exc:
         print(f"refused:{exc}")
         return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {db} --apply")
+        return 4
     try:
         result = ol.unregister_owner(conn, a.label, a.token, generation=a.generation, pane_id=a.pane_id,
-                                     pane_birth=a.pane_birth, now=time.time(), dry_run=not a.apply)
+                                     pane_birth=a.pane_birth, now=time.time(), dry_run=False)
     except ol.InvalidOwner as exc:
         print(f"refused:owner_project_unmapped:{exc}")
         return 2
@@ -104,8 +137,7 @@ def main(argv=None) -> int:
         return 2
     finally:
         conn.close()
-    mode = "apply" if a.apply else "dry-run"
-    print(f"{mode}:{result}:{a.label}")
+    print(f"apply:{result}:{a.label}")
     return 0
 
 

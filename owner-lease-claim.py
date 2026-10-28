@@ -38,7 +38,6 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as oled  # noqa: E402
-import private_sqlite  # noqa: E402
 
 
 def main(argv=None, resolve=None) -> int:
@@ -55,9 +54,12 @@ def main(argv=None, resolve=None) -> int:
     os.umask(0o077)
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
     try:
-        conn = private_sqlite.open_private(db, ol.connect, require_table="owner_leases")
+        conn = ol.open_rw_checked(db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {db} --apply")
         return 4
     if resolve is None:
         import publisher  # noqa: E402

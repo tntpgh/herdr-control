@@ -16,6 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 import owner_lease as ol  # noqa: E402
+import owner_lease_renew as olr  # noqa: E402
 
 T0 = 1_792_000_000.0
 TTL = 600

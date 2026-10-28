@@ -21,6 +21,7 @@ import owner_dispatch as od  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
 import json  # noqa: E402
 import owner_lease as ol  # noqa: E402
+import owner_lease_renew as olr  # noqa: E402
 import result_availability as ra  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import sqlite3  # noqa: E402
@@ -388,6 +389,7 @@ def main() -> int:
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     register_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    register_pretracking_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     unregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     reregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
@@ -786,6 +788,172 @@ def register_cases(base: Path) -> None:
          and lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
                         (AR,)).fetchone() == before_ar)
     lc.close()
+
+
+def register_pretracking_cases(base: Path) -> None:
+    """R17b: the live store's owner_projects/owner_leases were created by
+    code that predates owner_schema_version entirely (v1+v2+v3 applied by
+    an OLDER codebase, no CREATE TABLE owner_schema_version ever run) --
+    R17's own fix (open_and_migrate(), migrating on every open) was
+    rejected on review: a --dry-run silently advancing schema_version is a
+    real, unwanted write, not read-only. R17b's replacement: --dry-run
+    opens read-only (sqlite mode=ro) and reports `schema_pending:<cur>-><target>`
+    without ever migrating; the real write path refuses
+    `schema_migration_required:<cur>-><target>` instead of migrating
+    implicitly; owner-lease-migrate.py is the one explicit, auditable path
+    a schema now advances through (see verify-owner-lease-migrate.py for
+    that CLI's own suite). This builds the exact live-defect shape (NOT
+    verify-owner-lease.py's own v1_db() fixture, which seeds
+    owner_schema_version at version 1 -- that is the already-tracked case;
+    this one has no owner_schema_version table at all), drives it through
+    the real CLI, and separately proves a genuine REGRESSION: the SAME
+    scenario run against a real git-archived snapshot of a4516e1 (R17,
+    before this fix) shows the OLD code's --dry-run DID silently migrate
+    the file -- the exact defect REVIEW-r17 caught."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("orc_pt", HERE / "owner-register.py")
+    orc = importlib.util.module_from_spec(spec); spec.loader.exec_module(orc)
+
+    def pretracking_db(dest_base: Path) -> str:
+        fd, path = tempfile.mkstemp(suffix=".sqlite3", dir=dest_base)
+        os.close(fd)
+        d = sqlite3.connect(path, isolation_level=None)
+        for v in (1, 2, 3):
+            for stmt in ol.MIGRATIONS[v]:
+                d.execute(stmt)
+        reg_at, acq_at, exp_at = ol._iso(T0 - 3600), ol._iso(T0 - 1800), ol._iso(T0 + 3600)
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("kb", "tntpgh/knowledge-base", reg_at))
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("tos", "tntpgh/thurber-os", reg_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L1", "kb", "w1:p1", "term_kb", acq_at, acq_at, exp_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L2", "tos", "w1:p2", "term_tos", acq_at, acq_at, exp_at))
+        d.close()
+        os.chmod(path, 0o600)
+        return path
+
+    def snap(path: str) -> tuple[float, bytes]:
+        return os.stat(path).st_mtime, Path(path).read_bytes()
+
+    db = pretracking_db(base)
+    raw = lambda: sqlite3.connect(db)
+    tables_before = lambda c: {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    case("R17b fixture: no owner_schema_version table exists before any open",
+         "owner_schema_version" not in tables_before(raw()))
+    projects_full = lambda c: c.execute("SELECT * FROM owner_projects ORDER BY label").fetchall()
+    leases_full = lambda c: c.execute(
+        "SELECT lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,released_at,"
+        "release_reason,session_digest FROM owner_leases ORDER BY lease_id").fetchall()
+    pre_conn = raw()
+    pre_projects = projects_full(pre_conn)  # (label, project, registered_at, max_open) -- v3 shape, 4 cols
+    pre_leases = leases_full(pre_conn)
+    pre_conn.close()
+
+    NEW = "tourguide"
+    NEW_RESOLVE = {NEW: ("w5:p5", "term_tg1", hashlib.sha256(b"tg-session-1").hexdigest())}
+
+    def run(dry_run, db_path=None):
+        os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=db_path or db)
+        argv = ["--label", NEW, "--project", "tntpgh/tourguide"]
+        if dry_run:
+            argv.append("--dry-run")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = orc.main(argv, resolve=NEW_RESOLVE.get)
+        finally:
+            os.environ.pop("HERDR_OWNER_LEASE_WRITER", None)
+            os.environ.pop("HERDR_OWNER_LEASE_DB", None)
+        return rc, buf.getvalue().strip()
+
+    # --- R17b item 1: dry-run on the v3 fixture is truly read-only ---
+    before_dry = snap(db)
+    rc, out = run(dry_run=True)
+    after_dry = snap(db)
+    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->5",
+         rc == 0 and "schema_pending:3->5" in out)
+    case("R17b: dry-run bytes AND mtime unchanged (truly read-only, never migrates)",
+         before_dry == after_dry)
+
+    # --- R17b item 2: the real write path refuses, never migrates implicitly ---
+    before_w = snap(db)
+    rc, out = run(dry_run=False)
+    after_w = snap(db)
+    case("R17b: writer on a v3 store refuses schema_migration_required:3->5, names owner-lease-migrate.py",
+         rc == 4 and f"refused:schema_migration_required:3->5:owner-lease-migrate.py --db {db} --apply" in out)
+    case("R17b: writer refusal leaves bytes AND mtime unchanged", before_w == after_w)
+
+    # --- R17b item 3: owner-lease-migrate.py --apply is the one explicit path ---
+    mig_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1")
+    mig_rc = subprocess.run([sys.executable, str(HERE / "owner-lease-migrate.py"), "--db", db, "--apply"],
+                            capture_output=True, text=True, env=mig_env, timeout=30)
+    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v5",
+         mig_rc.returncode == 0 and "migrated:3->5" in mig_rc.stdout)
+    post_migrate = raw()
+    case("R17b: migration preserved kb/tos rows and leases, only v4/v5 newly tracked",
+         [r[:4] for r in projects_full(post_migrate)] == pre_projects
+         and all(r[4:] == (None, None, None) for r in projects_full(post_migrate))
+         and leases_full(post_migrate) == pre_leases
+         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5])
+    post_migrate.close()
+
+    # --- now-current store: dry-run reports no schema_pending; real write succeeds ---
+    rc, out = run(dry_run=True)
+    case("R17b: dry-run on the now-migrated store reports no schema_pending",
+         rc == 0 and "schema_pending" not in out and "dry-run:owner_projects" in out)
+    rc, out = run(dry_run=False)
+    post_apply = raw()
+    case("R17b: real register succeeds once the store is migrated",
+         rc == 0 and out.splitlines()[0] == f"registered:{NEW}:tntpgh/tourguide")
+    case("R17b: kb/tos rows stay byte-preserved across the real write (only tourguide is new)",
+         [r for r in projects_full(post_apply) if r[0] != NEW] ==
+         [(lbl, proj, reg, mo, None, None, None) for (lbl, proj, reg, mo) in pre_projects]
+         and leases_full(post_apply) == pre_leases)
+    case("R17b: tourguide registered with no lifecycle bound/token (CLI exposes neither flag)",
+         post_apply.execute("SELECT lifecycle_end_at, unregister_token FROM owner_projects WHERE label=?",
+                            (NEW,)).fetchone() == (None, None))
+    case("R17b: migrated-but-unbounded kb stays fail-closed -- renew_due refuses no_lifecycle_bound",
+         olr.renew_due(post_apply, "kb", ("w1:p1", "term_kb", ""), now=T0 + 10) == "no_lifecycle_bound")
+    case("R17b: migrated-but-untoken'd kb stays fail-closed -- unregister_owner raises Unauthorized",
+         raises(lambda: ol.unregister_owner(post_apply, "kb", "any-token", now=T0 + 10, dry_run=False),
+                ol.Unauthorized))
+    post_apply.close()
+
+    # --- REGRESSION PROOF: the SAME scenario against a real a4516e1 (R17) snapshot ---
+    # git-archived (never frozen-exec'd in memory -- owner-register.py resolves its
+    # own lib/ import path from __file__, which only a real file on disk gives it),
+    # run as a genuine subprocess so its --dry-run runs EXACTLY the code REVIEW-r17
+    # flagged, with no interference from the current (fixed) lib/owner_lease.py.
+    old_base = Path(tempfile.mkdtemp(dir=base))
+    old_db = pretracking_db(old_base)
+    snapshot_dir = old_base / "a4516e1-snapshot"
+    snapshot_dir.mkdir()
+    archive = subprocess.run(["git", "archive", "a4516e1", "lib", "owner-register.py"],
+                             cwd=HERE, capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(snapshot_dir)], input=archive, check=True)
+    old_cli = snapshot_dir / "owner-register.py"
+    before_old = snap(old_db)
+    old_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=old_db)
+    old_proc = subprocess.run([sys.executable, str(old_cli), "--label", "ghost", "--project", "tntpgh/ghost",
+                               "--dry-run"], capture_output=True, text=True, env=old_env, timeout=30)
+    after_old = snap(old_db)
+    old_tables = {r[0] for r in sqlite3.connect(old_db).execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    case("REGRESSION PROOF: a4516e1 (R17)'s --dry-run against a v3 store DID mutate the file "
+         "(schema silently migrated) -- the exact defect REVIEW-r17 caught; this file's own "
+         "'dry-run bytes unchanged' cases above would have FAILED against this snapshot",
+         before_old != after_old and "owner_schema_version" in old_tables)
+    _ = old_proc  # refusal/exit code irrelevant here -- the file mutation is what's being proven
+
+
+def raises(fn, exc):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
 
 
 def unregister_cases(base: Path) -> None:
