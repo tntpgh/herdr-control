@@ -398,7 +398,25 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
     both modes. Refuses (OpenRequests) while any OPEN owner_requests exist
     for the label, in ANY generation -- those are still-unresolved
     deliveries/replies that unregistering must never make silently
-    unreachable."""
+    unreachable.
+
+    r14/TOCTOU fix: the checks below run ONCE as a cheap pre-check (fast
+    refusal, and the only check that runs at all for dry_run, which must
+    report a refusal without ever taking the write lock) -- but for a real
+    --apply they are NOT the authorization. body() below re-reads the
+    token, unregistered_at, live-lease identity fence, and OpenRequests
+    count a SECOND time, from scratch, under _tx()'s BEGIN IMMEDIATE
+    (SQLite's single-writer lock), exactly the pattern release()/
+    enqueue()/transition() already use via _fence(). This closes the gap
+    REVIEW-r14.md found: a concurrent legitimate claim or a newly-enqueued
+    request landing in the window between the pre-check and the old
+    unconditional body() could make unregister_owner() report success
+    while tearing down a DIFFERENT holder's lease than the one the caller
+    fenced against, or strand a brand-new open request. Now any such
+    interleaving is caught by the re-check inside the lock and raises the
+    same typed exception the pre-check would have, rolling back the
+    transaction -- unregister_owner() never trusts a read taken before it
+    held the write lock."""
     now = time.time() if now is None else now
     row = conn.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
                        (label,)).fetchone()
@@ -420,7 +438,22 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
         return "would_unregister"
 
     def body():
+        row2 = conn.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                            (label,)).fetchone()
+        if not row2:
+            raise InvalidOwner(f"{label} is not a registered owner")
+        stored_token2 = row2[1]
+        if not stored_token2 or not hmac.compare_digest(stored_token2, token or ""):
+            raise Unauthorized(f"{label}: token mismatch")
+        if row2[0] is not None:
+            return "already_unregistered"
         cur2 = _live(conn, label, now)
+        if cur2 and (cur2[3], cur2[1], cur2[2]) != (generation, pane_id, pane_birth):
+            raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
+        open_n2 = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                               (label, *OPEN)).fetchone()[0]
+        if open_n2:
+            raise OpenRequests(f"{label}: {open_n2} open owner_requests")
         if cur2:
             lease_id, _pane, _birth, gen, _renewed, _expires, _sess = cur2
             conn.execute("UPDATE owner_leases SET released_at=?, release_reason='unregistered' WHERE lease_id=?",

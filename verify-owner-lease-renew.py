@@ -226,6 +226,91 @@ def main():
     case("publisher, both flags ON: renew tick runs over every registered label",
          out == {"hc": "no_live_lease", "kb": "not_due"})
 
+    # --- r14/TOCTOU: unregister_owner()'s identity fence and OpenRequests
+    # refusal must be re-verified INSIDE _tx()'s BEGIN IMMEDIATE, not just
+    # as a pre-check -- a concurrent legitimate claim or a newly-enqueued
+    # request landing between the pre-check and the old unconditional
+    # body() could make it report success while tearing down a DIFFERENT
+    # holder's lease, or strand a brand-new open request (REVIEW-r14.md,
+    # tmp/in/ra/release/unregister-toctou-identity-check.py and
+    # -openrequests-check.py). Same monkeypatch-ol._tx technique already
+    # used and accepted for F1/F3.
+
+    # Scenario 1: caller fences against the gen-1 holder it actually knows
+    # about; a DIFFERENT holder (P3,B3) legitimately claims gen-2 in the
+    # window between the caller's pre-check and unregister's own _tx().
+    path7 = scratch()
+    c7 = ol.connect(path7)
+    P3, B3, S3 = "w1:p3", "term_ccc", "c" * 64
+    ol.register_owner(c7, "race-id", "tntpgh/race-id", now=T0, unregister_token="tok-race")
+    gen_r1 = ol.acquire(c7, "race-id", P1, B1, 10, T0, session_digest=S1)  # short TTL: will expire
+    case("fixture: race-id live at gen 1 under (P1,B1)", gen_r1 == 1)
+    c7b = ol.connect(path7)
+    real_tx7 = ol._tx
+
+    def spying_tx7(conn, fn, mutation=True):
+        if spying_tx7.armed:
+            spying_tx7.armed = False
+            spying_tx7.new_gen = ol.acquire(c7b, "race-id", P3, B3, TTL, T0 + 15, session_digest=S3)
+        return real_tx7(conn, fn, mutation=mutation)
+
+    spying_tx7.armed = True
+    ol._tx = spying_tx7
+    try:
+        unreg_result = _raises_typed(
+            lambda: ol.unregister_owner(c7, "race-id", "tok-race", generation=gen_r1, pane_id=P1, pane_birth=B1,
+                                        now=T0 + 16, dry_run=False))
+    finally:
+        ol._tx = real_tx7
+    live_after7 = ol._live(c7, "race-id", T0 + 16)
+    row7 = c7.execute("SELECT unregistered_at FROM owner_projects WHERE label='race-id'").fetchone()
+    case("r14/identity: interleaved claim (P3,B3) at gen 2 actually landed",
+         spying_tx7.new_gen == 2 and live_after7 is not None and live_after7[1:3] == (P3, B3))
+    case("r14/identity: unregister_owner() raises Unauthorized instead of silently releasing the NEW holder",
+         unreg_result is ol.Unauthorized)
+    case("r14/identity: the gen-2 holder (P3,B3) is still live -- NOT torn down",
+         live_after7 is not None and live_after7[1:3] == (P3, B3))
+    case("r14/identity: the label was never unregistered",
+         row7[0] is None)
+    c7b.close()
+    c7.close()
+
+    # Scenario 2: a NEW open request for the SAME fenced holder/generation
+    # lands between the caller's "0 open requests" pre-check and the write.
+    path8 = scratch()
+    c8 = ol.connect(path8)
+    ol.register_owner(c8, "race-oq", "tntpgh/race-oq", now=T0, unregister_token="tok-race2")
+    gen_r2 = ol.acquire(c8, "race-oq", P1, B1, TTL, T0, session_digest=S1)
+    c8b = ol.connect(path8)
+    real_tx8 = ol._tx
+
+    def spying_tx8(conn, fn, mutation=True):
+        if spying_tx8.armed:
+            spying_tx8.armed = False
+            spying_tx8.rq = ol.enqueue(c8b, "race-oq", gen_r2, P1, B1, "r_new_during_race", now=T0 + 1)
+        return real_tx8(conn, fn, mutation=mutation)
+
+    spying_tx8.armed = True
+    ol._tx = spying_tx8
+    try:
+        unreg_result2 = _raises_typed(
+            lambda: ol.unregister_owner(c8, "race-oq", "tok-race2", generation=gen_r2, pane_id=P1, pane_birth=B1,
+                                        now=T0 + 2, dry_run=False))
+    finally:
+        ol._tx = real_tx8
+    open_after8 = c8.execute("SELECT request_id, state FROM owner_requests WHERE label='race-oq'").fetchall()
+    row8 = c8.execute("SELECT unregistered_at FROM owner_projects WHERE label='race-oq'").fetchone()
+    case("r14/openrequests: interleaved enqueue landed as a queued open request",
+         spying_tx8.rq["state"] == "queued" and any(s == "queued" for _, s in open_after8))
+    case("r14/openrequests: unregister_owner() raises OpenRequests instead of silently succeeding",
+         unreg_result2 is ol.OpenRequests)
+    case("r14/openrequests: the new open request is still queued, not stranded unreachable",
+         any(rid == "r_new_during_race" and s == "queued" for rid, s in open_after8))
+    case("r14/openrequests: the label was never unregistered",
+         row8[0] is None)
+    c8b.close()
+    c8.close()
+
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
@@ -236,6 +321,15 @@ def _raises(fn):
         return False
     except RuntimeError:
         return True
+
+
+def _raises_typed(fn):
+    """Returns the raised exception's type, or None if it didn't raise."""
+    try:
+        fn()
+        return None
+    except Exception as exc:  # noqa: BLE001 - deliberately broad, test wants the type
+        return type(exc)
 
 
 if __name__ == "__main__":
