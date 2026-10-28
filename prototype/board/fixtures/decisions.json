@@ -1,0 +1,52 @@
+{
+  "synthetic": true,
+  "note": "Shapes follow hub.py form rows (status open|answered|cancelled|expired|gone). Request text is shown verbatim. This board cannot answer anything.",
+  "decisions": [
+    {
+      "id": "d1",
+      "card_id": "c7",
+      "status": "open",
+      "requested_at": "2026-10-26T19:57:00Z",
+      "expires_at": "2026-10-26T21:57:00Z",
+      "request_text": "Allow tool: write\n  path: docs/guides/onboarding-synthetic.md\n  reason: file is outside the task's declared writes\n\n[Approve]  [Deny]",
+      "answer": null,
+      "answered_at": null,
+      "answered_via": null
+    },
+    {
+      "id": "d2",
+      "card_id": "c10",
+      "status": "expired",
+      "requested_at": "2026-10-26T16:00:00Z",
+      "expires_at": "2026-10-26T18:00:00Z",
+      "request_text": "Archive 6 worktrees older than 30 days in lighthouse-docs (synthetic)?\n  each one has no unpushed commits\n\n[Approve]  [Deny]",
+      "answer": null,
+      "answered_at": null,
+      "answered_via": null
+    },
+    {
+      "id": "d3",
+      "card_id": "c12",
+      "status": "answered",
+      "requested_at": "2026-10-26T19:31:00Z",
+      "expires_at": "2026-10-26T21:31:00Z",
+      "request_text": "Allow tool: bash\n  command: cat ../shared-config/session-keys.example\n  reason: read a file outside the worktree\n\n[Approve]  [Deny]",
+      "answer": "deny",
+      "answer_note": "Reads outside the worktree. Use the fixture copy instead.",
+      "answered_at": "2026-10-26T19:40:00Z",
+      "answered_via": "hub"
+    },
+    {
+      "id": "d4",
+      "card_id": "c13",
+      "status": "answered",
+      "requested_at": "2026-10-26T15:30:00Z",
+      "expires_at": "2026-10-26T17:30:00Z",
+      "request_text": "Hand the token-store design to an implement worker?\n  design doc: docs/token-store-synthetic.md\n\n[Approve]  [Deny]",
+      "answer": "approve",
+      "answer_note": "",
+      "answered_at": "2026-10-26T16:05:00Z",
+      "answered_via": "dashboard"
+    }
+  ]
+}
