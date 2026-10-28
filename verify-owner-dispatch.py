@@ -388,6 +388,8 @@ def main() -> int:
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     register_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    unregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    reregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
@@ -769,6 +771,296 @@ def register_cases(base: Path) -> None:
     case("REGISTER: group/other-readable lease DB -> refused before any write",
          run(label="another-fresh-label")[1] == "refused:lease_db_not_private_regular" and projects() == after_write)
     os.chmod(lease_db, 0o600)
+
+    # --- r15/F2: a plain re-run must REFUSE on an already-unregistered row,
+    # never silently clear it and resume as if nothing had happened ---
+    AR = "ar-label"
+    AR_RESOLVE = {AR: ("w6:p6", "term_ar1", hashlib.sha256(b"ar-session-1").hexdigest())}
+    ol.register_owner(lc, AR, "tntpgh/ar-project", now=T0, unregister_token="ar-old-tok")
+    ol.unregister_owner(lc, AR, "ar-old-tok", now=T0 + 1, dry_run=False)
+    before_ar = lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                           (AR,)).fetchone()
+    rc, out = run(label=AR, project="tntpgh/ar-project", resolve=AR_RESOLVE.get)
+    case("REGISTER: refuses an already-unregistered row (AlreadyUnregistered), never silently clears it",
+         rc == 2 and out.startswith("refused:AlreadyUnregistered:")
+         and lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                        (AR,)).fetchone() == before_ar)
+    lc.close()
+
+
+def unregister_cases(base: Path) -> None:
+    """owner-lease-unregister.py: supported per-label rollback
+    (R12/R13-BOUNDS.md). Dry-run default; --apply required; authorization
+    token required (a label registered with none can never be
+    unregistered); live-lease identity+generation fence; refuses while any
+    OPEN owner_requests exist (even for dry-run); idempotent;
+    DeliveryGate.registered() (lib/owner_lease_delivery.py) flips to False
+    only after a successful --apply, returning the label to legacy
+    delivery under the per-label gate (R8-PERLABEL.md); no code path other
+    than this CLI ever calls unregister_owner()."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("olu", HERE / "owner-lease-unregister.py")
+    olu = importlib.util.module_from_spec(spec); spec.loader.exec_module(olu)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    os.chmod(lease_db, 0o600)
+    gate = old.DeliveryGate(lease_db)
+    UL, TOK = "ur-label", "secret-unregister-token-1"
+    UL_PANE, UL_BIRTH, UL_SESS = "w9:p9", "term_ur1", hashlib.sha256(b"ur-session-1").hexdigest()
+    ol.register_owner(lc, UL, "tntpgh/ur-project", now=T0, unregister_token=TOK)
+
+    def run(label=UL, token=TOK, generation=0, pane_id="", pane_birth="", apply=False, flags=True):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--token", token]
+        if generation:
+            argv += ["--generation", str(generation)]
+        if pane_id:
+            argv += ["--pane-id", pane_id]
+        if pane_birth:
+            argv += ["--pane-birth", pane_birth]
+        if apply:
+            argv.append("--apply")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = olu.main(argv)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    case("UNREGISTER: flags off -> refused, nothing changed",
+         run(flags=False) == (4, "refused:flags_off") and gate.registered(UL))
+    case("UNREGISTER: unmapped label -> refused",
+         run(label="ghost-label") == (2, "refused:owner_project_unmapped:ghost-label is not a registered owner"))
+    case("UNREGISTER: WRONG token -> refused:unauthorized, nothing changed (no auth, no fallback)",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:")
+         and gate.registered(UL))
+    case("UNREGISTER: no live lease yet, correct token -> dry-run succeeds",
+         run() == (0, f"dry-run:would_unregister:{UL}") and gate.registered(UL))
+
+    # --- live-lease identity+generation fence ---
+    gen1 = ol.acquire(lc, UL, UL_PANE, UL_BIRTH, TTL, T0, session_digest=UL_SESS)
+    case("fixture: UL now has a live lease", gen1 == 1)
+    case("UNREGISTER: correct token but WRONG generation/identity -> refused:unauthorized, nothing changed",
+         run(generation=99, pane_id="w0:p0", pane_birth="term_wrong")[0] == 2
+         and run(generation=99, pane_id="w0:p0", pane_birth="term_wrong")[1].startswith("refused:unauthorized:")
+         and gate.registered(UL) and ol.holder_tuple(lc, UL, T0 + 1) is not None)
+    case("UNREGISTER: correct token AND correct generation/identity -> dry-run succeeds",
+         run(generation=gen1, pane_id=UL_PANE, pane_birth=UL_BIRTH) == (0, f"dry-run:would_unregister:{UL}"))
+
+    # --- refuse while an OPEN owner_request exists, dry-run or apply ---
+    holder = ol.holder_tuple(lc, UL, T0 + 1)
+    ol.enqueue(lc, UL, holder[3], holder[0], holder[1], "r_open", now=T0 + 1)
+    good = dict(generation=gen1, pane_id=UL_PANE, pane_birth=UL_BIRTH)
+    case("UNREGISTER: open owner_request blocks even dry-run",
+         run(**good)[0] == 2 and run(**good)[1].startswith("refused:open_requests:"))
+    case("UNREGISTER: open owner_request blocks --apply too, nothing changed",
+         run(apply=True, **good)[0] == 2 and gate.registered(UL))
+    ol.transition(lc, "r_open", "delivering", UL, holder[3], holder[0], holder[1], now=T0 + 2)
+    ol.transition(lc, "r_open", "replied", UL, holder[3], holder[0], holder[1], now=T0 + 3)
+    case("UNREGISTER: once the request reaches a TERMINAL state, dry-run succeeds",
+         run(**good) == (0, f"dry-run:would_unregister:{UL}") and gate.registered(UL))
+
+    # --- apply: releases the live lease and sets unregistered_at ---
+    case("UNREGISTER: before apply, UL still has a live lease",
+         ol.holder_tuple(lc, UL, T0 + 3) is not None)
+    rc, out = run(apply=True, **good)
+    case("UNREGISTER: --apply releases the lease and unregisters",
+         rc == 0 and out == f"apply:unregistered:{UL}"
+         and ol.holder_tuple(lc, UL, T0 + 3) is None and not gate.registered(UL))
+    case("UNREGISTER: no cross-owner reroute -- KB and DOTS still registered and untouched",
+         gate.registered(KB) and gate.registered(DOTS)
+         and lc.execute("SELECT unregistered_at FROM owner_projects WHERE label IN (?,?)", (KB, DOTS)).fetchall()
+             == [(None,), (None,)])
+    case("UNREGISTER: idempotent re-run (dry-run), correct token -> already_unregistered",
+         run() == (0, f"dry-run:already_unregistered:{UL}"))
+    case("UNREGISTER: idempotent re-run (--apply), correct token -> already_unregistered, no error",
+         run(apply=True) == (0, f"apply:already_unregistered:{UL}"))
+    case("UNREGISTER: WRONG token after unregister learns nothing (still refused, not already_unregistered)",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:"))
+    gate.close()
+
+    # --- GUARD (R14-GUARD.md): no code path other than this CLI REALLY
+    # CALLS unregister_owner() -- detects ast.Call nodes only (func is a
+    # Name or Attribute named 'unregister_owner'), never a docstring/
+    # comment/string mention, so owner-register.py's and
+    # owner_lease_delivery.py's prose references to the name are correctly
+    # NOT flagged, with no allowlist needed for either. ---
+    import ast as _ast
+
+    def _real_calls(path: Path, name: str) -> list[int]:
+        tree = _ast.parse(path.read_text())
+        hits = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                fn = node.func
+                if (isinstance(fn, _ast.Name) and fn.id == name) or (isinstance(fn, _ast.Attribute) and fn.attr == name):
+                    hits.append(node.lineno)
+        return hits
+
+    allowed = {"owner-lease-unregister.py", "lib/owner_lease.py"}
+    offenders = []
+    for py in HERE.glob("**/*.py"):
+        rel = str(py.relative_to(HERE))
+        if rel in allowed or rel.startswith("tmp/") or "/.venv/" in rel or rel.startswith("verify-"):
+            continue
+        if _real_calls(py, "unregister_owner"):
+            offenders.append(rel)
+    case("GUARD: no production code path other than this CLI calls unregister_owner() automatically",
+         offenders == [])
+
+    # self-test: prove the guard is not vacuously true -- a REAL call in a
+    # file outside the allowlist/scan-excludes must actually be detected.
+    import tempfile as _tempfile
+    _selftest_dir = Path(_tempfile.mkdtemp())
+    _selftest_path = _selftest_dir / "would_be_offender.py"
+    _selftest_path.write_text("def x():\n    unregister_owner(None, 'l', 't')\n")
+    case("GUARD self-test: a real unregister_owner() call IS detected by _real_calls()",
+         _real_calls(_selftest_path, "unregister_owner") == [2])
+    case("GUARD self-test: a docstring/comment mention is NOT detected as a call",
+         _real_calls(HERE / "owner-register.py", "unregister_owner") == []
+         and _real_calls(HERE / "lib" / "owner_lease_delivery.py", "unregister_owner") == [])
+    import shutil as _shutil
+    _shutil.rmtree(_selftest_dir, ignore_errors=True)
+    lc.close()
+
+
+def reregister_cases(base: Path) -> None:
+    """owner-lease-reregister.py: r15/F2's explicit, authorized recovery
+    path for a label owner-lease-unregister.py has already turned off.
+    Dry-run default; --apply required; authorization is the label's
+    CURRENT unregister_token; the new token/bound NEVER inherit the old
+    ones; never creates or revives a lease."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("olrr", HERE / "owner-lease-reregister.py")
+    olrr = importlib.util.module_from_spec(spec); spec.loader.exec_module(olrr)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    os.chmod(lease_db, 0o600)
+    gate = old.DeliveryGate(lease_db)
+    RL, OLD_TOK = "rr-label", "old-tok-1"
+    ol.register_owner(lc, RL, "tntpgh/rr-project", now=T0, unregister_token=OLD_TOK)
+    ol.unregister_owner(lc, RL, OLD_TOK, now=T0 + 1, dry_run=False)
+    case("fixture: RL is unregistered", not gate.registered(RL))
+
+    def row():
+        return lc.execute("SELECT unregistered_at, unregister_token, lifecycle_end_at FROM owner_projects "
+                          "WHERE label=?", (RL,)).fetchone()
+
+    def run(label=RL, project="tntpgh/rr-project", token=OLD_TOK, new_token="new-tok-1", end=T0 + 5_000_000,
+            apply=False, flags=True):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--project", project, "--token", token, "--new-token", new_token,
+                "--lifecycle-end", str(end)]
+        if apply:
+            argv.append("--apply")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = olrr.main(argv)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    before_row = row()
+    case("REREGISTER: flags off -> refused, nothing changed",
+         run(flags=False) == (4, "refused:flags_off") and row() == before_row)
+    case("REREGISTER: wrong token -> refused:unauthorized, row unchanged INCLUDING the old token",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:")
+         and row() == before_row)
+    case("REREGISTER: project mismatch -> refused, row unchanged",
+         run(project="tntpgh/other-project")[0] == 2 and row() == before_row)
+    case("REREGISTER: dry-run (correct token) changes nothing",
+         run() == (0, f"dry-run:would_reregister:{RL}") and row() == before_row and not gate.registered(RL))
+    case("REREGISTER: never creates or revives a lease before apply",
+         ol.holder_tuple(lc, RL, T0 + 2) is None)
+    rc, out = run(apply=True)
+    case("REREGISTER: --apply flips registered() to True with the new token/bound",
+         rc == 0 and out == f"apply:reregistered:{RL}" and gate.registered(RL))
+    after_row = row()
+    case("REREGISTER: unregistered_at cleared, token is the NEW one, NOT the old",
+         after_row[0] is None and after_row[1] == "new-tok-1" and after_row[1] != OLD_TOK)
+    case("REREGISTER: lifecycle_end_at was set to the NEW supplied bound",
+         after_row[2] == ol._iso(T0 + 5_000_000))
+    case("REREGISTER: still never created or revived a lease",
+         ol.holder_tuple(lc, RL, T0 + 2) is None)
+    case("REREGISTER: the OLD token can no longer unregister the label (rotated, not retained)",
+         isinstance(_raises(lambda: ol.unregister_owner(lc, RL, OLD_TOK, now=T0 + 3, dry_run=True)), ol.Unauthorized))
+    case("REREGISTER: not-currently-unregistered label -> not_unregistered, nothing to do",
+         run(token="new-tok-1") == (0, f"dry-run:not_unregistered:{RL}"))
+    gate.close()
+
+    # --- r16/F3: two concurrent reregister_owner() calls (same old token,
+    # different new tokens) must NEVER both report "reregistered" -- the
+    # loser must see "race_lost" and write nothing, never silently
+    # overwritten while believing it won (tmp/in/ra/r16/reregister-toctou-
+    # check.py). Reproduced by monkeypatching ol._tx to let a SECOND
+    # connection's ENTIRE reregister_owner() call commit in the exact
+    # window between the FIRST caller's advisory read and its own _tx().
+    TC = "race-label"
+    ol.register_owner(lc, TC, "tntpgh/race-project", now=T0, unregister_token="tok-shared")
+    ol.unregister_owner(lc, TC, "tok-shared", now=T0 + 1, dry_run=False)
+    lc2 = ol.connect(lease_db)
+    real_tx = ol._tx
+
+    def spying_tx(conn, fn, mutation=True):
+        if spying_tx.armed:
+            spying_tx.armed = False
+            spying_tx.b_result = ol.reregister_owner(lc2, TC, "tntpgh/race-project", "tok-shared", "tok-B",
+                                                     T0 + 2_000_000, now=T0 + 2, dry_run=False)
+        return real_tx(conn, fn, mutation=mutation)
+
+    spying_tx.armed = True
+    spying_tx.b_result = None
+    ol._tx = spying_tx
+    try:
+        a_result = ol.reregister_owner(lc, TC, "tntpgh/race-project", "tok-shared", "tok-A",
+                                       T0 + 1_000_000, now=T0 + 3, dry_run=False)
+    finally:
+        ol._tx = real_tx
+    race_row = lc.execute("SELECT unregistered_at, unregister_token, lifecycle_end_at FROM owner_projects "
+                          "WHERE label=?", (TC,)).fetchone()
+    race_events = lc.execute("SELECT kind FROM owner_events WHERE label=? AND kind='reregistered'",
+                             (TC,)).fetchall()
+    case("r16/F3: interleaved caller B (landed first) reports reregistered",
+         spying_tx.b_result == "reregistered")
+    case("r16/F3: interleaved caller A (lost the race) reports race_lost, NOT reregistered",
+         a_result == "race_lost")
+    case("r16/F3: row holds the WINNER's (B's) token and bound, not A's",
+         race_row == (None, "tok-B", ol._iso(T0 + 2_000_000)))
+    case("r16/F3: audit has exactly ONE reregistered line, not two",
+         len(race_events) == 1)
+
+    # --- r16/F3: the CLI surfaces race_lost as a nonzero exit, not a
+    # false success (monkeypatch ol.reregister_owner itself, since driving
+    # an ACTUAL race through the CLI's own main() needs the same
+    # cross-connection interleaving already proven above at the library
+    # level -- this only needs to prove the CLI's result->exit mapping) ---
+    real_reregister = ol.reregister_owner
+    ol.reregister_owner = lambda *a, **k: "race_lost"
+    try:
+        rc_cli, out_cli = run(apply=True)
+    finally:
+        ol.reregister_owner = real_reregister
+    case("r16/F3: CLI exits nonzero (2) and prints race_lost, never a fake success",
+         rc_cli == 2 and out_cli == f"apply:race_lost:{RL}")
+    lc2.close()
     lc.close()
 
 

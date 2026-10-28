@@ -107,6 +107,22 @@ class DeliveryGate:
         row = self.conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone()
         return bool(row and row[0])
 
+    def registered(self, label: str) -> bool:
+        """True if `label` is CURRENTLY registered: an owner_projects row
+        exists (owner_lease.py's register_owner()/owner-register.py) AND
+        unregister_owner() has not since run for it (unregistered_at IS
+        NULL, schema v4). This is the per-label opt-in signal for the
+        delivery gate: a label with no row, or one unregister_owner() has
+        cleared, gets the pre-gate legacy behavior (never touches
+        admit/begin_notice/on_reply); a label WITH a live row but no
+        current live lease still goes through the gate and gets admit()'s
+        existing `owner_no_lease` block -- fail CLOSED, never a silent
+        fallback to legacy for a label that opted in and hasn't
+        unregistered."""
+        row = self.conn.execute("SELECT 1 FROM owner_projects WHERE label=? AND unregistered_at IS NULL",
+                                (label,)).fetchone()
+        return row is not None
+
     def admit(self, label: str, pane_id: str, pane_birth: str, exchange_id: str, now: float | None = None) -> Admission:
         now = time.time() if now is None else now
         try:

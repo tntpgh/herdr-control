@@ -2353,7 +2353,8 @@ class OwnersView(unittest.TestCase):
         conn = hub._ro_sqlite(str(lease_db))
         try:
             with self.assertRaises(sqlite3.OperationalError) as cm:
-                conn.execute("INSERT INTO owner_projects VALUES ('x','tntpgh/x','2026-01-01T00:00:00Z',5)")
+                conn.execute("INSERT INTO owner_projects(label,project,registered_at,max_open) "
+                            "VALUES ('x','tntpgh/x','2026-01-01T00:00:00Z',5)")
                 conn.commit()
             self.assertIn("readonly", str(cm.exception).lower())
         finally:

@@ -70,6 +70,8 @@ def main():
     # --- normal path ---
     path = scratch()
     g = old.DeliveryGate(path)
+    case("registered(): True for a label with an owner_projects row", g.registered("kb"))
+    case("registered(): False for a label never registered", not g.registered("ghost"))
     case("no lease -> blocked owner_no_lease, nothing queued",
          g.admit("kb", P1, B1, "oex_1", T0).reason == "owner_no_lease" and state(path, "oex_1") is None)
     gen1 = holder_acquires(path, P1, B1, T0)
@@ -282,6 +284,67 @@ def main():
         case("publisher, flag ON, missing DB: tick fails, never ungated", False)
     except FileNotFoundError:
         case("publisher, flag ON, missing DB: tick fails, never ungated", delivered() == delivered_before_missing)
+
+    # --- per-label opt-in (R8-PERLABEL.md): registered() gates admit/on_reply ---
+    npath = scratch(max_open=10)  # registers "kb"; "ghost" never registered
+    c = ol.connect(npath)
+    ol.register_owner(c, "hc", "tntpgh/herdr-control", max_open=10, now=T0)
+    c.close()
+    ng = old.DeliveryGate(npath)
+    c = ol.connect(npath)
+    gen_hc = ol.acquire(c, "hc", P2, B2, 1, T0)  # 1s TTL
+    c.close()
+    case("registered label with an EXPIRED (not just never-acquired) lease: still owner_no_lease",
+         ng.registered("hc") and gen_hc == 1
+         and ng.admit("hc", P2, B2, "oex_gate_exp", T0 + 10).reason == "owner_no_lease")
+    ng.close()
+
+    os.environ.update({old.FLAG: "1", old.DB_ENV: npath})
+    pub._OWNER_LEASE_GATE = None
+    pub.hub_get = lambda _p: {"panes": [{"pane_id": "w9:p9", "birth": "term_ghost", "agent": "omp"}]}
+    ghost_local = {"owners": {"ghost": {"pane_id": "w9:p9", "pane_birth": "term_ghost"}}}
+    n0 = delivered()
+    r = pub.deliver_owner({"exchange_id": "oex_ghost", "owner_label": "ghost", "sender": "tnt", "body": "hi"},
+                          ghost_local)
+    case("publisher PER-LABEL: unregistered label delivers via LEGACY even with the flag ON",
+         r["outcome"] == "delivered" and delivered() == n0 + 1)
+
+    real_now = __import__("time").time()
+    c = ol.connect(npath)
+    ol.acquire(c, "hc", P2, B2, 1, real_now)  # 1s TTL: expired by the time deliver_owner runs below
+    c.close()
+    __import__("time").sleep(1.2)
+    pub.hub_get = lambda _p: {"panes": [{"pane_id": P2, "birth": B2, "agent": "omp"}]}
+    hc_local = {"owners": {"hc": {"pane_id": P2, "pane_birth": B2}}}
+    pub._OWNER_LEASE_GATE = None
+    r = pub.deliver_owner({"exchange_id": "oex_hc_exp", "owner_label": "hc", "sender": "tnt", "body": "hi"},
+                          hc_local)
+    case("publisher PER-LABEL: registered label, EXPIRED lease -> blocked, no legacy fallback",
+         r == {"exchange_id": "oex_hc_exp", "outcome": "blocked", "reason": "owner_no_lease"}
+         and delivered() == n0 + 1)
+
+    c = ol.connect(npath)
+    ol.acquire(c, "hc", P2, B2, TTL, __import__("time").time())  # hc renews with a live lease
+    c.close()
+    pub._OWNER_LEASE_GATE = None
+    r = pub.deliver_owner({"exchange_id": "oex_hc_live", "owner_label": "hc", "sender": "tnt", "body": "hi"},
+                          hc_local)
+    case("publisher PER-LABEL: registered label, LIVE lease -> gated delivery",
+         r["outcome"] == "delivered" and delivered() == n0 + 2
+         and state(npath, "oex_hc_live")[0] == "delivering")
+
+    # --- reply crediting, both ways (credit_owner_reply, extracted for direct testing) ---
+    ng2 = old.DeliveryGate(npath)
+    case("credit_owner_reply: identity already False -> stays False, gate never touched",
+         pub.credit_owner_reply(ng2, "ghost", "oex_x", False) is False)
+    case("credit_owner_reply: unregistered label, identity True -> stays True (legacy, gate not consulted)",
+         pub.credit_owner_reply(ng2, "ghost", "oex_x", True) is True)
+    case("credit_owner_reply: registered label, live generation, real reply -> True (gated credit)",
+         pub.credit_owner_reply(ng2, "hc", "oex_hc_live", True) is True
+         and state(npath, "oex_hc_live")[0] == "replied")
+    case("credit_owner_reply: registered label, unknown exchange -> False (fail closed, not legacy)",
+         pub.credit_owner_reply(ng2, "hc", "oex_never_queued", True) is False)
+    ng2.close()
 
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     return 1 if FAILS else 0

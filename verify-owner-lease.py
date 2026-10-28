@@ -78,7 +78,7 @@ def main():
 
     # --- schema / migration ---
     p, c = fresh(label=None)
-    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 3 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 3)
+    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 5 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 5)
     ol.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0)
     case("events: DELETE rejected by trigger", raises(lambda: c.execute("DELETE FROM owner_events"), sqlite3.IntegrityError))
     case("events: UPDATE rejected by trigger", raises(lambda: c.execute("UPDATE owner_events SET kind='x'"), sqlite3.IntegrityError))
@@ -370,8 +370,8 @@ def main():
     pre_projects = snap(pre, "owner_projects")
     pre.close()
     u = ol.connect(path)
-    case("v1 -> v3 upgrade applies each version exactly once", ol.migrate(u) == 3 and ol.migrate(u) == 3
-         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2, 3])
+    case("v1 -> v5 upgrade applies each version exactly once", ol.migrate(u) == 5 and ol.migrate(u) == 5
+         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2, 3, 4, 5])
     v1_lease_cols = "lease_id, label, pane_id, pane_birth, generation, acquired_at, renewed_at, expires_at, released_at, release_reason"
     case("upgrade preserves leases, requests and events (incl. seq) verbatim",
          snap(u, "owner_leases", v1_lease_cols) == before["owner_leases"]
