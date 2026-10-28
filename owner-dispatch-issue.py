@@ -175,12 +175,17 @@ def render_form(rec: dict) -> bytes:
     accepts ONLY a stored page byte-identical to this rendering, so what was on
     screen is exactly the record (including holder, request sha and window).
     A classic gen1 record (no expected_prev_generation/bind_live_generation
-    key) renders BYTE-IDENTICAL to the original claim_initial-only form
-    (frozen at 1a0b873); a successor record (expected_prev_generation
-    present) additionally names the released predecessor and the
-    generation being claimed (claim_successor path); a bind-live record
-    (bind_live_generation present, R12) names the ALREADY-LIVE generation
-    it binds to and states plainly that nothing is claimed or released."""
+    key), a successor record (expected_prev_generation present -- additionally
+    names the released predecessor and the generation being claimed), and a
+    bind-live record (bind_live_generation present, R12 -- names the
+    ALREADY-LIVE generation it binds to and states plainly that nothing is
+    claimed or released) all share the same title/H1 shape, derived from
+    rec["owner_label"]/rec["project"] (R12d fix: the title/H1 used to be a
+    FIXED "KB owner-dispatch pilot" string regardless of the real label --
+    deployed form 20261028T204112-8740 showed that wording for a thurber-os
+    grant. Never hardcode a label here; title/H1 schema content changed
+    (no longer byte-identical to the pre-R12d baseline), everything else
+    -- table rows, intro paragraph wording per mode -- is unchanged)."""
     emb = approval_bytes(rec)
     sha = hashlib.sha256(emb).hexdigest()
     h = rec["expected_holder"]
@@ -215,8 +220,10 @@ def render_form(rec: dict) -> bytes:
                   f'generation-{rec["expected_generation"]} lease claim and one grant for the request below. Nothing retries.</p>')
     else:
         intro = "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
-    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Approve ONE KB owner-dispatch pilot request</title></head><body>"
-            "<h1>Approve ONE read-only KB pilot request?</h1>"
+    label_t, proj_t = esc(rec["owner_label"]), esc(rec["project"])
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Approve ONE owner-dispatch request for '
+            f'{label_t} ({proj_t})</title></head><body>'
+            f'<h1>Approve ONE owner-dispatch request for {label_t} ({proj_t})?</h1>'
             f"{intro}"
             f"<table>{table}</table>"
             f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
@@ -573,10 +580,28 @@ def build_main(argv, resolve=None, now=None) -> int:
     at build time (refused:live_generation_unresolved otherwise), and
     re-confirmed again at issue time (ANSWER-r12.md) since build and issue
     are separated by a human answering the form. Claims nothing either way.
+    Exactly one of --request-id (free-form) or --queue-item-id ID (R12e,
+    tmp/in/r12/QUEUE-RID.md) is required: --queue-item-id derives
+    request_id = queue_supervisor.rid_for(label, ID) BEFORE the approval
+    bytes are hashed, so the signed form shows the canonical queue rid --
+    a grant meant for queue-supervisor.py's tick_lane() can then never be
+    built with a request_id that diverges from what the queue will later
+    present to oda.consume(), the gap tmp/out/r12/REPORT-r12d-queue-rid.md
+    reported. oda.consume()/consume_standing()'s own equality checks are
+    untouched by this: request_id is still an opaque string to them.
+    --queue-item-id and its derived rid are validated BEFORE any approval
+    bytes are built or hashed (R12f, tmp/in/r12/QUEUE-RID-VALIDATE.md):
+    the id must fully match queue_supervisor._ID_RE, and rid_for(label,
+    ID) must match queue_supervisor._RID_RE -- the SAME alphabets/limits
+    tick_lane() itself enforces before ever consuming a grant, reused
+    directly here (never duplicated) so a bad id/rid is refused before a
+    human ever approves it, not only at dispatch time.
     Serves nothing and records nothing."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
-    for a in ("--label", "--project", "--request-dir", "--request-name", "--request-id", "--auth-id", "--out"):
+    for a in ("--label", "--project", "--request-dir", "--request-name", "--auth-id", "--out"):
         ap.add_argument(a, required=True)
+    ap.add_argument("--request-id")
+    ap.add_argument("--queue-item-id")
     ap.add_argument("--manifest", action="append", required=True)
     ap.add_argument("--lease-ttl-s", type=int, default=1800)
     ap.add_argument("--grant-window-s", type=int, default=1800)
@@ -584,6 +609,31 @@ def build_main(argv, resolve=None, now=None) -> int:
     ap.add_argument("--bind-live-generation", type=int, default=0)
     ap.add_argument("--lease-db")
     a = ap.parse_args(argv)
+    if a.request_id is not None and a.queue_item_id is not None:
+        print("refused:request_id_and_queue_item_id_mutually_exclusive")
+        return 2
+    if a.request_id is None and a.queue_item_id is None:
+        print("refused:request_id_or_queue_item_id_required")
+        return 2
+    if a.queue_item_id is not None:
+        # lib/queue_supervisor.py:71 (_ID_RE) and :123 (_RID_RE) -- the
+        # queue's OWN accepted alphabets/limits, reused directly (never
+        # duplicated here): a queue item id tick_lane() will ever read
+        # from a queue.json file must already satisfy _ID_RE, and the rid
+        # it derives (rid_for(label, id)) must already satisfy _RID_RE
+        # (checked again at tick_lane():255 before any grant consumption
+        # or send) -- refusing anything that would fail those checks
+        # BEFORE a human ever approves it, rather than only at dispatch
+        # time deep in the queue pipeline.
+        if not qs._ID_RE.match(a.queue_item_id):
+            print("refused:queue_item_id_invalid")
+            return 2
+        request_id = qs.rid_for(a.label, a.queue_item_id)
+        if not qs._RID_RE.match(request_id):
+            print("refused:queue_item_id_rid_invalid")
+            return 2
+    else:
+        request_id = a.request_id
     clock = (lambda: now) if now is not None else time.time
     if a.expected_prev_generation < 0:
         print("refused:expected_prev_generation_negative")
@@ -651,7 +701,7 @@ def build_main(argv, resolve=None, now=None) -> int:
     rec = {"protocol": PROTOCOL, "owner_label": a.label, "project": a.project, "max_open": 1,
            "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
            "expected_generation": a.bind_live_generation if a.bind_live_generation else a.expected_prev_generation + 1,
-           "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id,
+           "lease_ttl_s": a.lease_ttl_s, "request_id": request_id,
            "request_name": a.request_name, "request_sha256": oda.body_sha256(data), "manifest": a.manifest,
            "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
     if a.expected_prev_generation >= 1:
