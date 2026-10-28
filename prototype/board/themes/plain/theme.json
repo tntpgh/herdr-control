@@ -1,0 +1,62 @@
+{
+  "id": "plain",
+  "name": "Plain dark (high contrast, no characters)",
+  "presentation_only": "Text labels only. Same states, same meanings, same (absent) approval paths as every other theme.",
+  "palette": {
+    "--bg": "#0d0d0d",
+    "--surface": "#161616",
+    "--surface-2": "#1f1f1f",
+    "--fg": "#f2f2f2",
+    "--muted": "#cfcfcf",
+    "--accent": "#ffffff",
+    "--brass": "#e0e0e0",
+    "--border": "#8a8a8a",
+    "--ok": "#f2f2f2",
+    "--warn": "#f2f2f2",
+    "--bad": "#f2f2f2",
+    "--info": "#f2f2f2"
+  },
+  "characters": {},
+  "guests": {
+    "bigshot":  { "name": "Bounty board", "role": "New bounty cards", "plain_text": "Bounty board", "appears_for": ["panel:bounties"], "sprite": null, "flavour": [] },
+    "old-guys": { "name": "Maintenance", "role": "Maintenance and archive work", "plain_text": "Maintenance / archive", "appears_for": ["lane:maintenance", "bounty:archive"], "sprite": null, "flavour": [] }
+  },
+  "job_classes": {
+    "plan":        { "character": null, "badge": "Planning" },
+    "architect":   { "character": null, "badge": "Architecture" },
+    "design":      { "character": null, "badge": "Design" },
+    "deep-review": { "character": null, "badge": "Deep review" },
+    "implement":   { "character": null, "badge": "Build" },
+    "debug":       { "character": null, "badge": "Debugger" },
+    "code":        { "character": null, "badge": "Code" },
+    "docs":        { "character": null, "badge": "Docs" },
+    "review":      { "character": null, "badge": "Review" },
+    "explore":     { "character": null, "badge": "Explore" },
+    "quick":       { "character": null, "badge": "Quick check" },
+    "mechanical":  { "character": null, "badge": "Mechanical sweep" },
+    "research":    { "character": null, "badge": "Research" }
+  },
+  "unrecognized": { "character": null, "badge": "Unrecognized job class" },
+  "function_badges": {
+    "captain":       { "character": null, "badge": "Captain" },
+    "release_watch": { "character": null, "badge": "Release watch" },
+    "project_lead":  { "character": null, "badge": "Project lead" },
+    "debugger":      { "character": null, "badge": "Debugger" }
+  },
+  "panels": {
+    "overview":   null,
+    "decisions":  null,
+    "gbp_drafts": null,
+    "bounties":   null
+  },
+  "stations": [
+    { "id": "bridge",   "area": "bridge",   "name": "Planning and release (captain)",       "character": null, "job_classes": ["plan", "architect"], "function_badges": ["captain", "release_watch"], "shows": ["decisions"] },
+    { "id": "lounge",   "area": "lounge",   "name": "Research and drafts",                  "character": null, "job_classes": ["research", "explore"], "shows": ["gbp"] },
+    { "id": "workshop", "area": "workshop", "name": "Design and build",                     "character": null, "job_classes": ["design", "implement", "code", "docs"] },
+    { "id": "kennel",   "area": "kennel",   "name": "QA and test",                          "character": null, "job_classes": ["quick", "mechanical"] },
+    { "id": "hangar",   "area": "hangar",   "name": "Project leads and debugging",          "character": null, "job_classes": ["debug"], "function_badges": ["project_lead", "debugger"], "shows": ["leads"] },
+    { "id": "cargo",    "area": "cargo",    "name": "Unrecognized jobs and maintenance",    "character": null, "guest": "old-guys", "job_classes": [], "shows": ["unrecognized", "maintenance"] },
+    { "id": "bounty",   "area": "bounty",   "name": "Bounty board",                         "character": null, "guest": "bigshot", "job_classes": [], "shows": ["bounties"] },
+    { "id": "dock",     "area": "dock",     "name": "Independent review (outside the crew)", "character": null, "job_classes": ["review", "deep-review"], "outside": true, "note": "Independent: not crew and not under the captain." }
+  ]
+}

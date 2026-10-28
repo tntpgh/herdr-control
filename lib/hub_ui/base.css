@@ -1,0 +1,618 @@
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:var(--info)}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,[tabindex]:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+main:focus{outline:none}
+.skip{position:absolute;left:-999px;top:0;z-index:10;background:var(--accent);color:var(--bg);padding:.5em .8em;font-weight:700}
+.skip:focus{left:.5em}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* header + nav
+
+   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 4, found while fixing
+   item 4): this was a bare `header{...}` tag selector, so it also
+   matched the <header class=room-head> each room renders deep inside
+   <main> (lib/hub_ui/ui.js roomHtml) -- the page's own top nav bar
+   styling (background:var(--surface), a 2px brass bottom border) was
+   leaking into every room's detail header too. Mostly invisible before
+   because .room's own card background/border (removed just above, same
+   round) visually absorbed it; stripping the card chrome made the leak
+   the dominant thing left behind. The chrome() page shell
+   (lib/hub_ui/__init__.py) renders the real header as a direct child of
+   <body>, before <main> -- body>header scopes to exactly that one
+   element and no longer reaches into room-head. */
+body>header{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:12px 20px;border-bottom:2px solid var(--brass);background:var(--surface)}
+/* r15 fix (tmp/in/FIX-r15.md item 3, conductor measure at 260px: "nav
+   chips overflow"): flex items default to min-width:auto, which floors
+   their shrinkability at their own content's intrinsic width even inside
+   a flex-wrap:wrap parent -- flex-wrap only controls line breaks BETWEEN
+   items, not how narrow any one item itself can go. header and its nav
+   are the most likely source (several nav links in a row); min-width:0
+   only changes how far something is ALLOWED to shrink, never its size
+   when there is room, so this is safe at any width.
+
+   r18 fix (tmp/in/FIX-r18.md item 2, conductor real-Chromium measure of
+   6a75769 at 375: "SYNTHETIC banner, room cards text, Needs-your-call
+   line cut at the right edge"). Same bug, same fix, wider net: .room
+   itself already had min-width:0 (r7), but its own children
+   (.room-head's flex row, .wcards' grid of task cards) are ALSO
+   flex/grid items one level down that need the same floor removed, and
+   .ship-bottom (the "Needs your call" bar, display:flex) and its
+   .call-chip child were never covered at all. */
+header,header nav,main,.ship,.hull,.side-rail,.chips,.room-head,.wcards,.ship-bottom,.call-chip{min-width:0}
+header .brand{font-size:16px;letter-spacing:.04em}
+header nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
+/* r19 motion fix (tmp/in/r19/MOTION-SPEC.md: "Tabs 160ms ease-out
+   color/opacity, 2px indicator"): header nav a.on's border-bottom-color
+   already WAS the 2px indicator (r4/r15), just with no transition -- the
+   underline used to snap instantly. transition only; killed globally for
+   html[data-reduce]/prefers-reduced-motion by the existing blanket rule
+   below, same as everything else motion adds this round. */
+header nav a{color:var(--muted);text-decoration:none;padding:2px 0;border-bottom:2px solid transparent;
+  transition:color 160ms ease-out,border-bottom-color 160ms ease-out}
+header nav a:hover{color:var(--fg)}
+header nav a.on{color:var(--fg);border-bottom-color:var(--accent)}
+details.navgroup{position:relative;padding-left:12px;border-left:1px solid var(--border);font-size:13px}
+details.navgroup>summary{cursor:pointer;color:var(--muted);list-style:none;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+details.navgroup>summary::-webkit-details-marker{display:none}
+details.navgroup>summary::before{content:"\25B8  ";color:var(--accent)}
+details.navgroup[open]>summary::before{content:"\25BE  "}
+.navgroup-body{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;margin-top:4px}
+/* r19 fix (tmp/in/r19/R19-AMEND-SPA.md): .nav-disabled styled the old
+   disabled "bounties" tab span, now removed -- the bounty board moved
+   inline, no disabled nav entry left to style. */
+.hdr-meta{margin-left:auto}
+.prefs{position:relative;font-size:13px}
+.prefs>summary{cursor:pointer;color:var(--muted);list-style:none;padding:2px 8px;border:1px solid var(--border);border-radius:6px}
+.prefs>summary::-webkit-details-marker{display:none}
+/* r17 fix (tmp/in/FIX-r17.md item 2, from independent review r9 section 3
+   "Mobile", carried forward from before 65b4f0d): a flat 230px min-width
+   on a popup anchored to .prefs (itself mid-header's flex row, not flush
+   to the viewport edge) overflows any viewport narrower than ~246px
+   regardless of which side it's anchored to -- the mobile override only
+   changes left vs right anchoring, never the floor itself.
+
+   r18 fix (tmp/in/FIX-r18.md item 2 + tmp/in/SHOTS.md's own
+   scrollWidth/innerWidth acceptance test, re-measured this round with a
+   same-origin iframe harness, tmp/measure-harness.py, since plain
+   headless --window-size screenshots don't honour width=device-width
+   reliably for this check): r17's min(230px, calc(100vw - 16px)) was
+   still applied to min-width, which only ever sets a FLOOR -- it can
+   never stop the box from growing WIDER than that if its content (the
+   theme <select>'s own option text) needs more room, so the box kept
+   overflowing exactly as before, just with smaller numbers. The actual
+   cap has to be max-width, which the spec guarantees wins over min-width
+   whenever the two conflict: min-width:230px (floor, unchanged, keeps it
+   comfortable on anything wider) plus max-width:calc(100vw - 16px)
+   (ceiling, new) so a narrow viewport always wins regardless of content.
+   min-width:0 on the body/select/label so the select itself can still
+   shrink inside that capped box instead of forcing it wider again. */
+.prefs-body{position:absolute;right:0;top:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:230px;
+  max-width:calc(100vw - 16px);padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px}
+.prefs-body,.prefs-body label,.prefs-body select{min-width:0}
+.prefs-body label{display:flex;gap:8px;align-items:center}
+.prefs select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px;max-width:100%}
+html:not([data-js]) .prefs,html:not([data-js]) .viewbar{display:none}
+/* r14b fix (tmp/in/FIX-r14b.md item 7): repo chips + the Ship/Overview
+   layout radio moved into a collapsed-by-default section (lib/hub_ui/
+   __init__.py home()) so the primary route reads as ship + feeds, not a
+   stack of controls above it. Same visual language as details.navgroup. */
+details.chrome-more{margin:0 0 10px;font-size:13px}
+details.chrome-more>summary{cursor:pointer;color:var(--muted);list-style:none;text-transform:uppercase;letter-spacing:.08em;font-size:11px}
+details.chrome-more>summary::-webkit-details-marker{display:none}
+details.chrome-more>summary::before{content:"\25B8  ";color:var(--accent)}
+details.chrome-more[open]>summary::before{content:"\25BE  "}
+details.chrome-more>*{margin-top:8px}
+
+main{max-width:1150px;margin:0 auto;padding:16px 20px 60px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+h3{font-size:14px;margin:14px 0 6px}
+table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:table}
+td,th{padding:8px 10px;border-top:1px solid var(--border);vertical-align:top;text-align:left} tr:first-child td,tr:first-child th{border-top:0}
+th{color:var(--muted);font-weight:600;font-size:12px}
+.pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);white-space:nowrap;display:inline-block}
+.hot .pill,.pill.hot{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.bad{color:var(--bad);border-color:var(--bad);border-width:2px;font-weight:600}
+.pill.run{color:var(--info);border-color:var(--info)}
+.age{color:var(--muted);white-space:nowrap;text-align:right} .dim{color:var(--muted)} small{color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;text-decoration:none;color:inherit;display:block}
+a.card:hover{border-color:var(--info)}
+.card .n{font-size:28px;font-weight:700;line-height:1.1} .card .t{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+.card.hot{border-color:var(--accent);border-width:2px;border-left-width:6px} .card .s{font-size:12px;color:var(--muted);margin-top:6px}
+iframe{width:100%;height:720px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
+iframe.dframe{height:calc(100vh - 190px);min-height:560px}
+.dhead{margin:10px 0 8px}
+details.hist{margin-top:22px;border-top:1px solid var(--border);padding-top:6px}
+details.hist>summary{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);cursor:pointer;padding:6px 0;list-style:none}
+details.hist>summary::-webkit-details-marker{display:none}
+details.hist>summary::before{content:"\25B8  ";color:var(--accent)}
+details.hist[open]>summary::before{content:"\25BE  "}
+details.hist>summary:hover{color:var(--fg)}
+details.hist>table{margin-top:8px}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word}
+button{font:inherit}
+button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid var(--info);background:transparent;color:var(--info);cursor:pointer} button.decide:hover{background:var(--info);color:var(--bg)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--bad)} .dot.ok{background:var(--ok)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;font-weight:600;color:var(--fg);text-decoration:none;min-width:0;max-width:100%;overflow-wrap:anywhere}
+.chips a.chip small{font-weight:400;color:var(--muted)}
+.chips a.chip:hover,.chips a.chip.on{border-color:var(--info)}
+.chips a.chip.on{background:var(--surface-2);box-shadow:inset 0 -2px 0 var(--info)}
+.chips a.chip.hot{border-color:var(--bad);border-style:dashed}
+input[type=text],input:not([type]),textarea{background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+form button[type=submit]{background:var(--surface-2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+li.done{color:var(--muted)}
+
+/* crew emblem (decoration; hidden from assistive tech) */
+.crew-slot:empty{display:none}
+.crew-slot{float:right;margin:0 0 8px 12px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.flavour{display:none;font-style:italic;font-size:12px;color:var(--muted);margin:2px 0 0}
+html[data-flavour] .flavour{display:block}
+
+/* layout toggle on / */
+.viewbar{display:inline-flex;gap:14px;align-items:center;border:1px solid var(--border);border-radius:8px;padding:4px 12px 6px;margin:0 0 8px}
+.viewbar legend{font-size:11px;color:var(--muted);padding:0 4px}
+.viewbar label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+.viewbar input{accent-color:var(--accent)}
+#ship-view{display:none}
+html[data-view=ship] #ship-view{display:block}
+html[data-view=ship] #overview-view{display:none}
+
+/* Ship (layout B) */
+.ship-log{margin:0 0 12px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--brass);border-radius:8px}
+/* r16 fix (tmp/in/FIX-r16.md item 2, conductor real-Chromium measure of
+   e2e53c8 at both 960 and 260): banner text still ran past the right
+   edge despite r15's overflow-wrap:anywhere -- at a width that clips at
+   960px too (not just narrow 260), the likely cause was never the TEXT
+   failing to wrap inside a correctly-sized box, it was the box itself:
+   a plain <p> with no explicit width should fill its containing block,
+   but r15's .ship-hero (aspect-ratio:920/280, no max-width) sat directly
+   above it and is the prime suspect for pushing the page wider than the
+   viewport generally. That hero is deleted this round (item 1); belt and
+   suspenders, .ship-alert also gets an explicit width/max-width:100% so
+   it can never inherit intrinsic sizing from anywhere above it again. */
+.ship-alert{margin:0 0 12px;padding:10px 12px;border:2px solid var(--bad);border-radius:8px;font-weight:600;width:100%;max-width:100%;overflow-wrap:anywhere}
+/* r14b fix (tmp/in/FIX-r14b.md item 4): distinct from .ship-alert's error
+   red -- this is a mode indicator, not a problem. */
+.synthetic-banner{border-color:var(--warn);background:var(--surface-2);text-align:center;letter-spacing:.03em}
+/* r16 fix (tmp/in/FIX-r16.md item 1, conductor real-Chromium measure of
+   e2e53c8): the r15 hero was sharp (no longer pixelated) but still showed
+   the same Bridge + Project Deck strip .ship-art shows directly below,
+   now also carrying baked fake task cards that read as live status -- a
+   worse flavour of the same duplication complaint r14 first raised.
+   Conductor's own fix is structural: delete the separate hero entirely
+   and put the real title/tagline onto .ship-art's own top ~12% instead
+   (one image on the page, not two competing crops of the same asset) --
+   see .ship-art-title below, next to .ship-art's own rule. */
+.ship{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,35%);gap:16px;align-items:start}
+/* r14b fix (tmp/in/FIX-r14b.md item 6): an expanded feed stayed confined
+   to the 35% side-rail column, leaving the 65% hull column empty beside
+   it -- "dead area". While any feed is open, drop to a single column so
+   the open feed (and the rest of .side-rail) gets the full row width;
+   .hull reflows below it rather than sitting empty beside it. Same
+   :has()-driven reflow precedent as .room-list:has(.room:target) below. */
+.ship:has(.feed-panel[open]){grid-template-columns:1fr}
+.room-list{display:grid;gap:10px}
+/* r14 fix (tmp/in/FIX-r14.md item 2/3, conductor real-Chromium measure of
+   abe6fd3): background-size:cover is spec-guaranteed to leave zero gap --
+   switching .ship-art to it in r13 did not change what the conductor
+   measured (.room-pin still outside .ship-art's own measured box; ~80px
+   band still inside the frame), which only makes sense if .ship-art's
+   OWN box was never actually narrow-and-fully-covered in the first place,
+   but something WIDER than the art's intended aspect-ratio box. The one
+   thing both r9's <img> attempt and r13's background-image attempt share:
+   .ship-art has always been a CSS Grid item (.hull was `display:grid` with
+   no explicit grid-template-columns, an implicit auto-sized column) with
+   zero in-flow children of its own (masks/pins are all position:absolute,
+   contributing nothing to intrinsic/content sizing) -- auto-track sizing
+   combined with aspect-ratio on a content-empty grid item is exactly the
+   kind of interaction this worker cannot verify without a browser. .hull
+   never needed grid for its own sake (it only ever stacks exactly 2
+   children vertically); removing the grid entirely and using plain block
+   flow + margin-bottom removes that whole class of ambiguity -- a block
+   box always takes its full containing-block width, no track-sizing
+   algorithm involved. */
+.hull{display:block}
+.hull>.ship-art,.hull>.room{margin-bottom:10px}
+.hull>.room:last-child{margin-bottom:0}
+/* r15 fix (tmp/in/FIX-r15.md item 2, conductor real-Chromium measure of
+   fc09734: "~70px band still sits above the ship art inside its frame...
+   remove it"). background-size:cover is spec-guaranteed to leave no gap,
+   so the ~70px the conductor keeps measuring was never an actual
+   rendering gap -- it was .ship-mask-top itself: an intentional flat-
+   colour patch covering the baked nav/title band (r6), which reads as
+   "empty space" once there's nothing else nearby explaining it. r13's
+   fix (tmp/in/FIX-r13.md item 2) switched the TECHNIQUE (<img> ->
+   background-image) but never addressed this; r14's fix (grid -> block)
+   addressed the gutter (item 2) but not this band (item 3 was still
+   open). The actual fix: stop covering the baked band with a mask and
+   instead crop it OUT of what .ship-art shows at all, the same way the
+   r15 hero above skips it via background-position.
+
+   Unlike the hero, .ship-art's own cover is WIDTH-constrained (box aspect
+   998:1024 is narrower per-column than the image's 1536:1024, so cover
+   fills the full HEIGHT and crops only width) -- there is no vertical
+   background-position slack to use for a simple top-anchor shift. Needs
+   the same interior-rectangle crop math as the r14b hero attempt: for
+   source N x M and crop x0,y0,w,h, background-size is (N/w)% (M/h)% and
+   background-position is (x0/(N-w))% (y0/(M-h))%. Crop: x0=0 (left-
+   anchored, same as before), y0=92 (skip the ~90-110px baked nav band,
+   same by-eye estimate .ship-mask-top used), w=998 (unchanged), y1=900
+   (also skip the baked bottom "Needs your call" bar .ship-mask-bottom
+   used to cover, so that mask goes too) -> h=808. Computed (not hand-
+   rounded) with python3: size 153.9078% 126.7327%, position 0% 42.5926%,
+   aspect-ratio 998/808.
+
+   Both .ship-mask-top and .ship-mask-bottom are removed (their content is
+   now simply never shown, not covered).
+
+   r18c fix (tmp/in/r18c/MEASURE-056534a.md items 1-2, conductor real-
+   Chromium re-measure of 056534a): still "the art occupies only ~60% of
+   its box... ~190px dead band on the right... pins floating in a
+   separate column" even after r18b narrowed and colour-matched
+   .ship-mask-row to the art's own ambient tone -- a flat fill, however
+   well colour-matched, still reads as dead space next to a textured
+   illustration (no rivets/lights/detail in a solid colour, so the eye
+   can tell there's nothing there even when the colour is right).
+   "art must fill its frame (or frame shrink to art)" -- took the second
+   option literally instead of trying a fourth variant of painting over
+   the same zone: shrunk the BOX ITSELF so there's no leftover frame to
+   begin with, rather than a differently-coloured patch inside an
+   unchanged frame. Re-cropped .ship-art's own width to stop exactly
+   where the baked status cards start (the same 73%-of-998 boundary
+   .ship-mask-row used, 76.5% measured left edge of the baked cards with
+   a ~3.5-point safety margin) instead of cropping around them: new crop
+   w=728.54 (was 998), x0/y0/h unchanged (0/92/808, so every .room-pin
+   top:% below is untouched -- only the width changes). Computed with
+   python3: aspect-ratio 728.54/808, background-size 210.8326% 126.7327%
+   (height factor unchanged since h didn't change), background-position
+   0% 42.5926% (unchanged, x0 unchanged). .ship-mask-row is deleted
+   entirely (CSS rule + the <div> ui.js rendered per row) -- there is no
+   baked card left inside the visible crop to hide, so there is nothing
+   left to mask. .room-pin moves from "inside the masked zone" to
+   directly on the new, fully-real right edge of the art (see below). */
+.ship-art{position:relative;overflow:hidden;aspect-ratio:728.54/808;border-radius:10px;border:2px solid var(--brass);
+  background-color:var(--surface-2);background-size:210.8326% 126.7327%;background-position:0% 42.5926%}
+/* r16-r18c fix history (.ship-art-title, now removed entirely -- see
+   below): a real HTML title/tagline was laid over .ship-art's own top
+   ~12% (r16) once a second baked "BEBOP / WORK MAKES A GOOD CREW."
+   caption was found sitting right underneath it (r17, source y~155-200,
+   mapped via (y-92)/808*100 like every other station offset in this
+   file: ~7.8%-13.4% of the box). Went through a flat-colour mask (r17),
+   a colour-matched radial-gradient feather (r18), and finally merging
+   that gradient directly onto .ship-art-title's own backdrop instead of
+   a separate masking sibling (r18b) -- each round still left an opaque
+   (or near-opaque) panel painted over part of the art.
+
+   r18d fix (tmp/in/r18d/MEASURE-fd05edd.md item 2, conductor real-
+   Chromium re-measure of fd05edd): "a solid navy panel painted over the
+   top-left of the art... that is a mask over the baked caption... no
+   opaque overlay on the art. Use the native art (original top graphic
+   visible)." Tried dropping just the backdrop first (keeping the real
+   HTML h2/p with only a text-shadow, no fill) and screenshotted the
+   result (tmp/shots/title-zoom1.png): the real "BEBOP / Work makes a
+   good crew." text sat directly on top of the baked "BEBOP / WORK MAKES
+   A GOOD CREW." caption a few pixels below it -- two near-identical
+   captions stacked, reading as a rendering glitch, not a fix.
+
+   The real HTML title was never needed for anything other than showing
+   this exact text, which the art already shows natively once nothing is
+   painted over it. Deleted .ship-art-title (the CSS rule and the
+   <div><h2>/<p> ui.js rendered inside .ship-art) entirely instead of
+   re-trying a fourth overlay variant. theme.name/theme.tagline move to
+   an aria-label on .ship-art itself (role="img") so the text stays in
+   the accessibility tree exactly as before -- the only thing that
+   changes is that sighted users now see the art's own native title
+   instead of a duplicate HTML one, opaque or not. */
+/* r18/r18b fix history (.ship-mask-row, now removed -- see .ship-art's
+   own r18c comment above for why): "the art occupies only about 60
+   percent of its box with the room pins floating in a separate right
+   column, far from their rooms" went through narrowing the mask (r18,
+   32%->27%), colour-matching it to the art (r18b), and finally deleting
+   it altogether in favour of cropping the box itself (r18c) -- a flat
+   fill never stopped reading as dead space next to a textured
+   illustration no matter how it was sized or coloured.
+
+   r18c fix (tmp/in/r18c/MEASURE-056534a.md items 1-2): with the baked
+   status cards now cropped out of .ship-art's own box entirely, there
+   is nothing left under the right edge to mask -- .room-pin sits
+   directly on the real, fully-visible art instead of inside a masked
+   zone. right:2% hugs the new (narrower) box's own edge, same offset
+   already tuned in r18 to read as "attached to the row" rather than
+   centred in a sidebar. */
+.room-pin{position:absolute;z-index:2;right:2%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  background:var(--surface);border:1px solid var(--border);border-radius:50%;text-decoration:none;
+  color:var(--fg);font-size:12px;font-weight:700;text-align:center;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+.room-pin .pin-label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.room-pin:hover,.room-pin:focus-visible{border-color:var(--accent)}
+.room-pin.urgent{border-color:var(--warn);color:var(--warn)}
+.room-pin .pin-count{color:var(--accent)}
+.room-pin.urgent .pin-count{color:var(--warn)}
+.room-pin[data-station=bridge]{top:9.90%}
+.room-pin[data-station=projectdeck]{top:29.68%}
+.room-pin[data-station=buildbay]{top:49.45%}
+.room-pin[data-station=scout]{top:69.22%}
+.room-pin[data-station=qualitygate]{top:88.99%}
+.room{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;min-width:0;display:grid;gap:6px;align-content:start}
+.hull>.room{border-top:3px solid var(--accent)}
+/* r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 4, conductor real-
+   Chromium re-measure of f5c8422): "Room detail at 1280 is still a
+   stacked card under the art, not a native room layout." .room-list's
+   selected room used the SAME filled-background, bordered, rounded-
+   corner, accent-topped box as .hull>.room (the plain theme's only
+   representation of each room, with no art to sit under -- there it
+   genuinely needs to read as a self-contained card). Under the art,
+   that same box reads as a second, disconnected panel stacked below
+   the illustration instead of as more detail about the room already
+   picked from it. Strips the card chrome down to a plain inline
+   section -- no fill, no border, no rounded corners, just a thin top
+   divider and page-level padding -- so it reads as "this page is now
+   showing you Build Bay's detail" rather than "here is a Build Bay
+   card". Specificity (0,2,0) already outranks .room's own (0,1,0), no
+   !important needed for this part. */
+.room-list>.room{background:none;border:none;border-radius:0;padding:16px 0 0}
+/* r7 review (tmp/in/REVIEW-r7.md item 3): showing all 5 full room cards
+   stacked (1198px tall) is still too much on screen even with the overlap
+   fixed. Only one room's full card is visible in .room-list at a time --
+   ui.js picks the default (most attention, ties broken by task count then
+   station order) and marks it .selected; clicking a .room-pin's #room-<id>
+   anchor switches via :target, a real browser navigation, no JS/input
+   involved (Ship renders no <input>/<button>/<form> anywhere -- check.js
+   asserts this). .room-list is only ever present when hasArt (the art +
+   pins exist to pick a room from); the plain theme's .hull has no pins, so
+   every room stays visible there, unaffected by this rule. */
+/* !important: conductor's browser measure of 9d7c9bf showed all 5 rooms
+   still visible (at load, and with #room-buildbay active) despite the
+   specificity of .room-list>.room (0,2,0) already outranking .room's own
+   display:grid (0,1,0) on paper. Unable to reproduce or instrument this in
+   a real browser (no browser tool available to this worker); !important
+   removes any possible ambiguity about which display value wins, rather
+   than leave a rule this worker cannot verify depending on cascade
+   subtlety it cannot test. */
+.room-list>.room{display:none!important}
+.room-list>.room.selected{display:grid!important}
+.room-list:has(.room:target)>.room{display:none!important}
+.room-list:has(.room:target)>.room:target{display:grid!important}
+.room-head{display:flex;gap:10px;align-items:flex-start}
+.room-head h3{margin:0 0 2px;font-size:14px}
+.room-place{font-size:12px;color:var(--muted);margin:0}
+.room-status,.room-extra{font-size:13px;margin:0}
+.room-extra{padding-top:6px;border-top:1px dashed var(--border)}
+.room-extra ul{margin:4px 0 0;padding-left:18px}
+details.room-cards{margin:0}
+details.room-cards>summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none;padding:2px 0}
+details.room-cards>summary::-webkit-details-marker{display:none}
+details.room-cards>summary::before{content:"\25B8  ";color:var(--accent)}
+details.room-cards[open]>summary::before{content:"\25BE  "}
+.wcards{display:grid;gap:8px;margin-top:6px}
+.wcard{background:var(--surface);border:2px solid var(--border);border-left-width:6px;border-radius:8px;padding:8px 10px;min-width:0}
+.wcard h4{margin:0 0 4px;font:600 12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-word}
+.wcard p{margin:3px 0;font-size:12.5px}
+.wmeta{color:var(--muted);font-size:12px}
+.badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--brass)}
+.badge.unrec{border:2px dashed var(--bad)}
+/* right rail: Big Shot (suggestions) + Maintenance Log (unrecognized), the
+   reference's right-column cards -- same real data, never fabricated. */
+.side-rail{display:grid;gap:12px}
+.side-panel{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px}
+.side-panel h3{margin:0 0 8px;font-size:13px}
+.sidecard{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;margin:0 0 8px}
+.sidecard:last-child{margin-bottom:0}
+.sidecard h4{margin:0 0 4px;font-size:13px}
+.sidecard p{margin:3px 0;font-size:12.5px}
+/* r12 addendum (tmp/in/ITERATE-r12-ADDENDUM.md items 5-7): compact,
+   collapsed-by-default feeds in the side rail. <details> gives keyboard
+   operation and instant (reduced-motion-safe, nothing to animate)
+   open/close for free; aria-expanded is synced in ui.js's DOM-wiring
+   section since <details> doesn't expose it natively. */
+.feed-panel{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px}
+.feed-panel>summary{cursor:pointer;list-style:none;font-size:13px;font-weight:700}
+.feed-panel>summary::-webkit-details-marker{display:none}
+.feed-panel>summary::before{content:"\25B8  ";color:var(--accent)}
+.feed-panel[open]>summary::before{content:"\25BE  "}
+.feed-count{display:inline-block;min-width:16px;padding:0 5px;margin:0 2px;border-radius:999px;background:var(--surface);border:1px solid var(--brass);font-size:11px;text-align:center}
+.feed-source{margin:4px 0 0;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+.feed-list{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
+.feed-list li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:12.5px;padding-top:6px;border-top:1px solid var(--border)}
+.feed-list li:first-child{padding-top:0;border-top:none}
+.feed-label{font-weight:600;word-break:break-word}
+.feed-meta{margin-left:auto;white-space:nowrap}
+/* r12 iteration item 2: give "Needs your call" the same visual weight as
+   the reference's alert icon + bordered button -- still a <p>/<a>, no new
+   control. */
+.call-chip{font-weight:600;overflow-wrap:anywhere}
+.call-chip.urgent strong{color:var(--bad)}
+.call-btn{border:1px solid var(--brass);border-radius:6px;padding:2px 10px;text-decoration:none;color:var(--fg)}
+.call-btn:hover{border-color:var(--accent);color:var(--accent)}
+/* bottom bar: "needs your call", slim -- replaces the old dense head line */
+.ship-bottom{margin:14px 0 0;padding:8px 12px;display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:13px}
+.ship-bottom strong{color:var(--accent)}
+.ship-more{margin:6px 0 0;font-size:12.5px}
+.ship-more>summary{cursor:pointer;color:var(--muted);list-style:none}
+.ship-more>summary::-webkit-details-marker{display:none}
+.ship-more>summary::before{content:"\25B8  ";color:var(--accent)}
+.ship-more[open]>summary::before{content:"\25BE  "}
+.side-more{margin:10px 0 0;font-size:12.5px}
+.side-more>summary{cursor:pointer;color:var(--muted);list-style:none}
+.side-more>summary::-webkit-details-marker{display:none}
+.side-more>summary::before{content:"\25B8  ";color:var(--accent)}
+.side-more[open]>summary::before{content:"\25BE  "}
+.side-more>*{margin-top:8px}
+
+/* r19 (tmp/in/r19/R19-BOUNTY-MOTION.md + R19-AMEND-SPA.md): inline bounty
+   board, same visual language as .side-panel/.feed-panel -- not a new
+   component family, just those two patterns combined (summary card +
+   <details> disclosure of real .wcard rows, same card() markup the room
+   list already uses). */
+.bounty-board{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:14px 0 0}
+.bounty-board h3{margin:0 0 6px;font-size:14px;display:flex;align-items:center;gap:8px}
+.bounty-portrait{display:inline-flex;flex:0 0 auto}
+.bounty-portrait svg{display:block}
+.bounty-list{margin:8px 0 0;font-size:12.5px}
+.bounty-list>summary{cursor:pointer;color:var(--muted);list-style:none;font-weight:600}
+.bounty-list>summary::-webkit-details-marker{display:none}
+.bounty-list>summary::before{content:"\25B8  ";color:var(--accent)}
+.bounty-list[open]>summary::before{content:"\25BE  "}
+.bounty-list>.wcards{margin-top:8px}
+.badge.open{color:var(--warn);border-color:var(--warn)}
+.badge.cleared{color:var(--bg);background:var(--ok);border-color:var(--ok)}
+.badge.stale{border:2px dashed var(--warn);color:var(--warn)}
+
+/* state chips + card borders: shape + icon + words, never colour alone */
+.st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}
+.st[data-d=executing]{color:var(--accent)}
+.st[data-d=unconfirmed]{color:var(--muted);border-style:dotted;font-style:italic}
+.st[data-d=starting]{color:var(--info);border-style:dotted}
+.st[data-d=blocked]{color:var(--warn);border-width:3px}
+.st[data-d=stalled]{color:var(--warn);border-style:dashed;border-width:3px}
+.st[data-d=in_review]{color:var(--info)}
+.st[data-d=done_with_proof]{color:var(--bg);background:var(--ok);border-color:var(--ok)}
+.st[data-d=closed]{color:var(--muted);border-width:1px}
+.st[data-d=failed]{color:var(--bg);background:var(--bad);border-color:var(--bad)}
+.st[data-d=cancelled]{color:var(--muted);border-width:1px;text-decoration:line-through}
+.st[data-d=lost],.st[data-d=gone]{color:var(--bad);border-style:dotted}
+.st[data-d=unknown]{color:var(--bad);border-style:dashed}
+.wcard[data-d=executing]{border-color:var(--accent)}
+.wcard[data-d=unconfirmed]{border-style:dotted;background:var(--bg)}
+.wcard[data-d=blocked]{border-color:var(--warn)}
+.wcard[data-d=stalled]{border-color:var(--warn);border-style:dashed}
+.wcard[data-d=in_review]{border-color:var(--info)}
+.wcard[data-d=done_with_proof]{border-color:var(--ok)}
+.wcard[data-d=failed]{border-color:var(--bad);border-width:3px;border-left-width:6px}
+.wcard[data-d=lost],.wcard[data-d=gone]{border-color:var(--bad);border-style:dotted}
+.wcard[data-d=unknown]{border-color:var(--bad);border-style:dashed}
+.wcard[data-d=unconfirmed] .sprite,.wcard[data-d=lost] .sprite,.wcard[data-d=gone] .sprite{filter:grayscale(1);opacity:.6}
+
+/* Loops = flight plan: each loop a leg with cadence and last fix */
+main[data-view=loops] table tr td:first-child{width:1%;white-space:nowrap}
+main[data-view=loops] h2:first-of-type+table tr{background-image:linear-gradient(var(--brass),var(--brass));background-size:2px 100%;background-repeat:no-repeat;background-position:18px 0}
+main[data-view=loops] h2:first-of-type+table td:first-child{padding-left:30px}
+main[data-view=loops] small{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* Timeline = flight log: monospace entries, sequence and time as the log margin */
+main[data-view=timeline] table{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+main[data-view=timeline] table td:nth-child(1),main[data-view=timeline] table td:nth-child(2){white-space:nowrap;color:var(--muted);border-right:1px dashed var(--border)}
+main[data-view=timeline] table td.age{text-align:left}
+
+/* motion: only .anim sprites move; .anim is only set for executing work with herdr live */
+@keyframes sp-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+.sprite{flex:none;display:block}
+.sprite.anim .sp-fig{animation:sp-bob 1.4s ease-in-out infinite}
+/* when the ship-art backdrop replaces the per-room sprite, the real room
+   pin pulses for an executing station instead (same keyframe, same
+   reduced-motion/herdr-down rules below still stop it). */
+.room-pin.anim{animation:sp-bob 1.4s ease-in-out infinite}
+/* r19 motion (tmp/in/r19/MOTION-SPEC.md): ambient, non-informational
+   layers drawn over the one ship.png raster -- starfield drift, console
+   glow, optional scanline. Each uses animation (never transition, since
+   nothing about them changes state) so the existing reduce-motion kill
+   switch below stops all three identically. .ship-ambient's own box is
+   position:absolute, inset:0, inherits .ship-art's overflow:hidden crop,
+   pointer-events:none so it never intercepts clicks on the room pins
+   painted after it in DOM order. */
+.ship-ambient{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.ship-ambient::before,.ship-ambient::after{content:"";position:absolute;inset:-20%}
+@keyframes ship-starfield{0%{background-position:0 0}100%{background-position:-400px 300px}}
+.ship-ambient::before{
+  background-image:radial-gradient(1.5px 1.5px at 20% 30%,var(--fg) 0,transparent 100%),
+    radial-gradient(1.5px 1.5px at 60% 70%,var(--fg) 0,transparent 100%),
+    radial-gradient(1px 1px at 80% 15%,var(--fg) 0,transparent 100%),
+    radial-gradient(1px 1px at 40% 85%,var(--fg) 0,transparent 100%);
+  background-size:400px 300px;opacity:.12;animation:ship-starfield 52s linear infinite}
+@keyframes ship-console-glow{0%,100%{opacity:.08}50%{opacity:.16}}
+.ship-ambient::after{
+  background:radial-gradient(120px 90px at 72% 60%,var(--accent) 0,transparent 70%);
+  opacity:.08;animation:ship-console-glow 6s ease-in-out infinite}
+/* scanline: optional per spec, dropped entirely under 640px (fewer
+   layers on mobile, transform/opacity only, see the 640px block below). */
+.ship-scanline{position:absolute;left:0;right:0;height:2px;background:var(--fg);opacity:.05;
+  animation:ship-scanline 21s linear infinite}
+@keyframes ship-scanline{0%{top:-2px;opacity:0}5%{opacity:.05}95%{opacity:.05}100%{top:100%;opacity:0}}
+/* r19 motion fix (MOTION-SPEC.md: "Feed/disclosure 200-240ms cubic-bezier
+   open reveal, preserve DOM/scroll/selected-tab, no whole-board-size
+   animation"): every <details> in this file opens its content as the
+   element right after <summary> (feed-panel/room-cards/bounty-list/
+   side-more/ship-more/prefs/navgroup-body/chrome-more) -- one rule covers
+   all of them instead of near-duplicates per class. Opacity+transform
+   only, so nothing about the board's own size animates; closing stays
+   instant (<details> has no native close-transition hook to use). */
+@keyframes disclosure-reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+details[open]>summary+*{animation:disclosure-reveal 220ms cubic-bezier(.2,.8,.2,1)}
+/* r19 motion fix (MOTION-SPEC.md: "status transitions... start cue once,
+   steady running, completion reveal once, failure stays static, no
+   endless pulse"): ui.js/HubUI never DOM-patches a single chip in place,
+   it re-renders the whole Ship HTML each poll tick, so a fresh element
+   for a given data-d value IS the real transition moment in this
+   architecture; animation-iteration-count:1 (the "1" above is already
+   the default, named here for clarity) keeps it from looping -- the
+   endless case is .room-pin.anim above, which is for ongoing "something
+   is executing" presence, not a status-change cue, and already loops
+   only while S.live_connected && !prefs.reduce via ui.js's own moving
+   flag. failed/lost/gone/unknown/cancelled get no entrance keyframe at
+   all here: static is the acceptance criterion, not an oversight. */
+@keyframes status-start{0%{opacity:.4;transform:scale(.88)}100%{opacity:1;transform:scale(1)}}
+@keyframes status-complete{0%{opacity:.4;transform:scale(.9)}60%{opacity:1;transform:scale(1.05)}100%{opacity:1;transform:scale(1)}}
+.st[data-d=executing]{animation:status-start 350ms ease-out 1}
+.st[data-d=done_with_proof]{animation:status-complete 450ms ease-out 1}
+/* r19 motion fix (MOTION-SPEC.md "Pause offscreen/hidden-tab via
+   observers"): only the two looping ambient layers pause -- the one-shot
+   status/disclosure animations above are already finished long before a
+   tab switch or scroll could matter, nothing to pause there. */
+html[data-hidden] .ship-ambient,html[data-hidden] .ship-scanline,
+.ship-art.offscreen .ship-ambient,.ship-art.offscreen .ship-scanline{animation-play-state:paused}
+html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{animation:none!important;transition:none!important}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+/* r6 review (tmp/in/REVIEW-r6.md): the single-column breakpoint was
+   1000px, wide enough to swallow genuine desktop/tablet widths into the
+   mobile stack; narrowed to a clearly-mobile cutoff so the 65/35 split
+   holds at any desktop width. */
+@media (max-width:760px){
+  .ship{grid-template-columns:1fr}
+}
+@media (max-width:640px){
+  header{padding:10px 12px}
+  .hdr-meta{margin-left:0}
+  .prefs-body{left:0;right:auto}
+  main{padding:12px 10px 48px}
+  table{display:block;overflow-x:auto}
+  /* r15 fix (tmp/in/FIX-r15.md item 3, conductor real-Chromium measure at
+     260px): this block used to cancel .ship-art's aspect-ratio and hide
+     .room-pin/.ship-mask at <=640px (REVIEW-r7.md item 5's reasoning:
+     without aspect-ratio and with no in-flow content, .ship-art collapsed
+     to 0 height, so pins/masks had to go too, and every room was forced
+     visible to keep rooms reachable without pins). The conductor now
+     wants the art to scale WITH its container at any width instead of
+     disappearing -- aspect-ratio already does that on its own; removing
+     the override is the whole fix. .ship-art itself and .ship-art-title
+     are untouched by this block -- all percentage-based, all scale with
+     the box. (.ship-mask-row, mentioned here originally, was removed in
+     r18c -- see .ship-art's own comment above.)
+
+     r16 fix (tmp/in/FIX-r16.md item 3, conductor real-Chromium measure of
+     e2e53c8 at 260px): .room-pin's own content (icon+label+count,
+     fixed-px font-size/padding, not percentage-based) does NOT shrink
+     proportionally with the box the way its top:% position does -- the
+     absolute-px GAP between two consecutive top:% positions shrinks as
+     the box narrows (shorter box height at the same aspect ratio), so at
+     260px a pin's own near-constant height (conductor measured 39-53px)
+     exceeds the shrunk gap and pins start overlapping each other. Rather
+     than shrinking pin text/padding to fit an unknown-in-advance
+     threshold (no browser to test the exact cutoff), hide pins at the
+     same already-established <=640px breakpoint and force every room
+     visible in .room-list so rooms stay reachable without them -- the
+     conductor's own suggested fix ("rely on the room cards below"). The
+     art image itself, including the new title text, stays visible and
+     scaling; only the interactive pin overlay goes away. */
+  .room-pin{display:none}
+  .room-list>.room{display:grid!important}
+  .crew-slot{float:none}
+  iframe.dframe{height:80vh;min-height:420px}
+  /* r19 motion fix (MOTION-SPEC.md "Mobile: fewer layers, transform/
+     opacity only, no looping blur/filter"): drop the scanline layer
+     entirely below 640px, same already-established pin breakpoint. */
+  .ship-scanline{display:none}
+}
