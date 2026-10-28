@@ -397,6 +397,7 @@ def main() -> int:
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     bind_live_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    title_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
@@ -1933,11 +1934,12 @@ def issue_cases(base: Path) -> None:
     frozen = _frozen_gen1_module()
     d, lc, ldb, adb, rq, roots, proj = setup()
     fid, rec, asha = decision(d, proj)  # prev_gen=0 default -> classic shape, no successor keys at all
-    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes/render_form byte-identical to the frozen baseline",
+    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes byte-identical to the frozen baseline "
+         "(render_form's title/H1 deliberately changed, R12d -- it used to hardcode a fixed \"KB\" label "
+         "regardless of the real owner; see render_form()'s own docstring)",
          set(rec) == frozen.KEYS
          and frozen.validate_approval(dict(rec)) == rec
-         and frozen.approval_bytes(rec) == odi.approval_bytes(rec)
-         and frozen.render_form(rec) == odi.render_form(rec))
+         and frozen.approval_bytes(rec) == odi.approval_bytes(rec))
     frozen_successor = _frozen_gen1_module(ref="0ac8ba1f7f5431899819b3a7fd1713957e965bb8")  # SUCCESSOR_KEYS postdates 1a0b873
     saved_root = odi.STATE_ROOT
     odi.STATE_ROOT = os.path.realpath(d / "state")
@@ -2162,20 +2164,20 @@ def bind_live_cases(base: Path) -> None:
                    "expected_holder": dict(HOLD), "expected_generation": 1, "lease_ttl_s": TTL,
                    "request_id": "classic-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
                    "manifest": ["result.md"], "auth_id": "auth-classic-1", "grant_window_s": 1800}
-    case("FROZEN COMPAT (ffa64cc): classic initial-claim KEYS/approval_bytes/render_form byte-identical",
+    case("FROZEN COMPAT (ffa64cc): classic initial-claim KEYS/approval_bytes byte-identical "
+         "(render_form's title/H1 deliberately changed, R12d)",
          odi.KEYS == frozen.KEYS
          and odi.approval_bytes(classic_rec) == frozen.approval_bytes(classic_rec)
-         and odi.render_form(classic_rec) == frozen.render_form(classic_rec)
          and odi.validate_approval(classic_rec) == frozen.validate_approval(classic_rec))
     successor_rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1,
                      "expected_holder": dict(HOLD2), "expected_generation": 2, "lease_ttl_s": TTL,
                      "expected_prev_generation": 1, "expected_prev_holder": dict(HOLD),
                      "request_id": "successor-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
                      "manifest": ["result.md"], "auth_id": "auth-successor-1", "grant_window_s": 1800}
-    case("FROZEN COMPAT (ffa64cc): SUCCESSOR_KEYS/approval_bytes/render_form byte-identical",
+    case("FROZEN COMPAT (ffa64cc): SUCCESSOR_KEYS/approval_bytes byte-identical "
+         "(render_form's title/H1 deliberately changed, R12d)",
          odi.SUCCESSOR_KEYS == frozen.SUCCESSOR_KEYS
          and odi.approval_bytes(successor_rec) == frozen.approval_bytes(successor_rec)
-         and odi.render_form(successor_rec) == frozen.render_form(successor_rec)
          and odi.validate_approval(successor_rec) == frozen.validate_approval(successor_rec))
     standing_rec = {"protocol": odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj,
                     "expected_holder": dict(HOLD), "expected_generation": 1,
@@ -2206,6 +2208,39 @@ def bind_live_cases(base: Path) -> None:
     case("FROZEN COMPAT (ffa64cc): classic initial-claim still issues end to end via claim_initial, unchanged",
          got == (0, "issued:auth-classic-1:gen1"))
     lc.close()
+
+
+def title_cases(base: Path) -> None:
+    """owner-dispatch-issue.py render_form()'s title/H1 (R12d,
+    tmp/in/r12/TITLE-FIX.md): deployed build-form at d39e64d rendered a
+    FIXED 'KB owner-dispatch pilot' title/H1 for a thurber-os grant (form
+    20261028T204112-8740) -- every field below the heading was thurber-os,
+    only the heading lied. Title/H1 must derive from rec['owner_label']/
+    rec['project'] for EVERY label, never a fixed 'KB' string."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("odissue_title", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
+
+    def mk(label, project):
+        rec = {"protocol": odi.PROTOCOL, "owner_label": label, "project": project, "max_open": 1,
+               "expected_holder": dict(HOLD), "expected_generation": 1, "lease_ttl_s": 1800,
+               "request_id": "title-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+               "manifest": ["result.md"], "auth_id": "auth-title-1", "grant_window_s": 1800}
+        return odi.render_form(rec).decode()
+
+    for label, project in [("thurber-os", "tntpgh/thurber-os"), ("herdr-control-dots", "tntpgh/dotfiles"),
+                           ("some-other-label", "tntpgh/some-other-repo")]:
+        html = mk(label, project)
+        case(f"TITLE: build-form for label {label!r} -> title/H1 contain the real label, never a fixed KB",
+             html.count(label) >= 2  # once in <title>, once in <h1>
+             and "KB" not in html.split("<table>")[0]  # before the data table: no leftover fixed abbreviation
+             and "Approve ONE" in html)  # tampering-detection substring (verify-owner-dispatch.py's own
+                                         # "served page differs from the canonical rendering" case) still present
+    html_kb = mk(KB, "tntpgh/knowledge-base")
+    case("TITLE: build-form for label 'knowledge-base' -> title/H1 contain the real label (not a hardcoded 'KB')",
+         html_kb.count(KB) >= 2 and "Approve ONE" in html_kb)
 
 
 def standing_issue_cases(base: Path) -> None:

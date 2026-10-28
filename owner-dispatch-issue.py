@@ -175,12 +175,17 @@ def render_form(rec: dict) -> bytes:
     accepts ONLY a stored page byte-identical to this rendering, so what was on
     screen is exactly the record (including holder, request sha and window).
     A classic gen1 record (no expected_prev_generation/bind_live_generation
-    key) renders BYTE-IDENTICAL to the original claim_initial-only form
-    (frozen at 1a0b873); a successor record (expected_prev_generation
-    present) additionally names the released predecessor and the
-    generation being claimed (claim_successor path); a bind-live record
-    (bind_live_generation present, R12) names the ALREADY-LIVE generation
-    it binds to and states plainly that nothing is claimed or released."""
+    key), a successor record (expected_prev_generation present -- additionally
+    names the released predecessor and the generation being claimed), and a
+    bind-live record (bind_live_generation present, R12 -- names the
+    ALREADY-LIVE generation it binds to and states plainly that nothing is
+    claimed or released) all share the same title/H1 shape, derived from
+    rec["owner_label"]/rec["project"] (R12d fix: the title/H1 used to be a
+    FIXED "KB owner-dispatch pilot" string regardless of the real label --
+    deployed form 20261028T204112-8740 showed that wording for a thurber-os
+    grant. Never hardcode a label here; title/H1 schema content changed
+    (no longer byte-identical to the pre-R12d baseline), everything else
+    -- table rows, intro paragraph wording per mode -- is unchanged)."""
     emb = approval_bytes(rec)
     sha = hashlib.sha256(emb).hexdigest()
     h = rec["expected_holder"]
@@ -215,8 +220,10 @@ def render_form(rec: dict) -> bytes:
                   f'generation-{rec["expected_generation"]} lease claim and one grant for the request below. Nothing retries.</p>')
     else:
         intro = "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
-    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Approve ONE KB owner-dispatch pilot request</title></head><body>"
-            "<h1>Approve ONE read-only KB pilot request?</h1>"
+    label_t, proj_t = esc(rec["owner_label"]), esc(rec["project"])
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Approve ONE owner-dispatch request for '
+            f'{label_t} ({proj_t})</title></head><body>'
+            f'<h1>Approve ONE owner-dispatch request for {label_t} ({proj_t})?</h1>'
             f"{intro}"
             f"<table>{table}</table>"
             f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
