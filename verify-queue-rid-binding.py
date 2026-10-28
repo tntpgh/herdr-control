@@ -246,5 +246,67 @@ case("REQUIRED: neither --request-id nor --queue-item-id given is refused before
      and not (d4 / "neither.html").exists())
 lc4.close()
 
+# --- R12f (tmp/in/r12/QUEUE-RID-VALIDATE.md): --queue-item-id and its
+# derived rid are validated BEFORE any approval bytes are built or hashed,
+# reusing queue_supervisor's OWN alphabets (lib/queue_supervisor.py:71
+# _ID_RE <=64 chars, :123 _RID_RE <=100 chars -- the SAME patterns
+# tick_lane() itself checks before ever consuming a grant). Negative cases
+# assert no form file (and so no approval) exists afterwards; boundary
+# positives assert the opposite -- build-form SUCCEEDS at the limit, not
+# one past it (the brief's "no form file" wording applies to the negative
+# cases; a boundary POSITIVE that produced no form would contradict its
+# own purpose of proving the limit is inclusive, not exclusive). ---
+LONGLABEL = "x" * 48  # LABEL_RE max length (lib/owner_lease.py:82, ^[a-z0-9][a-z0-9-]{0,47}$)
+
+
+def build_only(tag, *, label, resolve, queue_item_id=None, request_id=None):
+    d = Path(os.path.realpath(tempfile.mkdtemp(dir=str(TMPBASE))))
+    rq = d / "req"; rq.mkdir(); (rq / "req.txt").write_bytes(body)
+    out_path = d / f"form-{tag}.html"
+    argv = ["--label", label, "--project", f"tntpgh/{label}", "--request-dir", str(rq), "--request-name", "req.txt",
+           "--auth-id", f"auth-{tag}", "--out", str(out_path), "--manifest", "result.md"]
+    if queue_item_id is not None:
+        argv += ["--queue-item-id", queue_item_id]
+    if request_id is not None:
+        argv += ["--request-id", request_id]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = odi.build_main(argv, resolve=resolve, now=T0)
+    return rc, buf.getvalue().strip(), out_path
+
+
+rc5a, out5a, path5a = build_only("badchar", label=LABEL, resolve=reg_ok, queue_item_id="bad id")
+case("R12f NEGATIVE: a queue item id with a bad character (space, outside _ID_RE's "
+     "[A-Za-z0-9_-]) is refused before any approval bytes are built, no form written",
+     rc5a == 2 and out5a == "refused:queue_item_id_invalid" and not path5a.exists())
+
+id65 = "a" * 65
+rc5b, out5b, path5b = build_only("id65", label=LABEL, resolve=reg_ok, queue_item_id=id65)
+case("R12f NEGATIVE: a 65-character queue item id (_ID_RE caps at 64) is refused, no form written",
+     rc5b == 2 and out5b == "refused:queue_item_id_invalid" and not path5b.exists())
+
+id_exceed = "y" * 50  # len(LONGLABEL)=48 + len(id)=50 + len("q--")=3 -> rid 101 chars, > _RID_RE's 100
+rc5c, out5c, path5c = build_only("ridexceed", label=LONGLABEL, resolve={LONGLABEL: (PANE_ID, PANE_BIRTH, SESS)}.get,
+                                 queue_item_id=id_exceed)
+case("R12f NEGATIVE: a VALID id (passes _ID_RE) whose derived rid exceeds 100 chars (a long label) is "
+     "refused before any approval bytes are built, no form written -- id alone being valid is not enough",
+     rc5c == 2 and out5c == "refused:queue_item_id_rid_invalid" and not path5c.exists()
+     and len(qs.rid_for(LONGLABEL, id_exceed)) == 101)
+
+id64 = "w" * 64
+rc5d, out5d, path5d = build_only("id64", label=LABEL, resolve=reg_ok, queue_item_id=id64)
+case("R12f BOUNDARY POSITIVE: a 64-character queue item id (_ID_RE's own limit, inclusive) is ACCEPTED, "
+     "form written",
+     rc5d == 0 and out5d.startswith("built:") and path5d.exists())
+
+id_rid100 = "z" * 49  # len(LONGLABEL)=48 + len(id)=49 + len("q--")=3 -> rid exactly 100
+rc5e, out5e, path5e = build_only("rid100", label=LONGLABEL, resolve={LONGLABEL: (PANE_ID, PANE_BIRTH, SESS)}.get,
+                                 queue_item_id=id_rid100)
+case("R12f BOUNDARY POSITIVE: a derived rid of exactly 100 chars (_RID_RE's own limit, inclusive) is "
+     "ACCEPTED, form written",
+     rc5e == 0 and out5e.startswith("built:") and path5e.exists()
+     and len(qs.rid_for(LONGLABEL, id_rid100)) == 100)
+
+
 print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
 sys.exit(1 if FAILS else 0)

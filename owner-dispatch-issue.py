@@ -589,6 +589,13 @@ def build_main(argv, resolve=None, now=None) -> int:
     present to oda.consume(), the gap tmp/out/r12/REPORT-r12d-queue-rid.md
     reported. oda.consume()/consume_standing()'s own equality checks are
     untouched by this: request_id is still an opaque string to them.
+    --queue-item-id and its derived rid are validated BEFORE any approval
+    bytes are built or hashed (R12f, tmp/in/r12/QUEUE-RID-VALIDATE.md):
+    the id must fully match queue_supervisor._ID_RE, and rid_for(label,
+    ID) must match queue_supervisor._RID_RE -- the SAME alphabets/limits
+    tick_lane() itself enforces before ever consuming a grant, reused
+    directly here (never duplicated) so a bad id/rid is refused before a
+    human ever approves it, not only at dispatch time.
     Serves nothing and records nothing."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
     for a in ("--label", "--project", "--request-dir", "--request-name", "--auth-id", "--out"):
@@ -608,7 +615,25 @@ def build_main(argv, resolve=None, now=None) -> int:
     if a.request_id is None and a.queue_item_id is None:
         print("refused:request_id_or_queue_item_id_required")
         return 2
-    request_id = a.request_id if a.request_id is not None else qs.rid_for(a.label, a.queue_item_id)
+    if a.queue_item_id is not None:
+        # lib/queue_supervisor.py:71 (_ID_RE) and :123 (_RID_RE) -- the
+        # queue's OWN accepted alphabets/limits, reused directly (never
+        # duplicated here): a queue item id tick_lane() will ever read
+        # from a queue.json file must already satisfy _ID_RE, and the rid
+        # it derives (rid_for(label, id)) must already satisfy _RID_RE
+        # (checked again at tick_lane():255 before any grant consumption
+        # or send) -- refusing anything that would fail those checks
+        # BEFORE a human ever approves it, rather than only at dispatch
+        # time deep in the queue pipeline.
+        if not qs._ID_RE.match(a.queue_item_id):
+            print("refused:queue_item_id_invalid")
+            return 2
+        request_id = qs.rid_for(a.label, a.queue_item_id)
+        if not qs._RID_RE.match(request_id):
+            print("refused:queue_item_id_rid_invalid")
+            return 2
+    else:
+        request_id = a.request_id
     clock = (lambda: now) if now is not None else time.time
     if a.expected_prev_generation < 0:
         print("refused:expected_prev_generation_negative")
