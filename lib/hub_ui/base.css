@@ -238,15 +238,35 @@ html[data-view=ship] #overview-view{display:none}
    aspect-ratio 998/808.
 
    Both .ship-mask-top and .ship-mask-bottom are removed (their content is
-   now simply never shown, not covered); .ship-mask-row/.room-pin per-
-   station top:% values are re-derived against the NEW 808px-tall box
-   (old_img_y = old_pct/100*1024; new_pct = (old_img_y - 92) / 808 * 100)
-   -- also computed with python3, not by hand, given 10 values. Bridge's
-   mask-row came out -0.23% (now clamped to 0%, it was already sitting at
-   almost exactly the new crop's top edge). .ship-mask-row's own height
-   also rescales: 16% * (1024/808) ~= 20.28%. */
-.ship-art{position:relative;overflow:hidden;aspect-ratio:998/808;border-radius:10px;border:2px solid var(--brass);
-  background-color:var(--surface-2);background-size:153.9078% 126.7327%;background-position:0% 42.5926%}
+   now simply never shown, not covered).
+
+   r18c fix (tmp/in/r18c/MEASURE-056534a.md items 1-2, conductor real-
+   Chromium re-measure of 056534a): still "the art occupies only ~60% of
+   its box... ~190px dead band on the right... pins floating in a
+   separate column" even after r18b narrowed and colour-matched
+   .ship-mask-row to the art's own ambient tone -- a flat fill, however
+   well colour-matched, still reads as dead space next to a textured
+   illustration (no rivets/lights/detail in a solid colour, so the eye
+   can tell there's nothing there even when the colour is right).
+   "art must fill its frame (or frame shrink to art)" -- took the second
+   option literally instead of trying a fourth variant of painting over
+   the same zone: shrunk the BOX ITSELF so there's no leftover frame to
+   begin with, rather than a differently-coloured patch inside an
+   unchanged frame. Re-cropped .ship-art's own width to stop exactly
+   where the baked status cards start (the same 73%-of-998 boundary
+   .ship-mask-row used, 76.5% measured left edge of the baked cards with
+   a ~3.5-point safety margin) instead of cropping around them: new crop
+   w=728.54 (was 998), x0/y0/h unchanged (0/92/808, so every .room-pin
+   top:% below is untouched -- only the width changes). Computed with
+   python3: aspect-ratio 728.54/808, background-size 210.8326% 126.7327%
+   (height factor unchanged since h didn't change), background-position
+   0% 42.5926% (unchanged, x0 unchanged). .ship-mask-row is deleted
+   entirely (CSS rule + the <div> ui.js rendered per row) -- there is no
+   baked card left inside the visible crop to hide, so there is nothing
+   left to mask. .room-pin moves from "inside the masked zone" to
+   directly on the new, fully-real right edge of the art (see below). */
+.ship-art{position:relative;overflow:hidden;aspect-ratio:728.54/808;border-radius:10px;border:2px solid var(--brass);
+  background-color:var(--surface-2);background-size:210.8326% 126.7327%;background-position:0% 42.5926%}
 /* r16 fix (tmp/in/FIX-r16.md item 1): real title/tagline text laid
    directly over .ship-art's own top ~12%.
 
@@ -300,76 +320,28 @@ html[data-view=ship] #overview-view{display:none}
    Verified by cropping a fresh screenshot down to just this region
    (tmp/shots/caption-zoom4.png): baked text fully gone, soft edges,
    no hard rectangle. */
-.ship-mask-row{position:absolute;z-index:1;pointer-events:none}
 .ship-art-title{position:absolute;z-index:2;top:0;left:0;width:52%;height:17%;padding:10px 14px;color:#fff;
   background-image:radial-gradient(ellipse at center,rgba(13,36,78,1) 0%,rgba(13,36,78,1) 80%,rgba(13,36,78,0) 100%);
   text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.6)}
 .ship-art-title h2{margin:0;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .ship-art-title p{margin:2px 0 0;font-size:11px}
-/* r18 fix (tmp/in/FIX-r18.md item 3, conductor real-Chromium measure of
-   6a75769 at 1280, corrected shots tmp/in/r17bshots/): "the art occupies
-   only about 60 percent of its box with the room pins floating in a
-   separate right column, far from their rooms" -- the 32% mask-row width
-   (r8's own widening, in reaction to a real leak back then) was measured
-   directly this round rather than inherited on faith: probed the
-   unmasked reference image at the current r15 crop with tmp/png_probe.py
-   (a stdlib-only PNG decoder, no installs) across Bridge/Build Bay/Scout
-   rows -- every baked status card's own left edge starts at ~76.5% of
-   .ship-art's width, consistently, not ~68% (32% mask). Narrowed to 27%
-   (73%-100%), a ~3.5-point safety margin under the measured 76.5%, moving
-   visible art from 68% to 73% of the box width.
+/* r18/r18b fix history (.ship-mask-row, now removed -- see .ship-art's
+   own r18c comment above for why): "the art occupies only about 60
+   percent of its box with the room pins floating in a separate right
+   column, far from their rooms" went through narrowing the mask (r18,
+   32%->27%), colour-matching it to the art (r18b), and finally deleting
+   it altogether in favour of cropping the box itself (r18c) -- a flat
+   fill never stopped reading as dead space next to a textured
+   illustration no matter how it was sized or coloured.
 
-   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 1, conductor real-
-   Chromium re-measure of f5c8422): "right ~100px of the ship panel is
-   empty navy" -- two things were actually contributing. First,
-   .room-pin was a wide multi-line card (see below), filling most of
-   this strip with ANOTHER solid box, so the strip read as one unbroken
-   slab; now it's a small count-only badge (see .room-pin), so most of
-   the strip is genuinely just the mask colour on its own.
-
-   Second, and the real fix here: the mask was var(--surface-2)
-   (#212d48), a UI-chrome colour, not sampled from the art. The art's
-   own ambient tone in this exact strip (sampled from the reference
-   mockup, lib/hub_ui/themes/bebop/ship.png, the dark ship-interior
-   background around and between the baked cards, not the cards
-   themselves) measures close to rgb(15,22,38) -- visibly darker and
-   more saturated-blue than surface-2. Swapped the fill to that sampled
-   tone so the masked strip's colour matches the art it's sitting next
-   to instead of looking like a separate UI panel dropped on top of it.
-   The strip is still a flat colour -- true texture would mean baking a
-   masked version of the art itself, out of scope for a CSS-only round
-   -- but a colour-matched flat fill reads as "this part of the ship is
-   just dim" rather than "a rectangle was pasted over the art". */
-.ship-mask-row{top:0;right:0;width:27%;height:20.28%;background:#0f1626}
-.ship-mask-row[data-station=bridge]{top:0%}
-.ship-mask-row[data-station=projectdeck]{top:19.54%}
-.ship-mask-row[data-station=buildbay]{top:39.31%}
-.ship-mask-row[data-station=scout]{top:59.08%}
-.ship-mask-row[data-station=qualitygate]{top:78.85%}
-/* Small, real hotspots over the masked status-card zone -- one per room,
-   non-overlapping (each confined to its own row band), linking to the
-   matching .room card's real status below.
-
-   r18 fix (tmp/in/FIX-r18.md item 3): right:4% centred the pin well
-   inside the (old, wider) masked zone, reading as "floating in a
-   separate column, far from their rooms" per the conductor's measure.
-   right:2% (was 4%), and the mask narrower (27%, see .ship-mask-row
-   above), pulled it toward the boundary with the illustrated room but
-   a 26%-wide multi-line "name + count" card still read as a parallel
-   info column -- it duplicates the room's own name, which the art
-   already draws as a large baked label right next to it (every
-   screenshot this round confirms "BRIDGE / Jet . Captain" etc. are
-   legible in the art itself).
-
-   r18b fix (tmp/in/r18b/MEASURE-f5c8422.md item 1, conductor real-
-   Chromium re-measure): shrunk the pin to just its live count, a small
-   round badge rather than a name+count card -- the room's own name is
-   never duplicated, so the badge only needs to be big enough for 1-2
-   digits. .pin-label is kept in the DOM (the <a>'s aria-label already
-   carries the full "Bridge: 2 tasks" text for assistive tech either
-   way) but visually hidden, standard sr-only clip pattern, not display:
-   none, so it's still in the accessibility tree exactly as before. */
-.room-pin{position:absolute;z-index:2;right:4%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+   r18c fix (tmp/in/r18c/MEASURE-056534a.md items 1-2): with the baked
+   status cards now cropped out of .ship-art's own box entirely, there
+   is nothing left under the right edge to mask -- .room-pin sits
+   directly on the real, fully-visible art instead of inside a masked
+   zone. right:2% hugs the new (narrower) box's own edge, same offset
+   already tuned in r18 to read as "attached to the row" rather than
+   centred in a sidebar. */
+.room-pin{position:absolute;z-index:2;right:2%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
   background:var(--surface);border:1px solid var(--border);border-radius:50%;text-decoration:none;
   color:var(--fg);font-size:12px;font-weight:700;text-align:center;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.5)}
 .room-pin .pin-label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -556,9 +528,10 @@ html[data-reduce] *,html[data-reduce] *::before,html[data-reduce] *::after{anima
      visible to keep rooms reachable without pins). The conductor now
      wants the art to scale WITH its container at any width instead of
      disappearing -- aspect-ratio already does that on its own; removing
-     the override is the whole fix. .ship-art itself, .ship-art-title and
-     .ship-mask-row are untouched by this block -- all percentage-based,
-     all scale with the box.
+     the override is the whole fix. .ship-art itself and .ship-art-title
+     are untouched by this block -- all percentage-based, all scale with
+     the box. (.ship-mask-row, mentioned here originally, was removed in
+     r18c -- see .ship-art's own comment above.)
 
      r16 fix (tmp/in/FIX-r16.md item 3, conductor real-Chromium measure of
      e2e53c8 at 260px): .room-pin's own content (icon+label+count,
