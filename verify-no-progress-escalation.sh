@@ -123,7 +123,7 @@ export HERDR_ESCALATION_QUIESCE_POLLS=3
 PANES_DIR="$WORK/panes"; mkdir -p "$PANES_DIR"
 rm -f "$PANES_DIR"/*.alive "$PANES_DIR"/*.lag "$PANES_DIR"/*.indeterminate "$PANES_DIR"/*.birth "$PANES_DIR"/*.birth-unreachable 2>/dev/null
 ORDER_LOG="$WORK/order.log"; : >"$ORDER_LOG"
-rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected" "$WORK/spawn-kill-after-effect" "$WORK/concurrent-write-violations.log"
+rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/spawn-uncertain-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected" "$WORK/spawn-kill-after-effect" "$WORK/concurrent-write-violations.log"
 export PANES_DIR ORDER_LOG HERE_REPO="$here"
 
 # R3 #5 ("offline only: no live close or spawn") belt-and-suspenders: every
@@ -288,6 +288,14 @@ now="$(_now_iso)"
 registry_init
 _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
   VALUES ($(_sq "$succ_task"), $(_sq "$succ_task"), '', '', '', '', $(_sq "$succ_pane"), $(_sq "$succ_birth"), '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
+if [ -f "$WORK/spawn-uncertain-receipt" ]; then
+  # Round 2 M2: a real spawn-task.sh registered the task, but could not
+  # confirm liveness or kickoff delivery. It emits a receipt for human
+  # reconciliation while exiting nonzero; the escalation caller MUST NOT
+  # bind it as a safe successor or retry it.
+  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=uncertain\n' "$succ_task" "$succ_task"
+  exit 4
+fi
 # R7 (conductor addition, blocking): a nonzero exit does NOT by itself
 # prove nothing was created -- simulate a kill/timeout/late failure
 # AFTER the row above (a real tasks row, same as a success) is already
@@ -1047,6 +1055,48 @@ bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpZ --context-
 z_esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
 [ "${z_esc_n2:-0}" = 1 ] && ok "Z: once the old writer actually quiesces, a later retry succeeds exactly once" \
   || bad "Z: recovery after a quiesce timeout (got $z_esc_n2)"
+
+# ============================================================== case CC ===
+# Round 2 M2: the real spawn registered a successor but returned the
+# receipt with `verified=uncertain` (the realistic send-to-agent exit 4 /
+# herdr-down shape). This is NOT a safe successor: _esc_spawn_successor
+# must return rc 2, _esc_spawn_next_tier must leave the journal in_flight,
+# mark the old task blocked, and record the exact orphan task_id plus its
+# receipt_state for a human. Later ticks must never issue a second spawn.
+RUN=taskCC; TASK=taskCC; PANE=pane-CC; BRANCH=esc-test-cc
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-uncertain-receipt"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpCC --context-dir "$CTX" >/dev/null
+done
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpCC --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-uncertain-receipt"
+cc_spawn_count="$(grep -c -- 'spawn implement esc-test-cc' "$ORDER_LOG" 2>/dev/null)"
+cc_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label=$(_sq "implement:$BRANCH");" 2>/dev/null)"
+cc_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+cc_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+cc_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+cc_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+cc_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+cc_receipt_task="$(printf '%s' "$cc_detail" | jq -r '.detail.receipt_task_id // empty' 2>/dev/null)"
+cc_receipt_state="$(printf '%s' "$cc_detail" | jq -r '.detail.receipt_state // empty' 2>/dev/null)"
+[ "${cc_spawn_count:-0}" = 1 ] && ok "CC: verified=uncertain receipt never triggers a second real spawn" \
+  || bad "CC: spawn count (got $cc_spawn_count, want 1)"
+[ "${cc_rows:-0}" = 1 ] && ok "CC: exactly one orphan successor row exists for human reconciliation" \
+  || bad "CC: successor row count (got $cc_rows, want 1)"
+[ "${cc_esc_n:-0}" = 0 ] && ok "CC: verified=uncertain is never model_escalated/bound" \
+  || bad "CC: model_escalated should be 0 (got $cc_esc_n)"
+[ "${cc_failed_n:-0}" -ge 1 ] && ok "CC: uncertain receipt records a hook-failed hold" \
+  || bad "CC: expected model_escalation_hook_failed"
+[ "$cc_state" = blocked ] && ok "CC: original task is explicitly blocked, not silently left running" \
+  || bad "CC: original task state (got [$cc_state], want blocked)"
+[ "$cc_journal" = in_flight ] && ok "CC: journal remains in_flight permanently" \
+  || bad "CC: journal state (got [$cc_journal], want in_flight)"
+[ -n "$cc_receipt_task" ] && [ "$cc_receipt_state" = uncertain ] && ok "CC: blocked event records receipt_task_id=$cc_receipt_task and receipt_state=uncertain" \
+  || bad "CC: receipt reconciliation fields (task=[$cc_receipt_task] state=[$cc_receipt_state])"
 
 # ============================================================== case AA ===
 # R7 (conductor addition, blocking): a nonzero exit from the spawn command

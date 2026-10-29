@@ -23,6 +23,16 @@ export DETECTION_DIR="$WORK/detection"
 export COUNTER="$WORK/enter-count"
 export KEYS="$WORK/keys.log"
 export SENDTEXT="$WORK/send-text.log"
+# M2/L2 TOCTOU re-check calls herdr() from send-to-agent.sh's OWN process
+# (not this test harness's), so the stub it runs under only sees EXPORTED
+# vars — $WORK itself is never exported (SCREEN_DIR/COUNTER/etc. are,
+# individually, by design). A stub that wrote "$WORK/pi-count" directly
+# resolved to the literal path "/pi-count" in that child and failed on the
+# read-only root silently (require_agent_pane's `2>/dev/null` swallows the
+# error) — pane_process_info_ok then reads an empty `info` and refuses
+# every scenario, not just the ones testing the refusal. Route it through
+# its own exported var instead, same as every other stub state file here.
+export PICOUNT="$WORK/pi-count"
 # feat/stall-watchdog: a registered-task SUBMITTED send now looks up
 # task_for_pane (lib/run-registry.sh) unconditionally, where before it only
 # ran when HERDR_PANE_ID was set. Isolated to a scratch registry so every
@@ -78,8 +88,14 @@ herdr() {
       # at the top of send_to_agent_run — default to a live agent so every
       # scenario below, which is testing delivery/confirmation logic, not
       # this gate, is unaffected. NO_AGENT=1 flips it for the scenarios that
-      # exist to prove the gate itself.
-      if [ "${NO_AGENT:-0}" = 1 ]; then
+      # exist to prove the gate itself. AGENT_DIES_ON_CALL=<n> (fix/launch-
+      # receipt-r2 TOCTOU re-check) answers "agent" for the first n-1 calls
+      # and "bare shell" from call n onward — proving the SECOND check
+      # immediately before send-text, not just the first one at entry.
+      local pi_count
+      pi_count=$(cat "$PICOUNT" 2>/dev/null); pi_count="${pi_count:-0}"
+      pi_count=$((pi_count + 1)); echo "$pi_count" >"$PICOUNT"
+      if [ "${NO_AGENT:-0}" = 1 ] || { [ -n "${AGENT_DIES_ON_CALL:-}" ] && [ "$pi_count" -ge "$AGENT_DIES_ON_CALL" ]; }; then
         printf '{"result":{"process_info":{"foreground_processes":[{"name":"zsh","cmdline":"-zsh"}]}}}\n'
       else
         printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude"}]}}}\n'
@@ -96,8 +112,8 @@ bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 reset_state() {
   rm -rf "$SCREEN_DIR" "$DETECTION_DIR"; mkdir -p "$SCREEN_DIR" "$DETECTION_DIR"
-  echo 0 >"$COUNTER"; : >"$KEYS"; : >"$SENDTEXT"
-  unset NO_AGENT
+  echo 0 >"$COUNTER"; : >"$KEYS"; : >"$SENDTEXT"; rm -f "$PICOUNT"
+  unset NO_AGENT AGENT_DIES_ON_CALL
 }
 screen() { cat >"$SCREEN_DIR/$1"; }              # screen <idx>  <<EOF ... EOF
 detection() { cat >"$DETECTION_DIR/$1"; }        # detection <idx> <<EOF ... EOF
@@ -560,6 +576,20 @@ last_as 0
 NO_AGENT=1 send --submit-only; rc=$?
 [ "$rc" -eq 3 ] && ok "exit 3 REFUSED on --submit-only to a bare shell" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
 [ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed" || bad "Enters=$(enters_pressed)"
+
+printf '== fix/launch-receipt-r2 round 2 (M2/L2 TOCTOU): agent recycled to a bare shell BETWEEN the entry check and send-text is refused, exit 3, zero input ==\n'
+reset_state
+screen 0 <<'EOF'
+❯ hello there
+───────────────────
+  branch:main
+EOF
+last_as 0
+AGENT_DIES_ON_CALL=2 send "hello there"; rc=$?
+[ "$rc" -eq 3 ] && ok "exit 3 REFUSED when the second (pre-send-text) liveness check sees a bare shell" \
+  || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed once the re-check refuses" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed — the TOCTOU gap is closed, not just the entry check" || bad "typed into a recycled pane: $(cat "$SENDTEXT")"
 
 
 [ "$fail" -eq 0 ]

@@ -1277,19 +1277,21 @@ done
 # anything downstream infers liveness from "the registry says running and
 # nothing errored". The receipt itself is printed below, after the --brief
 # kickoff block, not here — its `verified=` value distinguishes
-# `launcher-verified-ready` (this check passed, no --brief requested) from
+# `launcher-verified-ready` (this check passed, no --brief requested),
 # `brief-delivered` (this check passed AND, if --brief was requested, the
-# kickoff was confirmed SUBMITTED, send-to-agent.sh exit 0). Round 2, M2
-# (independent review of 335f458): the field order/shape is
-# `task_id=... run_id=... verified=...`, matching the ALREADY-DEPLOYED
-# receipt lib/escalation.sh's `_esc_spawn_successor` parses
+# kickoff was confirmed SUBMITTED, send-to-agent.sh exit 0), and (round 2,
+# M2 follow-up) `uncertain`, next. Round 2, M2 (independent review of
+# 335f458): the field order/shape is `task_id=... run_id=... verified=...`,
+# matching the ALREADY-DEPLOYED receipt lib/escalation.sh's
+# `_esc_spawn_successor` parses
 # (`^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*`) — the first draft
 # here invented a second, differently-ordered receipt
 # (`run_id=... task_id=... pane=... verified=...`) that would have printed
 # TWO receipt lines once this branch merged with the deployed one; `pane=`
 # is dropped (escalation.sh never read it, and a caller that needs it has
-# task_id already). The receipt is NEVER printed on anything but a fully
-# confirmed success below — see `uncertain`, next.
+# task_id already). The receipt is NEVER printed on a CONFIRMED-dead
+# outcome (`launch_failed` — the real agent process never started at all)
+# — only on a confirmed success or a genuinely AMBIGUOUS one, next.
 #
 # `uncertain`, not `launch_failed` or a soft warning (round 2, root-audit
 # follow-up, 2026-10-29): three startup outcomes are genuinely AMBIGUOUS,
@@ -1301,19 +1303,29 @@ done
 # herdr). The earlier draft treated an undelivered kickoff as fatal
 # `launch_failed` unconditionally and told the operator to "send it
 # yourself" — actively harmful: the agent IS alive (pane_is_agent already
-# confirmed it), so that advice strands a live, working agent on a
-# terminal "never started" row that can never be approved or completed
-# again (every bound approval on a `launch_failed` task is refused), and a
-# caller automatically re-invoking spawn-task.sh on the same worktree/
-# branch (lib/escalation.sh's successor dispatch, completion-harvest) must
-# NEVER read this as either a clean success (no HERDR_SPAWN_RECEIPT is
-# ever printed here) or a confirmed no-effect failure safe to retry (this
-# always happens after `register_task`/`_spawn_committed=1`, so the R7
-# EXIT trap stays silent too) — either misreading risks a second, real,
-# duplicate writer in the same worktree. `uncertain` (lib/run-registry.sh)
-# is non-terminal: a human, or `mark-launch-failed.sh` (the one supported
+# confirmed it, or in the herdr-unreachable case may well be), so that
+# advice strands a live, working agent on a terminal "never started" row
+# that can never be approved or completed again (every bound approval on a
+# `launch_failed` task is refused). `uncertain` (lib/run-registry.sh) is
+# non-terminal: a human, or `mark-launch-failed.sh` (the one supported
 # lifecycle command, re-verifying the pane exactly as it does for a
 # `running` row) resolves it once the real outcome is known.
+#
+# Round 2 conductor follow-up (2026-10-29, post-rebase): an `uncertain`
+# outcome DOES now print `HERDR_SPAWN_RECEIPT ... verified=uncertain` —
+# the first draft here printed nothing and relied on a nonzero exit alone
+# reading as rc 2 (UNCERTAIN) at the escalation.sh call site, which is
+# correct for "never auto-retry" but throws away the one thing an operator
+# reconciling a blocked task needs most: WHICH task_id. A real task WAS
+# registered here (`_spawn_committed=1` already set, same as the
+# confirmed-success path) and may well be alive — this is not "no
+# effect", so it must never claim `HERDR_SPAWN_NO_EFFECT` either. The
+# script still exits NONZERO on this path (fail-safe default for any
+# caller that only checks `$?` and never looks at the receipt at all) —
+# `lib/escalation.sh`'s `_esc_spawn_successor` is hardened (same branch)
+# to parse the receipt regardless of exit code and treat `verified=
+# uncertain` as NEVER a safe successor to bind, while still recording the
+# task_id on the blocked task's event instead of discarding it.
 #
 # `_spawn_mark_startup_outcome`: every branch below that leaves `starting`/
 # `running` for `launch_failed` or `uncertain` goes through this one
@@ -1356,9 +1368,13 @@ if [ "$managed" = 1 ]; then
   # agent" below, herdr being unreachable here is exactly the "uncertain"
   # shape: the agent may well be alive and fine.
   if ! pane_process_info_ok "$pane"; then
+    spawn_verified=uncertain
     _spawn_mark_startup_outcome uncertain spawn_startup_uncertain \
       '{"reason":"herdr itself could not be reached to confirm whether a live agent process is running after readiness output appeared"}'
-    echo "spawn-task: refusing — herdr could not be reached to confirm pane $pane's foreground process; task $task_id left UNCERTAIN, not launch_failed (the agent may well be alive and ready). Re-check once herdr answers: bash $here/mark-launch-failed.sh $run_id $task_id marks it dead only if it is still unconfirmable or genuinely gone; otherwise resolve it by hand once you've confirmed it yourself." >&2
+    echo "spawn-task: uncertain — herdr could not be reached to confirm pane $pane's foreground process; task $task_id left UNCERTAIN, not launch_failed (the agent may well be alive and ready). Re-check once herdr answers: bash $here/mark-launch-failed.sh $run_id $task_id marks it dead only if it is still unconfirmable or genuinely gone; otherwise resolve it by hand once you've confirmed it yourself." >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" \
+      "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
     exit 1
   fi
   if ! pane_is_agent "$pane" 2>/dev/null; then
@@ -1411,9 +1427,10 @@ if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
       2) kickoff_reason="send-to-agent exit 2 (bad usage, or a send/Enter call to herdr itself failed)" ;;
     esac
     herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state idle >/dev/null 2>&1 || true
+    spawn_verified=uncertain
+    kickoff_note="UNCERTAIN ($kickoff_reason — see mark-launch-failed.sh)"
     _spawn_mark_startup_outcome uncertain spawn_kickoff_uncertain "$(jq -nc --arg r "$kickoff_reason" '{reason:$r}')"
-    echo "spawn-task: refusing — $kickoff_reason; task $task_id left UNCERTAIN, not launch_failed (the agent is alive and may well have the brief). Re-check the pane by hand; once you know the real outcome, resolve with: bash $here/mark-launch-failed.sh $run_id $task_id (if genuinely dead or never reachable) — or clear it yourself once confirmed fine." >&2
-    exit 1
+    echo "spawn-task: uncertain — $kickoff_reason; task $task_id left UNCERTAIN, not launch_failed (the agent is alive and may well have the brief). The receipt below prints verified=uncertain and the script exits nonzero — re-check the pane by hand; once you know the real outcome, resolve with: bash $here/mark-launch-failed.sh $run_id $task_id (if genuinely dead or never reachable) — or clear it yourself once confirmed fine." >&2
   fi
 fi
 if [ "$managed" = 1 ]; then
@@ -1469,11 +1486,6 @@ else
 fi
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"
-# A programmatic caller (lib/escalation.sh's successor discovery, R5) needs
-# to bind to the EXACT task this call created, not re-derive it by
-# scanning the registry for a branch+label match afterward (racy against
-# any unrelated task sharing that same branch+label). This one line is
-# the receipt: always printed, last, on every real (non-dry-run) success
-# path above. Purely additive — existing callers that only read the
-# human-facing block above are unaffected.
-printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s\n' "$task_id" "$run_id"
+case "$spawn_verified" in
+  uncertain) exit 1 ;;
+esac

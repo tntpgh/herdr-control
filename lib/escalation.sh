@@ -557,8 +557,9 @@ _esc_check_launch_authority() {
 
 # _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
 # RECEIPT task_id on stdout, rc 0, when one was actually parsed out of the
-# spawn command's own output (R5: "bind to the actual spawn receipt ...
-# no lookup by branch+label"). Two DISTINCT non-zero outcomes:
+# spawn command's own output AND its `verified=` field is not `uncertain`
+# (R5: "bind to the actual spawn receipt ... no lookup by branch+label").
+# Three DISTINCT non-zero outcomes:
 #   rc 1  a DOCUMENTED pre-spawn no-effect receipt (`HERDR_SPAWN_NO_EFFECT`)
 #         was found in the output — the spawn command itself proved,
 #         before touching the registry at all, that nothing was created.
@@ -574,27 +575,52 @@ _esc_check_launch_authority() {
 #         exited nonzero with no no-effect receipt either (R7 root-audit:
 #         "a nonzero exit does NOT prove no side effect" — a failure
 #         AFTER the registry write, a timeout, or a kill all exit
-#         nonzero too, with a real row/pane already live). UNCERTAIN —
-#         the caller MUST NOT retry.
-# A real spawn-task.sh prints `HERDR_SPAWN_RECEIPT task_id=... run_id=...`
-# as its LAST line on every real (non-dry-run) success path, and
-# `HERDR_SPAWN_NO_EFFECT reason=...` on any exit before `register_task`
-# (the one place a `tasks` row is actually created) has succeeded — a
-# provable "nothing committed yet" boundary via its own exit trap, not a
-# guess from the exit code. HERDR_ESC_SPAWN_CMD overrides (tests,
-# operators) must emit the same two lines to be trusted the same way.
+#         nonzero too, with a real row/pane already live), OR (round 2,
+#         M2) a receipt WAS parsed but its own `verified=` field reads
+#         `uncertain` — spawn-task.sh's own signal that a real task is
+#         registered and may be alive, but neither its liveness (herdr
+#         unreachable mid-check) nor its kickoff delivery (send-to-agent
+#         exit other than a confirmed SUBMIT) could be confirmed.
+#         UNCERTAIN in every one of these shapes — the caller MUST NOT
+#         retry. When a task_id WAS parsed despite rc 2 (the `verified=
+#         uncertain` case, or any receipt printed alongside a nonzero
+#         exit), stdout still carries it — unlike rc 1/the old "nothing
+#         on failure" contract — purely so the caller below can record
+#         WHICH task to reconcile (R7 fix 3) instead of discarding it;
+#         this is never a success signal, only the return code is.
+# A real spawn-task.sh prints `HERDR_SPAWN_RECEIPT task_id=... run_id=...
+# verified=...` as its LAST line on every path that registered a real
+# task (confirmed success OR `uncertain`), and `HERDR_SPAWN_NO_EFFECT
+# reason=...` on any exit before `register_task` (the one place a
+# `tasks` row is actually created) has succeeded — a provable "nothing
+# committed yet" boundary via its own exit trap, not a guess from the
+# exit code. Round 2 (conductor, 2026-10-29): spawn-task.sh still exits
+# NONZERO on its `uncertain` outcomes (fail-safe default for any caller
+# that only checks `$?`) — the receipt parse below is therefore never
+# gated on the command's own exit code, only on `verified=` itself.
+# HERDR_ESC_SPAWN_CMD overrides (tests, operators) must emit the same
+# two lines to be trusted the same way; an override emitting the legacy
+# two-field receipt (no `verified=` at all) is treated as confirmed,
+# same as always.
 _esc_spawn_successor() {
-  local out rc task_id
+  local out rc task_id verified
   if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
     out="$(bash "$HERDR_ESC_SPAWN_CMD" "$@" 2>/dev/null)"; rc=$?
   else
     out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)"; rc=$?
   fi
+  task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
   if [ "$rc" = 0 ]; then
-    task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
-    [ -n "$task_id" ] && { printf '%s\n' "$task_id"; return 0; }
+    verified="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT .*verified=\([^ ]*\)$/\1/p' | tail -n1)"
+    if [ -n "$task_id" ] && [ "$verified" != uncertain ]; then
+      printf '%s\n' "$task_id"; return 0
+    fi
+  fi
+  if [ -n "$task_id" ]; then
+    printf '%s\n' "$task_id"
     return 2
   fi
+  [ "$rc" = 0 ] && return 2
   printf '%s\n' "$out" | grep -q '^HERDR_SPAWN_NO_EFFECT' && return 1
   return 2
 }
@@ -914,15 +940,25 @@ _esc_spawn_next_tier() {
     return 1
   fi
   if [ "$spawn_rc" = 2 ]; then
-    # UNCERTAIN: either the command exited 0 with no receipt, or exited
-    # nonzero with no documented no-effect receipt either — R7: a
-    # nonzero exit alone does not prove nothing was created. The journal
+    # UNCERTAIN: either the command exited 0 with no receipt, exited
+    # nonzero with no documented no-effect receipt either (R7: a nonzero
+    # exit alone does not prove nothing was created), or (round 2, M2) a
+    # receipt WAS parsed with `verified=uncertain` — spawn-task.sh's own
+    # signal that a real task is registered and may be alive, but its
+    # liveness or kickoff delivery could not be confirmed. The journal
     # row stays 'in_flight' permanently — never cleared, never retried
     # blind. By this point esc_escalate's loop has already confirmed
     # the OLD writer quiesced (that is what gated this call in the
     # first place) — so this is a genuinely writer-less hold, not an
-    # ambiguous one, and never a two-writer state.
-    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_spawn_uncertain "$old_pane" "$old_pane_birth"
+    # ambiguous one, and never a two-writer state. When `_esc_spawn_
+    # successor` still surfaced a task_id despite rc 2 (R7 fix 3), it is
+    # recorded on the blocked event so an operator reconciling this
+    # later has the exact row to look at, not just a free-text reason.
+    if [ -n "$receipt" ]; then
+      _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_spawn_uncertain "$old_pane" "$old_pane_birth" "$receipt" uncertain
+    else
+      _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_spawn_uncertain "$old_pane" "$old_pane_birth"
+    fi
     printf 'escalation: %s/%s spawn produced no verifiable receipt — journal left in_flight (uncertain), task marked blocked (old writer already confirmed quiesced), holding for the conductor rather than retrying blind or adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
     return 1
   fi

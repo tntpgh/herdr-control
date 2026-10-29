@@ -178,5 +178,24 @@ rel_calls2="$(wc -l < "$RELLOG" | tr -d ' ')"
 [ "$rel_calls2" = "1" ] && ok "the late grace timer found the key already claimed and delivered nothing more" \
   || bad "grace timer delivered again after release_wake_hold: $rel_calls2 total calls"
 
+printf '== fix/launch-receipt-r2 (L1): _wake_outcome_for maps every send-to-agent.sh exit code onto its documented vocabulary ==\n'
+check_outcome() {  # <exit-code> <want>
+  local got; got="$(_wake_outcome_for "$1")"
+  [ "$got" = "$2" ] && ok "exit $1 -> $2" || bad "exit $1 -> got '$got', want '$2'"
+}
+check_outcome 0 submitted
+check_outcome 4 unsubmitted
+check_outcome 2 transport_error
+# exit 3 REFUSED (not an agent pane) and exit 6 REFUSED (someone typing) used
+# to fall through to the catch-all 'unknown' here — only exit 5 (permission
+# prompt) was mapped to 'refused'. An unknown wake outcome is invisible to
+# every caller that branches on 'refused' (attention_escalation_result,
+# wake_result audit rows), so a send-to-agent.sh TOCTOU refusal (exit 3) or a
+# someone-typing refusal (exit 6) silently vanished from the audit trail.
+check_outcome 3 refused
+check_outcome 5 refused
+check_outcome 6 refused
+check_outcome 9 unknown
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

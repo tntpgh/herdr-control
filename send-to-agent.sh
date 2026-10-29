@@ -312,11 +312,13 @@ fi
 # in Slack never reached the pane. Use the pane API, which the Enter loop below
 # already uses, so the whole script speaks one interface.
 #
-# Skipped entirely under --submit-only: there is nothing to type, the text is
-# already sitting in the composer (an operator typed it directly, or a prior
-# send-to-agent.sh call left it stranded) — this call exists only to press
-# Enter and confirm.
+# Re-check the foreground process immediately before typing. The initial
+# require_agent_pane above runs before prompt reads, typing-guard delays, and
+# composer inspection; a pane can be recycled or its agent can exit during
+# that interval. Never send raw text to a newly bare shell just because the
+# pane passed the earlier check.
 if [ "$submit_only" -eq 0 ]; then
+  require_agent_pane "$pane" || exit 3
   herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
     echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2
     exit 2
