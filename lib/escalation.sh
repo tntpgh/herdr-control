@@ -562,7 +562,14 @@ _esc_check_launch_authority() {
 #   rc 1  a DOCUMENTED pre-spawn no-effect receipt (`HERDR_SPAWN_NO_EFFECT`)
 #         was found in the output — the spawn command itself proved,
 #         before touching the registry at all, that nothing was created.
-#         Safe for the caller to retry.
+#         DATA-safe to retry (no duplicate writer risk) but R9 (review-
+#         ESC-R8 item 4, TOCTOU): by the time this is ever reached,
+#         esc_escalate's own ordering has already confirmed the OLD
+#         writer quiesced — a confirmed-clean failure here (e.g. the
+#         real spawn-task.sh's own authority gate refusing the SAME
+#         caller moments after a passing pre-flight check) still
+#         leaves the task with ZERO owners, so the caller treats this
+#         exactly like rc 2 below: blocked, discoverable, never retried.
 #   rc 2  everything else: the command exited 0 with no receipt, OR
 #         exited nonzero with no no-effect receipt either (R7 root-audit:
 #         "a nonzero exit does NOT prove no side effect" — a failure
@@ -724,27 +731,32 @@ _esc_task_json() {
 # out for this (task_id, to_tier), and what came of it":
 #   no row              genuinely never attempted — the ONLY state that
 #                        may claim the row and call _esc_spawn_successor.
-#   state='in_flight'    a spawn was issued and its outcome is UNCERTAIN
-#                        (the command exited 0 but no receipt parsed, or a
-#                        parsed receipt didn't resolve to a live task).
-#                        NOT a retryable failure — a second real spawn
-#                        command could easily be a second real writer. The
-#                        row stays 'in_flight' forever: every later check
-#                        (this call's own remaining retries, any later
-#                        tick, a restarted process) refuses to spawn again
-#                        and holds for the conductor, who alone can
-#                        actually reconcile "did that spawn really land,
-#                        and as what" by hand.
+#   state='in_flight'    a spawn was issued and either (a) its outcome is
+#                        UNCERTAIN (the command exited 0 but no receipt
+#                        parsed, or a parsed receipt didn't resolve to a
+#                        live task — a second real spawn command could
+#                        easily be a second real writer), or (b) R9: it
+#                        was a CONFIRMED-clean failure (a documented
+#                        no-effect receipt) — data-safe to retry, but by
+#                        construction the old writer is already confirmed
+#                        gone by this point (esc_escalate's own ordering),
+#                        so review-ESC-R8 item 4's TOCTOU gap (authority
+#                        lost between a passing pre-flight and the real
+#                        spawn command's own re-check) showed a "safe,
+#                        transient" retry can leave the task silently
+#                        owner-less forever if the SAME cause recurs on
+#                        every attempt. Neither case is a retryable
+#                        failure anymore: the row stays 'in_flight'
+#                        forever: every later check (this call's own
+#                        remaining retries, any later tick, a restarted
+#                        process) refuses to spawn again and holds for
+#                        the conductor, who alone can actually reconcile
+#                        "did that spawn really land, and as what, and
+#                        is it safe to try again" by hand (clearing the
+#                        row directly — there is no automatic path back).
 #   state='bound'        the attempt that claimed this row got a receipt
 #                        that resolved to a real, live task — resolve
 #                        through successor_task_id, never spawn again.
-# A CONFIRMED clean failure (the spawn command's own exit code says it
-# failed) is NOT uncertain: nothing was created, so the claimed row is
-# deleted, freeing the next retry to claim fresh (case B/C: a transient
-# failure must still be retryable within the bound, and across a later
-# call). Only a command that exits 0 without a usable receipt — the one
-# shape that cannot be told apart from "it worked, I just didn't hear
-# back" — ever leaves a permanent 'in_flight' row.
 _esc_journal_schema() {
   _sql "CREATE TABLE IF NOT EXISTS escalation_spawn_journal (
     task_id TEXT NOT NULL, to_tier TEXT NOT NULL, state TEXT NOT NULL,
@@ -779,14 +791,6 @@ _esc_journal_bind() {
   _sql "UPDATE escalation_spawn_journal SET state='bound', successor_task_id=$(_sq "$3"),
       updated_at=$(_sq "$(_now_iso)")
     WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2");" >/dev/null 2>&1
-}
-# _esc_journal_clear <task_id> <to_tier> — ONLY for a CONFIRMED clean
-# failure (the spawn command's own exit code said it failed): nothing was
-# created, so the next retry is free to claim fresh. Never called for an
-# uncertain outcome — that row must never clear itself.
-_esc_journal_clear() {
-  _sql "DELETE FROM escalation_spawn_journal
-    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2") AND state='in_flight';" >/dev/null 2>&1
 }
 # _esc_mark_blocked_uncertain <run_id> <task_id> <to_tier> <reason> \
 #   <old_pane_id> <old_pane_birth> [<receipt_task_id>] [<receipt_state>] —
@@ -889,10 +893,24 @@ _esc_spawn_next_tier() {
 
   receipt="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")"; spawn_rc=$?
   if [ "$spawn_rc" = 1 ]; then
-    # Confirmed clean: a DOCUMENTED no-effect receipt proved nothing was
-    # created (R7 — the spawn command's own exit code alone never proves
-    # this). Safe to retry — free the claim.
-    _esc_journal_clear "$task_id" "$to_tier"
+    # R9 (conductor, blocking — review-ESC-R8 item 4, TOCTOU Scenario
+    # A): a DOCUMENTED no-effect receipt proves nothing was CREATED,
+    # but it does NOT prove a retry will fare any better — the OLD
+    # writer is already confirmed gone by this point (esc_escalate's
+    # own quiesce-before-spawn ordering), so a confirmed-clean failure
+    # here (the real spawn-task.sh's own authority gate re-checking
+    # and refusing the SAME caller moments after a passing pre-flight
+    # — or any other pre-registration refusal) leaves the task with
+    # ZERO real owners regardless of whether it's retried. Blind
+    # automatic retry risks silently repeating the exact same failure
+    # (same root cause, same outcome) with nothing ever surfaced.
+    # Treated exactly like the uncertain (rc 2) branch below from this
+    # point on: the journal row is left exactly as claimed (NOT
+    # cleared), so no later attempt — this call's remaining retries,
+    # or any future call — can ever silently re-attempt, and the task
+    # is marked blocked with its own distinct, discoverable reason.
+    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_spawn_confirmed_clean_toctou "$old_pane" "$old_pane_birth"
+    printf 'escalation: %s/%s spawn confirmed no side effect (documented no-effect receipt) but the old writer was already confirmed quiesced — never retried blind, task marked blocked, holding for the conductor (a TOCTOU gap between a passing pre-flight check and the real spawn command'"'"'s own re-check, review-ESC-R8 item 4)\n' "$task_id" "$to_tier" >&2
     return 1
   fi
   if [ "$spawn_rc" = 2 ]; then

@@ -13,10 +13,13 @@
 #
 #   A. success path: exact commit sha + exact model names (haiku->sonnet),
 #      quiesce-before-spawn ordering, model_escalated only after both
-#   B. failure then retry then success within the bound: exactly one close,
-#      exactly `bound` spawn attempts, exactly one successor task row
-#   C. retries exhausted: no model_escalated, tier NOT consumed, a later
-#      call (transient failure cleared) still succeeds exactly once
+#   B. R9 (TOCTOU Scenario A, review-ESC-R8 item 4): pre-flight passes,
+#      quiesce completes, THEN the spawn confirms no side effect — blocks
+#      on the FIRST attempt (no retry to 2/3), discoverable blocked
+#      reason + journal fields, stays held even once the cause clears
+#   C. R9: a held (blocked) attempt does not consume the tier; recovery
+#      is possible but only once a human reconciles the stuck journal
+#      row by hand — never automatic
 #   D. dry run: no quiesce, no spawn, no model_escalated, tier NOT consumed
 #      — a real tick right after still escalates normally
 #   E. human-wait is still never a loop (regression from R1)
@@ -379,45 +382,87 @@ ci="$(order_index 'close pane-A')"; si="$(order_index 'spawn implement esc-test-
   || bad "A: quiesce-before-spawn ordering (close@$ci spawn@$si)"
 
 # =============================================================== case B ===
+# R9 (conductor, blocking — review-ESC-R8 item 4, TOCTOU Scenario A):
+# this is the EXACT TOCTOU shape the review's run-early.sh probe
+# reproduced — the pre-flight authority check PASSES (default fake
+# stub, no override here), quiesce runs and completes normally, and
+# ONLY THEN does the spawn command fail with a DOCUMENTED no-effect
+# receipt (R7's contract) — simulating the real spawn-task.sh's own
+# early (pre-registration) authority re-check losing a race the
+# pre-flight check could not have predicted. Pre-R9 (8376ffb), this
+# bare "confirmed clean" signal was treated as freely retryable: up to
+# 3 blind attempts, then silently left `running` with zero real
+# owners and no event at all. R9 requires this indistinguishable in
+# kind from any other post-quiesce spawn failure: blocked on the
+# FIRST attempt (not after exhausting the bound), discoverable, and —
+# since the journal row is never cleared — never retried again, not
+# even once the simulated cause is gone, until a human reconciles it.
 RUN=taskB; TASK=taskB; PANE=pane-B; BRANCH=esc-test-b
 seed_task "$TASK" "$PANE" "$BRANCH"
-printf '2' > "$WORK/spawn-fail-count"   # fail twice, succeed on the 3rd (== HERDR_ESCALATION_HOOK_RETRIES default bound)
+printf '1' > "$WORK/spawn-fail-count"   # would have "succeeded on retry" under the OLD (pre-R9) design
 : >"$ORDER_LOG"
 for i in 1 2 3; do
   bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpB --context-dir "$CTX" >/dev/null
 done
-spawn_attempts="$(grep -c -- 'spawn.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
+spawn_attempts="$(grep -c -- 'spawn-fail.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
 close_count="$(grep -c -- 'close pane-B' "$ORDER_LOG" 2>/dev/null)"
 esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
-succ_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label='implement:$BRANCH';" 2>/dev/null)"
-[ "${spawn_attempts:-0}" = 3 ] && ok "B: retried exactly 3 times (2 failures + 1 success)" || bad "B: spawn attempts (got $spawn_attempts)"
-[ "${close_count:-0}" = 1 ] && ok "B: pane closed exactly once across all retries (idempotent quiesce)" || bad "B: close count (got $close_count)"
-[ "${esc_n:-0}" = 1 ] && ok "B: exactly one model_escalated after failure+retry+success" || bad "B: model_escalated count (got $esc_n)"
-[ "${succ_rows:-0}" = 1 ] && ok "B: exactly one successor task row (no double-spawn)" || bad "B: successor row count (got $succ_rows)"
+b_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+b_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+b_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+b_reason="$(printf '%s' "$b_detail" | jq -r '.detail.reason // empty' 2>/dev/null)"
+b_jtbl="$(printf '%s' "$b_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+b_jkey_tier="$(printf '%s' "$b_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+[ "${spawn_attempts:-0}" = 1 ] && ok "B: R9 — a confirmed-clean failure blocks on the FIRST attempt, never retries to 2 or 3" \
+  || bad "B: R9 spawn attempts (got $spawn_attempts, want 1)"
+[ "${close_count:-0}" = 1 ] && ok "B: pane closed exactly once (quiesce completes before the spawn attempt)" \
+  || bad "B: close count (got $close_count)"
+[ "${esc_n:-0}" = 0 ] && ok "B: R9 — never escalates on a confirmed-clean-but-held outcome" \
+  || bad "B: model_escalated should be 0 (got $esc_n)"
+[ "$b_state" = blocked ] && ok "B: R9 — the task is explicitly marked blocked, not left running with zero owners" \
+  || bad "B: R9 task state (got [$b_state], want blocked)"
+[ "$b_reason" = escalation_spawn_confirmed_clean_toctou ] && ok "B: R9 — blocked reason is the specific, discoverable TOCTOU reason" \
+  || bad "B: R9 blocked reason (got [$b_reason])"
+[ "$b_jtbl" = escalation_spawn_journal ] && [ "$b_jkey_tier" = standard ] && ok "B: R9 — the blocked event still records the journal table/key for reconciliation" \
+  || bad "B: R9 discoverability fields (journal_table=[$b_jtbl] journal_key.to_tier=[$b_jkey_tier])"
+[ "$b_journal" = in_flight ] && ok "B: R9 — the journal stays in_flight permanently, same as the uncertain case, never cleared by a confirmed-clean failure" \
+  || bad "B: R9 journal state (got [$b_journal], want in_flight)"
+# R9: even once the simulated cause is gone, there is no automatic
+# recovery — the permanent journal lock, not the external cause, is
+# what holds this task, exactly like the uncertain (rc=2) family.
+: > "$WORK/spawn-fail-count"
+bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpB --context-dir "$CTX" >/dev/null
+esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
+spawn_attempts2="$(grep -c -- 'spawn.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
+[ "${esc_n2:-0}" = 0 ] && [ "${spawn_attempts2:-0}" = 1 ] && ok "B: R9 — NOT auto-recovered once the simulated cause clears; still held, no new spawn attempt" \
+  || bad "B: R9 should still be blocked after the cause clears (esc_n2=$esc_n2 spawn_attempts2=$spawn_attempts2)"
 
 # =============================================================== case C ===
+# R9: a held (blocked) attempt does not consume the tier, and recovery
+# is possible but ONLY once a human reconciles the stuck journal row
+# by hand — the conductor-mediated recovery path the uncertain (rc=2)
+# family has always had, now shared by the confirmed-clean branch too.
 RUN=taskC; TASK=taskC; PANE=pane-C; BRANCH=esc-test-c
 seed_task "$TASK" "$PANE" "$BRANCH"
-printf '999' > "$WORK/spawn-fail-count"   # always fails
-export HERDR_ESCALATION_HOOK_RETRIES=2
+printf '999' > "$WORK/spawn-fail-count"   # irrelevant how many; blocks on attempt 1 either way
 : >"$ORDER_LOG"
 for i in 1 2 3; do
   bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpC --context-dir "$CTX" >/dev/null
 done
-spawn_attempts="$(grep -c -- 'spawn-fail.* esc-test-c' "$ORDER_LOG" 2>/dev/null)"
 esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
 failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
-[ "${spawn_attempts:-0}" = 2 ] && ok "C: stopped retrying at the configured bound (2)" || bad "C: spawn attempts at bound (got $spawn_attempts)"
-[ "${esc_n:-0}" = 0 ] && ok "C: no model_escalated when the hook never succeeds" || bad "C: model_escalated should be 0 (got $esc_n)"
+[ "${esc_n:-0}" = 0 ] && ok "C: no model_escalated when the hook is held" || bad "C: model_escalated should be 0 (got $esc_n)"
 [ "${failed_n:-0}" -ge 1 ] && ok "C: hook failure recorded in the audit trail" || bad "C: model_escalation_hook_failed recorded"
-esc_already_escalated "$RUN" "$TASK" standard && bad "C: tier must NOT be consumed by a failed attempt" || ok "C: tier not consumed — still retryable"
-# the transient failure clears; the NEXT call (another external tick) must
-# still succeed, exactly once, proving the bound only limited ONE call.
+esc_already_escalated "$RUN" "$TASK" standard && bad "C: tier must NOT be consumed by a blocked attempt" || ok "C: tier not consumed — reconciliation can still unblock it"
+# R9: simulate a human reconciling the stuck journal row by hand (the
+# only way past the permanent in_flight lock) alongside the external
+# cause clearing — a later call must then succeed exactly once.
 : > "$WORK/spawn-fail-count"
+_sql "DELETE FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" >/dev/null 2>&1
 bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpC --context-dir "$CTX" >/dev/null
 esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
-[ "${esc_n2:-0}" = 1 ] && ok "C: a later retry succeeds exactly once after the transient failure clears" || bad "C: recovery retry (got $esc_n2)"
-export HERDR_ESCALATION_HOOK_RETRIES=3
+[ "${esc_n2:-0}" = 1 ] && ok "C: R9 — recovery is possible but ONLY once a human reconciles the stuck journal row, never automatically" \
+  || bad "C: recovery after manual reconciliation (got $esc_n2)"
 
 # =============================================================== case D ===
 RUN=taskD; TASK=taskD; PANE=pane-D; BRANCH=esc-test-d
