@@ -461,6 +461,26 @@ details.room-cards[open]>summary::before{content:"\25BE  "}
 .badge.cleared{color:var(--bg);background:var(--ok);border-color:var(--ok)}
 .badge.stale{border:2px dashed var(--warn);color:var(--warn)}
 
+/* tmp/in/BRIEF.md (2026-10-28) / tmp/in/REVIEW-DASH.md: current workers,
+   holds & decisions, escalation events -- inline sections on Ship, same
+   container language as .bounty-board above (one real source each, no
+   tab). .ship-subnav is plain fragment links, same markup kind check.js
+   already allows (just <a>). */
+.ship-subnav{display:flex;gap:14px;margin:10px 0 0;font-size:12.5px}
+.ship-subnav a{color:var(--muted);text-decoration:none;border-bottom:1px solid transparent}
+.ship-subnav a:hover{color:var(--fg);border-color:var(--border)}
+.ship-section{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:14px 0 0}
+.ship-section h3{margin:0 0 6px;font-size:14px}
+.ship-section table{margin-top:4px}
+/* One-shot entrance for a row genuinely new since the last page load (ui.js
+   tracks "seen" ids in localStorage; .row-new is applied only to an id not
+   in that set, never to every row on every refresh -- tmp/in/REVIEW-DASH.md
+   F3). No !important: the blanket reduce kill-switch below always wins
+   regardless of rule order, so this never needs its own media gate. */
+@keyframes row-new{0%{opacity:0;transform:translateY(-3px)}100%{opacity:1;transform:translateY(0)}}
+tr.row-new{animation:row-new 500ms ease-out 1}
+
+
 /* state chips + card borders: shape + icon + words, never colour alone */
 .st{display:inline-flex;gap:5px;align-items:center;font-weight:700;font-size:12px;padding:1px 7px;border-radius:4px;border:2px solid currentColor}
 .st[data-d=executing]{color:var(--accent)}

@@ -7,6 +7,7 @@ var live = JSON.parse(readFile('tmp/hub-preview/ship-live.json'));
 var down = JSON.parse(readFile('tmp/hub-preview/ship-down.json'));
 var regerr = JSON.parse(readFile('tmp/hub-preview/ship-regerr.json'));
 var themes = JSON.parse(readFile('tmp/hub-preview/themes.json'));
+var scoped = JSON.parse(readFile('tmp/hub-preview/ship-scoped.json'));
 var fails = 0;
 function ok(name, cond) { print((cond ? 'ok   ' : 'FAIL ') + name); if (!cond) fails++; }
 var esc = HubUI.esc;
@@ -50,6 +51,57 @@ ok('bounty cards show owner + proof-or-unverified', /Owner: .+ \u00B7 Proof: /.t
 // model/attempt-count/hold values, same count as task cards overall.
 ok('escalation honesty line present at least once', h.indexOf('Escalation: tracking not enabled') !== -1);
 ok('no invented escalation model/attempt data anywhere', !/current model|attempt \d|escalation reason:/i.test(h));
+// tmp/in/BRIEF.md (2026-10-28) / tmp/in/REVIEW-DASH.md (F1-F3): one-page
+// Ship, workers/holds/escalation inline with anchor nav, built on hub_ui
+// (not a parallel STYLE/render_overview surface).
+ok('subnav reaches all three new sections',
+  h.indexOf('<nav class="ship-subnav"') !== -1 && h.indexOf('href="#workers"') !== -1 &&
+  h.indexOf('href="#holds"') !== -1 && h.indexOf('href="#escalation"') !== -1);
+var workersHtml = (h.split('id="workers"')[1] || '').split('id="holds"')[0];
+ok('every live worker pane is listed', live.workers.every(function (w) { return workersHtml.indexOf(esc(w.pane)) !== -1; }));
+// F2: production's herdr_live.agent is the CLI KIND ("omp"), never a model
+// id -- nothing upstream of this fixture invents one, and nothing here may
+// either. The honesty line must say so, and no row may claim "model:".
+ok('worker agent kind shown, exactly what herdr reports (never relabelled as a model)',
+  live.workers.every(function (w) { return workersHtml.indexOf('>' + esc(w.agent) + '</td>') !== -1 || workersHtml.indexOf(esc(w.agent) + ' \u00B7') !== -1; }));
+ok('model is said not-recorded, never shown as if known',
+  workersHtml.indexOf('Model: not recorded') !== -1 && !/\bmodel\s*[:=]\s*"?(claude|gpt|opus|sonnet|haiku)/i.test(workersHtml));
+ok('no row claims a model value it does not have', live.workers.every(function (w) { return !('model' in w); }));
+// N1 (tmp/in/REVIEW-DASH.md round-2): /?repo=demo-app's real ship_snapshot()
+// output (check.py's "ship-scoped" dump, NOT a hand-built fixture) must
+// render only its own panes, state the hidden count, and never show a pane
+// with no owning task -- the static HTML fetch can't prove this (renderShip
+// runs client-side), so it is proven here against the real scoped data.
+var scopedHtml = HubUI.renderShip(scoped, themes.bebop, { reduce: false });
+var scopedWorkersHtml = (scopedHtml.split('id="workers"')[1] || '').split('id="holds"')[0];
+ok('scoped workers section lists only this repo\'s panes',
+  scoped.workers.length > 0 && scoped.workers.every(function (w) { return scopedWorkersHtml.indexOf(esc(w.pane)) !== -1; }));
+ok('scoped workers section never shows a pane dropped by scope',
+  scopedWorkersHtml.indexOf('w2:p1') === -1 && scopedWorkersHtml.indexOf('w3:p2') === -1);
+ok('scoped workers section states the hidden count', scoped.workers_hidden === 2 &&
+  scopedWorkersHtml.indexOf('2 pane(s) hidden by this scope') !== -1);
+ok('scoped workers section never lists a pane with an empty task',
+  scoped.workers.every(function (w) { return !!w.task; }));
+var holdsHtml = (h.split('id="holds"')[1] || '').split('id="escalation"')[0];
+ok('holds section lists every open decision', live.decisions.open.every(function (f) { return holdsHtml.indexOf(esc(f.title)) !== -1; }));
+var escHtml = h.split('id="escalation"')[1] || '';
+ok('escalation section honestly stubbed, no row data', escHtml.indexOf('Escalation tracking is not enabled') !== -1);
+// F3: a row is highlighted ONLY the first time its id is rendered, never on
+// every refresh of already-seen data.
+var allPanes = live.workers.map(function (w) { return w.pane; });
+var hNoneSeen = HubUI.renderShip(live, themes.bebop, { reduce: false, seenWorkers: [] });
+ok('unseen-before worker rows get the new-row entrance', allPanes.length > 0 &&
+  (hNoneSeen.split('id="workers"')[1] || '').split('id="holds"')[0].indexOf('class="row-new') !== -1);
+var hAllSeen = HubUI.renderShip(live, themes.bebop, { reduce: false, seenWorkers: allPanes });
+ok('already-seen worker rows never re-animate as new',
+  (hAllSeen.split('id="workers"')[1] || '').split('id="holds"')[0].indexOf('row-new') === -1);
+var allHoldIds = live.decisions.open.map(function (f, i) { return f.id || ('_idx' + i); });
+var hdNoneSeen = HubUI.renderShip(live, themes.bebop, { reduce: false, seenHolds: [] });
+ok('unseen-before hold rows get the new-row entrance', allHoldIds.length > 0 &&
+  (hdNoneSeen.split('id="holds"')[1] || '').split('id="escalation"')[0].indexOf('class="row-new') !== -1);
+var hdAllSeen = HubUI.renderShip(live, themes.bebop, { reduce: false, seenHolds: allHoldIds });
+ok('already-seen hold rows never re-animate as new',
+  (hdAllSeen.split('id="holds"')[1] || '').split('id="escalation"')[0].indexOf('row-new') === -1);
 ok('open decisions listed', live.decisions.open.every(function (f) { return h.indexOf(esc(f.title)) !== -1; }));
 ok('expired forms never read as approved', h.indexOf('not approved, not declined') !== -1);
 ok('suggestions are proposal-only', h.indexOf('Proposal-only. Nothing is dispatched from here') !== -1);

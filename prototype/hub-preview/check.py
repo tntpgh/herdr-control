@@ -194,6 +194,28 @@ def main() -> int:
     check("bounty board renders inline on Ship", "class=\"bounty-board\"" in home)
     check("finished >24h hidden and counted", ship["hidden_finished"] == 1 and "implement:feat/old-thing" not in got)
     check("/ html carries no form token", "preview-token-not-real" not in home)
+    # N1 (tmp/in/REVIEW-DASH.md round-2): under a repo scope, a live pane
+    # whose owning task is NOT in that repo must be dropped and counted,
+    # never shown with an empty task (the exact regression _live_rows()
+    # guards against for /herdr; this round shipped it unguarded for Ship).
+    # Fixture ground truth (fixtures.py tasks()): of the 6 live panes, only
+    # w1:p1/w1:p3/w3:p1/w6:p1 own a demo-app task; w2:p1 owns demo-infra's
+    # plan:plan/q4-roadmap and w3:p2 owns demo-docs's deep-review:review/
+    # pr-38-r2, so scoping to demo-app must hide exactly those two.
+    check("unscoped / lists all 6 live panes", {w["pane"] for w in ship["workers"]} ==
+          {"w1:p1", "w2:p1", "w1:p3", "w3:p1", "w3:p2", "w6:p1"}, {w["pane"] for w in ship["workers"]})
+    shome = (OUT / "new" / new["/?repo=demo-app"]["file"]).read_text()
+    sship = json.loads(re.search(r"id=ship-data>(.*?)</script>", shome, re.S).group(1))
+    check("/?repo=demo-app keeps only demo-app panes",
+          {w["pane"] for w in sship["workers"]} == {"w1:p1", "w1:p3", "w3:p1", "w6:p1"},
+          {w["pane"] for w in sship["workers"]})
+    check("/?repo=demo-app hides the other repos' panes, counted (not silently dropped)",
+          sship["workers_hidden"] == 2, sship["workers_hidden"])
+    # The "N hidden" caption and per-row rendering happen client-side in
+    # renderShip() (host.innerHTML = ... in apply()); the static fetch
+    # above has no JS engine, so that text lives in check.js, not here.
+    check("/?repo=demo-app never lists a pane with an empty task",
+          all(w["task"] for w in sship["workers"]), [w for w in sship["workers"] if not w["task"]])
     dhome = (OUT / "down" / down["/"]["file"]).read_text()
     dship = json.loads(re.search(r"id=ship-data>(.*?)</script>", dhome, re.S).group(1))
     check("herdr-down snapshot says not connected", dship["live_connected"] is False)
@@ -202,7 +224,8 @@ def main() -> int:
     rship = json.loads(re.search(r"id=ship-data>(.*?)</script>", rhome, re.S).group(1))
     check("registry error reaches the Ship", bool(rship.get("error")))
     themes = json.loads(re.search(r"id=hub-themes>(.*?)</script>", home, re.S).group(1))
-    for name, obj in (("ship-live", ship), ("ship-down", dship), ("ship-regerr", rship), ("themes", themes)):
+    for name, obj in (("ship-live", ship), ("ship-down", dship), ("ship-regerr", rship),
+                       ("ship-scoped", sship), ("themes", themes)):
         (OUT / f"{name}.json").write_text(json.dumps(obj))
 
     print("== themes")
@@ -224,6 +247,26 @@ def main() -> int:
         for panel, who in (t.get("panels") or {}).items():
             check(f"{tid}: panel {panel} crew defined", panel in hub_ui.PANELS.values() and who in (t.get("characters") or {}))
     check("broken theme is skipped, not applied", _broken_theme_skipped())
+
+    print("== motion: new-row entrance is fully killed under reduced motion")
+    # Not a screenshot (one anecdote): a cascade proof. base.css's existing
+    # blanket kill-switch (html[data-reduce] *, @media prefers-reduced-
+    # motion:reduce) uses !important on every property; !important always
+    # wins over a non-!important rule regardless of selector specificity or
+    # source order (CSS cascade, unconditionally) -- so the new tr.row-new
+    # rule only has to avoid !important of its own to be guaranteed killed,
+    # never a second manual media query (tmp/in/REVIEW-DASH.md F3's "the
+    # only way to stop it is the OS-level setting" is the failure this
+    # reuses, not repeats).
+    css = hub_ui.BASE_CSS
+    check("blanket data-reduce kill-switch present and unmodified",
+          "html[data-reduce] *" in css and "animation:none!important" in css)
+    check("blanket prefers-reduced-motion media kill-switch present",
+          "@media (prefers-reduced-motion:reduce)" in css and "animation:none!important" in css.split("prefers-reduced-motion:reduce){", 1)[-1][:80])
+    m = re.search(r"tr\.row-new\{([^}]*)\}", css)
+    check("tr.row-new rule exists", bool(m), css[:0])
+    check("tr.row-new carries no !important (so the blanket kill-switch always wins, any rule order)",
+          bool(m) and "!important" not in m.group(1), m.group(1) if m else None)
 
     print("== job classes")
     sh = (ROOT / "lib/agent-profiles.sh").read_text()
