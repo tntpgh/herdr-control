@@ -44,6 +44,7 @@ import argparse
 import ast
 import concurrent.futures as cf
 import datetime as dt
+import fcntl
 import hashlib
 import hmac
 import html
@@ -1190,6 +1191,56 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def _lock_held(form_id: str) -> bool:
+    """Whether THE SPECIFIC process that registered `form_id` is still
+    running -- not just that its recorded pid number currently maps to
+    SOME process.
+
+    Conductor, 2026-10-29: a bare pid is reusable -- the OS recycles pid
+    numbers, so "pid N is running" can be true of a totally unrelated
+    later process once the original one has died. Binding to an flock
+    held on `<form_id>.lock` for the process's entire lifetime sidesteps
+    that: the kernel releases the lock the instant the holding process
+    exits or dies, by crash or otherwise, regardless of what pid number
+    anything is later reused as. formserve.py's `main()` opens and locks
+    this file right after registering the form and never closes the
+    descriptor. No lockfile, or one nobody holds, means not alive -- an
+    unverifiable identity is never treated as alive.
+    """
+    if not re.fullmatch(r"[0-9A-Za-z._-]{1,120}", form_id or ""):
+        return False
+    path = FORMS_DIR / f"{form_id}.lock"
+    try:
+        fh = open(path, "r+b")
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True  # someone already holds it -- the original run is alive
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)  # we just acquired it -- nobody was holding it
+        return False
+    finally:
+        fh.close()
+
+
+def _form_server_alive(f: dict) -> bool:
+    """Whether the process that originally served this form is still the
+    thing answering on its port -- not just that SOMETHING now does.
+
+    `port_open()` alone is fooled the moment that port is reused by an
+    unrelated later run of the same managed service: two long-dead form
+    ids (20261029T141355-8737, 20261029T141620-8737) kept reading as
+    servable purely because a THIRD, newer run
+    (20261029T141644-8737) was later listening on the same :8737 --
+    Terrence, 2026-10-29. Binding to the registering process's own held
+    lock (`_lock_held`) closes the gap -- a reused port behind a dead or
+    unrelated process is correctly not this form's server.
+    """
+    return port_open(int(f.get("port", 0) or 0)) and _lock_held(f.get("id") or "")
+
+
 def form_html(form_id: str) -> Path:
     """Where the hub keeps its own copy of a form's HTML.
 
@@ -1227,7 +1278,7 @@ def forms_data() -> dict:
                 if exp and now_ms > int(exp):
                     # An expired form is still unanswered — never "declined".
                     f["status"] = "expired"
-                elif not f["hub_servable"] and not port_open(int(f.get("port", 0) or 0)):
+                elif not f["hub_servable"] and not _form_server_alive(f):
                     # Pre-hub form whose server died without recording an outcome.
                     # A hub-servable one is NEVER gone: this page can still answer it.
                     f["status"] = "gone"
@@ -1267,6 +1318,7 @@ def portal_data() -> dict:
 # formserve needs no change: it still calls window.submitAnswers().
 HUB_SUBMIT_SHIM = """
 <input type="hidden" id="__formserve_token" value="%(token)s">
+<input type="hidden" id="__formserve_request_id" value="%(form_id)s">
 <script>
 (function () {
   window.submitAnswers = function (answers) {
@@ -1291,6 +1343,7 @@ HUB_SUBMIT_SHIM = """
           ? "Cancelled. The agent has been notified."
           : "Saved: " + pairs + ". The agent has been notified.";
         document.body.appendChild(b);
+        if (window.__herdrClearFormDraft) window.__herdrClearFormDraft();
         return true;
       });
     }).catch(function (e) {
@@ -1304,7 +1357,117 @@ HUB_SUBMIT_SHIM = """
   };
 })();
 </script>
+<script>
+// Draft preservation (Terrence, 2026-10-29; tightened by the conductor the
+// same day): a form restart or restyle must never silently DROP unsaved
+// edits, but must never silently APPLY one either. sessionStorage only --
+// nothing server-side, nothing auto-submitted, nothing auto-restored.
+//
+// Keyed by the request's own stable identity (the SOURCE filename, never
+// the per-run registry id -- a restart mints a brand new id, which would
+// defeat the whole point) AND a hash of the form's current semantic schema
+// (headings/legends, option values, and the field name+type set). Either
+// changing -- a different request, or the same request now asking a
+// different question -- produces a different storage key by construction,
+// so a stale draft is never even looked up: fails closed, not a migration.
+//
+// Sensitive and hidden fields are never captured: password/hidden types,
+// plus any field whose name/id/autocomplete reads as a credential.
+// Identical logic to formserve.py's SHIM, duplicated the same way the rest
+// of this shim already is -- the hub serves a DIFFERENT copy (its own
+// durable one) than the live port does.
+(function () {
+  var REQUEST_ID = (document.getElementById("__formserve_request_id") || {}).value || "";
+  var SENSITIVE_RE = /token|secret|password|passwd|credential|api[_-]?key|private[_-]?key|ssn|ccnum|card[_-]?number|cvv/i;
+  function isSensitive(el) {
+    if (el.type === "password" || el.type === "hidden") return true;
+    var ac = (el.autocomplete || "").toLowerCase();
+    if (ac === "current-password" || ac === "new-password" || ac.indexOf("cc-") === 0) return true;
+    return SENSITIVE_RE.test(el.name || "") || SENSITIVE_RE.test(el.id || "");
+  }
+  function fields() {
+    return Array.prototype.slice.call(document.querySelectorAll("input,textarea,select"))
+      .filter(function (el) { return !isSensitive(el) && (el.name || el.id); });
+  }
+  function fieldKey(el) { return el.name || el.id; }
+  function hashOf(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) { h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; }
+    return h.toString(36);
+  }
+  function schemaOf(current) {
+    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend"))
+      .map(function (el) { return (el.textContent || "").trim(); });
+    var options = Array.prototype.slice.call(document.querySelectorAll("option,input[type=radio],input[type=checkbox]"))
+      .map(function (el) { return (el.value || el.textContent || "").trim(); }).sort();
+    var fieldSig = current.map(function (el) { return fieldKey(el) + ":" + el.type; }).sort();
+    return hashOf(JSON.stringify({ h: headings, o: options, f: fieldSig }));
+  }
+  var current = fields();
+  var key = "herdr-form-draft:" + REQUEST_ID + ":" + schemaOf(current);
+  function clearDraft() { try { sessionStorage.removeItem(key); } catch (e) {} }
+  function saveDraft() {
+    var data = {};
+    current.forEach(function (el) {
+      var k = fieldKey(el);
+      if (el.type === "checkbox" || el.type === "radio") { if (el.checked) data[k] = el.value; }
+      else { data[k] = el.value; }
+    });
+    try { sessionStorage.setItem(key, JSON.stringify(data)); } catch (e) {}
+  }
+  var draft = null;
+  try {
+    var raw = sessionStorage.getItem(key);
+    if (raw) draft = JSON.parse(raw);
+  } catch (e) { draft = null; }
+  // A non-empty, schema-matching draft exists -- OFFER it. Nothing is
+  // applied to a field until the human clicks Restore.
+  if (draft && Object.keys(draft).length) {
+    document.addEventListener("DOMContentLoaded", function () {
+      var bar = document.createElement("div");
+      bar.setAttribute("role", "status");
+      bar.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:99998;padding:8px 16px;" +
+        "font:600 13px system-ui,-apple-system,sans-serif;text-align:center;background:#3a5a3a;color:#fff";
+      var msg = document.createElement("span");
+      msg.textContent = "Unsaved edits found from before this page reloaded. ";
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Restore";
+      btn.style.cssText = "margin-left:8px;padding:2px 10px;font:600 12px system-ui,sans-serif;" +
+        "border:1px solid #fff;border-radius:3px;background:transparent;color:#fff;cursor:pointer";
+      btn.addEventListener("click", function () {
+        current.forEach(function (el) {
+          var k = fieldKey(el);
+          if (!(k in draft)) return;
+          if (el.type === "checkbox" || el.type === "radio") { el.checked = el.value === draft[k]; }
+          else { el.value = draft[k]; }
+        });
+        bar.textContent = "Restored.";
+        bar.style.background = "#1f6e7e";
+      });
+      bar.appendChild(msg);
+      bar.appendChild(btn);
+      document.body.insertBefore(bar, document.body.firstChild);
+    });
+  }
+  current.forEach(function (el) {
+    el.addEventListener("input", saveDraft);
+    el.addEventListener("change", saveDraft);
+  });
+  window.__herdrClearFormDraft = clearDraft;
+})();
+</script>
 """
+
+
+def _draft_form_identity(form_id: str, row: dict) -> str:
+    """A form's STABLE identity for the draft-preservation key: survives a
+    restart of the same managed form, unlike the registry `id` (a fresh
+    timestamp + port every run -- see `_form_server_alive`'s docstring for
+    why that value is ephemeral). `form_path` is the SOURCE file formserve
+    was given, which stays the same across restarts of the same form."""
+    fp = row.get("form_path")
+    return Path(fp).stem if fp else form_id
 
 
 def _form_row(form_id: str) -> tuple[Path, dict] | tuple[None, None]:
@@ -1350,6 +1513,7 @@ def serve_stored_form(form_id: str) -> tuple[int, bytes]:
         out = out.replace("</body>", frozen + "</body>") if "</body>" in out else out + frozen
         return 200, out.encode()
     shim = HUB_SUBMIT_SHIM % {"token": _esc(row.get("token") or ""),
+                              "form_id": _esc(_draft_form_identity(form_id, row)),
                               "action": f"/decisions/{form_id}/submit"}
     out = raw.replace("</body>", shim + "</body>") if "</body>" in raw else raw + shim
     return 200, out.encode()
@@ -2627,7 +2791,7 @@ def _loop_decisions() -> dict:
         if not key:
             continue
         if f.get("status") == "open":
-            out[key] = {"status": "open", "url": f.get("url")} if port_open(int(f.get("port", 0) or 0)) else out.get(key, {})
+            out[key] = {"status": "open", "url": f.get("url")} if _form_server_alive(f) else out.get(key, {})
             continue
         if f.get("status") != "answered":
             continue

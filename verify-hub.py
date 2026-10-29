@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hub boundary regressions: python3 verify-hub.py (stdlib, mock secrets/DB only)."""
 import contextlib
+import fcntl
 import datetime as dt
 import importlib.util
 import io
@@ -2207,6 +2208,107 @@ class SentinelTrend(unittest.TestCase):
             status="degraded", failed=["rating_usefulness"])
         self.assertEqual(loop["outcome"], "degraded")
         self.assertIn("failed signals: rating_usefulness", loop["detail"])
+
+
+class FormServerIdentity(unittest.TestCase):
+    """A reused port must not keep a stale form id reading as alive.
+
+    20261029T141355-8737 and 20261029T141620-8737 (Terrence, 2026-10-29)
+    both died without answering, but `port_open(8737)` kept returning True
+    once a THIRD, unrelated run (20261029T141644-8737) later listened on
+    the same port -- `port_open()` alone proves nothing about WHICH
+    process answers there. A bare recorded `pid` is not enough either
+    (conductor, 2026-10-29): pid numbers are reusable. `_form_server_alive()`
+    requires an flock held on `<id>.lock` for the process's whole lifetime
+    -- the kernel releases it the instant that exact process exits or dies,
+    immune to the pid being later reused by anything unrelated. These pin
+    that binding at both call sites that used to trust `port_open()` (or a
+    bare pid) alone: `forms_data()`'s gone-status derivation and
+    `_loop_decisions()`'s open-with-url inclusion.
+    """
+
+    def _form(self, forms_dir, *, form_id, port, status="open", loops_key=None,
+              hub_servable=False):
+        row = {"id": form_id, "title": "t", "url": f"http://127.0.0.1:{port}",
+               "port": port, "pid": 999999, "status": status, "token": "tok",
+               "form_path": str(forms_dir / f"{form_id}.srcform"),
+               "created_at": 0, "expires_at": None}
+        (forms_dir / f"{form_id}.json").write_text(json.dumps(row))
+        if hub_servable:
+            (forms_dir / f"{form_id}.html").write_text("<html><body>x</body></html>")
+        if loops_key:
+            (forms_dir / f"{form_id}.key").write_text(loops_key)
+        return row
+
+    def _hold_lock(self, forms_dir, form_id):
+        """Stand-in for formserve.py's own long-held flock: acquired here,
+        in the TEST process, to simulate "the registering run is still
+        alive." flock() is scoped to the open file description, not the
+        process, so a second, independent open+trylock on the same path
+        genuinely conflicts even from within the same process."""
+        fh = open(forms_dir / f"{form_id}.lock", "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh  # caller keeps it open for "alive"; closes it for "died"
+
+    def _run(self, forms_dir, fn):
+        orig_forms_dir, orig_port_open = hub.FORMS_DIR, hub.port_open
+        hub.FORMS_DIR = forms_dir
+        hub.port_open = lambda *a, **k: True  # the port IS open -- reused, not this form's
+        try:
+            return fn()
+        finally:
+            hub.FORMS_DIR, hub.port_open = orig_forms_dir, orig_port_open
+
+    def test_not_hub_servable_form_with_no_lock_goes_gone_even_if_port_is_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, hub_servable=False)
+            data = self._run(forms_dir, hub.forms_data)
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141355-8737"], "gone")
+
+    def test_not_hub_servable_form_with_a_released_lock_goes_gone(self):
+        """The lockfile exists -- the run that registered it DID hold it --
+        but it has since exited and released it. A bare `os.kill(pid, 0)`
+        on a REUSED pid could have read this as alive; the lock cannot."""
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, hub_servable=False)
+            fh = self._hold_lock(forms_dir, "20261029T141355-8737")
+            fh.close()  # released, as a real process exiting would
+            data = self._run(forms_dir, hub.forms_data)
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141355-8737"], "gone")
+
+    def test_not_hub_servable_form_with_a_held_lock_stays_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141644-8737", port=8737, hub_servable=False)
+            fh = self._hold_lock(forms_dir, "20261029T141644-8737")
+            try:
+                data = self._run(forms_dir, hub.forms_data)
+            finally:
+                fh.close()
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141644-8737"], "open")
+
+    def test_loop_decisions_does_not_offer_a_url_for_a_port_reused_by_a_dead_forms_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, loops_key="k1")
+            out = self._run(forms_dir, hub._loop_decisions)
+        self.assertEqual(out.get("k1"), {}, "a released lock behind a reused port must not surface a url")
+
+    def test_loop_decisions_offers_a_url_when_the_registering_run_actually_holds_its_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141644-8737", port=8737, loops_key="k1")
+            fh = self._hold_lock(forms_dir, "20261029T141644-8737")
+            try:
+                out = self._run(forms_dir, hub._loop_decisions)
+            finally:
+                fh.close()
+        self.assertEqual(out["k1"], {"status": "open", "url": "http://127.0.0.1:8737"})
 
 
 if __name__ == "__main__":
