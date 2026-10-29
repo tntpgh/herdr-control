@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.herdr-control.ra-sender</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- One ra-sender run: the ONLY piece of the result-availability
+		     pipeline that can call herdr-deliver.sh (up to 120s). Split out
+		     of com.herdr-control.remote-mcp's publisher.py (tmp/in/
+		     BRIEF-optC.md, Option C) because launchd's StartInterval does
+		     not overlap runs of the SAME job -- one slow send used to wedge
+		     the whole 15s publisher tick (messaging, tasks, owner-inbox,
+		     lease renewal, the status sync itself), exceeding the Worker's
+		     own 90s disconnect threshold on a single slow send. Own
+		     StartInterval below, independent of com.herdr-control.remote-mcp's:
+		     a slow send here never blocks that tick, and that tick never
+		     blocks this. Render (install.sh --remote-mcp-ra-sender):
+		     __REMOTE_MCP_PYTHON__ -> the SAME pinned interpreter the
+		     publisher plist uses (launchd/resolve-hub-python.sh), __RA_SENDER_PY__
+		     -> the DEPLOYED app worktree's remote-mcp/ra-sender.py,
+		     __LOG_PATH__ -> ~/Library/Logs/com.herdr-control.ra-sender.log. -->
+		<string>__REMOTE_MCP_PYTHON__</string>
+		<string>__RA_SENDER_PY__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- Same belt as the hub/publisher: nothing here calls `op`, but if a
+		     descendant ever does it must fail fast, never paint a Touch ID
+		     prompt. -->
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
+		<!-- Exactly the result-availability + owner-lease-gate keys
+		     com.herdr-control.remote-mcp's plist carries, the SAME fixed
+		     single-machine herdr-control state root, so ra-sender.py reads
+		     the identical `staged` ra_requests rows the publisher's now
+		     observe-only tick writes -- a staged row IS the hand-off, no
+		     separate queue. Deliberately WITHOUT HERDR_OWNER_LEASE_RENEW:
+		     lease renewal never sends anything and stays in the publisher
+		     (BRIEF-optC.md #3) -- duplicating it here would just be two
+		     processes renewing the same leases for no benefit. -->
+		<key>HERDR_RESULT_AVAILABILITY</key>
+		<string>1</string>
+		<key>HERDR_RESULT_AVAILABILITY_DB</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/result-availability.sqlite3</string>
+		<key>HERDR_RESULT_AVAILABILITY_JOURNAL</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/journal</string>
+		<key>HERDR_RESULT_AVAILABILITY_ROOTS</key>
+		<string>thurber-os=/Users/thurbs/.local/state/herdr/owner-dispatch/handoffs/thurber-os</string>
+		<key>HERDR_OWNER_LEASE_DELIVERY</key>
+		<string>1</string>
+		<key>HERDR_OWNER_LEASE_DB</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/owner-lease.sqlite3</string>
+	</dict>
+	<!-- Decoupled from the publisher's 15s cadence on purpose: a result
+	     notice has no 90s-disconnect-style deadline of its own, and a
+	     slower cadence here means fewer herdr-deliver.sh attempts overall.
+	     15s kept for now for operational simplicity (one cadence to reason
+	     about) -- safe to lengthen later without touching the publisher. -->
+	<key>StartInterval</key>
+	<integer>15</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>

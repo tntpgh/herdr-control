@@ -1296,34 +1296,34 @@ RESULT_AVAILABILITY_CONDUCTOR = "conductor"
 
 
 def result_availability_tick() -> dict | None:
-    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. Requires the
-    owner-lease gate too (HERDR_OWNER_LEASE_DELIVERY=1). One pass of
-    lib/result_availability.py tick():
+    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. STAGE ONLY --
+    never sends anything, never opens a subprocess. tmp/in/BRIEF-optC.md
+    (following tmp/LATENCY.md's Option C): the actual send (GatedNotice's
+    admit/begin_notice/notify/settle, the one step that can block on
+    herdr-deliver.sh for up to 120s) moved to remote-mcp/ra-sender.py's own
+    LaunchAgent -- launchd's StartInterval does not overlap runs of the same
+    job (publisher.py's own _sha256_file docstring documents the identical
+    failure shape under a different cause, P9: one slow call used to wedge
+    the WHOLE publisher, not just the step that was slow), and a single
+    120s send already exceeds the Worker's own 90s disconnect threshold on
+    its own. ra-sender.py reads the SAME HERDR_RESULT_AVAILABILITY_DB/
+    _ROOTS/_JOURNAL and HERDR_OWNER_LEASE_DB this function does; a `staged`
+    ra_requests row IS the hand-off between them, no separate queue file.
+
+    What this still does, every tick, cheaply (lib/result_availability.py
+    tick(), pure sqlite + file-hash, no network, no subprocess):
       holder(label)  the live lease tuple, only while the registry names the
                      same (pane, birth, session); else None -> held:stale_generation.
-      prepare/notify GatedNotice: the conductor's DeliveryGate (admit, body-bound
-                     exchange id, begin_notice with the lease margin) before
-                     the notifying CAS; a fresh registry/lease/session/generation
-                     check immediately before herdr-deliver.sh (no --force);
-                     known-unsent refusals -> held:not_dispatched:<reason>.
+      pending -> observing -> staged, over consecutive ticks, once a
+                     dispatched request's result file stabilizes.
+    A row already `staged` is immediately held (`staged_for_ra-sender`)
+    WITHOUT ever calling the owner-lease gate's admit() -- that only
+    happens in ra-sender.py, which is also where RESULT_AVAILABILITY_CONDUCTOR
+    (R8-PERLABEL.md: RA's recipient is always the fixed `conductor` label)
+    is actually used.
 
-    R8-PERLABEL.md: RA's recipient is always the fixed `conductor` label
-    (RESULT_AVAILABILITY_CONDUCTOR) -- there is no legacy/ungated RA notice
-    path to fall back to, unlike the two owner-inbox call sites. No new
-    per-label check is needed here: GatedNotice.prepare() (lib/
-    result_availability.py:604-612) already calls gate.admit() per request,
-    and Availability.tick() (lib/result_availability.py:547-554) already
-    turns a Held result from admit() failing into
-    `held:not_dispatched:<reason>` for THAT row only, then `continue`s to
-    the next -- this is unconditional on WHY admit() refused (disabled,
-    fenced, or -- the case that matters here -- `owner_no_lease` because
-    `conductor` has no owner_projects row at all). An unregistered
-    conductor therefore makes every RA row perpetually `held:not_dispatched:
-    owner_no_lease` -- safe (no crash, no data loss, retried every tick,
-    same idiom as a stale generation) but also means RA delivers NOTHING
-    until `conductor` is registered and leased: this tick never blocks, but
-    RA notification is effectively inert until that happens. State plainly,
-    not glossed over."""
+    Requires the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1) read-only,
+    for the holder/generation check only."""
     if os.environ.get("HERDR_RESULT_AVAILABILITY") != "1":
         return None
     gate = owner_lease_gate()
@@ -1341,36 +1341,11 @@ def result_availability_tick() -> dict | None:
         reg = registry_resolver(label)
         return cur if cur and reg and tuple(reg) == cur[:3] else None
 
-    def type_notice(pane, text):
-        proc = subprocess.run([DELIVER, pane, text], capture_output=True, text=True, timeout=120)
-        return proc.returncode == 0
-
-    notice = ra.GatedNotice(gate, RESULT_AVAILABILITY_CONDUCTOR, bound, type_notice)
-
-    # SPEED (tmp/in/BRIEF.md #3): herdr-deliver.sh's own subprocess carries a
-    # 120s timeout, and avail.tick() below walks every staged row in ONE
-    # call -- unbudgeted, a tick that found two rows ready at once would
-    # call notify() (type_notice) twice in sequence, up to 240s inside a
-    # single 15s-cadence tick. may_begin caps the irreversible queued->
-    # delivering transition (GatedNotice.prepare's begin_notice) to ONCE per
-    # tick -- not the cheaper, idempotent admit() before it, so a row that is
-    # ALREADY permanently duplicate-blocked (admit() refuses before may_begin
-    # is ever consulted) can never starve a legitimate row of the one slot.
-    # A budget-refused row stays admitted/queued, never 'blocked', and is
-    # retried -- still notify-eligible -- on the next tick.
-    budget = {"left": 1}
-
-    def may_begin():
-        if budget["left"] <= 0:
-            return False
-        budget["left"] -= 1
-        return True
-
-    def prepare_budgeted(rid, text):
-        return notice.prepare(rid, text, may_begin=may_begin)
+    def observe_only(rid, text):
+        return ra.Held("staged_for_ra-sender")
 
     try:
-        return avail.tick(bound, notice.notify, prepare=prepare_budgeted)
+        return avail.tick(bound, lambda *a, **k: False, prepare=observe_only)
     finally:
         avail.close()
 
