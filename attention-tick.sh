@@ -361,7 +361,7 @@ attention_tick() {
     task="$(task_for_pane "$pane" 2>/dev/null)"
     [ -n "$task" ] || continue          # no registration: nothing to escalate FOR
     state="$(printf '%s' "$task" | jq -r '.state // empty')"
-    case "$state" in completed|failed|cancelled|lost) continue ;; esac
+    case "$state" in completed|failed|launch_failed|cancelled|lost) continue ;; esac
 
     local probe visible
     probe="$(attention_probe "$pane")"

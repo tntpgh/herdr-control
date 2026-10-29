@@ -1268,10 +1268,44 @@ dd_close2="$(grep -c -- "close $PANE" "$ORDER_LOG" 2>/dev/null)"
 [ "$dd_state2" = blocked ] && [ "${dd_spawn2:-0}" = 0 ] && [ "${dd_close2:-0}" = 0 ] \
   && ok "DD (restart): a second independent batch of fresh-process ticks still refuses — the fence is durable (real SQLite events table), not an in-memory flag that a restart would lose" \
   || bad "DD (restart): state=[$dd_state2] spawn=$dd_spawn2 close=$dd_close2 (want blocked/0/0)"
-[ "$TASK" = "$dd_task_id_preserved" ] && [ "$RUN" = "$dd_run_id_preserved" ] \
-  && ok "DD: request identity (task_id/run_id) is exactly preserved — the fence never substitutes or drops it" \
-  || bad "DD: identity drifted (task_id=[$TASK] run_id=[$RUN])"
+dd_db_task_id="$(_sql "SELECT task_id FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+dd_db_run_id="$(_sql "SELECT run_id FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+# N7 (round 3 review, LOW): compare the REAL registry row's own task_id/
+# run_id columns, not shell variables copied from $TASK/$RUN at line 1232
+# (a tautology that cannot fail even when the fence itself fails) — this
+# queries the same row escalation.sh just wrote to.
+[ "$dd_db_task_id" = "$TASK" ] && [ "$dd_db_run_id" = "$RUN" ] \
+  && ok "DD: request identity (task_id/run_id) is exactly preserved in the real registry row — the fence never substitutes or drops it" \
+  || bad "DD: identity drifted (db task_id=[$dd_db_task_id] db run_id=[$dd_db_run_id], want task_id=[$TASK] run_id=[$RUN])"
+# N5 (round 3 review, MEDIUM, blocking): a DRY RUN must never block a
+# fenced task — the fence in lib/escalation.sh now sits strictly below
+# the `dry_run` return, so a preview literally cannot reach it. Fresh
+# task, independent of taskDD above (already blocked by this point).
+RUN=taskDD2; TASK=taskDD2; PANE=pane-DD2; BRANCH=esc-test-dd2
+seed_task "$TASK" "$PANE" "$BRANCH"
+append_event "$RUN" "$TASK" spawn_startup_uncertain \
+  '{"reason":"herdr unreachable mid-liveness-check (simulated, case DD dry-run)"}' >/dev/null
+dd_dry_state0="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+: >"$ORDER_LOG"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpDD2 --dry-run --context-dir "$CTX" >/dev/null
+done
+dd_dry_state1="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+dd_dry_n="$(event_count "$RUN" "$TASK" model_escalation_dry_run)"
+dd_dry_blocked_n="$(event_count "$RUN" "$TASK" state_changed)"
+dd_dry_spawn="$(grep -c -- 'spawn implement esc-test-dd2' "$ORDER_LOG" 2>/dev/null)"
+[ "$dd_dry_state1" = "$dd_dry_state0" ] && ok "DD (dry-run, N5): a dry run NEVER blocks a fenced task — state unchanged ([$dd_dry_state1]) across 3 dry-run ticks" \
+  || bad "DD (dry-run, N5): state changed by a dry run (got [$dd_dry_state1], started [$dd_dry_state0])"
+[ "${dd_dry_blocked_n:-0}" = 0 ] && ok "DD (dry-run, N5): zero state_changed events — no set_task_state call at all, not even to re-assert the same state" \
+  || bad "DD (dry-run, N5): expected zero state_changed events (got $dd_dry_blocked_n)"
+[ "${dd_dry_n:-0}" -ge 1 ] && ok "DD (dry-run, N5): the documented model_escalation_dry_run event still lands normally on a fenced task" \
+  || bad "DD (dry-run, N5): expected at least one model_escalation_dry_run event (got $dd_dry_n)"
+[ "${dd_dry_spawn:-0}" = 0 ] && ok "DD (dry-run, N5): still no spawn attempted (dry run never spawns regardless of the fence)" \
+  || bad "DD (dry-run, N5): spawn count (got $dd_dry_spawn, want 0)"
 # criterion (c): approve, unblock and complete still work on a fenced task.
+# Reset to the ORIGINAL (real-fence, actually blocked) task — taskDD2
+# above exercised only the dry-run path and was never blocked.
+RUN=taskDD; TASK=taskDD; PANE=pane-DD; BRANCH=esc-test-dd
 dd_appr_sha="deadbeefcase0dd0000000000000000000000000000000000000000000000"
 file_approval_record "$TASK" "/fake/dd/path.sh" "$dd_appr_sha" "security-reviewer" >/dev/null 2>&1
 dd_appr_state="$(file_approval_state "$TASK" "/fake/dd/path.sh" "$dd_appr_sha" 2>/dev/null)"

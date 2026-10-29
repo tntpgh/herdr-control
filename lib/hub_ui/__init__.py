@@ -74,7 +74,7 @@ DISPLAY = {
     "gone":            {"label": "Pane gone", "icon": "\u2205", "attention": True},
     "unknown":         {"label": "Unrecognized state", "icon": "\u00BF", "attention": True},
 }
-TERMINAL = ("completed", "failed", "cancelled", "lost", "gone")
+TERMINAL = ("completed", "failed", "launch_failed", "cancelled", "lost", "gone")
 RECENT_FINISHED_S = 24 * 3600
 SHIP_TASK_CAP = 60
 

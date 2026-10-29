@@ -2080,10 +2080,10 @@ prune_completed_tasks() {               # max_age_days
   _sql "BEGIN IMMEDIATE;
     DELETE FROM events WHERE task_id IN (
       SELECT task_id FROM tasks
-       WHERE state IN ('completed','failed','cancelled','lost')
+       WHERE state IN ('completed','failed','launch_failed','cancelled','lost')
          AND julianday(updated_at) < julianday('now', '-${days} days'));
     DELETE FROM tasks
-     WHERE state IN ('completed','failed','cancelled','lost')
+     WHERE state IN ('completed','failed','launch_failed','cancelled','lost')
        AND julianday(updated_at) < julianday('now', '-${days} days');
     COMMIT;" >/dev/null 2>&1
 }

@@ -330,7 +330,7 @@ else
   bad "--brief delivery ambiguous: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted kickoff + final-receipt blocks, UNMANAGED: never attempts kickoff, no receipt, regardless of --brief ==\n'
+printf '== extracted kickoff + final-receipt blocks, UNMANAGED: never attempts kickoff, but DOES still receipt (C1-b, round 3 review: restored from the 83f72c1 regression that dropped it for unmanaged success) ==\n'
 capture=$(mktemp)
 (
   set_task_state() { printf 'state:%s\n' "$3" >> "$capture"; }
@@ -341,11 +341,13 @@ capture=$(mktemp)
   eval "$block3_src"
 ) >>"$capture" 2>&1
 rc=$?
-if [ "$rc" = 0 ] && [ ! -s "$capture" ]; then
-  ok "unmanaged: kickoff + final-receipt blocks are a complete no-op regardless of --brief"
+if [ "$rc" = 0 ] && ! grep -q '^state:' "$capture" \
+   && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=launcher-verified-ready$' "$capture"; then
+  ok "unmanaged: kickoff block is a no-op regardless of --brief, but the final receipt still prints (C1-b) — no send-to-agent call despite FAKE_STA_RC=1, no state transition"
 else
   bad "unmanaged: rc=$rc capture=$(cat "$capture")"
 fi
+
 
 printf '== extracted final-receipt + exit-code gate, spawn_verified=uncertain: exits nonzero (fail-safe default for a caller that only checks $?) ==\n'
 ( managed=0 run_id=r1 task_id=t1 spawn_verified=uncertain; eval "$block3_src" )
@@ -395,12 +397,40 @@ fi
 
 printf '== REAL registry + REAL escalation.sh, restart simulated (fresh process re-sources both libs), durable ambiguous-launch fence on the exact row the herdr-unreachable run above produced: refuses automatic respawn, approve/unblock/complete still work (owner criteria a/b/c) ==\n'
 sfr_fence_marker="$(mktemp)"
+sfr_fence_stub_dir="$(mktemp -d)"
+# N6 (round 3 review): the marker/authority stubs must be generated into
+# this run's own mktemp -d, never a path under tmp/ (gitignored, so a
+# fresh checkout would silently find nothing there and the test would
+# break for everyone but this worktree).
+cat > "$sfr_fence_stub_dir/spawn-marker.sh" <<'SH'
+#!/usr/bin/env bash
+# Used only by verify-startup-failure-reconciliation.sh's real-registry +
+# escalation-fence scenario. On the REAL (fenced) run this must never be
+# invoked: the durable ambiguous_launch_fence in esc_escalate refuses
+# before ever reaching HERDR_ESC_SPAWN_CMD/HERDR_ESC_PANE_CLOSE_CMD. The
+# mutant run (fence condition disabled) is expected to reach this and
+# record the call, which is what proves the test discriminates.
+printf 'SPAWN_OR_CLOSE_CALLED: %s\n' "$*" >> "${SFR_FENCE_SPAWN_MARKER:?SFR_FENCE_SPAWN_MARKER unset}"
+exit 1
+SH
+# N6: HERDR_ESC_AUTHORITY_CMD="" (empty) falls through to the REAL
+# ancestry check, which refuses for lack of herdr-pane ancestry in this
+# plain test shell regardless of whether the fence exists -- both the
+# fenced and fence-deleted (mutant) runs then hit the SAME
+# no_launch_authority refusal before ever distinguishing themselves, so
+# the test could not tell a working fence from a missing one. An
+# ADMITTING stub (exit 0) removes that false floor: only the real fence
+# can stop a real escalation attempt here now.
+cat > "$sfr_fence_stub_dir/authority-admit.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
 (
   export HERDR_RUN_STATE_DIR="$rr_runs_dir"
   export SFR_FENCE_SPAWN_MARKER="$sfr_fence_marker"
-  export HERDR_ESC_SPAWN_CMD="$here/tmp/r4/sfr-fence-spawn-marker.sh"
-  export HERDR_ESC_PANE_CLOSE_CMD="$here/tmp/r4/sfr-fence-spawn-marker.sh"
-  export HERDR_ESC_AUTHORITY_CMD=""
+  export HERDR_ESC_SPAWN_CMD="$sfr_fence_stub_dir/spawn-marker.sh"
+  export HERDR_ESC_PANE_CLOSE_CMD="$sfr_fence_stub_dir/spawn-marker.sh"
+  export HERDR_ESC_AUTHORITY_CMD="$sfr_fence_stub_dir/authority-admit.sh"
   # Fresh process, fresh sourcing of BOTH libs — nothing survives from the
   # herdr-unreachable run above but the durable SQLite file at
   # $HERDR_RUN_STATE_DIR/registry.sqlite3. This IS the restart.
@@ -411,7 +441,8 @@ sfr_fence_marker="$(mktemp)"
   esc_escalate rrun1 rtask1 claude evidence_stub '{}' 0 "$(mktemp -d)" >/dev/null 2>&1
   esc_rc=$?
   post_state="$(read_task rrun1 rtask1 | jq -r .state)"
-  printf 'esc_rc=%s pre_state=%s post_state=%s\n' "$esc_rc" "$pre_state" "$post_state"
+  post_reason="$(_sql "SELECT payload FROM events WHERE run_id='rrun1' AND task_id='rtask1' AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null | jq -r '.detail.reason // empty' 2>/dev/null)"
+  printf 'esc_rc=%s pre_state=%s post_state=%s post_reason=%s\n' "$esc_rc" "$pre_state" "$post_state" "$post_reason"
   [ -s "$sfr_fence_marker" ] && printf 'SPAWN_OR_CLOSE_CALLED\n'
   # criteria (c): approve/unblock/complete on the now-fenced (blocked) row.
   file_approval_record rtask1 /fake/sfr-fence.sh deadbeefsfrfence00000000000000000000000000000000000000000000 security-reviewer >/dev/null 2>&1
@@ -425,15 +456,17 @@ fence_out="$(cat "$sfr_fence_marker.out")"
 if printf '%s' "$fence_out" | grep -q 'esc_rc=1' \
    && printf '%s' "$fence_out" | grep -q 'pre_state=starting' \
    && printf '%s' "$fence_out" | grep -q 'post_state=blocked' \
+   && printf '%s' "$fence_out" | grep -q 'post_reason=ambiguous_launch_fence' \
    && ! printf '%s' "$fence_out" | grep -q 'SPAWN_OR_CLOSE_CALLED' \
    && printf '%s' "$fence_out" | grep -q 'approve_state=approved' \
    && printf '%s' "$fence_out" | grep -q 'unblock_state=running' \
    && printf '%s' "$fence_out" | grep -q 'complete_state=completed'; then
-  ok "real registry + real escalation, restart simulated: fence refuses (rc=1, task went starting->blocked, never quiesced/spawned), approve/unblock/complete all still work, exact task_id=rtask1/run_id=rrun1 preserved throughout"
+  ok "real registry + real escalation, restart simulated: fence refuses (rc=1, task went starting->blocked with reason=ambiguous_launch_fence specifically, never quiesced/spawned despite an ADMITTING launch-authority stub), approve/unblock/complete all still work, exact task_id=rtask1/run_id=rrun1 preserved throughout"
 else
   bad "real registry + real escalation, restart simulated: $fence_out"
 fi
 rm -rf "$(dirname "$rr_runs_dir")"
+
 
 printf '== full pipeline (real, non-dry-run spawn-task.sh), UNMANAGED literal command: reaches running regardless of pane-list stub shape ==\n'
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null

@@ -1173,26 +1173,102 @@ stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 # Persist intent BEFORE the external effect. If the process dies in this gap,
 # a retry holds outcome_unknown rather than executing the worker twice.
 if [ -n "$authorization_command_id" ]; then
-  launch_birth="$(pane_birth_now "$pane")" || exit 1
+  launch_birth="$(pane_birth_now "$pane")" || {
+    spawn_verified=launch_failed
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+      echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+    append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+      '{"reason":"could not query the worker pane'"'"'s birth before launch (authorization hold)"}' >/dev/null 2>&1 || true
+    echo "spawn-task: authorization hold: could not confirm worker pane birth before launch" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+    exit 1
+  }
   if [ -z "$pane_birth" ] || [ "$launch_birth" != "$pane_birth" ]; then
-    echo "spawn-task: authorization hold: worker pane disappeared or changed birth" >&2; exit 1
+    spawn_verified=launch_failed
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+      echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+    append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+      '{"reason":"worker pane disappeared or changed birth before launch (authorization hold)"}' >/dev/null 2>&1 || true
+    echo "spawn-task: authorization hold: worker pane disappeared or changed birth" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+    exit 1
   fi
   if [ -n "${source_pane:-}" ]; then
-    launch_source="$(caller_pane_from_ancestry)" || exit 1
-    launch_source_birth="$(pane_birth_now "$source_pane")" || exit 1
+    launch_source="$(caller_pane_from_ancestry)" || {
+      spawn_verified=launch_failed
+      set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+        echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+      append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+        '{"reason":"could not resolve this process'"'"'s own pane ancestry before launch (authorization hold)"}' >/dev/null 2>&1 || true
+      echo "spawn-task: authorization hold: could not resolve local source identity before launch" >&2
+      printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+      append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+      exit 1
+    }
+    launch_source_birth="$(pane_birth_now "$source_pane")" || {
+      spawn_verified=launch_failed
+      set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+        echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+      append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+        '{"reason":"could not query the authorizing source pane'"'"'s birth before launch (authorization hold)"}' >/dev/null 2>&1 || true
+      echo "spawn-task: authorization hold: could not confirm source pane birth before launch" >&2
+      printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+      append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+      exit 1
+    }
     if [ "$launch_source" != "$source_pane" ] || [ "$launch_source_birth" != "$source_birth" ] || \
        ! pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real"; then
-      echo "spawn-task: authorization hold: local source identity changed before launch" >&2; exit 1
+      spawn_verified=launch_failed
+      set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+        echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+      append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+        '{"reason":"local source identity changed before launch (authorization hold)"}' >/dev/null 2>&1 || true
+      echo "spawn-task: authorization hold: local source identity changed before launch" >&2
+      printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+      append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+      exit 1
     fi
   fi
   mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launch_claimed || {
-    echo "spawn-task: authorization hold: could not claim launch" >&2; exit 1;
+    spawn_verified=launch_failed
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1 || \
+      echo "spawn-task: warning — could not transition task $task_id to launch_failed (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
+    append_event "$run_id" "$task_id" spawn_launch_authorization_failed \
+      '{"reason":"could not claim the launch authorization slot before launch"}' >/dev/null 2>&1 || true
+    echo "spawn-task: authorization hold: could not claim launch" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+    exit 1
   }
 fi
-herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
+# C1 (round 3 review, blocking): `herdr pane run` is the actual external
+# effect -- a nonzero exit from it does not by itself prove the command
+# was never typed into the pane (same boundary ambiguity the R7 comment
+# above documents for escalation's own spawn receipt). Uncertain, not
+# launch_failed: a human must look, not an automatic respawn.
+herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || {
+  spawn_verified=uncertain
+  append_event "$run_id" "$task_id" spawn_startup_uncertain \
+    '{"reason":"herdr pane run returned nonzero -- a nonzero exit does not by itself prove the command was never typed into the pane"}' >/dev/null 2>&1 || true
+  echo "spawn-task: launch failed: $cli" >&2
+  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+  append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+  exit 1
+}
 if [ -n "$authorization_command_id" ]; then
   mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launched || {
-    echo "spawn-task: authorization hold: launch acknowledgement lost; outcome_unknown, do not relaunch" >&2; exit 1;
+    # The launch above DID succeed -- only the ledger acknowledgement was
+    # lost. Uncertain, not launch_failed: the agent may be alive and
+    # working; the fence (lib/escalation.sh) must see this event too.
+    spawn_verified=uncertain
+    append_event "$run_id" "$task_id" spawn_startup_uncertain \
+      '{"reason":"herdr pane run succeeded but the authorization ledger acknowledgement was lost -- outcome_unknown, do not relaunch"}' >/dev/null 2>&1 || true
+    echo "spawn-task: authorization hold: launch acknowledgement lost; outcome_unknown, do not relaunch" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+    exit 1
   }
 fi
 if [ "$managed" != 1 ]; then
@@ -1515,11 +1591,16 @@ printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a h
 # above, which print their own receipt as the last thing on their own
 # (earlier) exit path. Previously this printed BEFORE the whole
 # informational banner above, so the banner — not the receipt — was last.
-if [ "$managed" = 1 ]; then
-  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
-  append_event "$run_id" "$task_id" "spawn_receipt" \
-    "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
-fi
+# C1-b (round 3 review, blocking regression from 83f72c1): this receipt
+# used to print for EVERY successful spawn, managed or not. A round-2
+# draft wrapped it in `if [ "$managed" = 1 ]`, silently dropping it for
+# unmanaged literal-command spawns — unconditional again, matching the
+# original contract (and the 3 launch_failed/herdr-unreachable/
+# authorization-hold receipts above, none of which are managed-gated
+# either).
+printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+append_event "$run_id" "$task_id" "spawn_receipt" \
+  "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
 case "$spawn_verified" in
   uncertain) exit 1 ;;
 esac

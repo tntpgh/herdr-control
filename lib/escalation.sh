@@ -971,7 +971,7 @@ _esc_spawn_next_tier() {
   fi
   succ_state="$(printf '%s' "$succ_json" | jq -r '.state // empty' 2>/dev/null)"
   case "$succ_state" in
-    completed|failed|cancelled|lost|gone)
+    completed|failed|launch_failed|cancelled|lost|gone)
       _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_receipt_terminal "$old_pane" "$old_pane_birth" "$receipt" "$succ_state"
       printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — journal left in_flight (uncertain), task marked blocked (old writer already confirmed quiesced), holding for the conductor\n' "$task_id" "$to_tier" "$receipt" "$succ_state" >&2
       return 1
@@ -1033,32 +1033,6 @@ esc_escalate() {
   to_tier="$(esc_next_tier "$from_tier")" || { printf 'escalation: %s is already at the ladder ceiling\n' "$task_id" >&2; return 1; }
   esc_already_escalated "$run_id" "$task_id" "$to_tier" && { printf 'escalation: %s already escalated to %s (cap: one per tier)\n' "$task_id" "$to_tier" >&2; return 1; }
 
-  # round 2 review, owner criterion (a) (2026-10-29): a task whose OWN
-  # launch itself produced an ambiguous outcome (spawn_startup_uncertain /
-  # spawn_kickoff_uncertain — lib/run-registry.sh's N1/N2 comment) must
-  # never be automatically respawned: the agent may well be alive and
-  # working it, and nothing here can tell a genuinely dead task apart
-  # from one that is merely unconfirmed — spawning a successor risks a
-  # silent duplicate launch, the exact failure the owner acceptance
-  # criteria exist to prevent. This is a DURABLE fence: it re-queries the
-  # real events table (task_event_count) on every call, no in-memory
-  # state, so it survives a restart of this process, the stall watchdog,
-  # or the whole hub. approve/unblock/complete are untouched by this —
-  # they go through herdr-action.sh/set_task_state directly, never
-  # through esc_escalate, and `blocked` (what this sets) is a normal
-  # legal state every one of those paths already handles.
-  if [ "$(task_event_count "$run_id" "$task_id" spawn_startup_uncertain)" != 0 ] \
-     || [ "$(task_event_count "$run_id" "$task_id" spawn_kickoff_uncertain)" != 0 ]; then
-    local fence_task_json fence_old_pane fence_old_pane_birth
-    fence_task_json="$(read_task "$run_id" "$task_id")"
-    fence_old_pane="$(printf '%s' "$fence_task_json" | jq -r '.pane_id // empty' 2>/dev/null)"
-    fence_old_pane_birth="$(printf '%s' "$fence_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
-    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" ambiguous_launch_fence \
-      "$fence_old_pane" "$fence_old_pane_birth"
-    printf 'escalation: %s has an ambiguous-launch fence on record (spawn_startup_uncertain or spawn_kickoff_uncertain event — its OWN launch was never confirmed one way or the other) — refusing automatic respawn; the agent may already be alive and working this task, and a successor would risk a silent duplicate launch. Task marked blocked for a human to reconcile (re-check the pane, then approve/unblock/complete as normal, or mark-launch-failed.sh if it is genuinely dead).\n' "$task_id" >&2
-    return 1
-  fi
-
   printf '%s' "${evidence:-{\}}" | jq -e . >/dev/null 2>&1 || evidence='{}'
   to_agent="$(esc_tier_agent "$agent" "$to_tier")"
   local from_model to_model
@@ -1079,6 +1053,46 @@ esc_escalate() {
     append_event "$run_id" "$task_id" model_escalation_dry_run "$dry_payload" >/dev/null 2>&1
     printf '%s\n' "$dry_payload"
     return 0
+  fi
+
+  # round 2 review, owner criterion (a) (2026-10-29); moved below the
+  # dry_run return (round 3 review N5): a task whose OWN launch itself
+  # produced an ambiguous outcome (spawn_startup_uncertain /
+  # spawn_kickoff_uncertain — lib/run-registry.sh's N1/N2 comment) must
+  # never be automatically respawned: the agent may well be alive and
+  # working it, and nothing here can tell a genuinely dead task apart
+  # from one that is merely unconfirmed — spawning a successor risks a
+  # silent duplicate launch, the exact failure the owner acceptance
+  # criteria exist to prevent. This is a DURABLE fence: it re-queries the
+  # real events table directly on every call, no in-memory state, so it
+  # survives a restart of this process, the stall watchdog,
+  # or the whole hub. approve/unblock/complete are untouched by this —
+  # they go through herdr-action.sh/set_task_state directly, never
+  # through esc_escalate, and `blocked` (what this sets) is a normal
+  # legal state every one of those paths already handles. N5: this MUST
+  # run after the dry_run short-circuit above, never before it — a dry
+  # run is documented (this function's own header) to NEVER write
+  # anything but `model_escalation_dry_run`, so it must never call
+  # `_esc_mark_blocked_uncertain`'s `set_task_state ... blocked` either;
+  # a caller previewing an escalation must never have a side effect on
+  # the task merely for asking.
+  local fence_n fence_sql_rc
+  fence_n="$(_sql "SELECT COUNT(*) FROM events WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+    AND type IN ('spawn_startup_uncertain','spawn_kickoff_uncertain');" 2>/dev/null)"; fence_sql_rc=$?
+  # N9 (round 3 review, LOW): fail CLOSED (treat as fenced), not open, when
+  # the count itself is unreadable (`_sql` nonzero, or no output at all) —
+  # `task_event_count`'s own `${n:-0}` convenience would read a genuine SQL
+  # error the same as "zero events," letting an ambiguous task respawn on a
+  # transient registry hiccup. A real zero-row answer is a nonempty "0".
+  if [ "$fence_sql_rc" != 0 ] || [ -z "$fence_n" ] || [ "$fence_n" != 0 ]; then
+    local fence_task_json fence_old_pane fence_old_pane_birth
+    fence_task_json="$(read_task "$run_id" "$task_id")"
+    fence_old_pane="$(printf '%s' "$fence_task_json" | jq -r '.pane_id // empty' 2>/dev/null)"
+    fence_old_pane_birth="$(printf '%s' "$fence_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
+    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" ambiguous_launch_fence \
+      "$fence_old_pane" "$fence_old_pane_birth"
+    printf 'escalation: %s has an ambiguous-launch fence on record (spawn_startup_uncertain or spawn_kickoff_uncertain event — its OWN launch was never confirmed one way or the other) — refusing automatic respawn; the agent may already be alive and working this task, and a successor would risk a silent duplicate launch. Task marked blocked for a human to reconcile (re-check the pane, then approve/unblock/complete as normal, or mark-launch-failed.sh if it is genuinely dead).\n' "$task_id" >&2
+    return 1
   fi
 
   local fence

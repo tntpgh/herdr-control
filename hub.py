@@ -489,7 +489,7 @@ class Cached:
 # and ONE liveness source (the subscription below): the shell half that used to
 # duplicate this in bash had no caller, and it had already drifted from this
 # code in two ways no suite could see.
-TERMINAL = ("completed", "failed", "cancelled", "lost")
+TERMINAL = ("completed", "failed", "launch_failed", "cancelled", "lost")
 
 
 def pane_statuses() -> dict | None:
@@ -5271,7 +5271,7 @@ def _live_rows(scope: str = "") -> str:
         task = tasks.get(p["pane_id"]) or {}
         reg = task.get("state")
         blocked = p["agent_status"] == herdr_live.BLOCKED
-        diverges = bool(reg) and ((reg == "blocked") != blocked) and reg not in ("completed", "failed", "cancelled", "lost")
+        diverges = bool(reg) and ((reg == "blocked") != blocked) and reg not in ("completed", "failed", "launch_failed", "cancelled", "lost")
         rows.append(
             f"<tr{' class=hot' if blocked else ''}><td>{_esc(p['pane_id'])}</td>"
             f"<td>{_esc(task.get('label') or p.get('label') or '')}</td>"
