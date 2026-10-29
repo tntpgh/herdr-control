@@ -13,10 +13,13 @@
 #
 #   A. success path: exact commit sha + exact model names (haiku->sonnet),
 #      quiesce-before-spawn ordering, model_escalated only after both
-#   B. failure then retry then success within the bound: exactly one close,
-#      exactly `bound` spawn attempts, exactly one successor task row
-#   C. retries exhausted: no model_escalated, tier NOT consumed, a later
-#      call (transient failure cleared) still succeeds exactly once
+#   B. R9 (TOCTOU Scenario A, review-ESC-R8 item 4): pre-flight passes,
+#      quiesce completes, THEN the spawn confirms no side effect — blocks
+#      on the FIRST attempt (no retry to 2/3), discoverable blocked
+#      reason + journal fields, stays held even once the cause clears
+#   C. R9: a held (blocked) attempt does not consume the tier; recovery
+#      is possible but only once a human reconciles the stuck journal
+#      row by hand — never automatic
 #   D. dry run: no quiesce, no spawn, no model_escalated, tier NOT consumed
 #      — a real tick right after still escalates normally
 #   E. human-wait is still never a loop (regression from R1)
@@ -57,9 +60,50 @@
 #   U. R4 residual (a): a slow close/spawn hook that outlasts the raw
 #      lock TTL does NOT let a second writer in — a background renewer
 #      keeps the fence fresh for the whole attempt
-#   V. R4 residual (b): first-successor discovery correlates to this
-#      attempt's own spawn request, not bare branch+label — a
-#      pre-existing decoy on the same branch+label is never adopted
+#   V/W. R5: first-successor discovery binds to the spawn's own
+#      RECEIPT (task_id echoed back by the spawn call itself), never a
+#      branch+label scan at any timestamp filter — a decoy on the same
+#      branch+label is never adopted whether created at the same moment
+#      as the request (V) or later, mid-loop (W)
+#   X. R5: a spawn whose registry row lands but whose receipt is missing
+#      or unparseable fails CLOSED — no adoption, no escalation, task
+#      held for the conductor like any other hook failure
+#   Y. R6 (root-audit reject of R5): a lost receipt on a spawn that
+#      ACTUALLY SUCCEEDED is UNCERTAIN — a durable, restart-surviving
+#      spawn journal (checked/claimed BEFORE the spawn command runs)
+#      caps it at exactly ONE real attempt across this call's own retry
+#      loop, every later watchdog tick, and a simulated process restart;
+#      the task is marked blocked/held rather than left silently running
+#      with zero or an unbounded number of real owners. Independently
+#      reproduced by the reviewer against 30398f8: 6 orphaned running
+#      successor rows for one task across just 2 calls.
+#   Z. R7 (conductor, blocking): a direct proof that at most ONE writer
+#      ever has an actual chance to write, grounded in the fact that a
+#      successor REUSES the original's exact worktree path — not just
+#      log-line ordering ("killing a pane is not on its own proof of
+#      ownership"). A dedicated global violation log (checked at the
+#      very end, across the WHOLE suite, not just this case) records
+#      any moment fake-spawn.sh would begin "writing" (creating its
+#      task row) while the task's recorded old-writer pane is still
+#      alive. This case specifically covers the two paths no other case
+#      exercises: quiesce TIMEOUT (close issued, the pane genuinely
+#      never goes away even after the full poll bound — no spawn is
+#      ever attempted at all) and RECOVERY once the pane does go away.
+#   AA. R7 (conductor addition, blocking): a nonzero exit from the spawn
+#      command does NOT by itself prove no side effect occurred — a
+#      real row/pane created and then killed/timed out/failed late,
+#      with neither a receipt nor a documented no-effect marker, must
+#      stay UNCERTAIN: no retry (ever, including across a simulated
+#      restart), task held for the conductor. 827d6c1 treated any
+#      nonzero exit as confirmed-safe-to-retry and would reattempt.
+#   BB. R8 (conductor, blocking): the real production caller (hub.py's
+#      background watchdog thread) has NO herdr-pane ancestry, so
+#      spawn-task.sh's own authority gate refuses every automated spawn
+#      — this runs the REAL, unmodified gate (no override) from a
+#      non-pane caller and proves the old writer stays untouched and
+#      the task is marked blocked, never silently left `running` with
+#      zero owners. Must FAIL on 2c58dd2 (R7), which has no pre-flight
+#      check and would quiesce before ever discovering the refusal.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -79,7 +123,7 @@ export HERDR_ESCALATION_QUIESCE_POLLS=3
 PANES_DIR="$WORK/panes"; mkdir -p "$PANES_DIR"
 rm -f "$PANES_DIR"/*.alive "$PANES_DIR"/*.lag "$PANES_DIR"/*.indeterminate "$PANES_DIR"/*.birth "$PANES_DIR"/*.birth-unreachable 2>/dev/null
 ORDER_LOG="$WORK/order.log"; : >"$ORDER_LOG"
-rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane"
+rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected" "$WORK/spawn-kill-after-effect" "$WORK/concurrent-write-violations.log"
 export PANES_DIR ORDER_LOG HERE_REPO="$here"
 
 # R3 #5 ("offline only: no live close or spawn") belt-and-suspenders: every
@@ -199,10 +243,42 @@ if [ -f "$fail_f" ]; then
   if [ "${n:-0}" -gt 0 ]; then
     printf '%s' "$((n-1))" > "$fail_f"
     printf 'spawn-fail %s %s\n' "$job" "$branch" >> "$ORDER_LOG"
+    # R7: this failure happens BEFORE any registry row is created below
+    # -- matches real spawn-task.sh's own pre-registration exit trap
+    # exactly: a documented, provable no-effect receipt, not just a
+    # bare nonzero exit (which R7 no longer trusts by itself).
+    printf 'HERDR_SPAWN_NO_EFFECT reason=simulated_pre_registration_failure\n'
     exit 1
   fi
 fi
 printf 'spawn %s %s\n' "$job" "$branch" >> "$ORDER_LOG"
+# R7 (conductor, blocking): a direct, mechanism-level proof that the
+# successor's own first real side effect (creating its row -- the
+# moment it would begin doing real work) never happens while the
+# ORIGINAL task's recorded old-writer pane is still alive. Independent
+# of event-log ordering ("killing a pane is not on its own proof of
+# ownership") -- this queries the LIVE liveness marker at the exact
+# instant the new writer is about to activate. Checked globally, once,
+# at the very end of the whole suite (case R's sibling check) so every
+# scenario in every case — not just a hand-picked subset — is covered.
+orig_pane="$(cat "$WORK/orig-pane-$branch" 2>/dev/null)"
+if [ -n "$orig_pane" ]; then
+  orig_birth="$(cat "$WORK/orig-pane-birth-$branch" 2>/dev/null)"
+  violate=0
+  if [ -n "$orig_birth" ]; then
+    # Mirror _esc_quiesce_old_writer's OWN birth check exactly: a LIVE
+    # birth that no longer matches the recorded one means a different
+    # incarnation now occupies that pane_id (case L) -- genuinely NOT
+    # our old writer, never a violation.
+    live_birth="$(bash "$HERDR_ESC_PANE_BIRTH_CMD" "$orig_pane" 2>/dev/null)"
+    [ "$live_birth" = "$orig_birth" ] && [ -f "$PANES_DIR/$orig_pane.alive" ] && violate=1
+  else
+    [ -f "$PANES_DIR/$orig_pane.alive" ] && violate=1
+  fi
+  if [ "$violate" = 1 ]; then
+    printf 'CONCURRENT_WRITE_VIOLATION old_pane=%s branch=%s job=%s\n' "$orig_pane" "$branch" "$job" >> "$WORK/concurrent-write-violations.log"
+  fi
+fi
 succ_task="task_succ_${job}_$$_${RANDOM}"
 succ_pane="pane_succ_${job}_$$_${RANDOM}"
 succ_birth="birth_succ_${job}_$$_${RANDOM}"
@@ -212,6 +288,41 @@ now="$(_now_iso)"
 registry_init
 _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
   VALUES ($(_sq "$succ_task"), $(_sq "$succ_task"), '', '', '', '', $(_sq "$succ_pane"), $(_sq "$succ_birth"), '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
+# R7 (conductor addition, blocking): a nonzero exit does NOT by itself
+# prove nothing was created -- simulate a kill/timeout/late failure
+# AFTER the row above (a real tasks row, same as a success) is already
+# committed, with no receipt and no no-effect marker either. The caller
+# must treat this as UNCERTAIN, never as confirmed-safe-to-retry.
+if [ -f "$WORK/spawn-kill-after-effect" ]; then
+  exit 137
+fi
+# Case W (R5): a decoy lands on this EXACT branch+label strictly AFTER
+# the real successor's own row — the realistic "arrives right behind
+# it" race a highest-rowid/latest-timestamp heuristic cannot defend
+# against, only a true receipt binding can.
+di="$WORK/decoy-inject-branch"
+if [ -f "$di" ] && [ "$(cat "$di")" = "$branch" ] && [ ! -f "$WORK/decoy-injected" ]; then
+  : > "$WORK/decoy-injected"
+  decoy_task="$(cat "$WORK/decoy-inject-task-id" 2>/dev/null)"
+  decoy_now="$(_now_iso)"
+  _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
+    VALUES ($(_sq "$decoy_task"), $(_sq "$decoy_task"), '', '', '', '', '', '', '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$decoy_now"), $(_sq "$decoy_now"));"
+fi
+# R5: the receipt IS the discovery mechanism now — suppressible for the
+# missing-receipt fail-closed test (case X), which still creates the row
+# above (a real spawn can succeed at the registry write and still fail
+# to deliver a usable receipt, e.g. truncated output).
+if [ ! -f "$WORK/spawn-suppress-receipt" ]; then
+  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s\n' "$succ_task" "$succ_task"
+fi
+exit 0
+SH
+cat >"$WORK/fake-authority.sh" <<'SH'
+#!/usr/bin/env bash
+# R8: the default fake authority stub always reports admissible, so the
+# existing 108 cases above (none of which are about launch authority)
+# are unaffected by the new pre-flight gate. Case BB below deliberately
+# UNSETS HERDR_ESC_AUTHORITY_CMD to exercise the REAL, unmodified gate.
 exit 0
 SH
 
@@ -219,6 +330,7 @@ export HERDR_ESC_PANE_ALIVE_CMD="$WORK/fake-pane-alive.sh"
 export HERDR_ESC_PANE_BIRTH_CMD="$WORK/fake-pane-birth.sh"
 export HERDR_ESC_PANE_CLOSE_CMD="$WORK/fake-pane-close.sh"
 export HERDR_ESC_SPAWN_CMD="$WORK/fake-spawn.sh"
+export HERDR_ESC_AUTHORITY_CMD="$WORK/fake-authority.sh"
 
 seed_task() {   # task_id pane branch [pane_birth] [job]
   local task_id="$1" pane="$2" branch="$3" birth="${4:-}" job="${5:-explore}" now
@@ -228,6 +340,12 @@ seed_task() {   # task_id pane branch [pane_birth] [job]
     VALUES ($(_sq "$task_id"), $(_sq "$task_id"), '', '', '', '', $(_sq "$pane"), $(_sq "$birth"), '', $(_sq "$REPO"), $(_sq "$REPO"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
   : > "$PANES_DIR/$pane.alive"
   [ -n "$birth" ] && printf '%s' "$birth" > "$PANES_DIR/$pane.birth"
+  # R7: a precise lookup for fake-spawn.sh's concurrent-write-violation
+  # check (which pane was this escalation's ORIGINAL writer) — a SQL
+  # heuristic over `tasks` is ambiguous once a decoy (case V/W) or a
+  # recycled pane (case L) is in play; this is exact.
+  printf '%s' "$pane" > "$WORK/orig-pane-$branch"
+  printf '%s' "$birth" > "$WORK/orig-pane-birth-$branch"
 }
 
 escalated_payload() {   # run_id task_id tier -> payload json (empty if none)
@@ -264,45 +382,87 @@ ci="$(order_index 'close pane-A')"; si="$(order_index 'spawn implement esc-test-
   || bad "A: quiesce-before-spawn ordering (close@$ci spawn@$si)"
 
 # =============================================================== case B ===
+# R9 (conductor, blocking — review-ESC-R8 item 4, TOCTOU Scenario A):
+# this is the EXACT TOCTOU shape the review's run-early.sh probe
+# reproduced — the pre-flight authority check PASSES (default fake
+# stub, no override here), quiesce runs and completes normally, and
+# ONLY THEN does the spawn command fail with a DOCUMENTED no-effect
+# receipt (R7's contract) — simulating the real spawn-task.sh's own
+# early (pre-registration) authority re-check losing a race the
+# pre-flight check could not have predicted. Pre-R9 (8376ffb), this
+# bare "confirmed clean" signal was treated as freely retryable: up to
+# 3 blind attempts, then silently left `running` with zero real
+# owners and no event at all. R9 requires this indistinguishable in
+# kind from any other post-quiesce spawn failure: blocked on the
+# FIRST attempt (not after exhausting the bound), discoverable, and —
+# since the journal row is never cleared — never retried again, not
+# even once the simulated cause is gone, until a human reconciles it.
 RUN=taskB; TASK=taskB; PANE=pane-B; BRANCH=esc-test-b
 seed_task "$TASK" "$PANE" "$BRANCH"
-printf '2' > "$WORK/spawn-fail-count"   # fail twice, succeed on the 3rd (== HERDR_ESCALATION_HOOK_RETRIES default bound)
+printf '1' > "$WORK/spawn-fail-count"   # would have "succeeded on retry" under the OLD (pre-R9) design
 : >"$ORDER_LOG"
 for i in 1 2 3; do
   bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpB --context-dir "$CTX" >/dev/null
 done
-spawn_attempts="$(grep -c -- 'spawn.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
+spawn_attempts="$(grep -c -- 'spawn-fail.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
 close_count="$(grep -c -- 'close pane-B' "$ORDER_LOG" 2>/dev/null)"
 esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
-succ_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label='implement:$BRANCH';" 2>/dev/null)"
-[ "${spawn_attempts:-0}" = 3 ] && ok "B: retried exactly 3 times (2 failures + 1 success)" || bad "B: spawn attempts (got $spawn_attempts)"
-[ "${close_count:-0}" = 1 ] && ok "B: pane closed exactly once across all retries (idempotent quiesce)" || bad "B: close count (got $close_count)"
-[ "${esc_n:-0}" = 1 ] && ok "B: exactly one model_escalated after failure+retry+success" || bad "B: model_escalated count (got $esc_n)"
-[ "${succ_rows:-0}" = 1 ] && ok "B: exactly one successor task row (no double-spawn)" || bad "B: successor row count (got $succ_rows)"
+b_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+b_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+b_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+b_reason="$(printf '%s' "$b_detail" | jq -r '.detail.reason // empty' 2>/dev/null)"
+b_jtbl="$(printf '%s' "$b_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+b_jkey_tier="$(printf '%s' "$b_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+[ "${spawn_attempts:-0}" = 1 ] && ok "B: R9 — a confirmed-clean failure blocks on the FIRST attempt, never retries to 2 or 3" \
+  || bad "B: R9 spawn attempts (got $spawn_attempts, want 1)"
+[ "${close_count:-0}" = 1 ] && ok "B: pane closed exactly once (quiesce completes before the spawn attempt)" \
+  || bad "B: close count (got $close_count)"
+[ "${esc_n:-0}" = 0 ] && ok "B: R9 — never escalates on a confirmed-clean-but-held outcome" \
+  || bad "B: model_escalated should be 0 (got $esc_n)"
+[ "$b_state" = blocked ] && ok "B: R9 — the task is explicitly marked blocked, not left running with zero owners" \
+  || bad "B: R9 task state (got [$b_state], want blocked)"
+[ "$b_reason" = escalation_spawn_confirmed_clean_toctou ] && ok "B: R9 — blocked reason is the specific, discoverable TOCTOU reason" \
+  || bad "B: R9 blocked reason (got [$b_reason])"
+[ "$b_jtbl" = escalation_spawn_journal ] && [ "$b_jkey_tier" = standard ] && ok "B: R9 — the blocked event still records the journal table/key for reconciliation" \
+  || bad "B: R9 discoverability fields (journal_table=[$b_jtbl] journal_key.to_tier=[$b_jkey_tier])"
+[ "$b_journal" = in_flight ] && ok "B: R9 — the journal stays in_flight permanently, same as the uncertain case, never cleared by a confirmed-clean failure" \
+  || bad "B: R9 journal state (got [$b_journal], want in_flight)"
+# R9: even once the simulated cause is gone, there is no automatic
+# recovery — the permanent journal lock, not the external cause, is
+# what holds this task, exactly like the uncertain (rc=2) family.
+: > "$WORK/spawn-fail-count"
+bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpB --context-dir "$CTX" >/dev/null
+esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
+spawn_attempts2="$(grep -c -- 'spawn.* esc-test-b' "$ORDER_LOG" 2>/dev/null)"
+[ "${esc_n2:-0}" = 0 ] && [ "${spawn_attempts2:-0}" = 1 ] && ok "B: R9 — NOT auto-recovered once the simulated cause clears; still held, no new spawn attempt" \
+  || bad "B: R9 should still be blocked after the cause clears (esc_n2=$esc_n2 spawn_attempts2=$spawn_attempts2)"
 
 # =============================================================== case C ===
+# R9: a held (blocked) attempt does not consume the tier, and recovery
+# is possible but ONLY once a human reconciles the stuck journal row
+# by hand — the conductor-mediated recovery path the uncertain (rc=2)
+# family has always had, now shared by the confirmed-clean branch too.
 RUN=taskC; TASK=taskC; PANE=pane-C; BRANCH=esc-test-c
 seed_task "$TASK" "$PANE" "$BRANCH"
-printf '999' > "$WORK/spawn-fail-count"   # always fails
-export HERDR_ESCALATION_HOOK_RETRIES=2
+printf '999' > "$WORK/spawn-fail-count"   # irrelevant how many; blocks on attempt 1 either way
 : >"$ORDER_LOG"
 for i in 1 2 3; do
   bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpC --context-dir "$CTX" >/dev/null
 done
-spawn_attempts="$(grep -c -- 'spawn-fail.* esc-test-c' "$ORDER_LOG" 2>/dev/null)"
 esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
 failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
-[ "${spawn_attempts:-0}" = 2 ] && ok "C: stopped retrying at the configured bound (2)" || bad "C: spawn attempts at bound (got $spawn_attempts)"
-[ "${esc_n:-0}" = 0 ] && ok "C: no model_escalated when the hook never succeeds" || bad "C: model_escalated should be 0 (got $esc_n)"
+[ "${esc_n:-0}" = 0 ] && ok "C: no model_escalated when the hook is held" || bad "C: model_escalated should be 0 (got $esc_n)"
 [ "${failed_n:-0}" -ge 1 ] && ok "C: hook failure recorded in the audit trail" || bad "C: model_escalation_hook_failed recorded"
-esc_already_escalated "$RUN" "$TASK" standard && bad "C: tier must NOT be consumed by a failed attempt" || ok "C: tier not consumed — still retryable"
-# the transient failure clears; the NEXT call (another external tick) must
-# still succeed, exactly once, proving the bound only limited ONE call.
+esc_already_escalated "$RUN" "$TASK" standard && bad "C: tier must NOT be consumed by a blocked attempt" || ok "C: tier not consumed — reconciliation can still unblock it"
+# R9: simulate a human reconciling the stuck journal row by hand (the
+# only way past the permanent in_flight lock) alongside the external
+# cause clearing — a later call must then succeed exactly once.
 : > "$WORK/spawn-fail-count"
+_sql "DELETE FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" >/dev/null 2>&1
 bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpC --context-dir "$CTX" >/dev/null
 esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
-[ "${esc_n2:-0}" = 1 ] && ok "C: a later retry succeeds exactly once after the transient failure clears" || bad "C: recovery retry (got $esc_n2)"
-export HERDR_ESCALATION_HOOK_RETRIES=3
+[ "${esc_n2:-0}" = 1 ] && ok "C: R9 — recovery is possible but ONLY once a human reconciles the stuck journal row, never automatically" \
+  || bad "C: recovery after manual reconciliation (got $esc_n2)"
 
 # =============================================================== case D ===
 RUN=taskD; TASK=taskD; PANE=pane-D; BRANCH=esc-test-d
@@ -519,6 +679,7 @@ esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
   || bad "M: recovery retry (got $esc_n2)"
 export HERDR_ESCALATION_HOOK_RETRIES=3
 
+
 # =============================================================== case N ===
 # R3 #5/#6: a genuine loop (real no-progress) WITH an open denial carries
 # the EXACT denial forward — into the audit event AND the context packet,
@@ -716,13 +877,15 @@ grep -q 'locked by a concurrent attempt' "$WORK/nested-probe-out.log" 2>/dev/nul
   || bad "U: nested attempt lock-refusal message missing: $(cat "$WORK/nested-probe-out.log" 2>/dev/null)"
 
 # =============================================================== case V ===
-# R4 residual (b): first-successor discovery must correlate to THIS
-# escalation's own spawn request, not a bare branch+label match — a
-# PRE-EXISTING unrelated task already sitting on the exact branch+label
-# the real successor would get (a decoy) must never be adopted.
+# R5: first-successor discovery binds to the spawn's own RECEIPT, never
+# a branch+label scan at any filter. Prove it against the SHARPEST case
+# a timestamp filter could never exclude: a decoy whose created_at is
+# forced far in the FUTURE (so `created_at >= request time` is true no
+# matter what "now" ever resolves to) — not relying on wall-clock luck
+# to land in the same second.
 RUN=taskV; TASK=taskV; PANE=pane-V; BRANCH=esc-test-v; DECOY=taskV_decoy
 seed_task "$DECOY" "pane-V-decoy" "$BRANCH" "" implement
-sleep 1   # guarantee the decoy's created_at predates this attempt's spawn request by a full second
+_sql "UPDATE tasks SET created_at='2099-01-01T00:00:00Z' WHERE task_id=$(_sq "$DECOY");" >/dev/null
 seed_task "$TASK" "$PANE" "$BRANCH"
 : >"$ORDER_LOG"
 for i in 1 2 3; do
@@ -731,17 +894,288 @@ done
 v_payload="$(escalated_payload "$RUN" "$TASK" standard)"
 v_successor="$(printf '%s' "$v_payload" | jq -r '.successor_task_id // empty')"
 v_spawn_count="$(grep -c -- 'spawn implement esc-test-v' "$ORDER_LOG" 2>/dev/null)"
-v_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label='implement:$BRANCH';" 2>/dev/null)"
-[ -n "$v_successor" ] && [ "$v_successor" != "$DECOY" ] && ok "V: the pre-existing decoy on the same branch+label is never adopted as the successor" \
+[ -n "$v_successor" ] && [ "$v_successor" != "$DECOY" ] && ok "V: a decoy no timestamp filter could ever exclude (created_at forced to the future) is still never adopted" \
   || bad "V: successor_task_id wrongly resolved to the decoy (got [$v_successor] decoy=[$DECOY])"
-[ "${v_spawn_count:-0}" = 1 ] && ok "V: a genuinely NEW successor was spawned despite the branch+label match existing" \
-  || bad "V: spawn count for the real attempt (got $v_spawn_count, expected 1 — the decoy's presence must not skip spawning)"
-[ "${v_rows:-0}" = 2 ] && ok "V: both the decoy and the real successor now exist as distinct rows" \
-  || bad "V: branch+label row count (got $v_rows, want 2: decoy + real successor)"
+[ "${v_spawn_count:-0}" = 1 ] && ok "V: a genuinely new successor was spawned and its own receipt was what resolved it" \
+  || bad "V: spawn count for the real attempt (got $v_spawn_count)"
+
+# =============================================================== case W ===
+# R5: a decoy injected from INSIDE the real attempt's own spawn call,
+# immediately before the real successor's own row — the most realistic
+# "concurrent, strictly after the request" scenario there is, not a
+# wall-clock guess about ordering between separate ticks.
+RUN=taskW; TASK=taskW; PANE=pane-W; BRANCH=esc-test-w; DECOY=taskW_decoy
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+printf '%s' "$BRANCH" > "$WORK/decoy-inject-branch"
+printf '%s' "$DECOY" > "$WORK/decoy-inject-task-id"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpW --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id"
+w_payload="$(escalated_payload "$RUN" "$TASK" standard)"
+w_successor="$(printf '%s' "$w_payload" | jq -r '.successor_task_id // empty')"
+w_spawn_count="$(grep -c -- 'spawn implement esc-test-w' "$ORDER_LOG" 2>/dev/null)"
+w_decoy_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE task_id=$(_sq "$DECOY");" 2>/dev/null)"
+[ -f "$WORK/decoy-injected" ] && [ "${w_decoy_rows:-0}" = 1 ] && ok "W: the decoy actually landed mid-spawn (test is exercising the real race, not a no-op)" \
+  || bad "W: decoy injection never happened — test setup broken"
+[ -n "$w_successor" ] && [ "$w_successor" != "$DECOY" ] && ok "W: a decoy injected strictly during the real attempt's own spawn is never adopted" \
+  || bad "W: successor_task_id wrongly resolved to the decoy (got [$w_successor] decoy=[$DECOY])"
+[ "${w_spawn_count:-0}" = 1 ] && ok "W: a genuinely new successor was spawned despite the concurrent decoy" \
+  || bad "W: spawn count for the real attempt (got $w_spawn_count)"
+
+# =============================================================== case X ===
+# R5: a spawn that writes its registry row but delivers no usable
+# receipt (truncated output, a non-conforming HERDR_ESC_SPAWN_CMD) must
+# fail CLOSED — no adoption via any fallback lookup, no model_escalated,
+# the task held for the conductor exactly like any other hook failure.
+# R6: strengthened to prove the retry-within-call dimension of the
+# duplicate-writer bug root-audit found in 30398f8 — a suppressed
+# receipt must cap at exactly ONE real spawn attempt across this single
+# esc_escalate call's own bound retries, and the original task must be
+# explicitly marked blocked/held rather than left silently running with
+# an unverifiable owner.
+RUN=taskX; TASK=taskX; PANE=pane-X; BRANCH=esc-test-x
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-suppress-receipt"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpX --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-suppress-receipt"
+x_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+x_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+x_pinned="$(task_last_event_payload "$RUN" "$TASK" writer_successor_pinned 2>/dev/null)"
+x_spawn_count="$(grep -c -- 'spawn implement esc-test-x' "$ORDER_LOG" 2>/dev/null)"
+x_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+[ "${x_esc_n:-0}" = 0 ] && ok "X: a spawn with no usable receipt never escalates" \
+  || bad "X: model_escalated should be 0 with a suppressed receipt (got $x_esc_n)"
+[ "${x_failed_n:-0}" = 1 ] && ok "X: the hook-failed path fires — task held for the conductor, same as any other hook failure" \
+  || bad "X: model_escalation_hook_failed count (got $x_failed_n)"
+[ -z "$x_pinned" ] && ok "X: no successor was ever pinned — the orphaned registry row is never silently adopted" \
+  || bad "X: a successor was wrongly pinned despite the suppressed receipt: $x_pinned"
+[ "${x_spawn_count:-0}" = 1 ] && ok "X: R6 — exactly ONE real spawn attempt across this call's own retry loop (30398f8 spawned 3)" \
+  || bad "X: R6 spawn count within one call (got $x_spawn_count, want 1)"
+[ "$x_state" = blocked ] && ok "X: R6 — the task is explicitly marked blocked/held, not silently left running with an unverifiable writer" \
+  || bad "X: R6 task state (got [$x_state], want blocked)"
+
+# =============================================================== case Y ===
+# R6 (root-audit reject of R5/30398f8): a lost receipt on a spawn that
+# ACTUALLY SUCCEEDED is UNCERTAIN, not a plain retryable failure — the
+# fake spawn hook below writes a genuinely new, distinct task row on
+# every call (exactly case X's own setup) but never emits a receipt.
+# Independently reproduced by the reviewer: 6 real, untracked, running
+# successor rows for one task across just 2 esc_escalate calls, with the
+# old writer's pane already closed before any of them could ever be
+# confirmed. This case proves the fix caps it at exactly ONE real spawn
+# across THREE dimensions in a single run:
+#   - retry-within-call: the first triggering tick's own esc_escalate
+#     call retries up to the configured bound internally.
+#   - a later, separate tick: no_progress_detect's window stays "loop"
+#     on every following tick (commit_sha/artifact_fp unchanged), so
+#     ticks 4-6 each independently re-enter esc_escalate — nothing in
+#     no-progress-escalate.sh's cmd_tick gates on the task's state
+#     before calling it, and esc_already_escalated only ever gates on a
+#     real model_escalated event, which never lands here.
+#   - a simulated restart: every `bash "$CLI" tick ...` invocation in
+#     this harness IS already an independent process — a fresh bash
+#     interpreter with zero shared in-process memory with any prior
+#     tick, only the SQLite registry persisting between them — so ticks
+#     4-6 exercise "survives a restart" exactly as rigorously as this
+#     architecture allows, not merely "survives a retry".
+RUN=taskY; TASK=taskY; PANE=pane-Y; BRANCH=esc-test-y
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-suppress-receipt"
+for i in 1 2 3; do                       # ticks 1-2 fill the window; tick 3 triggers escalate (retry-within-call)
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpY --context-dir "$CTX" >/dev/null
+done
+for i in 1 2 3; do                       # 3 MORE, fully separate processes: later ticks + simulated restart
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpY --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-suppress-receipt"
+y_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label=$(_sq "implement:$BRANCH");" 2>/dev/null)"
+y_spawn_count="$(grep -c -- 'spawn implement esc-test-y' "$ORDER_LOG" 2>/dev/null)"
+y_close_count="$(grep -c -- 'close pane-Y' "$ORDER_LOG" 2>/dev/null)"
+y_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+y_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+y_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+[ "${y_spawn_count:-0}" = 1 ] && ok "Y: R6 — exactly ONE real spawn attempt across retry-within-call + later ticks + simulated restart" \
+  || bad "Y: R6 spawn count (got $y_spawn_count, want 1 — this is the exact bug 30398f8 was rejected for)"
+[ "${y_rows:-0}" = 1 ] && ok "Y: R6 — exactly one successor row exists in the registry, not an unbounded pile of orphans" \
+  || bad "Y: R6 successor row count (got $y_rows, want 1)"
+[ "${y_close_count:-0}" = 1 ] && ok "Y: R6 — the old writer was closed exactly once, never re-triggered by a later tick" \
+  || bad "Y: R6 close count (got $y_close_count, want 1)"
+[ "${y_esc_n:-0}" = 0 ] && ok "Y: R6 — never actually escalates on an uncertain receipt (the audit trail stays honest)" \
+  || bad "Y: R6 model_escalated should be 0 (got $y_esc_n)"
+[ "${y_failed_n:-0}" = 4 ] && ok "Y: R6 — all 4 independent re-entries (1 retry-within-call + 3 later ticks) each record their own hook-failed audit event" \
+  || bad "Y: R6 model_escalation_hook_failed count (got $y_failed_n, want 4)"
+[ "$y_state" = blocked ] && ok "Y: R6 — the original task is explicitly marked blocked/held, not silently left running with zero known owners" \
+  || bad "Y: R6 task state (got [$y_state], want blocked)"
+
+# =============================================================== case Z ===
+# R7 (conductor, blocking — concurrent-write-attempt proof, timeout +
+# recovery legs): a quiesce TIMEOUT — the close command genuinely runs,
+# but the old pane refuses to go away even after the full poll bound
+# (HERDR_ESCALATION_QUIESCE_POLLS) — must NEVER reach spawn at all: no
+# second writer is ever given a chance to exist alongside a writer we
+# cannot confirm is gone. Recovery, once the old writer actually does
+# quiesce (a later, separate tick), still succeeds exactly once.
+RUN=taskZ; TASK=taskZ; PANE=pane-Z; BRANCH=esc-test-z
+seed_task "$TASK" "$PANE" "$BRANCH"
+printf '100' > "$PANES_DIR/$PANE.lag"   # never actually exhausts within this case -> the close hook's own "no .lag -> clear .alive" shortcut never fires, so the pane genuinely never reports dead
+: >"$ORDER_LOG"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpZ --context-dir "$CTX" >/dev/null
+done
+z_spawn_count="$(grep -c -- 'spawn implement esc-test-z' "$ORDER_LOG" 2>/dev/null)"
+z_close_count="$(grep -c -- 'close pane-Z' "$ORDER_LOG" 2>/dev/null)"
+z_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+z_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+[ "${z_spawn_count:-0}" = 0 ] && ok "Z: a quiesce TIMEOUT (the pane genuinely never goes away, even after the full poll bound) never reaches spawn at all" \
+  || bad "Z: spawn count during quiesce timeout (got $z_spawn_count, want 0)"
+[ "${z_close_count:-0}" -ge 1 ] && ok "Z: the close WAS attempted (quiesce does not skip it) — it just never confirms gone" \
+  || bad "Z: close attempted during timeout (got $z_close_count)"
+[ "${z_esc_n:-0}" = 0 ] && ok "Z: no model_escalated while the old writer refuses to quiesce" \
+  || bad "Z: model_escalated should be 0 during timeout (got $z_esc_n)"
+[ "${z_failed_n:-0}" -ge 1 ] && ok "Z: hook failure recorded for the quiesce timeout" \
+  || bad "Z: model_escalation_hook_failed recorded for timeout"
+_esc_pane_alive "$PANE" && ok "Z: the old pane genuinely still shows alive — the close never actually took effect" \
+  || bad "Z: old pane should still report alive after a timed-out quiesce"
+rm -f "$PANES_DIR/$PANE.alive" "$PANES_DIR/$PANE.lag"   # it finally goes away on its own
+bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpZ --context-dir "$CTX" >/dev/null
+z_esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
+[ "${z_esc_n2:-0}" = 1 ] && ok "Z: once the old writer actually quiesces, a later retry succeeds exactly once" \
+  || bad "Z: recovery after a quiesce timeout (got $z_esc_n2)"
+
+# ============================================================== case AA ===
+# R7 (conductor addition, blocking): a nonzero exit from the spawn command
+# does NOT by itself prove no side effect occurred — the fake hook here
+# genuinely creates a real, distinct task row (exactly like a successful
+# spawn) and THEN dies (simulating a kill/timeout/late failure) without
+# ever printing a receipt OR a documented no-effect marker. Must stay
+# UNCERTAIN: no retry (within this call, across a later tick, or across a
+# simulated restart), the task marked blocked, with the exact journal
+# table/key recorded for reconciliation (fix #3). Must FAIL against
+# 827d6c1, which treated ANY nonzero exit as confirmed-safe-to-retry.
+RUN=taskAA; TASK=taskAA; PANE=pane-AA; BRANCH=esc-test-aa
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-kill-after-effect"
+for i in 1 2 3; do                       # ticks 1-2 fill the window; tick 3 triggers (retry-within-call)
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpAA --context-dir "$CTX" >/dev/null
+done
+for i in 1 2 3; do                       # 3 MORE fully separate processes: later ticks + simulated restart
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpAA --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-kill-after-effect"
+aa_spawn_count="$(grep -c -- 'spawn implement esc-test-aa' "$ORDER_LOG" 2>/dev/null)"
+aa_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label=$(_sq "implement:$BRANCH");" 2>/dev/null)"
+aa_close_count="$(grep -c -- 'close pane-AA' "$ORDER_LOG" 2>/dev/null)"
+aa_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+aa_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+aa_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+[ "${aa_spawn_count:-0}" = 1 ] && ok "AA: R7 — a nonzero exit AFTER a real side effect never triggers a second real spawn attempt" \
+  || bad "AA: R7 spawn count (got $aa_spawn_count, want 1 — a nonzero exit alone is not proof of no side effect)"
+[ "${aa_rows:-0}" = 1 ] && ok "AA: R7 — exactly one successor row exists, not a reattempted pile" \
+  || bad "AA: R7 successor row count (got $aa_rows, want 1)"
+[ "${aa_close_count:-0}" = 1 ] && ok "AA: the old writer is still closed normally — quiesce runs before any spawn is ever attempted" \
+  || bad "AA: R7 close count (got $aa_close_count, want 1)"
+[ "${aa_esc_n:-0}" = 0 ] && ok "AA: R7 — never actually escalates on an uncertain outcome" \
+  || bad "AA: R7 model_escalated should be 0 (got $aa_esc_n)"
+[ "$aa_state" = blocked ] && ok "AA: R7 — the task is explicitly marked blocked/held" \
+  || bad "AA: R7 task state (got [$aa_state], want blocked)"
+[ "$aa_journal" = in_flight ] && ok "AA: R7 — the journal stays in_flight (uncertain) permanently, never cleared by a bare nonzero exit" \
+  || bad "AA: R7 journal state (got [$aa_journal], want in_flight)"
+aa_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+aa_jtbl="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+aa_jkey_tier="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+[ "$aa_jtbl" = escalation_spawn_journal ] && [ "$aa_jkey_tier" = standard ] && ok "AA: R7 fix 3 — the blocked event records the exact journal table/key for reconciliation, not just a free-text reason" \
+  || bad "AA: R7 discoverability fields (journal_table=[$aa_jtbl] journal_key.to_tier=[$aa_jkey_tier])"
+
+# ============================================================== case BB ===
+# R8 (conductor, blocking, root-audit of R7/2c58dd2): the real
+# production caller (hub.py's background _stall_watchdog_loop thread)
+# has NO herdr-pane ancestry at all, so spawn-task.sh's own
+# caller_pane_from_ancestry gate deterministically refuses every
+# automated spawn — and until R8, that refusal was discovered only
+# AFTER the old writer was already quiesced, leaving the task looking
+# `running` with zero real owners. This case runs the REAL, unmodified
+# gate (lib/pane-guard.sh's caller_pane_from_ancestry +
+# pane_is_conductor_eligible — no HERDR_ESC_AUTHORITY_CMD override; no
+# HERDR_ESC_SPAWN_CMD override either, since spawn-task.sh must never
+# even be reached) from a process with no herdr-pane ancestry (this
+# test runner itself, genuinely — the same structural fact the review
+# verified by reading hub.py/lib/pane-guard.sh directly), and proves
+# the old writer's pane is left untouched (never quiesced, never
+# closed) and the task ends up explicitly `blocked`. Must FAIL against
+# 2c58dd2 (R7), which has no pre-flight check at all: it would instead
+# quiesce first and leave the task silently `running`.
+#
+# Safety: `herdr` is shadowed on PATH for this case too (own isolated
+# shadow dir + violation log, separate from the suite-wide one case R
+# checks) — this never touches the real live herdr/hub, same offline
+# guarantee as the rest of the suite; it only proves the REAL gate
+# function genuinely attempted the call and failed closed, which is
+# the production-accurate outcome either way (no live herdr session
+# reachable from an unattended background caller).
+RUN=taskBB; TASK=taskBB; PANE=pane-BB; BRANCH=esc-test-bb
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+BB_SHADOW="$WORK/shadow-bin-bb"; mkdir -p "$BB_SHADOW"
+rm -f "$WORK/herdr-violation-bb"
+cat >"$BB_SHADOW/herdr" <<SH
+#!/usr/bin/env bash
+printf 'herdr called: %s\\n' "\$*" >> "$WORK/herdr-violation-bb"
+exit 1
+SH
+chmod +x "$BB_SHADOW/herdr"
+for i in 1 2 3; do
+  ( unset HERDR_ESC_SPAWN_CMD HERDR_ESC_AUTHORITY_CMD
+    # config.sh (sourced fresh inside $CLI's own process) unconditionally
+    # rebuilds PATH as "$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}" —
+    # a plain `export PATH="$BB_SHADOW:$PATH"` here gets its shadow
+    # demoted behind config.sh's own $HERDR_EXTRA_PATH default
+    # (/opt/homebrew/bin, where herdr actually lives), silently letting
+    # the REAL herdr through. Overriding HERDR_EXTRA_PATH itself is the
+    # only override config.sh's rebuild actually honors.
+    export HERDR_EXTRA_PATH="$BB_SHADOW"
+    bash "$CLI" tick "$RUN" "$TASK" --commit-sha "$HEAD_SHA" --artifact-fp fpBB --context-dir "$CTX" >/dev/null )
+done
+bb_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+bb_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+bb_reason="$(printf '%s' "$bb_detail" | jq -r '.detail.reason // empty' 2>/dev/null)"
+bb_jtbl="$(printf '%s' "$bb_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+bb_jkey_tier="$(printf '%s' "$bb_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+bb_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+bb_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH");" 2>/dev/null)"
+bb_close_count="$(grep -c -- 'close pane-BB' "$ORDER_LOG" 2>/dev/null)"
+[ "$bb_state" = blocked ] && ok "BB: R8 — no admissible launch authority marks the task blocked explicitly" \
+  || bad "BB: R8 task state (got [$bb_state], want blocked)"
+[ "$bb_reason" = no_launch_authority ] && ok "BB: R8 — blocked reason is the specific, discoverable no_launch_authority" \
+  || bad "BB: R8 blocked reason (got [$bb_reason], want no_launch_authority)"
+[ "$bb_jtbl" = escalation_spawn_journal ] && [ "$bb_jkey_tier" = standard ] && ok "BB: R8 — the blocked event still records the journal table/key for reconciliation" \
+  || bad "BB: R8 discoverability fields (journal_table=[$bb_jtbl] journal_key.to_tier=[$bb_jkey_tier])"
+[ -z "$bb_journal" ] && ok "BB: R8 — the spawn journal was never claimed; the gate refused before _esc_journal_claim" \
+  || bad "BB: R8 journal row should not exist (got [$bb_journal])"
+[ "${bb_rows:-0}" = 1 ] && ok "BB: R8 — no successor row was ever created (spawn-task.sh never reached)" \
+  || bad "BB: R8 tasks-for-branch count (got $bb_rows, want 1 — the original only)"
+[ "${bb_close_count:-0}" = 0 ] && ok "BB: R8 — the old writer's pane was NEVER closed (quiesce never reached)" \
+  || bad "BB: R8 close count (got $bb_close_count, want 0)"
+[ -f "$PANES_DIR/$PANE.alive" ] && ok "BB: R8 — the old writer's pane is still alive/intact after refusal" \
+  || bad "BB: R8 old writer pane should still be alive"
+[ -s "$WORK/herdr-violation-bb" ] && ok "BB: R8 — the REAL caller_pane_from_ancestry genuinely ran (isolated herdr-call proof, not a reimplementation returning a canned answer)" \
+  || bad "BB: R8 the real gate never attempted a herdr call at all — suspicious, re-check the override is actually unset"
 
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \
   || bad "R: real herdr was invoked: $(cat "$WORK/herdr-violation" 2>/dev/null)"
+# R7 (conductor, blocking): checked ONCE across the WHOLE suite — every
+# scenario in every case above (success, lost-receipt, timeout, kill-
+# after-effect, recovery) ran through fake-spawn.sh's own write-authority
+# check (see its own comment). Any violation anywhere fails the run.
+[ ! -s "$WORK/concurrent-write-violations.log" ] && ok "R: no concurrent-write violation anywhere in the whole suite — at most one writer ever had a chance to write" \
+  || bad "R: concurrent write violation(s): $(cat "$WORK/concurrent-write-violations.log" 2>/dev/null)"
 printf '%s passed, %s failed\n' "$pass" "$fail"
 # WORK lives under tmp/ (gitignored) — left in place rather than recursively
 # removed; rerunning resets the registry/order-log/pane state it depends on.
