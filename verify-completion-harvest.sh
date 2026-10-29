@@ -58,6 +58,24 @@ export -f herdr
 SEND_STUB="$WORK/send-stub.sh"
 cat > "$SEND_STUB" <<'EOF'
 #!/usr/bin/env bash
+# Review REVIEW-HARVEST-6a20224: two armed, one-shot failure modes a test
+# can drop a marker file for, consumed on use so the NEXT call (the real
+# watchdog's own M3 retry) sees normal behavior again -- lets a test
+# prove "a failed send still gets retried with the note intact" and "an
+# unconfirmed (typed) send is never retried at all" against the REAL
+# cmd_wake retry gate, not a mock of it.
+if [ -e "$WORK/fail_once_marker" ]; then
+  rm -f "$WORK/fail_once_marker"
+  echo "simulated transient send failure" >&2
+  exit 7
+fi
+if [ -e "$WORK/exit4_once_marker" ]; then
+  rm -f "$WORK/exit4_once_marker"
+  printf 'send-text %s\n' "$1" >> "$SENT"
+  printf '%s\n' "$3" >> "$WORK/last-msg.txt"
+  echo "unsubmitted"
+  exit 4
+fi
 printf 'send-text %s\n' "$1" >> "$SENT"
 printf '%s\n' "$3" >> "$WORK/last-msg.txt"
 echo "delivered"
@@ -232,6 +250,52 @@ n_receipt10=$(( $(_q "SELECT count(*) FROM events WHERE task_id='taskL1' AND typ
                + $(_q "SELECT count(*) FROM events WHERE task_id='taskL2' AND type='completion_receipt';") ))
 [ "$n_receipt10" = "2" ] && ok "10: both completions are still independently, durably receipted regardless of who won the dispatch race" \
   || bad "10: expected 2 total completion_receipt rows across taskL1+taskL2, got $n_receipt10"
+
+echo "== 11 (REVIEW-HARVEST-6a20224 HIGH): a send that fails outright leaves the successor re-dispatchable on retry =="
+register_task runM taskM workerM condM "$COND" "$CONDB" paneM paneMbirth repo/m "$WORK/wtM" labelM >/dev/null
+mkdir -p "$WORK/wtM/tmp"
+printf 'a completion whose first delivery attempt fails\n' > "$WORK/wtM/tmp/commit-msg.txt"
+assign_lane taskM laneFail >/dev/null
+queue_successor laneFail "spawn implement on herdr-control feat/after-retry" conductor >/dev/null
+: > "$SENT"; : > "$WORK/last-msg.txt"
+: > "$WORK/fail_once_marker"
+bash "$here/stall-watchdog.sh" wake taskM artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+n_sent11a=$(grep -c "send-text $COND" "$SENT" || true)
+[ "$n_sent11a" = "0" ] && ok "11: the first attempt's send genuinely failed -- nothing recorded as sent" \
+  || bad "11: expected 0 sends after the armed failure, got $n_sent11a"
+n_dispatch11a=$(successor_dispatch_count laneFail)
+[ "$n_dispatch11a" = "1" ] && ok "11: the dispatch claim is won on the FIRST attempt regardless of whether delivery succeeded" \
+  || bad "11: expected the claim already taken after attempt 1, got $n_dispatch11a"
+bash "$here/stall-watchdog.sh" wake taskM artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+n_dispatch11b=$(successor_dispatch_count laneFail)
+[ "$n_dispatch11b" = "1" ] && ok "11: the retry does NOT take a second claim -- still exactly one dispatch for laneFail" \
+  || bad "11: expected the claim count to stay at 1 across the retry, got $n_dispatch11b"
+grep -q "Pre-planned next (lane laneFail): spawn implement on herdr-control feat/after-retry" "$WORK/last-msg.txt" \
+  && ok "11: the retry's actually-delivered message still carries the successor note -- not silently dropped by the earlier failure" \
+  || bad "11: the successor note was lost on retry: $(cat "$WORK/last-msg.txt" 2>/dev/null)"
+n_sent11b=$(grep -c "send-text $COND" "$SENT" || true)
+[ "$n_sent11b" = "1" ] && ok "11: exactly one real delivery total -- the failed first attempt never counted as a send" \
+  || bad "11: expected exactly 1 send across both attempts, got $n_sent11b"
+
+echo "== 12 (REVIEW-HARVEST-6a20224): an uncertain (exit 4, typed-but-unsubmitted) send must never double-dispatch =="
+register_task runN taskN workerN condN "$COND" "$CONDB" paneN paneNbirth repo/n "$WORK/wtN" labelN >/dev/null
+mkdir -p "$WORK/wtN/tmp"
+printf 'a completion whose first delivery attempt is unconfirmed\n' > "$WORK/wtN/tmp/commit-msg.txt"
+assign_lane taskN laneUncertain >/dev/null
+queue_successor laneUncertain "spawn review on herdr-control feat/uncertain" conductor >/dev/null
+: > "$SENT"; : > "$WORK/last-msg.txt"
+: > "$WORK/exit4_once_marker"
+bash "$here/stall-watchdog.sh" wake taskN artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+grep -q "Pre-planned next (lane laneUncertain)" "$WORK/last-msg.txt" \
+  && ok "12: the one (uncertain) attempt did legitimately carry the note" \
+  || bad "12: expected the first, typed-but-unsubmitted attempt to carry the note: $(cat "$WORK/last-msg.txt" 2>/dev/null)"
+bash "$here/stall-watchdog.sh" wake taskN artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+n_sent12=$(grep -c "send-text $COND" "$SENT" || true)
+[ "$n_sent12" = "1" ] && ok "12: N4's own gate (already typed, never confirmed) blocks the retry entirely -- no second send attempted" \
+  || bad "12: expected exactly 1 send (no retry once typed), got $n_sent12"
+n_dispatch12=$(successor_dispatch_count laneUncertain)
+[ "$n_dispatch12" = "1" ] && ok "12: exactly one dispatch claim -- an uncertain send never burns a second claim nor needs to" \
+  || bad "12: expected exactly 1 successor_dispatched row for laneUncertain, got $n_dispatch12"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -85,18 +85,28 @@ already provide):
    assigned lane has, by construction, no queued successor; nothing here
    invents a lane for an unassigned task.
 5. **Successor dispatch claim** — `type=successor_dispatched`, `event_id =
-   dispatch_successor_<lane>_<sha of the successor content>`,
+   dispatch_successor_<lane>_<sha of the successor content>`, its
+   `task_id` column (not just payload) set to the winning task —
    `claim_once`-backed: "one writer per scope" (the scope being the
    lane), the same guarantee the resident-redemption token's atomic
-   consume relies on. Written the FIRST time a specific successor's
-   content is actually about to be handed to a live, reachable owner —
-   never on a merely-detected completion. A second, duplicate harvest of
-   the SAME completion (a wake retry, a restart, or — the race this
-   directly proves — two different tasks in the same lane completing in
-   quick succession) finds the claim already taken and is a no-op: the
-   successor note is included in the FIRST qualifying wake only, never a
-   second time. Replanning the lane (a genuinely different `next` string)
-   is a different event_id and dispatches again.
+   consume relies on. This is WHO gets to announce a given successor's
+   content, decided once and permanently — it is explicitly NOT a
+   delivery receipt (fixed post-review, REVIEW-HARVEST-6a20224 HIGH: an
+   earlier version folded "claim the right to announce" and "this attempt
+   delivered" into the same one-shot write, so a transient send failure
+   silently and permanently dropped the note on retry). `dispatch_
+   successor_owner(lane, next)` is the read-only complement: on every
+   wake attempt, a task checks who (if anyone) already owns the claim for
+   its lane's exact successor content — empty means try to win it; its
+   own task_id (an earlier attempt for this SAME wake already won it, but
+   maybe failed to deliver) means re-assert the note with zero new
+   writes; someone else's means stay silent, also zero new writes. A
+   duplicate harvest of the same completion (a wake retry, a restart, or
+   — the race this directly proves — two different tasks in the same
+   lane completing in quick succession) still produces exactly one claim
+   total; the note is included in every delivery attempt made by the
+   winning task, never by anyone else. Replanning the lane (a genuinely
+   different `next` string) is a different event_id and dispatches again.
 
 ### Wake integration (the only code-flow change, confined to `cmd_wake`)
 
@@ -115,10 +125,23 @@ alone):
    conductor pane, so a successor is never silently burned on a wake
    nobody received): look up the task's lane (`read_lane_for_task`); if
    assigned and not held, look up its queued successor
-   (`lane_successor_admits`). If one is found, claim the dispatch
-   (`dispatch_successor_once`) and, ONLY on a fresh claim, append it to
-   the SAME wake message as an extra line: `Pre-planned next (lane L):
-   <next>`. Nothing new is sent, delivered, or dispatched beyond the
+   (`lane_successor_admits`). Check who owns the dispatch claim for that
+   exact (lane, successor-content) pair (`dispatch_successor_owner`): if
+   nobody, try to win it (`dispatch_successor_once`); if it's already
+   this task (e.g. a prior attempt for the SAME wake failed to deliver
+   and this is the base wake's own M3 retry), re-assert with no new
+   write; if it's someone else, stay silent. Either way, append the note
+   to the SAME wake message as an extra line — `Pre-planned next (lane
+   L): <next>` — iff this task owns the claim. Because ownership is
+   checked fresh on every call rather than gating inclusion on "did THIS
+   specific attempt just win," a send that fails outright (nothing
+   delivered, nothing typed) does not lose the note: the base wake's own
+   retry (`_sw_wake_confirmed`/`_sw_wake_typed`) tries again, and the
+   owning task re-includes the note on that retry too, until delivery
+   confirms or the base wake's own N4 typed-gate stops retrying (an
+   unconfirmed-but-typed send is never retried at all, so it can never
+   double-dispatch either — there is no second attempt to double it
+   with). Nothing new is sent, delivered, or dispatched beyond the
    EXISTING `_sw_send_and_record` call, reused unchanged, carrying a
    longer string, to the SAME owner already resolved for this task. No
    new authority is exercised: the conductor still reads the wake and

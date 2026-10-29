@@ -96,18 +96,30 @@ _sw_digest() {                          # <text> -> short stable digest
 #      gated on a live, identity-matched conductor pane — never computed,
 #      let alone claimed, for an unreachable/dead owner, so a successor is
 #      never silently burned on a wake nobody received) — if the task's
-#      lane has a pre-planned successor and is not held, CLAIMS the
-#      dispatch exactly once per distinct successor content
-#      (dispatch_successor_once: "one writer per scope", the scope being
-#      the lane) and, only on a FRESH claim, folds it into the SAME
-#      message cmd_wake already sends. A duplicate harvest of the same
-#      completion (a wake retry, a restart) finds the claim already taken
-#      and omits the note the second time — exactly one dispatch per
-#      successor, never a repeated hand-off. Never a new send, never a
-#      spawn, never new authority: the successor is a string folded into
-#      the EXISTING wake to the EXISTING owner, nothing more. A task with
-#      no assigned lane, no queued successor, or an already-dispatched one
-#      degrades to exactly today's bare wake text.
+#      lane has a pre-planned successor and is not held, checks WHO (if
+#      anyone) already holds the dispatch claim for that exact lane +
+#      successor-content pair (dispatch_successor_owner): empty -> tries
+#      to WIN it (dispatch_successor_once, "one writer per scope", the
+#      scope being the lane); already ours (e.g. an earlier attempt for
+#      this SAME wake failed to deliver and this is the M3 retry) ->
+#      re-asserts it, no new write; someone else's -> silent. Either way
+#      the note is folded in iff we own the claim — review REVIEW-HARVEST-
+#      6a20224 HIGH: the claim is WHO gets to announce the successor,
+#      decided once, but whether THIS delivery attempt's message includes
+#      the note is re-derived from that fact every call, so a failed send
+#      (nothing delivered, nothing typed) never silently drops the note on
+#      its own retry — it just keeps riding along with the base wake's
+#      message, same as everything else in it, until delivery confirms or
+#      the base wake's own N4 typed-gate stops retrying. A duplicate
+#      harvest of the same completion by a DIFFERENT task racing the same
+#      lane still gets exactly one winner and omits the note on the loser
+#      — exactly one dispatch per successor, never a repeated hand-off
+#      across two different owners. Never a new send, never a spawn,
+#      never new authority: the successor is a string folded into the
+#      EXISTING wake to the EXISTING owner, nothing more. A task with no
+#      assigned lane, no queued successor, or a successor someone else
+#      already owns the dispatch for degrades to exactly today's bare
+#      wake text.
 _sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
   local path="$1/$2"
   [ -f "$path" ] || return 1
@@ -128,8 +140,20 @@ _sw_record_receipt() {                  # task_id signal artifact worktree
     [ -n "$sha" ] && record_completion_receipt "$task_id" "$artifact" "$sha" >/dev/null 2>&1
   fi
 }
+# Review REVIEW-HARVEST-6a20224 HIGH: the dispatch claim is the RIGHT to
+# announce a successor, decided once -- but whether THIS attempt's
+# message includes the note is re-derived from that permanent fact on
+# EVERY call, so a failed send's retry (same task, same key, called
+# again by cmd_wake's own M3 retry loop) still carries the note instead
+# of silently losing it. Owner-empty: try to win the claim. Owner==us
+# (we already won it, possibly on an earlier failed attempt for this
+# same wake): re-assert, no new write. Owner==someone else: silent, no
+# write attempted -- this is what keeps two tasks racing the same lane's
+# successor to exactly one dispatch and prevents a retry from ever
+# claiming twice (successor_dispatch_count stays at 1 regardless of how
+# many times this function is called for the winning task).
 _sw_successor_note() {                  # task_id signal conductor -> prints "Pre-planned next: ..." or nothing
-  local task_id="$1" signal="$2" conductor="$3" lane succ
+  local task_id="$1" signal="$2" conductor="$3" lane succ owner
   case "$signal" in
     artifact|handoff) ;;
     *) return 0 ;;
@@ -137,8 +161,12 @@ _sw_successor_note() {                  # task_id signal conductor -> prints "Pr
   lane="$(read_lane_for_task "$task_id" 2>/dev/null)" || return 0
   succ="$(lane_successor_admits "$lane" 2>/dev/null)" || return 0
   [ -n "$succ" ] || return 0
-  dispatch_successor_once "$lane" "$succ" "$conductor" >/dev/null 2>&1 \
-    && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
+  owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  if [ -z "$owner" ]; then
+    dispatch_successor_once "$lane" "$succ" "$task_id" "$conductor" >/dev/null 2>&1
+    owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  fi
+  [ "$owner" = "$task_id" ] && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
 }
 
 _sw_escalate_window_s() {

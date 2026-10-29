@@ -2085,27 +2085,50 @@ lane_successor_admits() {
   printf '%s\n' "$next"
 }
 
-# dispatch_successor_once <lane> <next> <dispatched_to> -> 0 the FIRST
-# time THIS EXACT successor content is dispatched for <lane> (claim_once
-# on event_id=dispatch_successor_<lane>_<sha256 of next>, scoped entirely
-# by the lane key the same way hold/release are -- "one writer per
-# scope": claim_once's underlying UNIQUE(event_id) constraint is what
-# makes two concurrent/duplicate harvest passes for the SAME completion
-# agree on exactly one winner, same guarantee the resident-redemption
-# token's atomic consume relies on). A duplicate harvest (same completion
-# re-detected, e.g. a wake retry or a restart) calling this again for the
-# identical content is a no-op (rc 1) -- the caller uses that to suppress
-# a second "Pre-planned next" line, not to send a second handoff. If the
-# lane is later replanned (a genuinely different `next`), that is a
-# different event_id and dispatches again, same "a changed fingerprint
-# re-arms" shape this whole feature already uses twice over (completion
-# receipts, stall-watchdog's own wake dedup).
+# dispatch_successor_once <lane> <next> <task_id> <dispatched_to> -> 0 the
+# FIRST time THIS EXACT successor content is dispatched for <lane>
+# (claim_once on event_id=dispatch_successor_<lane>_<sha256 of next>,
+# scoped entirely by the lane key the same way hold/release are -- "one
+# writer per scope": claim_once's underlying UNIQUE(event_id) constraint
+# is what makes two concurrent/duplicate harvest passes for the SAME
+# completion agree on exactly one winner, same guarantee the resident-
+# redemption token's atomic consume relies on). Review REVIEW-HARVEST-
+# 6a20224 HIGH: this claim is the RIGHT to announce the successor, never
+# a delivery receipt -- the caller (stall-watchdog.sh's _sw_successor_note)
+# calls this only when nobody owns it yet, then re-asserts ownership via
+# dispatch_successor_owner on every retry of the SAME task's wake, so a
+# failed send never silently drops the note: the claim who-won is
+# permanent, but INCLUDING the note in a message is re-decided every
+# attempt from that permanent fact, exactly like the base wake's own
+# retry-until-_sw_wake_confirmed already works. <task_id> is stored as
+# the claim row's real `task_id` column (not just payload) specifically
+# so dispatch_successor_owner can read it back. If the lane is later
+# replanned (a genuinely different `next`), that is a different event_id
+# and dispatches again, same "a changed fingerprint re-arms" shape this
+# whole feature already uses twice over (completion receipts,
+# stall-watchdog's own wake dedup).
 dispatch_successor_once() {
-  local lane="$1" next="$2" dispatched_to="${3:-}" sha
+  local lane="$1" next="$2" task_id="$3" dispatched_to="${4:-}" sha
+  [ -n "$lane" ] && [ -n "$next" ] && [ -n "$task_id" ] || return 1
+  sha="$(_sw_sha "$next")"
+  claim_once "dispatch_successor_${lane}_${sha}" "" "$task_id" successor_dispatched \
+    "$(jq -nc --arg l "$lane" --arg n "$next" --arg t "$task_id" --arg d "$dispatched_to" \
+       '{lane:$l, next:$n, task_id:$t, dispatched_to:$d}')"
+}
+
+# dispatch_successor_owner <lane> <next> -> the task_id that holds the
+# dispatch claim for this exact (lane, successor-content) pair, or empty
+# if nobody has claimed it yet. Read-only, never writes -- the retry-safe
+# complement to dispatch_successor_once: a task re-checks this on every
+# wake attempt rather than re-calling the one-shot claim, so its OWN
+# retries keep including the note (claim already won) while a DIFFERENT
+# task racing the same lane correctly sees someone else's task_id and
+# stays silent, with zero new writes either way.
+dispatch_successor_owner() {
+  local lane="$1" next="$2" sha
   [ -n "$lane" ] && [ -n "$next" ] || return 1
   sha="$(_sw_sha "$next")"
-  claim_once "dispatch_successor_${lane}_${sha}" "" "" successor_dispatched \
-    "$(jq -nc --arg l "$lane" --arg n "$next" --arg d "$dispatched_to" '{lane:$l, next:$n, dispatched_to:$d}')"
+  _sql "SELECT task_id FROM events WHERE event_id=$(_sq "dispatch_successor_${lane}_${sha}") LIMIT 1;" 2>/dev/null
 }
 
 # successor_dispatch_count <lane> -> integer count of distinct successor_
