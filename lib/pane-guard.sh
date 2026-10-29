@@ -69,8 +69,37 @@ EOF
   return 1
 }
 
+# pane_is_agent (and pane_birth_now below) are deliberately fail-CLOSED
+# two-state booleans for their own callers (send-to-agent.sh etc.): "herdr
+# itself could not answer" and "herdr answered and this pane is not an
+# agent" both mean "refuse to send input here", which is the safe direction
+# for a function whose whole job is deciding what may RECEIVE input.
+#
+# A caller deciding whether to MARK something dead (mark-launch-failed.sh)
+# needs the opposite failure direction: "don't know" must NOT read the same
+# as "confirmed dead", or a herdr hiccup buries a live worker (security
+# review, fix/launch-receipt-r2 round 2, 335f458: mark-launch-failed.sh and
+# require_agent_pane's refusal MESSAGE both collapsed "herdr errored" into
+# "pane is gone" / "not running an agent"). This is the shared primitive
+# both call sites use to tell the two apart before trusting either verdict:
+# 0 = herdr answered with well-formed JSON (the verdict, whatever it is, is
+# trustworthy); 1 = herdr itself failed or returned something unparseable
+# (the verdict, if any, is NOT trustworthy — treat as unknown, never as
+# "confirmed not an agent").
+pane_process_info_ok() {
+  local info
+  info=$(herdr pane process-info --pane "$1" 2>/dev/null) || return 1
+  [ -n "$info" ] || return 1
+  printf '%s' "$info" | jq -e . >/dev/null 2>&1 || return 1
+  return 0
+}
+
 require_agent_pane() {
   pane_is_agent "$1" && return 0
+  if ! pane_process_info_ok "$1"; then
+    echo "herdr: refusing to send input to '$1' — herdr unavailable (could not confirm what is running there)." >&2
+    return 1
+  fi
   echo "herdr: refusing to send input to '$1' — it is not running an agent." >&2
   echo "herdr: input sent to a shell pane executes as a command." >&2
   return 1

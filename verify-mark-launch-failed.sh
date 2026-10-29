@@ -27,9 +27,14 @@ _q() { sqlite3 -noheader "$DB" "$1" 2>/dev/null; }
 # PANES / FG_PID (space-separated "pane:birth" pairs / pid) drive what
 # `pane list` / `pane process-info` report, so each scenario below controls
 # exactly what mark-launch-failed.sh's own deadness re-check sees.
+# HERDR_DOWN=1 / PI_DOWN=1 make `pane list` / `pane process-info`
+# respectively FAIL (nonzero exit, as a down/unreachable herdr daemon
+# would) rather than answer — security review, fix/launch-receipt-r2 round
+# 2, 335f458: this must refuse as UNKNOWN, never read as "confirmed dead".
 herdr() {
   case "$1 $2" in
     "pane list")
+      [ "${HERDR_DOWN:-0}" = 1 ] && return 1
       printf '{"result":{"panes":['
       local first=1 pb
       for pb in ${PANES:-}; do
@@ -39,6 +44,7 @@ herdr() {
       done
       printf ']}}\n' ;;
     "pane process-info")
+      [ "${PI_DOWN:-0}" = 1 ] && return 1
       local target=""; local i
       for ((i=1; i<=$#; i++)); do [ "${!i}" = "--pane" ] && { j=$((i+1)); target="${!j}"; }; done
       if [ "$target" = "${AGENT_PANE:-}" ]; then
@@ -52,7 +58,8 @@ herdr() {
 export -f herdr
 
 run() {  # run <run_id> <task_id> [args...]
-  env PANES="${PANES:-}" AGENT_PANE="${AGENT_PANE:-}" HERDR_RUN_STATE_DIR="$HERDR_RUN_STATE_DIR" \
+  env PANES="${PANES:-}" AGENT_PANE="${AGENT_PANE:-}" HERDR_DOWN="${HERDR_DOWN:-0}" PI_DOWN="${PI_DOWN:-0}" \
+    HERDR_RUN_STATE_DIR="$HERDR_RUN_STATE_DIR" \
     PATH="$PATH" bash "$here/mark-launch-failed.sh" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"
 }
 reg() {  # reg <task_id> <pane_id> <pane_birth> <worktree> <branch> [created_at_offset_seconds]
@@ -125,6 +132,28 @@ run r1 t-shell; rc=$?
 [ "$(state_of t-shell)" = "launch_failed" ] && ok "state=launch_failed" || bad "state=$(state_of t-shell)"
 printf '%s' "$(last_event t-shell)" | jq -e '.dead_evidence | contains("bare shell")' >/dev/null 2>&1 \
   && ok "event names the pane as a bare shell" || bad "event: $(last_event t-shell)"
+
+printf '== herdr itself unreachable (pane list fails): refused as UNKNOWN, state untouched, no event — never read as confirmed dead ==\n'
+reg t-herdr-down pDown birthDown /wt/down br-down
+set_task_state r1 t-herdr-down running >/dev/null
+PANES="" AGENT_PANE="" HERDR_DOWN=1
+run r1 t-herdr-down; rc=$?
+HERDR_DOWN=0
+[ "$rc" = 1 ] && ok "exit 1" || bad "exit $rc: $(cat "$WORK/out.txt") $(cat "$WORK/err.txt")"
+grep -qi 'herdr unavailable' "$WORK/err.txt" && ok "names herdr as unavailable, not the pane as dead" || bad "stderr: $(cat "$WORK/err.txt")"
+[ "$(state_of t-herdr-down)" = "running" ] && ok "state untouched (still running)" || bad "state=$(state_of t-herdr-down)"
+[ -z "$(last_event t-herdr-down)" ] && ok "no launch_failed_marked event recorded" || bad "event: $(last_event t-herdr-down)"
+
+printf '== pane confirmed present and un-recycled, but process-info itself fails: refused as UNKNOWN, state untouched — the herdr-degraded-mid-check shape ==\n'
+reg t-pi-down pPiDown birthPiDown /wt/pidown br-pidown
+set_task_state r1 t-pi-down running >/dev/null
+PANES="pPiDown:birthPiDown" AGENT_PANE="" PI_DOWN=1
+run r1 t-pi-down; rc=$?
+PI_DOWN=0
+[ "$rc" = 1 ] && ok "exit 1" || bad "exit $rc: $(cat "$WORK/out.txt") $(cat "$WORK/err.txt")"
+grep -qi 'herdr unavailable' "$WORK/err.txt" && ok "names herdr as unavailable, not the pane as a bare shell" || bad "stderr: $(cat "$WORK/err.txt")"
+[ "$(state_of t-pi-down)" = "running" ] && ok "state untouched (still running)" || bad "state=$(state_of t-pi-down)"
+[ -z "$(last_event t-pi-down)" ] && ok "no launch_failed_marked event recorded" || bad "event: $(last_event t-pi-down)"
 
 printf '== --superseded-by a REAL newer same-worktree/branch task: marked launch_failed, disposition=superseded ==\n'
 reg t-old-1 pOld1 birthOld1 /wt/super br-super

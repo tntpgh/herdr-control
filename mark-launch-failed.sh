@@ -25,18 +25,28 @@
 #
 # DEADNESS IS RE-VERIFIED, NEVER TAKEN ON THE CALLER'S SAY-SO (same
 # fail-closed shape as every other registry writer in this repo): the task's
-# OWN registered pane must show one of —
-#   - gone entirely (pane_birth_now returns empty),
+# OWN registered pane must show a herdr-CONFIRMED answer of one of —
+#   - gone entirely (pane_birth_now succeeds and returns empty),
 #   - recycled (live terminal_id != the pane_birth recorded at registration),
-#   - or alive but NOT running a recognized agent (pane_is_agent, lib/
-#     pane-guard.sh — a bare shell).
+#   - or alive but NOT running a recognized agent (pane_process_info_ok
+#     succeeds, then pane_is_agent says no — lib/pane-guard.sh, a bare shell).
 # A pane that IS live and running an agent refuses outright: this command
 # marks a DEAD task dead, never a live one — use the normal completion path
 # (set_task_state … completed) for that.
 #
+# A herdr CLI error or unparseable JSON is NEVER treated as evidence of
+# death (security review, fix/launch-receipt-r2 round 2, 335f458: a herdr
+# hiccup — server down, transient timeout — used to read identically to
+# "pane confirmed gone" / "confirmed not an agent" and could bury a live
+# worker). `pane_birth_now`'s own return code and the new
+# `pane_process_info_ok` (lib/pane-guard.sh) tell "herdr didn't answer"
+# apart from "herdr answered" before either answer is trusted; "didn't
+# answer" refuses with the state left unchanged, same as a live pane does.
+#
 # Exit 0 marked. Exit 1 bad usage / no such task / already terminal /
-# superseded-by evidence does not check out / the pane is actually alive —
-# every refusal names why on stderr.
+# superseded-by evidence does not check out / the pane is actually alive /
+# herdr could not be reached to confirm either way — every refusal names
+# why on stderr, and none of them change the task's state.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/run-registry.sh"
@@ -70,16 +80,37 @@ reg_birth="$(printf '%s' "$task" | jq -r '.pane_birth // ""')"
 if [ -z "$pane" ]; then
   dead_evidence="task has no registered pane_id"
 else
-  live_birth="$(pane_birth_now "$pane" 2>/dev/null)"
+  # Fail CLOSED on uncertainty, not open (security review, fix/launch-
+  # receipt-r2 round 2, 335f458): a herdr CLI error or unparseable JSON
+  # must never read the same as a confirmed-dead answer, or a herdr hiccup
+  # (server down, transient timeout) buries a live worker. `pane_birth_now`
+  # already distinguishes this via its own return code (rc 1 = herdr itself
+  # failed, vs rc 0 with empty output = herdr answered and the pane is
+  # genuinely absent) — this was simply never checked before.
+  if ! live_birth="$(pane_birth_now "$pane" 2>/dev/null)"; then
+    echo "mark-launch-failed: refusing — herdr unavailable (could not confirm whether pane $pane still exists); state left unchanged. Retry once herdr is reachable." >&2
+    exit 1
+  fi
   if [ -z "$live_birth" ]; then
     dead_evidence="pane $pane no longer exists"
   elif [ -n "$reg_birth" ] && [ "$live_birth" != "$reg_birth" ]; then
     dead_evidence="pane $pane was recycled (registered birth=$reg_birth live birth=$live_birth)"
-  elif ! pane_is_agent "$pane" 2>/dev/null; then
-    dead_evidence="pane $pane is alive but its foreground process is not a recognized agent (bare shell)"
   else
-    echo "mark-launch-failed: refusing — pane $pane is alive and running an agent right now; this task is not dead. Use the normal completion path instead." >&2
-    exit 1
+    # Same fail-closed-on-uncertainty rule for the foreground-process check:
+    # `pane_is_agent` (lib/pane-guard.sh) alone can't tell "herdr failed"
+    # apart from "herdr answered: no agent" — it is a deliberate two-state
+    # boolean for send-to-agent.sh's refuse-to-send direction, where both
+    # cases mean the same thing. Marking something DEAD needs the opposite
+    # direction, so ask `pane_process_info_ok` first, independently.
+    if ! pane_process_info_ok "$pane"; then
+      echo "mark-launch-failed: refusing — herdr unavailable (could not confirm what is running in pane $pane); state left unchanged. Retry once herdr is reachable." >&2
+      exit 1
+    fi
+    if pane_is_agent "$pane" 2>/dev/null; then
+      echo "mark-launch-failed: refusing — pane $pane is alive and running an agent right now; this task is not dead. Use the normal completion path instead." >&2
+      exit 1
+    fi
+    dead_evidence="pane $pane is alive but its foreground process is not a recognized agent (bare shell)"
   fi
 fi
 
