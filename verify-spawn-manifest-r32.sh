@@ -28,10 +28,32 @@ trap 'rm -rf "$work"' EXIT
 repo="$work/repo"; mkdir -p "$repo"; git -C "$repo" init -q
 repo=$(cd "$repo" && pwd -P)
 
+# Same ancestry-resolving fixture verify-spawn-scope.sh uses (TRIAGE-23 #1-4:
+# spawn-task.sh's caller-ancestry gates, 001ab43/6cfed25, need `pane list` to
+# report a real fixture pane and `pane process-info` to report its
+# foreground process -- matched by pid AND name, since pane_is_conductor_eligible
+# also requires pane_is_agent (lib/pane-guard.sh) to see an agent-shaped
+# foreground process, not just a matching pid.
 cat > "$work/herdr" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "pane list") printf '{"result":{"panes":[]}}\n' ;;
+  "pane list")
+    # p1/term1 is the SAME worker pane "tab create" below hands back; the
+    # late post-launch recheck (spawn-task.sh ~1150-1161, authorization_
+    # command_id path) re-reads pane list for it, so it must resolve here
+    # too, alongside the caller's own fixture pane.
+    if [ -n "${HERDR_FG_PANE:-}" ]; then
+      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"p1","terminal_id":"term1"}]}}\n' \
+        "$HERDR_FG_PANE" "${HERDR_FG_BIRTH:-birth}"
+    else
+      printf '{"result":{"panes":[{"pane_id":"p1","terminal_id":"term1"}]}}\n'
+    fi ;;
+  "pane process-info")
+    if [ -n "${HERDR_FG_PID:-}" ]; then
+      printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp"}]}}}\n' "$HERDR_FG_PID"
+    else
+      printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+    fi ;;
   "tab list") printf '{"result":{"tabs":[]}}\n' ;;
   "workspace create") printf '{"result":{"workspace":{"workspace_id":"w1","active_tab_id":"tRoot"}}}\n' ;;
   "tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
@@ -44,9 +66,11 @@ printf '== a genuinely empty manifest (no --brief) still merges handoffs_write =
 # No --brief passed: manifest_json starts genuinely empty, the exact
 # pre-conditions the bug needed. explore is a write-restricted job class
 # (lib/agent-profiles.sh tools_for_job), so the merge block runs.
-out=$(env HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt" \
-  HERDR_RUN_STATE_DIR="$work/state" HERDR_POSTURE_FLOOR=write HERDR_PANE_ID= \
+out=$(env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt" \
+  HERDR_RUN_STATE_DIR="$work/state" HERDR_POSTURE_FLOOR=write \
+  HERDR_FG_PANE="fg-r32" HERDR_FG_BIRTH="fgbirth-r32" HERDR_FG_PID=$$ \
   bash "$here/spawn-task.sh" "$repo" r32-branch explore omp 2>&1)
+
 rc=$?
 line=$(printf '%s\n' "$out" | grep -A1 'capability manifest APPROVED' | tail -1 | sed 's/^ *//')
 
@@ -76,8 +100,9 @@ done
 exec "$real_jq" "\$@"
 STUB
 chmod +x "$work/jq"
-out2=$(env HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt2" \
-  HERDR_RUN_STATE_DIR="$work/state2" HERDR_POSTURE_FLOOR=write HERDR_PANE_ID= \
+out2=$(env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt2" \
+  HERDR_RUN_STATE_DIR="$work/state2" HERDR_POSTURE_FLOOR=write \
+  HERDR_FG_PANE="fg-r32b" HERDR_FG_BIRTH="fgbirth-r32b" HERDR_FG_PID=$$ \
   bash "$here/spawn-task.sh" "$repo" r32-branch-2 explore omp 2>&1)
 rc2=$?
 [ "$rc2" != 0 ] \
