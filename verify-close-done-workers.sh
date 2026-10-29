@@ -377,6 +377,227 @@ eval "$old_herdr_fn"
 export -f herdr
 
 
+#######################################################################
+# Section V: close-done-workers.sh's dirty check recognizes exactly the
+# spawn-provisioned .venv-bashlex link (DESIGN.md option (c)). Real git
+# throughout, real provision_worktree_bashlex_venv for every "provisioned"
+# fixture -- never a hand-made `ln` -- so a drift between the producer's
+# link shape and this checker's idea of it would fail the test.
+#######################################################################
+printf '\n== Section V: the dirty check recognizes exactly the spawn-provisioned .venv-bashlex link ==\n'
+
+. "$here/lib/bashlex-preflight.sh"
+
+# Same stubbing technique as verify-spawn-spec-proof.sh's bashlex-preflight
+# cases: a fake python3 answering exactly the two invocations
+# provision_worktree_bashlex_venv makes, no real interpreter or network.
+make_fake_bashlex_venv() {  # <dir> <bashlex-version>
+  local dir="$1" ver="$2"
+  mkdir -p "$dir/bin"
+  cat > "$dir/bin/python3" <<PYSTUB
+#!/usr/bin/env bash
+case "\$*" in
+  *importlib.metadata*) echo "$ver" ;;
+  *"import bashlex"*)   exit 0 ;;
+  *)                    exit 1 ;;
+esac
+PYSTUB
+  chmod +x "$dir/bin/python3"
+}
+
+V_PINNED_VER="$(sed -n 's/^bashlex==\([0-9.][0-9.]*\).*/\1/p' "$here/lib/bashlex-requirements.txt" | head -1)"
+V_GITIGNORE_RULE="$(grep -F '.venv-bashlex' "$here/.gitignore")"
+
+V_TMP=$(mktemp -d)
+
+# _v_mk_root <name> -> prints a fresh git repo set up like a real shared
+# checkout (committed .gitignore carrying the tracked .venv-bashlex/ rule,
+# refs/remotes/origin/main == HEAD) with NO local .venv-bashlex of its own.
+_v_mk_root() {
+  local root="$V_TMP/$1"
+  git init -q -b main "$root" >/dev/null
+  printf '%s\n' "$V_GITIGNORE_RULE" > "$root/.gitignore"
+  git -C "$root" add .gitignore
+  git -C "$root" -c user.email=t@t -c user.name=t commit -q -m gitignore
+  git -C "$root" remote add origin "$root-origin-placeholder" 2>/dev/null
+  git -C "$root" update-ref refs/remotes/origin/main "$(git -C "$root" rev-parse HEAD)"
+  printf '%s\n' "$root"
+}
+
+V_SHARED=$(_v_mk_root shared)
+make_fake_bashlex_venv "$V_SHARED/.venv-bashlex" "$V_PINNED_VER"
+
+V_SHARED_NOVENV=$(_v_mk_root shared-noventv)   # no local venv -> provisioning falls through to the app candidate
+
+V_APP="$V_TMP/app"
+make_fake_bashlex_venv "$V_APP/.venv-bashlex" "$V_PINNED_VER"
+export HERDR_APP_DIR="$V_APP"
+
+# _v_wt <root> <case-name> -> prints a fresh branch worktree off <root>,
+# upstream set to origin/main (so only the dirty rule under test decides),
+# .handoffs self-ignored exactly as spawn-task.sh:723 writes it.
+_v_wt() {
+  local root="$1" name="$2" wt="$V_TMP/wt-$2"
+  git -C "$root" worktree add -q -b "case-$name" "$wt" main >/dev/null
+  git -C "$wt" branch --set-upstream-to=origin/main "case-$name" >/dev/null
+  mkdir -p "$wt/.handoffs"
+  printf '*\n' > "$wt/.handoffs/.gitignore"
+  printf '%s\n' "$wt"
+}
+
+# _v_reg <run_id> <task_id> <pane_id> <repo> <wt> <label>
+_v_reg() {
+  register_task "$1" "$2" w c cp cb "$3" "birth$3" "$4" "$5" "$6" || bad "V setup: register $2"
+  set_task_state "$1" "$2" running || bad "V setup: $2 -> running"
+}
+
+# Every V-case pane needs its own idle entry in the herdr pane-list stub
+# (terminal_id "birth<pane_id>", matching the pane_birth passed to
+# register_task above) -- restored to the plain stub at the end of this
+# section, same save/override/restore pattern as F2 above.
+V_PANES=(pV1 pV1b pV2 pV2b pV2c pV2d pV3a pV3b pV4 pV5 pV5b pV5c pV6 pV7)
+V_PANES_JSON=$(printf '%s\n' "${V_PANES[@]}" | jq -R '{pane_id: ., agent_status: "idle", terminal_id: ("birth" + .)}' | jq -s .)
+V_BASE_PANES_JSON='[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"}]'
+V_ALL_PANES_JSON=$(jq -c -n --argjson a "$V_BASE_PANES_JSON" --argjson b "$V_PANES_JSON" '{result:{panes: ($a+$b)}}')
+export V_ALL_PANES_JSON
+old_herdr_fn_v="$(declare -f herdr)"
+herdr() {
+  printf '%s\n' "$1 $2" >> "$CALLS"
+  case "$1 $2" in
+    "pane list") printf '%s\n' "$V_ALL_PANES_JSON" ;;
+    "pane close") : ;;
+    *) printf '{}\n' ;;
+  esac
+}
+export -f herdr
+
+printf -- '-- V1: provisioned link via the real preflight -> close --\n'
+wtV1=$(_v_wt "$V_SHARED" 1)
+provision_worktree_bashlex_venv "$wtV1" "$V_SHARED" >/dev/null 2>&1
+[ -L "$wtV1/.venv-bashlex" ] || bad "V1 setup: provision did not create a link"
+_v_reg runV1 taskV1 pV1 "$V_SHARED" "$wtV1" "V1"
+out=$(bash "$here/close-done-workers.sh" --task=taskV1 2>&1)
+printf '%s' "$out" | grep -q '^  close  pV1' && ok "V1: provisioned link closes" || bad "V1 output: $out"
+
+printf -- '-- V1b: shared checkout has no local venv at provision time -> preflight links to the app venv -> close --\n'
+wtV1b=$(_v_wt "$V_SHARED_NOVENV" 1b)
+provision_worktree_bashlex_venv "$wtV1b" "$V_SHARED_NOVENV" >/dev/null 2>&1
+check "V1b setup: link targets the app venv (shared had none)" "$(readlink "$wtV1b/.venv-bashlex" 2>/dev/null)" "$V_APP/.venv-bashlex"
+_v_reg runV1b taskV1b pV1b "$V_SHARED_NOVENV" "$wtV1b" "V1b"
+out=$(bash "$here/close-done-workers.sh" --task=taskV1b 2>&1)
+printf '%s' "$out" | grep -q '^  close  pV1b' && ok "V1b: app-fallback provisioned link closes" || bad "V1b output: $out"
+
+printf -- '-- V2: wrong-target symlink, provenance forged to match (the forgery case) -> HOLD (symlink) --\n'
+wtV2=$(_v_wt "$V_SHARED" 2)
+other2=$(mktemp -d)/other-venv-2
+make_fake_bashlex_venv "$other2" "$V_PINNED_VER"
+ln -sfn "$other2" "$wtV2/.venv-bashlex"
+mkdir -p "$wtV2/.handoffs"
+printf 'source: %s\n' "$other2" > "$wtV2/.handoffs/bashlex-provenance.txt"
+_v_reg runV2 taskV2 pV2 "$V_SHARED" "$wtV2" "V2"
+out=$(bash "$here/close-done-workers.sh" --task=taskV2 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (symlink)' \
+  && ok "V2: forged wrong-target link HOLDs" || bad "V2 output: $out"
+
+printf -- '-- V2b: link targets a real candidate, provenance names the OTHER candidate -> HOLD (symlink) --\n'
+wtV2b=$(_v_wt "$V_SHARED" 2b)
+ln -sfn "$V_SHARED/.venv-bashlex" "$wtV2b/.venv-bashlex"
+mkdir -p "$wtV2b/.handoffs"
+printf 'source: %s\n' "$V_APP/.venv-bashlex" > "$wtV2b/.handoffs/bashlex-provenance.txt"
+_v_reg runV2b taskV2b pV2b "$V_SHARED" "$wtV2b" "V2b"
+out=$(bash "$here/close-done-workers.sh" --task=taskV2b 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (symlink)' \
+  && ok "V2b: candidate link with mismatched provenance HOLDs" || bad "V2b output: $out"
+
+printf -- '-- V2c: candidate-target link with NO provenance file at all -> HOLD (symlink) --\n'
+wtV2c=$(_v_wt "$V_SHARED" 2c)
+ln -s "$V_SHARED/.venv-bashlex" "$wtV2c/.venv-bashlex"
+_v_reg runV2c taskV2c pV2c "$V_SHARED" "$wtV2c" "V2c"
+out=$(bash "$here/close-done-workers.sh" --task=taskV2c 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (symlink)' \
+  && ok "V2c: candidate link with no provenance file HOLDs" || bad "V2c output: $out"
+
+printf -- '-- V2d: dangling symlink to a non-candidate path -> HOLD (symlink) --\n'
+wtV2d=$(_v_wt "$V_SHARED" 2d)
+ln -sfn "$(mktemp -u)/does-not-exist-venv" "$wtV2d/.venv-bashlex"
+_v_reg runV2d taskV2d pV2d "$V_SHARED" "$wtV2d" "V2d"
+out=$(bash "$here/close-done-workers.sh" --task=taskV2d 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (symlink)' \
+  && ok "V2d: dangling link to a non-candidate path HOLDs" || bad "V2d output: $out"
+
+printf -- '-- V3a (regression proof): a REAL DIRECTORY at .venv-bashlex (ignored today, closable before this change) -> HOLD (dir) --\n'
+wtV3a=$(_v_wt "$V_SHARED" 3a)
+make_fake_bashlex_venv "$wtV3a/.venv-bashlex" "$V_PINNED_VER"
+git -C "$wtV3a" check-ignore -q .venv-bashlex \
+  && ok "V3a setup: the real directory is ignored by .gitignore -- today's exact gap" \
+  || bad "V3a setup: directory unexpectedly not ignored"
+_v_reg runV3a taskV3a pV3a "$V_SHARED" "$wtV3a" "V3a"
+out=$(bash "$here/close-done-workers.sh" --task=taskV3a 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (dir)' \
+  && ok "V3a: a real directory at .venv-bashlex HOLDs" || bad "V3a output: $out"
+
+printf -- '-- V3b: a regular file at .venv-bashlex -> HOLD (file) --\n'
+wtV3b=$(_v_wt "$V_SHARED" 3b)
+printf 'not a venv\n' > "$wtV3b/.venv-bashlex"
+_v_reg runV3b taskV3b pV3b "$V_SHARED" "$wtV3b" "V3b"
+out=$(bash "$here/close-done-workers.sh" --task=taskV3b 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*not the spawn-provisioned link (file)' \
+  && ok "V3b: a regular file at .venv-bashlex HOLDs" || bad "V3b output: $out"
+
+printf -- '-- V4: provisioned link + an untracked file -> HOLD 1 uncommitted file(s), the link is dropped from the count --\n'
+wtV4=$(_v_wt "$V_SHARED" 4)
+provision_worktree_bashlex_venv "$wtV4" "$V_SHARED" >/dev/null 2>&1
+printf 'new\n' > "$wtV4/new.txt"
+_v_reg runV4 taskV4 pV4 "$V_SHARED" "$wtV4" "V4"
+out=$(bash "$here/close-done-workers.sh" --task=taskV4 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 uncommitted file(s)' \
+  && ok "V4: an untracked file HOLDs for exactly 1" || bad "V4 output: $out"
+
+printf -- '-- V5: provisioned link + a staged tracked change -> HOLD 1 uncommitted file(s) --\n'
+wtV5=$(_v_wt "$V_SHARED" 5)
+provision_worktree_bashlex_venv "$wtV5" "$V_SHARED" >/dev/null 2>&1
+printf 'changed\n' >> "$wtV5/.gitignore"
+git -C "$wtV5" add .gitignore
+_v_reg runV5 taskV5 pV5 "$V_SHARED" "$wtV5" "V5"
+out=$(bash "$here/close-done-workers.sh" --task=taskV5 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 uncommitted file(s)' \
+  && ok "V5: a staged tracked change HOLDs for exactly 1" || bad "V5 output: $out"
+
+printf -- '-- V5b: provisioned link + an unstaged tracked modification -> HOLD --\n'
+wtV5b=$(_v_wt "$V_SHARED" 5b)
+provision_worktree_bashlex_venv "$wtV5b" "$V_SHARED" >/dev/null 2>&1
+printf 'changed\n' >> "$wtV5b/.gitignore"
+_v_reg runV5b taskV5b pV5b "$V_SHARED" "$wtV5b" "V5b"
+out=$(bash "$here/close-done-workers.sh" --task=taskV5b 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 uncommitted file(s)' \
+  && ok "V5b: an unstaged tracked modification HOLDs" || bad "V5b output: $out"
+
+printf -- '-- V5c: a SECOND .venv-bashlex link nested under sub/ -> HOLD 1, only the top-level line is dropped --\n'
+wtV5c=$(_v_wt "$V_SHARED" 5c)
+provision_worktree_bashlex_venv "$wtV5c" "$V_SHARED" >/dev/null 2>&1
+mkdir -p "$wtV5c/sub"
+ln -sfn "$V_SHARED/.venv-bashlex" "$wtV5c/sub/.venv-bashlex"
+_v_reg runV5c taskV5c pV5c "$V_SHARED" "$wtV5c" "V5c"
+out=$(bash "$here/close-done-workers.sh" --task=taskV5c 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 uncommitted file(s)' \
+  && ok "V5c: a nested same-name link HOLDs; only the exact top-level line was dropped" || bad "V5c output: $out"
+
+printf -- '-- V6: no .venv-bashlex at all (preflight never ran) -> close --\n'
+wtV6=$(_v_wt "$V_SHARED" 6)
+_v_reg runV6 taskV6 pV6 "$V_SHARED" "$wtV6" "V6"
+out=$(bash "$here/close-done-workers.sh" --task=taskV6 2>&1)
+printf '%s' "$out" | grep -q '^  close  pV6' && ok "V6: absent .venv-bashlex closes" || bad "V6 output: $out"
+
+printf -- '-- V7: wt == repo (the shared checkout itself, which legitimately carries a real-directory venv) -> unchanged from today --\n'
+_v_reg runV7 taskV7 pV7 "$V_SHARED" "$V_SHARED" "V7"
+out=$(bash "$here/close-done-workers.sh" --task=taskV7 2>&1)
+printf '%s' "$out" | grep -q '^  close  pV7' && ok "V7: wt=repo row is not held for its own real-directory venv" || bad "V7 output: $out"
+
+eval "$old_herdr_fn_v"
+export -f herdr
+unset -f make_fake_bashlex_venv _v_mk_root _v_wt _v_reg
+
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

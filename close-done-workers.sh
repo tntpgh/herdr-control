@@ -34,6 +34,16 @@
 #   3. the worktree is clean (no uncommitted files) AND
 #   4. its branch has no unpushed commits
 #
+# Exception: the spawn-provisioned `.venv-bashlex` symlink (lib/bashlex-
+# preflight.sh) is not counted as dirty under check 3 — it is read-only
+# reuse of a venv that lives outside the worktree, never worktree work.
+# Anything else at that path (a foreign symlink, a real directory, a
+# regular file) still HOLDs the pane, named, even when every other check
+# would pass; a real-directory venv there (e.g. `install.sh --apply` run
+# inside the worktree by hand) used to slip through this gate entirely and
+# now HOLDs. The repo row itself ($wt = $repo) is exempt: it legitimately
+# carries a real-directory venv of its own.
+#
 # A pane failing any check is REPORTED and skipped, never closed quietly —
 # the whole point is that the operator sees what was held back and why.
 #
@@ -54,6 +64,8 @@ source "$HERE/lib/run-registry.sh"
 source "$HERE/lib/pane-guard.sh"
 # shellcheck source=lib/worktree-archive.sh
 source "$HERE/lib/worktree-archive.sh"
+# shellcheck source=lib/bashlex-preflight.sh
+source "$HERE/lib/bashlex-preflight.sh"
 
 apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; task_given=0; superseded_by=""
 for a in "$@"; do
@@ -315,6 +327,13 @@ _detached_pr_check() {
     _DPR_REASON="git could not list tracked changes/untracked files"
     return
   fi
+  if [ "$wt" != "$repo_path" ]; then
+    venv_state=$(worktree_bashlex_venv_state "$wt" "$repo_path")
+    case "$venv_state" in
+      provisioned) ut=$(printf '%s\n' "$ut" | grep -vxF '.venv-bashlex') ;;
+      foreign:*) _DPR_REASON=".venv-bashlex is not the spawn-provisioned link (${venv_state#foreign:})"; return ;;
+    esac
+  fi
   dirty=$(printf '%s\n%s\n' "$td" "$ut" | grep -c .)
   if [ "$dirty" != 0 ]; then
     _DPR_REASON="$dirty uncommitted/untracked file(s)"
@@ -452,7 +471,8 @@ _superseded_check() {
   local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
         head_sha="$7" superseded_by="$8" apply="$9" \
         old_json old_label old_created new_json new_label new_repo new_pr new_created \
-        td td_n ut outside pr_head reflog c cnt ign files repo_base ts archive_root root_why archive_dir
+        td td_n ut outside pr_head reflog c cnt ign files repo_base ts archive_root root_why archive_dir \
+        venv_state
   _DPR_REASON=""
 
   old_json=$(read_task "$run_id" "$task_id" 2>/dev/null)
@@ -488,6 +508,13 @@ _superseded_check() {
   if ! td=$(archive_enumerate_tracked_dirty "$wt") || ! ut=$(archive_enumerate_untracked "$wt"); then
     _DPR_REASON="git could not list tracked changes/untracked files"
     return
+  fi
+  if [ "$wt" != "$repo_path" ]; then
+    venv_state=$(worktree_bashlex_venv_state "$wt" "$repo_path")
+    case "$venv_state" in
+      provisioned) ut=$(printf '%s\n' "$ut" | grep -vxF '.venv-bashlex') ;;
+      foreign:*) _DPR_REASON=".venv-bashlex is not the spawn-provisioned link (${venv_state#foreign:})"; return ;;
+    esac
   fi
   td_n=$(printf '%s\n' "$td" | grep -c .)
   if [ "${td_n:-0}" != 0 ]; then
@@ -659,9 +686,17 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
       br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
-      dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      porcelain=$(git -C "$wt" status --porcelain 2>/dev/null)
+      if [ "$wt" != "$repo" ]; then
+        venv_state=$(worktree_bashlex_venv_state "$wt" "$repo")
+        case "$venv_state" in
+          provisioned) porcelain=$(printf '%s\n' "$porcelain" | grep -vxF '?? .venv-bashlex') ;;
+          foreign:*) reason=".venv-bashlex is not the spawn-provisioned link (${venv_state#foreign:})" ;;
+        esac
+      fi
+      dirty=$(printf '%s\n' "$porcelain" | grep -c .)
       up=$(git -C "$wt" for-each-ref --format='%(upstream:short)' "refs/heads/$br" 2>/dev/null)
-      [ "${dirty:-0}" != 0 ] && reason="$dirty uncommitted file(s)"
+      [ -z "$reason" ] && [ "${dirty:-0}" != 0 ] && reason="$dirty uncommitted file(s)"
       if [ -z "$reason" ]; then
         if [ -z "$up" ]; then
           # No upstream is only a risk when the branch holds commits no remote

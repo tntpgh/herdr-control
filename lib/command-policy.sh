@@ -8166,14 +8166,29 @@ conductor_reserved_reason() {
   # `.kube/config`, and `op inject`/`op run`/`op document get`/`gh auth
   # token`/`gcloud auth print-*-token`/`fly auth token`/`git credential`/
   # `security dump-keychain`/`security export`.
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
-     { [ "$mode" != python ] && _cp_env_dump_invoked "$1"; } || _cp_secret_var_expanded "$norm"; then
+  _cp_rr_why=""
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm"; then
+    _cp_rr_why="path-or-keyword"
+  elif { [ "$mode" != python ] && _cp_env_dump_invoked "$1"; }; then
+    _cp_rr_why="env-dump"
+  elif _cp_secret_var_expanded "$norm"; then
+    _cp_rr_why="secret-var-expansion"
+  fi
+  if [ -n "$_cp_rr_why" ]; then
+    [ -n "${HERDR_CP_DEBUG_LOG:-}" ] && ( umask 077; printf '%s rule=%s cmd=%s\n' "$(date -u +%FT%TZ)" "$_cp_rr_why" \
+      "$(printf '%s' "$raw" | cut -c1-200)" >> "$HERDR_CP_DEBUG_LOG" ) 2>/dev/null
     printf 'credential-value access remains human-only\n'
   # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
   # typed directly into the command (not a path/command match above) is
   # reserved too, UNLESS it is an obvious test-code placeholder — see
   # _cp_cred_shaped_and_not_placeholder for the exact carve-out.
   elif _cp_cred_shaped_and_not_placeholder "$norm"; then
+    # No cmd= field here: the trigger for this rule IS a literal secret
+    # value, so logging the raw command would write the credential itself
+    # to disk. Every other rule's cmd= is a path/keyword match, not a
+    # secret value, so it stays.
+    [ -n "${HERDR_CP_DEBUG_LOG:-}" ] && ( umask 077; printf '%s rule=cred-shaped-value\n' "$(date -u +%FT%TZ)" \
+      >> "$HERDR_CP_DEBUG_LOG" ) 2>/dev/null
     printf 'credential-value access remains human-only\n'
   # The curl clause knew only -X / --data / -d, so the upload verbs this same
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,

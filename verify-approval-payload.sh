@@ -259,6 +259,41 @@ else
 fi
 BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
 
+printf '== REVIEW B1: malformed arguments digest is refused at the input stage (exit 2), never reaching authority/downstream exact-match ==\n'
+# Regression test: 1ec0bc8's merge resolution dropped this format check
+# entirely (kept 437eebe's side of the conflict, discarded f1d7af4's), so a
+# malformed/empty digest fell through to the downstream exact-match proposal
+# verification and was refused there instead -- exit 8, not exit 2, and
+# without this exact message. Both of BOUND_DIGEST's malformed shapes below
+# are registered correctly (via record()) but presented to herdr-select.sh
+# with a different, invalid value, so a pre-fix tree exercises the
+# downstream mismatch path and fails these assertions.
+DF_INPUT="$(write_input "$WT/.handoffs/bound-digest-format.md" "digest format regression payload")"
+DF_JSON="$(printf '%s' "$DF_INPUT" | jq -cS .)"
+BOUND_REQUEST="request-digest-format"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+BOUND_DIGEST="sha256:$(printf '%s' "$DF_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$DF_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$DF_INPUT")"
+BOUND_DIGEST="not-sha256-shaped-at-all"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 2 ] && [ "$(keys_pressed)" = 0 ] && grep -qF "exact sha256 arguments digest" "$WORK/err.txt" \
+  && ok "a digest with no sha256: prefix is refused at the input stage (exit 2)" \
+  || bad "malformed digest (no prefix): rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+BOUND_DIGEST="sha256:deadbeef"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 2 ] && [ "$(keys_pressed)" = 0 ] && grep -qF "exact sha256 arguments digest" "$WORK/err.txt" \
+  && ok "a digest with the right prefix but wrong hex length is refused at the input stage (exit 2)" \
+  || bad "malformed digest (short hex): rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+# Resolve the occurrence with its correctly-formed digest: proves the format
+# check never false-positives a valid digest, and -- just as importantly for
+# suite hygiene -- consumes the pending occurrence record() created above so
+# it cannot leak into a later test's pending-bound query on this same pane.
+BOUND_DIGEST="sha256:$(printf '%s' "$DF_JSON" | shasum -a 256 | awk '{print $1}')"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "the same request resolves once the digest is well-formed again" \
+  || bad "well-formed digest after malformed attempts: rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""; BOUND_PAYLOAD_SHA=""
+
 printf '== exact deferred request resolves with no painted panel ==\n'
 BOUND_REQUEST="request-277-no-panel"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
 BOUND_INPUT="$(write_input "$WT/.handoffs/bound-no-panel.md" "private deferred payload")"
@@ -276,6 +311,52 @@ fi
 reset_keys; conductor_bound; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "duplicate bound resolution is refused" \
   || bad "duplicate bound resolution: rc=$rc keys=$(keys_pressed)"
+
+printf '== (i) authorize_bound own last gate: refuses a pinned occurrence with empty native_session, rollback, no durable row ==\n'
+BOUND_REQUEST="request-277-identity-gate"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+IG_INPUT="$(write_input "$WT/.handoffs/bound-identity-gate.md" "identity gate payload")"
+IG_JSON="$(printf '%s' "$IG_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$IG_JSON" | shasum -a 256 | awk '{print $1}')"
+SESSION_SAVE="$SESSION"; SESSION=""
+PANEL_STYLE=keyhint record write "$IG_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$IG_INPUT")"
+SESSION="$SESSION_SAVE"
+IG_OCC="$OCC_KEY"; IG_CALL="$CALL_ID"
+# Direct CLI call (same shape as atomic_claim()), bypassing herdr-select.sh's
+# own earlier proposal_check identity re-check, so this proves authorize_bound's
+# OWN gate specifically -- the "write path has zero knowledge of
+# identity_verified" gap REVIEW.md confirmed, now closed at the one place
+# every caller (conductor path today, a future human path per (ii)) funnels
+# through before the durable INSERT.
+ig_result="$("${OCC[@]}" authorize-bound --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" \
+  --session "" --call-id "$IG_CALL" --approval-request-id "$BOUND_REQUEST" \
+  --core-arguments-digest "$BOUND_DIGEST" --expect-payload-sha "$BOUND_PAYLOAD_SHA" \
+  --worktree "$WT" --conductor-pane w9:p9 --conductor-birth cond-birth \
+  --approval-id "appr-identity-gate" --choice Approve --authority conductor \
+  --decided-by test-identity-gate \
+  --review-reason reviewed --review-category branch-work --reviewer w9:p9 --audit-text header)"
+authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$IG_OCC';")"
+state_out="$("${OCC[@]}" state --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "" --call-id "$IG_CALL")"
+if [ "$(printf '%s' "$ig_result" | jq -r '.written // empty')" = identity_unverified ] && [ "$authorized_count" = 0 ] \
+   && [ "$(printf '%s' "$state_out" | jq -r .authorization)" = none ]; then
+  ok "authorize_bound refuses identity-unverified occurrence (written=identity_unverified), rolled back, no durable row"
+else
+  bad "identity gate direct write-path check: result=$ig_result authorized=$authorized_count state=$state_out"
+fi
+
+printf '== (i) same occurrence end to end: herdr-select.sh conductor Approve refuses before any resolved JSON prints, state stays none ==\n'
+: > "$SCREEN"
+approves_before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$IG_OCC';")"
+state_out="$("${OCC[@]}" state --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "" --call-id "$IG_CALL")"
+if [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 0 ] && [ "$(approve_rows)" = "$approves_before" ] \
+   && ! grep -q '"resolved":true' "$WORK/out.txt" \
+   && [ "$(printf '%s' "$state_out" | jq -r .authorization)" = none ]; then
+  ok "deferred fixture with empty native_session: conductor Approve refused end to end rc 8, no resolved JSON ever printed, state stays authorization:none -- the write path refuses BEFORE a 60-minute poller would have silently discovered the same thing"
+else
+  bad "end-to-end identity gate: rc=$rc keys=$(keys_pressed) authorized=$authorized_count state=$state_out; $(tail -3 "$WORK/err.txt")"
+fi
+"${OCC[@]}" withdrawn --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "" --call-id "$IG_CALL" --reason test >/dev/null
+BOUND_REQUEST=""; BOUND_DIGEST=""
 
 printf '== automated write/edit resolves by its own exact OMP request id, never the painted screen (Finding 1) ==\n'
 BOUND_REQUEST="request-exact-1"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"

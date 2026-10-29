@@ -18,6 +18,13 @@
 #                                      # (send_owner_message to a registered long-lived pane,
 #                                      # NOT a spawned task; ZERO-LOOP-001 #5, design-approval-only;
 #                                      # OFF on the Worker too by default -- remote-mcp/README.md)
+#   ./install.sh --apply --remote-mcp-ra-sender # also install the SEPARATE result-availability
+#                                      # send agent (remote-mcp/ra-sender.py) -- the only step
+#                                      # that can block on herdr-deliver.sh, split out of the
+#                                      # publisher's own 15s tick so a slow send never stalls
+#                                      # messaging/tasks/owner-inbox/lease-renewal (tmp/in/
+#                                      # BRIEF-optC.md). Independent of --remote-mcp; does not
+#                                      # imply or require it, and does not touch its plist.
 #   ./install.sh --apply --remote-mcp-conductor-pane=w5B:p16 # same, naming a standing
 #                                      # conductor pane every remote-mcp task falls back to
 #                                      # when it has no live interactive conductor of its own
@@ -70,7 +77,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/pane-guard.sh
 . "$here/lib/pane-guard.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; CHROME=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; REMOTE_MCP_RA_SENDER=0; CHROME=0
 REMOTE_MCP_CONDUCTOR_PANE=""
 for a in "$@"; do
   case "$a" in
@@ -83,9 +90,10 @@ for a in "$@"; do
     --remote-mcp-tasks) REMOTE_MCP=1; REMOTE_MCP_TASKS=1 ;;
     --remote-mcp-owner-inbox) REMOTE_MCP=1; REMOTE_MCP_OWNER_INBOX=1 ;;
     --remote-mcp-conductor-pane=*) REMOTE_MCP=1; REMOTE_MCP_CONDUCTOR_PANE="${a#*=}" ;;
+    --remote-mcp-ra-sender) REMOTE_MCP_RA_SENDER=1 ;;
     --chrome)  CHROME=1 ;;
     --repoint) REPOINT=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -580,6 +588,45 @@ if [ "$REMOTE_MCP" = 1 ]; then
     fi
   else
     echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, pinned interpreter, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note)"
+  fi
+fi
+
+# ---- result-availability send agent (optional, macOS) -----------------------
+# The ONLY piece of result-availability that can block on herdr-deliver.sh
+# (up to 120s), split out of com.herdr-control.remote-mcp's publisher.py onto
+# its own LaunchAgent (tmp/in/BRIEF-optC.md, Option C) -- a slow send here
+# must never stall the publisher's 15s messaging/tasks/owner-inbox/lease-
+# renewal tick. Independent of --remote-mcp: does not require it, does not
+# touch its plist. Runs from the DEPLOYED app worktree, like the hub and the
+# publisher. Registry entry: thurber-os launchd/agents.yaml.
+if [ "$REMOTE_MCP_RA_SENDER" = 1 ]; then
+  RA_PLIST="$HOME/Library/LaunchAgents/com.herdr-control.ra-sender.plist"
+  if [ "$APPLY" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    if ! RA_SENDER_PY_BIN="$(resolve_hub_python)"; then
+      INSTALL_RC=2
+      echo "  ! ra-sender NOT installed: no pinned python3 interpreter found." >&2
+      echo "    Looked for a versioned, absolute interpreter under" >&2
+      echo "    /opt/homebrew/bin or /usr/local/bin (e.g. python3.14)." >&2
+      echo "    Refusing to fall back to the ambiguous /usr/bin/env python3 — ra-sender" >&2
+      echo "    opens the registry sqlite directly, same as the publisher." >&2
+      echo "    Install one (brew install python@3.14) and re-run." >&2
+    elif deploy_app "${HUB_REV:-origin/main}"; then
+      sed -e "s|__REMOTE_MCP_PYTHON__|$(_sed_rhs "$RA_SENDER_PY_BIN")|" \
+          -e "s|__RA_SENDER_PY__|$HERDR_APP_DIR/remote-mcp/ra-sender.py|" \
+          -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.ra-sender.log|g" \
+        "$here/remote-mcp/com.herdr-control.ra-sender.plist.template" > "$RA_PLIST"
+      if ra_exit="$(load_interval_agent com.herdr-control.ra-sender "$RA_PLIST")"; then
+        echo "  ra-sender loaded (every 15 s, pinned interpreter $RA_SENDER_PY_BIN); first run last exit code: $ra_exit"
+      else
+        INSTALL_RC=2; echo "  ! ra-sender: first run exit ${ra_exit:-?}; check ~/Library/Logs/com.herdr-control.ra-sender.log" >&2
+      fi
+    else
+      INSTALL_RC=2
+      echo "  ! ra-sender NOT installed: deploy failed (above)." >&2
+    fi
+  else
+    echo "  + would install launchd plist -> $RA_PLIST ($HERDR_APP_DIR/remote-mcp/ra-sender.py every 15 s, pinned interpreter)"
   fi
 fi
 

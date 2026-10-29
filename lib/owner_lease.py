@@ -63,13 +63,16 @@ live pane set (herdr pane list). Clock is the caller's `now` (UTC seconds).
 """
 from __future__ import annotations
 
+import hmac
 import re
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 3
+import private_sqlite
+
+SCHEMA_VERSION = 5
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
 MAX_TTL_S = 86_400
@@ -127,6 +130,39 @@ class Disabled(Exception):
     """Owner leasing is disabled (rolled back); mutations fail closed."""
 
 
+class OpenRequests(Exception):
+    """unregister_owner() refused: open (non-terminal) owner_requests exist
+    for the label, in any generation."""
+
+
+class Unauthorized(Exception):
+    """unregister_owner() refused: missing/mismatched unregister_token, or
+    the caller's (generation, pane_id, pane_birth) does not match the
+    label's current live lease (R13-BOUNDS.md)."""
+
+
+class AlreadyUnregistered(Exception):
+    """register_owner() refused: the (label, project) row already exists
+    and is unregistered (unregistered_at set) -- r15/F2: a plain
+    re-registration must never silently clear that and resume as if
+    nothing had happened, discarding whatever token/bound the caller
+    supplied. reregister_owner() (lib/owner_lease.py) / owner-lease-
+    reregister.py is the deliberate, explicit, authorized recovery path."""
+
+
+class SchemaMigrationRequired(Exception):
+    """R17b: a WRITE-capable open (open_rw_checked()) refused because the
+    store's schema is behind SCHEMA_VERSION. No writer CLI migrates
+    implicitly anymore (R17's own open_and_migrate() did, and the review
+    that uncovered it (--dry-run silently migrating a live store) is why
+    this exists) -- owner-lease-migrate.py is the one explicit, auditable
+    path a schema actually advances through now. `cur`/`target` let the
+    caller print the exact owner-lease-migrate.py invocation."""
+    def __init__(self, cur: int, target: int):
+        self.cur, self.target = cur, target
+        super().__init__(f"schema at v{cur}, need v{target}")
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -136,6 +172,14 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def connect_ro(path: str) -> sqlite3.Connection:
+    """R17b: the read-only connector for dry-run/refused/validation-failure
+    CLI paths and owner-lease-migrate.py's default plan mode -- sqlite
+    mode=ro URI, same pattern owner-lease-reap.py already used. Any write
+    attempt fails at SQLite itself, not by caller discipline."""
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3, isolation_level=None)
 
 
 MIGRATIONS = {
@@ -200,28 +244,105 @@ MIGRATIONS = {
     3: [
         "ALTER TABLE owner_leases ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''",
     ],
+    # v4: per-label rollback (R12-RENEWAL.md). unregistered_at is nullable
+    # and defaults NULL for every existing row -- a plain ADD COLUMN, no
+    # table rebuild, no FK involved. NULL = registered (unchanged meaning
+    # for every pre-v4 row); non-NULL = unregister_owner() has run and the
+    # per-label gate's registered() (lib/owner_lease_delivery.py) must
+    # treat the label as never-registered again. The row itself is still
+    # never deleted: FK-protected the moment a lease or request exists, and
+    # unregister_owner() never attempts a DELETE.
+    4: [
+        "ALTER TABLE owner_projects ADD COLUMN unregistered_at TEXT",
+    ],
+    # v5: bounded renewal + authorized unregister (R13-BOUNDS.md). Both
+    # nullable, both recorded ONLY at register_owner() time ("at approval"),
+    # never updated afterward by this file -- extending a label's lifecycle
+    # or rotating its token is a deliberate separate decision, not built
+    # here because R13 did not ask for it.
+    #   lifecycle_end_at  ABSOLUTE bound (owner_lease_renew.py: renew_due()
+    #     refuses -- "no_lifecycle_bound" -- for any label where this is
+    #     NULL; once set, a renewal's effective TTL is clamped so
+    #     expires_at never crosses it, and once now >= it renewal stops
+    #     entirely ("lifecycle_ended") -- the label then fails closed on
+    #     its own existing TTL, exactly like any other unrenewed lease.
+    #   unregister_token  the "approval/token argument bound to the label"
+    #     unregister_owner() requires verbatim (hmac.compare_digest) before
+    #     doing anything else, including before the idempotent
+    #     already-unregistered check -- a wrong token learns nothing.
+    5: [
+        "ALTER TABLE owner_projects ADD COLUMN lifecycle_end_at TEXT",
+        "ALTER TABLE owner_projects ADD COLUMN unregister_token TEXT",
+    ],
 }
+
+
+def _infer_pre_tracking_version(conn: sqlite3.Connection) -> int:
+    """R17: the live store already had tables shaped like v1-v3 (owner_projects
+    with max_open, owner_leases with session_digest) WITHOUT owner_schema_version
+    ever existing -- that table, and the whole incremental MIGRATIONS scheme,
+    did not exist yet when this store's tables were first created; nobody ever
+    called migrate() against it even once. COALESCE(MAX(version),0) therefore
+    reads 0 on a store that is NOT actually empty, and blindly running v1's
+    bare `CREATE TABLE owner_projects (...)` (no IF NOT EXISTS; none of these
+    statements have one, by design -- a silent no-op on mismatch would be
+    worse than a loud crash) raises 'table owner_projects already exists'.
+
+    Infers the real starting version by introspecting the columns/tables each
+    version's own migration would have created, instead of trusting a version
+    counter that may simply never have been written. A genuinely fresh,
+    empty database (no owner_projects table at all) returns 0, unchanged from
+    before -- this only changes behavior for a store that already has tables
+    migrate() itself did not create. Not persisted: re-run every time migrate()
+    sees cur==0, which is correct and idempotent by construction (same inputs,
+    same answer) rather than fabricating an applied_at timestamp for history
+    this process never observed."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "owner_projects" not in tables:
+        return 0
+    proj_cols = {r[1] for r in conn.execute("PRAGMA table_info(owner_projects)").fetchall()}
+    if "unregister_token" in proj_cols and "lifecycle_end_at" in proj_cols:
+        return 5
+    if "unregistered_at" in proj_cols:
+        return 4
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(owner_leases)").fetchall()} if "owner_leases" in tables else set()
+    if "session_digest" in lease_cols:
+        return 3
+    if "max_open" in proj_cols:
+        return 2
+    return 1
 
 
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending versioned migrations atomically. Returns the schema version.
+    The ONLY caller now is owner-lease-migrate.py --apply (R17b): no CLI
+    open path calls this implicitly anymore -- see open_rw_checked()/open_ro().
 
     FKs are off for the duration (table rebuilds need it; the pragma is a no-op
-    inside a transaction) and every FK is checked before COMMIT."""
+    inside a transaction) and every FK is checked before COMMIT -- but ONLY
+    when a migration actually ran this call (checking FKs on an already-
+    current store that merely has a transient, migration-unrelated FK
+    violation -- e.g. a test fixture built with PRAGMA foreign_keys=OFF --
+    would reject something that isn't this call's problem; a future version
+    bump still gets checked, since 'cur != start' stays true for that)."""
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
         cur = conn.execute("SELECT COALESCE(MAX(version),0) FROM owner_schema_version").fetchone()[0]
+        if cur == 0:
+            cur = _infer_pre_tracking_version(conn)
+        start = cur
         for v in sorted(MIGRATIONS):
             if v > cur:
                 for stmt in MIGRATIONS[v]:
                     conn.execute(stmt)
                 conn.execute("INSERT INTO owner_schema_version VALUES (?,?)", (v, _iso(time.time())))
                 cur = v
-        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if bad:
-            raise sqlite3.IntegrityError(f"migration left {len(bad)} foreign-key violation(s): {bad[:3]}")
+        if cur != start:
+            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                raise sqlite3.IntegrityError(f"migration left {len(bad)} foreign-key violation(s): {bad[:3]}")
         conn.execute("COMMIT")
         return cur
     except BaseException:
@@ -229,6 +350,68 @@ def migrate(conn: sqlite3.Connection) -> int:
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def current_version(conn: sqlite3.Connection) -> int:
+    """R17b: read-only-safe version probe -- works on a mode=ro connection
+    (no CREATE TABLE, unlike migrate()'s own tracking-table bootstrap).
+    Checks owner_schema_version's existence via sqlite_master first (SELECT
+    against a table that doesn't exist would raise OperationalError, which
+    a read-only caller has no transaction to roll back from); falls back to
+    _infer_pre_tracking_version() exactly like migrate() does when cur==0,
+    or when the table itself is simply absent."""
+    has_tracking = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_schema_version'").fetchone()
+    if has_tracking:
+        cur = conn.execute("SELECT COALESCE(MAX(version),0) FROM owner_schema_version").fetchone()[0]
+        if cur > 0:
+            return cur
+    return _infer_pre_tracking_version(conn)
+
+
+def schema_status(conn: sqlite3.Connection) -> tuple[int, int]:
+    """(current_version, SCHEMA_VERSION) -- read-only safe."""
+    return current_version(conn), SCHEMA_VERSION
+
+
+def open_ro(path: str, require_table: str = "") -> sqlite3.Connection:
+    """R17b: the read-only open for dry-run / refused / validation-failure
+    CLI paths. Never migrates (can't -- sqlite mode=ro rejects any write at
+    the engine level, not by caller discipline), so schema_status() is the
+    only way these paths learn whether a migration is pending, to report
+    it rather than silently (or crashingly) acting on a stale schema."""
+    return private_sqlite.open_private(path, connect_ro, require_table=require_table)
+
+
+def open_rw_checked(path: str, require_table: str = "") -> sqlite3.Connection:
+    """R17b: the ONE shared WRITE-capable open path every owner_lease writer
+    CLI (owner-register.py, owner-dispatch-issue.py, owner-dispatch.py,
+    owner-lease-claim.py, owner-lease-reregister.py, owner-lease-resume.py,
+    owner-lease-unregister.py, queue-supervisor.py) uses instead of calling
+    private_sqlite.open_private(path, ol.connect, ...) directly. Replaces
+    R17's open_and_migrate(), which migrated on EVERY open including a
+    --dry-run call -- rejected on review (REVIEW-r17): "zero business-row
+    writes" is not the same promise as read-only, and a dry-run silently
+    advancing schema_version was a real, unwanted write. This function
+    NEVER migrates, and checks the schema version via a READ-ONLY probe
+    FIRST (sqlite mode=ro -- same discipline as open_ro()/owner-lease-
+    reap.py): a read-write connection is only ever opened once the schema
+    is confirmed current. If the store is behind SCHEMA_VERSION it raises
+    SchemaMigrationRequired(cur, SCHEMA_VERSION) without ever opening
+    read-write -- the caller prints refused:schema_migration_required and
+    names owner-lease-migrate.py, the one explicit, auditable, backed-up
+    path a schema now advances through. Not used by owner-lease-reap.py
+    (read-only by design); not pushed into private_sqlite.open_private()
+    itself, which is generic (also used by lib/owner_dispatch_auth.py's
+    own, unrelated migration scheme)."""
+    probe = private_sqlite.open_private(path, connect_ro, require_table=require_table)
+    try:
+        cur = current_version(probe)
+    finally:
+        probe.close()
+    if cur < SCHEMA_VERSION:
+        raise SchemaMigrationRequired(cur, SCHEMA_VERSION)
+    return private_sqlite.open_private(path, connect, require_table=require_table)
 
 
 def _event(conn, now, label, kind, ref="", generation=None, detail=""):
@@ -268,10 +451,27 @@ def _check_holder(pane_id, pane_birth):
     _check(BIRTH_RE, pane_birth, "pane birth")
 
 
-def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_OPEN, now: float | None = None) -> str:
+def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_OPEN, now: float | None = None,
+                   lifecycle_end_at: float | None = None, unregister_token: str | None = None) -> str:
     """Map label <-> canonical project with its queue policy. Idempotent for the
     same pair; any other overlap (label to another project, project to another
-    label) is refused."""
+    label) is refused.
+
+    lifecycle_end_at (R13-BOUNDS.md): an ABSOLUTE epoch-seconds bound
+    recorded ONLY on first insert -- owner_lease_renew.py's renew_due()
+    refuses to renew a label with no bound set at all, and clamps/stops at
+    this one once it is. unregister_token: the authorization
+    unregister_owner() requires verbatim. Neither is touched by an
+    idempotent re-registration of the SAME (label, project) pair -- set
+    once at approval, not silently replaced by a later call.
+
+    r15/F2: if the (label, project) row already exists and is unregistered
+    (unregistered_at set), this function REFUSES (AlreadyUnregistered)
+    rather than silently clearing that and resuming as if nothing had
+    happened -- a plain re-run of owner-register.py after an unregister
+    must never discard whatever token/bound the caller just supplied by
+    pretending to succeed. reregister_owner() is the deliberate, explicit,
+    authorized recovery path."""
     now = time.time() if now is None else now
     if not isinstance(label, str) or not LABEL_RE.match(label):
         raise InvalidOwner(f"invalid owner label {label!r}")
@@ -280,14 +480,184 @@ def register_owner(conn, label: str, project: str, max_open: int = DEFAULT_MAX_O
     proj = canonical_project(project)
 
     def body():
-        row = conn.execute("SELECT label, project FROM owner_projects WHERE label=? OR project=?", (label, proj)).fetchall()
-        if row == [(label, proj)]:
+        rows = conn.execute("SELECT label, project, unregistered_at FROM owner_projects WHERE label=? OR project=?",
+                            (label, proj)).fetchall()
+        exact = [r for r in rows if (r[0], r[1]) == (label, proj)]
+        if exact:
+            if exact[0][2] is not None:
+                raise AlreadyUnregistered(f"{label} -> {proj} was unregistered at {exact[0][2]}; "
+                                          "use owner-lease-reregister.py to restore it explicitly")
             return proj
-        if row:
-            raise InvalidOwner(f"{label} -> {proj} conflicts with existing {row}")
-        conn.execute("INSERT INTO owner_projects VALUES (?,?,?,?)", (label, proj, _iso(now), max_open))
+        if rows:
+            raise InvalidOwner(f"{label} -> {proj} conflicts with existing {[(r[0], r[1]) for r in rows]}")
+        conn.execute("INSERT INTO owner_projects(label,project,registered_at,max_open,lifecycle_end_at,unregister_token) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (label, proj, _iso(now), max_open, _iso(lifecycle_end_at) if lifecycle_end_at is not None else None,
+                      unregister_token))
         _event(conn, now, label, "registered", proj)
         return proj
+
+    return _tx(conn, body)
+
+
+def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id: str = "", pane_birth: str = "",
+                     now: float | None = None, dry_run: bool = True) -> str:
+    """Per-label rollback (R12/R13-BOUNDS.md): voluntarily release any live
+    lease, then mark the owner_projects row unregistered (unregistered_at
+    set) -- DeliveryGate.registered() (lib/owner_lease_delivery.py) then
+    sees the label as never-registered again, returning it to the
+    per-label gate's legacy delivery path. The row itself is still never
+    deleted (FK-protected the moment a lease or request exists; this
+    function never attempts a DELETE) -- this is a soft per-label disable.
+
+    Authorization (R13-BOUNDS.md), checked FIRST, before even the
+    idempotent already-unregistered short-circuit (a wrong token learns
+    nothing): `token` must exactly match (hmac.compare_digest)
+    owner_projects.unregister_token, recorded only at register_owner() time
+    -- a label registered with no token can NEVER be unregistered through
+    this function (fail closed, no fallback). If the label currently has a
+    LIVE lease, (generation, pane_id, pane_birth) must additionally match
+    it exactly (same fence shape as release()) -- unregistering an
+    ACTIVELY-held label without the caller proving it knows that exact
+    live state is refused. No live lease -> nothing to fence against, the
+    token check alone is the authorization for that case.
+
+    Dry-run by default (reap()'s own convention): every check below still
+    runs and can still refuse (InvalidOwner/Unauthorized/OpenRequests),
+    only the final mutation is skipped, so a dry-run of a refused call
+    reports the SAME refusal a real run would. Idempotent:
+    already-unregistered is a silent no-op ('already_unregistered') in
+    both modes. Refuses (OpenRequests) while any OPEN owner_requests exist
+    for the label, in ANY generation -- those are still-unresolved
+    deliveries/replies that unregistering must never make silently
+    unreachable.
+
+    r14/TOCTOU fix: the checks below run ONCE as a cheap pre-check (fast
+    refusal, and the only check that runs at all for dry_run, which must
+    report a refusal without ever taking the write lock) -- but for a real
+    --apply they are NOT the authorization. body() below re-reads the
+    token, unregistered_at, live-lease identity fence, and OpenRequests
+    count a SECOND time, from scratch, under _tx()'s BEGIN IMMEDIATE
+    (SQLite's single-writer lock), exactly the pattern release()/
+    enqueue()/transition() already use via _fence(). This closes the gap
+    REVIEW-r14.md found: a concurrent legitimate claim or a newly-enqueued
+    request landing in the window between the pre-check and the old
+    unconditional body() could make unregister_owner() report success
+    while tearing down a DIFFERENT holder's lease than the one the caller
+    fenced against, or strand a brand-new open request. Now any such
+    interleaving is caught by the re-check inside the lock and raises the
+    same typed exception the pre-check would have, rolling back the
+    transaction -- unregister_owner() never trusts a read taken before it
+    held the write lock."""
+    now = time.time() if now is None else now
+    row = conn.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                       (label,)).fetchone()
+    if not row:
+        raise InvalidOwner(f"{label} is not a registered owner")
+    stored_token = row[1]
+    if not stored_token or not hmac.compare_digest(stored_token, token or ""):
+        raise Unauthorized(f"{label}: token mismatch")
+    if row[0] is not None:
+        return "already_unregistered"
+    cur = _live(conn, label, now)
+    if cur and (cur[3], cur[1], cur[2]) != (generation, pane_id, pane_birth):
+        raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
+    open_n = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                          (label, *OPEN)).fetchone()[0]
+    if open_n:
+        raise OpenRequests(f"{label}: {open_n} open owner_requests")
+    if dry_run:
+        return "would_unregister"
+
+    def body():
+        row2 = conn.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                            (label,)).fetchone()
+        if not row2:
+            raise InvalidOwner(f"{label} is not a registered owner")
+        stored_token2 = row2[1]
+        if not stored_token2 or not hmac.compare_digest(stored_token2, token or ""):
+            raise Unauthorized(f"{label}: token mismatch")
+        if row2[0] is not None:
+            return "already_unregistered"
+        cur2 = _live(conn, label, now)
+        if cur2 and (cur2[3], cur2[1], cur2[2]) != (generation, pane_id, pane_birth):
+            raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
+        open_n2 = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                               (label, *OPEN)).fetchone()[0]
+        if open_n2:
+            raise OpenRequests(f"{label}: {open_n2} open owner_requests")
+        if cur2:
+            lease_id, _pane, _birth, gen, _renewed, _expires, _sess = cur2
+            conn.execute("UPDATE owner_leases SET released_at=?, release_reason='unregistered' WHERE lease_id=?",
+                         (_iso(now), lease_id))
+            _event(conn, now, label, "released", lease_id, gen, "unregistered")
+        conn.execute("UPDATE owner_projects SET unregistered_at=? WHERE label=?", (_iso(now), label))
+        _event(conn, now, label, "unregistered")
+        return "unregistered"
+
+    return _tx(conn, body)
+
+
+def reregister_owner(conn, label: str, project: str, old_token: str, new_token: str, lifecycle_end_at: float,
+                     now: float | None = None, dry_run: bool = True) -> str:
+    """r15/F2's explicit, authorized recovery path for a label unregister_owner()
+    has already turned off: clears unregistered_at, replacing BOTH
+    unregister_token and lifecycle_end_at with freshly-supplied values --
+    NEVER inherits the old ones (a stale token or an already-elapsed bound
+    would make the restored label either unrecoverable again or already
+    renewal-dead). Authorization is the SAME model as unregister_owner():
+    `old_token` must match (hmac.compare_digest) the row's CURRENT
+    unregister_token (unregister_owner() never clears it, only
+    unregistered_at, so the original approval credential is exactly what
+    proves the caller may restore it). `project` must match the row's
+    canonical project exactly -- this is a restore, never a silent
+    re-pointing of the label to a different project.
+
+    r16/F3: the advisory read above is OUTSIDE any transaction (same as
+    every other check in this function), but the actual write is a
+    CONDITIONAL UPDATE re-keyed on the EXACT `(unregistered_at IS NOT
+    NULL, unregister_token == <the stored_token this call just read>)`
+    pair -- not a fresh re-read. A concurrent reregister_owner() call
+    that already committed a DIFFERENT token in the window between this
+    call's advisory read and its own `_tx()` makes the WHERE clause match
+    nothing (`rowcount == 0`) -> `"race_lost"`, nothing written, never
+    silently overwriting the other caller's already-reported success.
+    Only one of two racing callers can ever see `"reregistered"`.
+
+    Never creates or revives a lease: this is a owner_projects-row-only
+    update; leases still come only from the normal acquire()/claim_*()
+    path, same as every other registration here. Dry-run by default
+    (every other writer in this module's own convention); every refusal
+    check below still runs in both modes."""
+    now = time.time() if now is None else now
+    proj = canonical_project(project)
+    row = conn.execute("SELECT project, unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                       (label,)).fetchone()
+    if not row:
+        raise InvalidOwner(f"{label} is not a registered owner")
+    if row[0] != proj:
+        raise InvalidOwner(f"{label} is registered to {row[0]!r}, not {proj!r}")
+    stored_token = row[2]
+    if not stored_token or not hmac.compare_digest(stored_token, old_token or ""):
+        raise Unauthorized(f"{label}: token mismatch")
+    if row[1] is None:
+        return "not_unregistered"
+    if not isinstance(lifecycle_end_at, (int, float)) or isinstance(lifecycle_end_at, bool) or lifecycle_end_at <= now:
+        raise ValueError("lifecycle_end_at must be a future epoch-seconds value")
+    if not new_token:
+        raise ValueError("new_token must be non-empty")
+    if dry_run:
+        return "would_reregister"
+
+    def body():
+        cur2 = conn.execute(
+            "UPDATE owner_projects SET unregistered_at=NULL, unregister_token=?, lifecycle_end_at=? "
+            "WHERE label=? AND unregistered_at IS NOT NULL AND unregister_token=?",
+            (new_token, _iso(lifecycle_end_at), label, stored_token))
+        if cur2.rowcount == 0:
+            return "race_lost"
+        _event(conn, now, label, "reregistered", proj)
+        return "reregistered"
 
     return _tx(conn, body)
 
@@ -460,6 +830,20 @@ def holder_tuple(conn, label, now=None):
     if not cur or not SESSION_DIGEST_RE.match(cur[6] or ""):
         return None
     return (cur[1], cur[2], cur[6], cur[3])
+
+
+def live_expiry(conn, label, now=None) -> float | None:
+    """Epoch-seconds expires_at of the label's live lease, or None when
+    there is none. Read-only. R12/owner-dispatch-issue.py's bind-live-
+    generation mode uses this to refuse issuing a grant whose own window
+    would outlive the lease it is bound to (ANSWER-r12.md: "expiry <=
+    lease expiry") -- the module's own ISO strings are always produced by
+    _iso() (fixed %Y-%m-%dT%H:%M:%S.%fZ, UTC), so parsing with the exact
+    inverse of that format is safe for every row this module itself wrote."""
+    cur = _live(conn, label, time.time() if now is None else now)
+    if not cur:
+        return None
+    return datetime.strptime(cur[5], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
 
 
 def _q(items):

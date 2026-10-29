@@ -215,6 +215,36 @@ require_agent_pane "$pane" || exit 3
 # request id, tool-call id, OMP effective-arguments digest, and reviewed full
 # payload sha.  Missing any one falls through to no legacy shortcut.
 if [ -n "$bound_request_id" ]; then
+  own_task_json="$(task_for_pane "$pane" 2>/dev/null)"
+  own_run=$(printf '%s' "$own_task_json" | jq -r '.run_id // empty')
+  own_task=$(printf '%s' "$own_task_json" | jq -r '.task_id // empty')
+  own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty')
+  own_birth=$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty')
+  owner_pane=$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty')
+  owner_birth=$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_birth // empty')
+  task_state=$(printf '%s' "$own_task_json" | jq -r '.state // empty')
+  occ_py="$(_registry_python 2>/dev/null)"
+
+  # Terminal DENIED delivery (herdr-control, 2026-10-26: refusals inside
+  # this branch used to just `echo ...; exit 8` -- the hook's poll
+  # (agent-hooks/omp-herdr-control.ts onApprovalRequested) saw nothing but
+  # lifecycle `requested` and sat for its own 60-minute timeout, discarding
+  # the real reason (lanes froze: 881c0d82, 2d40e7d2, 8230d929, b1c2710a).
+  # Every exit below now also calls this. It needs only what the request
+  # itself already named -- never conductor/caller authority, which is
+  # exactly what several of these checks are refusing: the caller here IS
+  # the enforcement engine recording its own verdict, never a human's.
+  # lib/prompt-occurrence.py refuse-bound is a safe no-op when occ_py is
+  # unset, the occurrence is missing, or it is already resolved/approved --
+  # exactly-once, never races a real approval into a denial or back.
+  _refuse_bound() {                       # reason
+    [ -n "$occ_py" ] && [ -n "$own_run" ] && [ -n "$own_task" ] || return 0
+    "$occ_py" "$here/lib/prompt-occurrence.py" refuse-bound --db "$(registry_db)" \
+      --run "$own_run" --task "$own_task" --approval-request-id "$bound_request_id" \
+      --core-arguments-digest "$bound_arguments_digest" --tool-call-id "$bound_tool_call_id" \
+      --reason "$1" >/dev/null 2>&1 || true
+  }
+
   printf '%s' "$bound_arguments_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
     echo "herdr-select: bound request requires an exact sha256 arguments digest." >&2; exit 2;
   }
@@ -256,11 +286,13 @@ if [ -n "$bound_request_id" ]; then
             "bound request $bound_ar_id needs YOUR Approve/Deny — decide in Slack or at http://127.0.0.1:8600/decisions" \
             >/dev/null 2>&1 || true
           echo "herdr-select: bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance." >&2
+          _refuse_bound "bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance"
           exit 8
         fi
       fi
     fi
     echo "herdr-select: bound requests require registered conductor authority." >&2
+    _refuse_bound "bound requests require registered conductor authority"
     exit 8
   fi
   case "$choice" in
@@ -275,34 +307,37 @@ if [ -n "$bound_request_id" ]; then
     echo "herdr-select: conductor requires --review-reason after reviewing the complete payload." >&2; exit 2;
   }
 
-  own_task_json="$(task_for_pane "$pane" 2>/dev/null)"
-  own_run=$(printf '%s' "$own_task_json" | jq -r '.run_id // empty')
-  own_task=$(printf '%s' "$own_task_json" | jq -r '.task_id // empty')
-  own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty')
-  own_birth=$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty')
-  owner_pane=$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty')
-  owner_birth=$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_birth // empty')
-  task_state=$(printf '%s' "$own_task_json" | jq -r '.state // empty')
   [ -n "$own_run" ] && [ -n "$own_task" ] && [ -n "$own_worktree" ] || {
-    echo "herdr-select: bound request is not attached to a registered task." >&2; exit 8;
+    echo "herdr-select: bound request is not attached to a registered task." >&2
+    _refuse_bound "bound request is not attached to a registered task"
+    exit 8;
   }
   case "$task_state" in starting|running|blocked) ;; *)
-    echo "herdr-select: conductor may only resolve an active registered task." >&2; exit 8 ;;
+    echo "herdr-select: conductor may only resolve an active registered task." >&2
+    _refuse_bound "conductor may only resolve an active registered task (state=$task_state)"
+    exit 8 ;;
   esac
-  require_pane_birth_match "$pane" || exit 7
+  require_pane_birth_match "$pane" || { _refuse_bound "pane birth no longer matches the live pane"; exit 7; }
   caller_pane="$(caller_pane_from_ancestry)" || {
-    echo "herdr-select: caller identity is unproven; conductor authority refused." >&2; exit 8;
+    echo "herdr-select: caller identity is unproven; conductor authority refused." >&2
+    _refuse_bound "caller identity is unproven; conductor authority refused"
+    exit 8;
   }
   [ -n "$owner_pane" ] && [ "$owner_pane" = "$caller_pane" ] &&
     [ -n "$owner_birth" ] && [ "$owner_birth" = "$(pane_birth_now "$owner_pane")" ] || {
-      echo "herdr-select: caller is not this task's live registered conductor." >&2; exit 8;
+      echo "herdr-select: caller is not this task's live registered conductor." >&2
+      _refuse_bound "caller is not this task's live registered conductor"
+      exit 8;
     }
   task_authorization_check "$own_task_json" || {
-    echo "herdr-select: ${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}; no request resolved." >&2
+    _task_auth_reason="${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}"
+    echo "herdr-select: ${_task_auth_reason}; no request resolved." >&2
+    _refuse_bound "$_task_auth_reason"
     exit 8
   }
-  occ_py="$(_registry_python 2>/dev/null)" || {
-    echo "herdr-select: no pinned python3 interpreter can verify the bound request." >&2; exit 8;
+  [ -n "$occ_py" ] || {
+    echo "herdr-select: no pinned python3 interpreter can verify the bound request." >&2
+    exit 8;
   }
   _bound_proposal() {
     "$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
@@ -313,7 +348,9 @@ if [ -n "$bound_request_id" ]; then
   }
   payload_json="$(_bound_proposal 2>/dev/null)"
   [ "$(printf '%s' "$payload_json" | jq -r '.ok == true' 2>/dev/null)" = true ] || {
-    echo "herdr-select: exact bound request verification failed: $(printf '%s' "$payload_json" | jq -r '.reason // "unreadable verification result"' 2>/dev/null)" >&2
+    _proposal_reason="exact bound request verification failed: $(printf '%s' "$payload_json" | jq -r '.reason // "unreadable verification result"' 2>/dev/null)"
+    echo "herdr-select: $_proposal_reason" >&2
+    _refuse_bound "$_proposal_reason"
     exit 8
   }
   registry_tool_lc=$(printf '%s' "$payload_json" | jq -r '.tool // empty')
@@ -326,11 +363,15 @@ if [ -n "$bound_request_id" ]; then
   # any category/release pin.
   if [ "${HERDR_BOUND_BASH:-}" = "1" ]; then
     case "$registry_tool_lc" in write|edit|bash|shell) ;; *)
-      echo "herdr-select: bound resolution is limited to write/edit/bash/shell." >&2; exit 8 ;;
+      echo "herdr-select: bound resolution is limited to write/edit/bash/shell." >&2
+      _refuse_bound "bound resolution is limited to write/edit/bash/shell (tool=$registry_tool_lc)"
+      exit 8 ;;
     esac
   else
     case "$registry_tool_lc" in write|edit) ;; *)
-      echo "herdr-select: bound resolution is limited to write/edit." >&2; exit 8 ;;
+      echo "herdr-select: bound resolution is limited to write/edit." >&2
+      _refuse_bound "bound resolution is limited to write/edit (tool=$registry_tool_lc)"
+      exit 8 ;;
     esac
   fi
 
@@ -344,11 +385,15 @@ if [ -n "$bound_request_id" ]; then
     [ "$(printf '%s' "$fresh_task" | jq -r '.conductor_pane_birth // empty')" = "$owner_birth" ] &&
     [ "$owner_birth" = "$(pane_birth_now "$caller_pane")" ] &&
     require_pane_birth_match "$pane" && task_authorization_check "$fresh_task" || {
-      echo "herdr-select: task identity or authority changed during bound review." >&2; exit 8;
+      echo "herdr-select: task identity or authority changed during bound review." >&2
+      _refuse_bound "task identity or authority changed during bound review"
+      exit 8;
     }
   rechecked="$(_bound_proposal 2>/dev/null)"
   [ "$(printf '%s' "$rechecked" | jq -r '.ok == true' 2>/dev/null)" = true ] || {
-    echo "herdr-select: bound request changed or expired during review." >&2; exit 8;
+    echo "herdr-select: bound request changed or expired during review." >&2
+    _refuse_bound "bound request changed or expired during review"
+    exit 8;
   }
   # Binding proves identity only, never permission: a bound bash/shell
   # request additionally classifies the CANONICAL bound command (from the
@@ -368,11 +413,13 @@ if [ -n "$bound_request_id" ]; then
       if [ "$_bound_verdict" = deny ] || [ -z "${_bound_command//[[:space:]]/}" ]; then
         echo "herdr-select: bound bash command classifies deny -- binding proves identity only, never permission." >&2
         echo "herdr-select: $_bound_reason" >&2
+        _refuse_bound "$_bound_reason"
         exit 8
       fi
       reservation="$(conductor_reserved_reason "$_bound_command")"
       if [ -n "$reservation" ]; then
         echo "herdr-select: $reservation" >&2
+        _refuse_bound "$reservation"
         exit 8
       fi
       ;;
@@ -401,7 +448,7 @@ if [ -n "$bound_request_id" ]; then
     approval_attempted "$approval_id" >/dev/null 2>&1 || true
     approval_confirmed "$approval_id" "lost-race" \
       "bound request was not claimed: $(printf '%s' "$authorized_json" | jq -r '.written // "unknown"')" >/dev/null 2>&1 || true
-    echo "herdr-select: exact bound request was not claimed; current authority or one-shot state changed." >&2
+    echo "herdr-select: exact bound request was not claimed ($(printf '%s' "$authorized_json" | jq -r '.written // "unknown"')); current authority or one-shot state changed." >&2
     exit 8
   fi
   approval_confirmed "$approval_id" "bound-request" \

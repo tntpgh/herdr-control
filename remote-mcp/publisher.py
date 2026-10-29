@@ -1217,6 +1217,28 @@ def owner_lease_gate():
     return _OWNER_LEASE_GATE
 
 
+def credit_owner_reply(gate, label: str, eid: str, identity_ok: bool) -> bool:
+    """Per-reply owner-lease crediting decision (R8-PERLABEL.md), extracted
+    for direct testing (verify-owner-lease-delivery.py) instead of only
+    reachable inside main()'s reply-scan loop. identity_ok in, identity_ok
+    out -- never upgrades a False to True.
+    gate is None (flag off) or `label` never registered
+    (lib/owner_lease_delivery.py: DeliveryGate.registered()) -> returned
+    UNCHANGED: legacy crediting, identity alone governs, same as before
+    this gate existed.
+    A registered label additionally needs gate.on_reply() == 'replied' (or
+    an already-settled 'replied'/'evidence' state) -- fail CLOSED: an
+    expired lease on a registered label clears identity_ok to False, never
+    a silent fallback to legacy for a label that opted in."""
+    if not identity_ok or gate is None or not gate.registered(label):
+        return identity_ok
+    credited = gate.on_reply(label, eid)
+    if credited != "replied" and gate.state(eid) not in ("replied", "evidence"):
+        log(f"owner reply {label}/{eid}: owner-lease {credited}; left local")
+        return False
+    return identity_ok
+
+
 def owner_session_digest(label: str, owner_row: dict) -> str:
     """Full sha256 of (label, agent_session): the owner_lease v3 session_digest
     a lease holder must carry. '' when the registry row has no session."""
@@ -1234,20 +1256,74 @@ def registry_resolver(label: str):
     return (row["pane_id"], row["pane_birth"], digest) if digest else None
 
 
+def owner_lease_renew_tick() -> dict | None:
+    """OFF BY DEFAULT: None unless HERDR_OWNER_LEASE_RENEW=1. Requires the
+    owner-lease gate too (HERDR_OWNER_LEASE_DELIVERY=1). One pass of
+    lib/owner_lease_renew.py renew_all_due() over every REGISTERED label
+    (owner_projects): renews the CURRENT live holder in place -- same
+    (pane, birth, session), later expires_at -- only when that identity
+    still matches the registry's CURRENT resolution for the label AND the
+    lease is within RENEW_MARGIN_S of expiry. Never claims a first lease,
+    never takes over a mismatched holder: any mismatch, any unresolvable
+    identity, or no live lease at all is reported and skipped, fail closed.
+
+    R12-RENEWAL.md: publisher.py is the renewal owner, not
+    queue-supervisor.py -- it already performs the registry read every
+    tick that sites 1-3 consult the owner-lease gate against, and its
+    launchd cadence is a confirmed, installed 15s schedule
+    (remote-mcp/com.herdr-control.remote-mcp.plist.template:77-78,
+    StartInterval=15); queue-supervisor.py has no installed launchd
+    schedule anywhere in this tree. lib/owner_lease_renew.py's
+    RENEW_MARGIN_S (900s) is ~60x that cadence: dozens of renewal attempts
+    before an actual expiry even if many consecutive ticks fail or are
+    skipped. The actual ol.acquire() call lives in that separate module,
+    never in owner_lease_delivery.py, which documents itself as never
+    acquiring/renewing a lease (lib/owner_lease_delivery.py:11-14) -- an
+    invariant this tick does not loosen."""
+    if os.environ.get("HERDR_OWNER_LEASE_RENEW") != "1":
+        return None
+    gate = owner_lease_gate()
+    if gate is None:
+        raise RuntimeError("HERDR_OWNER_LEASE_RENEW=1 needs the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1)")
+    lib = Path(__file__).resolve().parent.parent / "lib"
+    if str(lib) not in sys.path:
+        sys.path.insert(0, str(lib))
+    import owner_lease_renew as olr  # noqa: E402
+    return olr.renew_all_due(gate.conn, registry_resolver)
+
+
 RESULT_AVAILABILITY_CONDUCTOR = "conductor"
 
 
 def result_availability_tick() -> dict | None:
-    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. Requires the
-    owner-lease gate too (HERDR_OWNER_LEASE_DELIVERY=1). One pass of
-    lib/result_availability.py tick():
+    """OFF BY DEFAULT: None unless HERDR_RESULT_AVAILABILITY=1. STAGE ONLY --
+    never sends anything, never opens a subprocess. tmp/in/BRIEF-optC.md
+    (following tmp/LATENCY.md's Option C): the actual send (GatedNotice's
+    admit/begin_notice/notify/settle, the one step that can block on
+    herdr-deliver.sh for up to 120s) moved to remote-mcp/ra-sender.py's own
+    LaunchAgent -- launchd's StartInterval does not overlap runs of the same
+    job (publisher.py's own _sha256_file docstring documents the identical
+    failure shape under a different cause, P9: one slow call used to wedge
+    the WHOLE publisher, not just the step that was slow), and a single
+    120s send already exceeds the Worker's own 90s disconnect threshold on
+    its own. ra-sender.py reads the SAME HERDR_RESULT_AVAILABILITY_DB/
+    _ROOTS/_JOURNAL and HERDR_OWNER_LEASE_DB this function does; a `staged`
+    ra_requests row IS the hand-off between them, no separate queue file.
+
+    What this still does, every tick, cheaply (lib/result_availability.py
+    tick(), pure sqlite + file-hash, no network, no subprocess):
       holder(label)  the live lease tuple, only while the registry names the
                      same (pane, birth, session); else None -> held:stale_generation.
-      prepare/notify GatedNotice: the conductor's DeliveryGate (admit, body-bound
-                     exchange id, begin_notice with the lease margin) before
-                     the notifying CAS; a fresh registry/lease/session/generation
-                     check immediately before herdr-deliver.sh (no --force);
-                     known-unsent refusals -> held:not_dispatched:<reason>."""
+      pending -> observing -> staged, over consecutive ticks, once a
+                     dispatched request's result file stabilizes.
+    A row already `staged` is immediately held (`staged_for_ra-sender`)
+    WITHOUT ever calling the owner-lease gate's admit() -- that only
+    happens in ra-sender.py, which is also where RESULT_AVAILABILITY_CONDUCTOR
+    (R8-PERLABEL.md: RA's recipient is always the fixed `conductor` label)
+    is actually used.
+
+    Requires the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1) read-only,
+    for the holder/generation check only."""
     if os.environ.get("HERDR_RESULT_AVAILABILITY") != "1":
         return None
     gate = owner_lease_gate()
@@ -1265,14 +1341,11 @@ def result_availability_tick() -> dict | None:
         reg = registry_resolver(label)
         return cur if cur and reg and tuple(reg) == cur[:3] else None
 
-    def type_notice(pane, text):
-        proc = subprocess.run([DELIVER, pane, text], capture_output=True, text=True, timeout=120)
-        return proc.returncode == 0
-
-    notice = ra.GatedNotice(gate, RESULT_AVAILABILITY_CONDUCTOR, bound, type_notice)
+    def observe_only(rid, text):
+        return ra.Held("staged_for_ra-sender")
 
     try:
-        return avail.tick(bound, notice.notify, prepare=notice.prepare)
+        return avail.tick(bound, lambda *a, **k: False, prepare=observe_only)
     finally:
         avail.close()
 
@@ -1313,14 +1386,17 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": reason}
     pane_id = local["owners"][label]["pane_id"]
     gate = owner_lease_gate()
-    if gate is None:
+    if gate is None or not gate.registered(label):
         return _send_owner_notice(item, label, pane_id)
-    # Off-by-default owner-lease gate. The registered pane must hold the
-    # label's live lease. The exchange is enqueued (QUEUED) in that generation,
-    # the body is written (deduped) while queued and must match the persisted
-    # envelope byte-for-byte, and only then does a fenced begin_notice move it
-    # to `delivering`, immediately before typing, with enough lease left to
-    # cover the full delivery timeout.
+    # Off-by-default owner-lease gate, per-label (lib/owner_lease_delivery.py:
+    # DeliveryGate.registered() -- tmp/out/ra/PERLABEL.md / R8-PERLABEL.md):
+    # a label with no owner_projects row never reaches this point, forever,
+    # regardless of the flag. An opted-in label's registered pane must hold
+    # the label's live lease. The exchange is enqueued (QUEUED) in that
+    # generation, the body is written (deduped) while queued and must match
+    # the persisted envelope byte-for-byte, and only then does a fenced
+    # begin_notice move it to `delivering`, immediately before typing, with
+    # enough lease left to cover the full delivery timeout.
     pane_birth = local["owners"][label].get("pane_birth", "")
     adm = gate.admit(label, pane_id, pane_birth, exchange_id)
     if not adm.ok:
@@ -1801,13 +1877,8 @@ def main(argv: list[str]) -> int:
                 original = identities.get(f"{label}/{eid}")
                 identity_ok = bool(original and original == owners_now.get(label)
                                    and owner_pane_status(label, owners_now, reply_panes) == "ok")
-                gate = owner_lease_gate() if identity_ok else None
-                if gate is not None:
-                    # Credit only a reply to the CURRENT generation's delivery.
-                    credited = gate.on_reply(label, eid)
-                    if credited != "replied" and gate.state(eid) not in ("replied", "evidence"):
-                        log(f"owner reply {label}/{eid}: owner-lease {credited}; left local")
-                        identity_ok = False
+                identity_ok = credit_owner_reply(owner_lease_gate() if identity_ok else None,
+                                                  label, eid, identity_ok)
                 if identity_ok:
                     verified.append(r)
                 else:
@@ -1990,6 +2061,13 @@ def main(argv: list[str]) -> int:
         new_command_acks.append(ack)
         st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks
         save_state(st)
+
+    try:
+        renew_out = owner_lease_renew_tick()
+        if renew_out:
+            log(f"owner-lease renew: {renew_out}")
+    except Exception as exc:  # noqa: BLE001 - never blocks the publisher tick
+        log(f"owner-lease renew tick failed (no renewal this tick): {type(exc).__name__}: {exc}")
 
     try:
         ra_out = result_availability_tick()

@@ -12,7 +12,11 @@
 #    (binary, native, hook = agent-hooks/omp-herdr-control.ts, extension manifest);
 #  3 every extensions.manifest entry hashes to its file;
 #  4 the full tree (type, mode, sha256 per path) equals the base release except ./omp;
-#  5 both release-label lines name this release directory.
+#  5 both release-label lines name this release directory;
+#  6 the release's omp contains the env-binding guard block (issue #362:
+#     PI_CONFIG_FILES and friends refused before exec), digest-matched
+#     against tests/fixtures/launcher-env-guard.v26g.sh, and it runs before
+#     the argv-allowlist scan.
 set -uo pipefail
 [ $# -eq 3 ] || { echo "usage: $0 <release_dir> <base_release_dir> <commit>" >&2; exit 2; }
 rel="${1%/}" base="${2%/}" commit="$3"
@@ -76,5 +80,50 @@ printf 'release manifest sha256 %s\n' "$(s "$tmp/rel.m")"
 label="$(basename "$rel")"
 n="$(grep -c -- "$label" "$omp")"
 [ "$n" = 2 ] && grep -q "^export OMP_BOUND_RELEASE_ID=$label$" "$omp" && ok "release label $label x2" || bad "release label $label count $n"
+
+# 6. env-binding guard (issue #362): PI_CONFIG_FILES and friends must be
+# refused before exec, digest-matched against the pinned fixture, and must
+# precede the argv-allowlist scan -- otherwise a caller can smuggle an
+# overlay path past the allowlist through the environment instead of argv.
+guard_fixture="$here/tests/fixtures/launcher-env-guard.v26g.sh"
+guard_fixture_sha=a600b2183c675e46d433676100b9b9e36356afd20f821549466da0afb460da95
+guard_block_of() { awk '/^for env_var in /,/^done$/' "$1" 2>/dev/null; }
+guard_shape_ok() { case "$1" in 'for env_var in '*'PI_CONFIG_FILES'*'done') return 0 ;; *) return 1 ;; esac; }
+digest_of() { printf '%s\n' "$1" | shasum -a 256 | awk '{print $1}'; }
+fixture_guard="$(guard_block_of "$guard_fixture")"
+[ -n "$fixture_guard" ] && guard_shape_ok "$fixture_guard" && [ "$(digest_of "$fixture_guard")" = "$guard_fixture_sha" ] \
+  && ok "env-guard fixture present, shape ok, digest pinned ($guard_fixture_sha)" \
+  || bad "env-guard fixture missing/empty/wrong shape/digest mismatch: $guard_fixture"
+# 6b. v26h-r2 MEDIUM fix (issue #362): the guard must refuse when a listed
+# variable is DEFINED, not only when it is non-empty -- an explicitly-empty
+# CLAUDE_CONFIG_DIR resolves to the process cwd rather than the default
+# ~/.claude (docs/operations/launcher-release-notes.md), so a
+# `[ -z "$v" ]`-shaped non-empty-only test misses that exact bypass.
+# Static shape check only (fixture text, no execution with env vars set --
+# a prior guard-smoke attempt with real env vars set was refused by herdr
+# as human-only and is not repackaged here): the pinned contract must use
+# the existence test `${!env_var+x}` (expands to `x` iff SET, regardless of
+# value -- so `VAR=""` is refused same as `VAR=anything`), not a value test
+# like `${!env_var:-}` (misses `VAR=""`).
+if printf '%s' "$fixture_guard" | grep -q '{!env_var+x}' && ! printf '%s' "$fixture_guard" | grep -q '{!env_var:-}'; then
+  ok "fixture case: guard tests variable PRESENCE, so VAR=\"\" is refused (not only non-empty)"
+else
+  bad "fixture guard tests non-empty only -- a refused variable set to the empty string (e.g. CLAUDE_CONFIG_DIR=\"\") would bypass the guard"
+fi
+rel_guard="$(guard_block_of "$omp")"
+if [ -n "$rel_guard" ] && guard_shape_ok "$rel_guard"; then
+  [ "$(digest_of "$rel_guard")" = "$guard_fixture_sha" ] \
+    && ok "release omp env-guard block digest matches pinned fixture" \
+    || bad "release omp env-guard block digest != pinned fixture (drifted contract)"
+else
+  bad "release omp missing the env-binding guard block (issue #362 PI_CONFIG_FILES bypass unpatched)"
+fi
+guard_line="$(grep -n '^for env_var in ' "$omp" | head -1 | cut -d: -f1)"
+argv_line="$(grep -n '^args=("\$@")$' "$omp" | head -1 | cut -d: -f1)"
+if [ -n "$guard_line" ] && [ -n "$argv_line" ] && [ "$guard_line" -lt "$argv_line" ]; then
+  ok "env-guard runs before the argv-allowlist scan (line $guard_line < $argv_line)"
+else
+  bad "env-guard does not precede the argv-allowlist scan (guard_line=${guard_line:-absent} argv_line=${argv_line:-absent})"
+fi
 
 [ $fails -eq 0 ] && { echo "PASS: 0 failing"; exit 0; } || { echo "FAIL: $fails failing"; exit 1; }

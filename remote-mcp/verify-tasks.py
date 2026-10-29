@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -31,10 +32,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
-# Must equal config.sh's pinned release exactly; the exact-count assert in
-# _isolated_control fails loudly when config.sh moves without this.
-BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-23-queuesup-v26e/omp")
-BOUND_LAUNCHER_SHA256 = "11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403a09be4bc700"
+# Parsed directly from config.sh's own pin (CI-RED.md): a pin bump never
+# re-breaks this fixture, since it is never a hardcoded literal here.
+def _config_pin() -> tuple[Path, str]:
+    text = (HERE.parent / "config.sh").read_text()
+    bin_m = re.search(r'^HERDR_OMP_BIN="\$HOME/(.+)"\s*$', text, re.MULTILINE)
+    sha_m = re.search(r'^HERDR_OMP_LAUNCHER_SHA256="([0-9a-f]{64})"\s*$', text, re.MULTILINE)
+    if not bin_m or not sha_m:
+        raise RuntimeError(f"could not parse HERDR_OMP_BIN/HERDR_OMP_LAUNCHER_SHA256 from {HERE.parent / 'config.sh'}")
+    return Path(bin_m.group(1)), sha_m.group(1)
+
+
+BOUND_RELEASE_REL, BOUND_LAUNCHER_SHA256 = _config_pin()
 
 
 def _lib_tree_sha(control: Path) -> str:

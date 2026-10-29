@@ -37,7 +37,6 @@ import owner_dispatch as od  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
-import private_sqlite  # noqa: E402
 import queue_supervisor as qs  # noqa: E402
 import result_availability as ra  # noqa: E402
 
@@ -190,11 +189,16 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
         send = send or cli.make_send(publisher.DELIVER)  # the one delivery adapter
         resolve = resolve or publisher.registry_resolver
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
     except ValueError as exc:
         store.close()
         avail.close()
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        store.close()
+        avail.close()
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
         return 4
     gate = old.DeliveryGate(lease_db, conn=lconn)
     qroot = Path(root)
