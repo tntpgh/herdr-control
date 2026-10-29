@@ -105,6 +105,30 @@ HERDR_OMP_LAUNCHER_SHA256="11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403
 : "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code / review / docs
 : "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical
 
+# ---- no-progress -> stronger-model escalation (lib/escalation.sh) ----------
+# Fixed, reviewed order of model tiers a stalled task may be handed up
+# through. These are model_for_agent's own three tiers (fast/standard/deep,
+# same vocabulary as the job-class table above) — this is not a new model
+# vocabulary, just the order escalation is allowed to walk it in. A task
+# already on the last word has nowhere to escalate to and stays put.
+: "${HERDR_ESCALATION_LADDER:=fast standard deep}"
+# Consecutive no-progress ticks (lib/escalation.sh no_progress_tick, one per
+# stall-watchdog cycle) with identical evidence required before a loop
+# counts as "no progress" and may trigger an escalation. 2-3 per BRIEF.
+: "${HERDR_NO_PROGRESS_CYCLES:=3}"
+# 1 = record the escalation decision and context packet but never invoke
+# HERDR_ESCALATION_HANDOFF_CMD (no pane stop/start). --dry-run on the CLI
+# overrides this per call in either direction.
+: "${HERDR_ESCALATION_DRY_RUN:=0}"
+# Command invoked to perform the actual handoff: stop the old session,
+# start the new one at the escalated model, same worktree/manifest/approval
+# mode. Receives: <run_id> <task_id> <from_tier> <to_tier> <to_model>
+# <context_packet_path>. Empty (the default) means escalation is
+# audit-only — the registry event and context packet are the deliverable,
+# and whatever drives real pane handoff (spawn-task.sh respawn, a
+# conductor) is wired in later by setting this.
+: "${HERDR_ESCALATION_HANDOFF_CMD:=}"
+
 # ---- shared state (smart-name.sh ownership/debounce, attention.sh stalls) ---
 # Where the tools remember what they've done. Removable at any time; the tools
 # rebuild it. Kept out of the repo and out of ~/.config/herdr on purpose.
