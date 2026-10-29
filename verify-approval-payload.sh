@@ -259,6 +259,41 @@ else
 fi
 BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
 
+printf '== REVIEW B1: malformed arguments digest is refused at the input stage (exit 2), never reaching authority/downstream exact-match ==\n'
+# Regression test: 1ec0bc8's merge resolution dropped this format check
+# entirely (kept 437eebe's side of the conflict, discarded f1d7af4's), so a
+# malformed/empty digest fell through to the downstream exact-match proposal
+# verification and was refused there instead -- exit 8, not exit 2, and
+# without this exact message. Both of BOUND_DIGEST's malformed shapes below
+# are registered correctly (via record()) but presented to herdr-select.sh
+# with a different, invalid value, so a pre-fix tree exercises the
+# downstream mismatch path and fails these assertions.
+DF_INPUT="$(write_input "$WT/.handoffs/bound-digest-format.md" "digest format regression payload")"
+DF_JSON="$(printf '%s' "$DF_INPUT" | jq -cS .)"
+BOUND_REQUEST="request-digest-format"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+BOUND_DIGEST="sha256:$(printf '%s' "$DF_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$DF_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$DF_INPUT")"
+BOUND_DIGEST="not-sha256-shaped-at-all"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 2 ] && [ "$(keys_pressed)" = 0 ] && grep -qF "exact sha256 arguments digest" "$WORK/err.txt" \
+  && ok "a digest with no sha256: prefix is refused at the input stage (exit 2)" \
+  || bad "malformed digest (no prefix): rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+BOUND_DIGEST="sha256:deadbeef"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 2 ] && [ "$(keys_pressed)" = 0 ] && grep -qF "exact sha256 arguments digest" "$WORK/err.txt" \
+  && ok "a digest with the right prefix but wrong hex length is refused at the input stage (exit 2)" \
+  || bad "malformed digest (short hex): rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+# Resolve the occurrence with its correctly-formed digest: proves the format
+# check never false-positives a valid digest, and -- just as importantly for
+# suite hygiene -- consumes the pending occurrence record() created above so
+# it cannot leak into a later test's pending-bound query on this same pane.
+BOUND_DIGEST="sha256:$(printf '%s' "$DF_JSON" | shasum -a 256 | awk '{print $1}')"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "the same request resolves once the digest is well-formed again" \
+  || bad "well-formed digest after malformed attempts: rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""; BOUND_PAYLOAD_SHA=""
+
 printf '== exact deferred request resolves with no painted panel ==\n'
 BOUND_REQUEST="request-277-no-panel"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
 BOUND_INPUT="$(write_input "$WT/.handoffs/bound-no-panel.md" "private deferred payload")"

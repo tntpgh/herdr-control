@@ -245,10 +245,8 @@ if [ -n "$bound_request_id" ]; then
       --reason "$1" >/dev/null 2>&1 || true
   }
 
-  [ "$authority" = conductor ] || {
-    echo "herdr-select: bound requests require registered conductor authority." >&2
-    _refuse_bound "bound requests require registered conductor authority"
-    exit 8;
+  printf '%s' "$bound_arguments_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+    echo "herdr-select: bound request requires an exact sha256 arguments digest." >&2; exit 2;
   }
   printf '%s' "$bound_payload_sha" | grep -Eq '^[0-9a-f]{64}$' || {
     echo "herdr-select: bound request requires the reviewed full payload sha256." >&2; exit 2;
@@ -288,11 +286,13 @@ if [ -n "$bound_request_id" ]; then
             "bound request $bound_ar_id needs YOUR Approve/Deny — decide in Slack or at http://127.0.0.1:8600/decisions" \
             >/dev/null 2>&1 || true
           echo "herdr-select: bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance." >&2
+          _refuse_bound "bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance"
           exit 8
         fi
       fi
     fi
     echo "herdr-select: bound requests require registered conductor authority." >&2
+    _refuse_bound "bound requests require registered conductor authority"
     exit 8
   fi
   case "$choice" in
