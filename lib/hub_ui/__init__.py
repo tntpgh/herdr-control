@@ -289,15 +289,46 @@ def _epoch(iso) -> float | None:
         return None
 
 
-def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connected: bool, now: float,
+def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live: dict, now: float,
                    synthetic: bool = False) -> dict:
     """Everything the Ship view draws, from cache values render_overview()
     already read. Field lists are allow-lists: no form token, port, worktree
     path or conductor id leaves this function. `synthetic` is
     hub.PREVIEW_SYNTHETIC, true only under prototype/hub-preview/preview.py's
     fixture data (tmp/in/FIX-r14b.md item 4) -- never true against the live
-    registry."""
+    registry. `live` is hub.live_data()'s own dict (connected/agents/stats),
+    the same source hub.py's _live_rows() reads for /herdr -- not just a
+    connected flag, so the Ship workers section below can be built from a
+    cache value already held, not a second live read of its own."""
+    live_connected = bool(live.get("connected"))
     tasks = h.get("tasks") or []
+    # Current workers (Ship's "workers" section): herdr's own live agent
+    # list, joined to the registry task that owns each pane -- the same
+    # join hub.py's _live_rows() does for /herdr, read from the same `live`
+    # value, not a second subscription read. `agent` is herdr's AGENT KIND
+    # (the CLI it launched: "omp", "claude", "codex" -- lib/herdr_live.py's
+    # own field), never a model id: no source in this registry records
+    # which model a task ran with (model_for_agent in lib/agent-profiles.sh
+    # resolves one at LAUNCH time, to build the command line, and nothing
+    # writes it back into the registry afterward). Showing it as a model
+    # would be inventing a fact; the Ship workers section says so plainly
+    # instead (tmp/in/REVIEW-DASH.md F2).
+    tasks_by_pane = {t.get("pane_id"): t for t in tasks if t.get("pane_id")}
+    workers = []
+    if live_connected:
+        for p in live.get("agents") or []:
+            task = tasks_by_pane.get(p.get("pane_id")) or {}
+            reg = task.get("state")
+            blocked = p.get("agent_status") == "blocked"
+            diverges = bool(reg) and ((reg == "blocked") != blocked) and reg not in TERMINAL
+            since = p.get("since")
+            workers.append({
+                "pane": p.get("pane_id"), "task": task.get("label") or p.get("label") or "",
+                "herdr_status": p.get("agent_status"), "registry_state": reg, "diverges": diverges,
+                "agent": p.get("agent"), "workspace": p.get("workspace"),
+                "since": (dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                          if isinstance(since, (int, float)) else None),
+            })
     shown, hidden_finished = [], 0
     for t in tasks:
         state = t.get("state")
@@ -339,7 +370,7 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
     # render_decisions, ~line 5365); allow-listed the same way `open` is.
     recent_closed = sorted(history, key=lambda f: f.get("answered_at") or f.get("created_at") or "", reverse=True)[:5]
     decisions = {
-        "open": [{"title": f.get("title") or f.get("id"), "created_at": f.get("created_at"),
+        "open": [{"id": f.get("id"), "title": f.get("title") or f.get("id"), "created_at": f.get("created_at"),
                   "expires_at": f.get("expires_at")} for f in (forms.get("open") or [])],
         "recent_closed": [{"title": f.get("title") or f.get("id"), "status": f.get("status"),
                            "created_at": f.get("created_at"), "answered_at": f.get("answered_at")}
@@ -373,6 +404,7 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live_connecte
             "unrecognized": [r for r in rows if r["station"] is None],
             "projects": sorted(projects.values(), key=lambda p: (-p["attention"], p["name"])),
             "decisions": decisions, "suggestions": suggestions,
+            "workers": workers, "workers_live_error": (live.get("stats") or {}).get("last_error"),
             "loops": {"total": len(lps), "bad": bad_loops}}
 
 

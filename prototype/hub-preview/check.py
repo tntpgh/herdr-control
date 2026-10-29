@@ -225,6 +225,26 @@ def main() -> int:
             check(f"{tid}: panel {panel} crew defined", panel in hub_ui.PANELS.values() and who in (t.get("characters") or {}))
     check("broken theme is skipped, not applied", _broken_theme_skipped())
 
+    print("== motion: new-row entrance is fully killed under reduced motion")
+    # Not a screenshot (one anecdote): a cascade proof. base.css's existing
+    # blanket kill-switch (html[data-reduce] *, @media prefers-reduced-
+    # motion:reduce) uses !important on every property; !important always
+    # wins over a non-!important rule regardless of selector specificity or
+    # source order (CSS cascade, unconditionally) -- so the new tr.row-new
+    # rule only has to avoid !important of its own to be guaranteed killed,
+    # never a second manual media query (tmp/in/REVIEW-DASH.md F3's "the
+    # only way to stop it is the OS-level setting" is the failure this
+    # reuses, not repeats).
+    css = hub_ui.BASE_CSS
+    check("blanket data-reduce kill-switch present and unmodified",
+          "html[data-reduce] *" in css and "animation:none!important" in css)
+    check("blanket prefers-reduced-motion media kill-switch present",
+          "@media (prefers-reduced-motion:reduce)" in css and "animation:none!important" in css.split("prefers-reduced-motion:reduce){", 1)[-1][:80])
+    m = re.search(r"tr\.row-new\{([^}]*)\}", css)
+    check("tr.row-new rule exists", bool(m), css[:0])
+    check("tr.row-new carries no !important (so the blanket kill-switch always wins, any rule order)",
+          bool(m) and "!important" not in m.group(1), m.group(1) if m else None)
+
     print("== job classes")
     sh = (ROOT / "lib/agent-profiles.sh").read_text()
     known = re.search(r'^KNOWN_JOB_CLASSES="([^"]+)"', sh, re.M).group(1).split()
