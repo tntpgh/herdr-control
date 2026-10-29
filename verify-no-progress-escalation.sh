@@ -65,6 +65,15 @@
 #   X. R5: a spawn whose registry row lands but whose receipt is missing
 #      or unparseable fails CLOSED — no adoption, no escalation, task
 #      held for the conductor like any other hook failure
+#   Y. R6 (root-audit reject of R5): a lost receipt on a spawn that
+#      ACTUALLY SUCCEEDED is UNCERTAIN — a durable, restart-surviving
+#      spawn journal (checked/claimed BEFORE the spawn command runs)
+#      caps it at exactly ONE real attempt across this call's own retry
+#      loop, every later watchdog tick, and a simulated process restart;
+#      the task is marked blocked/held rather than left silently running
+#      with zero or an unbounded number of real owners. Independently
+#      reproduced by the reviewer against 30398f8: 6 orphaned running
+#      successor rows for one task across just 2 calls.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -792,6 +801,12 @@ w_decoy_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE task_id=$(_sq "$DECOY");"
 # receipt (truncated output, a non-conforming HERDR_ESC_SPAWN_CMD) must
 # fail CLOSED — no adoption via any fallback lookup, no model_escalated,
 # the task held for the conductor exactly like any other hook failure.
+# R6: strengthened to prove the retry-within-call dimension of the
+# duplicate-writer bug root-audit found in 30398f8 — a suppressed
+# receipt must cap at exactly ONE real spawn attempt across this single
+# esc_escalate call's own bound retries, and the original task must be
+# explicitly marked blocked/held rather than left silently running with
+# an unverifiable owner.
 RUN=taskX; TASK=taskX; PANE=pane-X; BRANCH=esc-test-x
 seed_task "$TASK" "$PANE" "$BRANCH"
 : >"$ORDER_LOG"
@@ -803,12 +818,72 @@ rm -f "$WORK/spawn-suppress-receipt"
 x_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
 x_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
 x_pinned="$(task_last_event_payload "$RUN" "$TASK" writer_successor_pinned 2>/dev/null)"
+x_spawn_count="$(grep -c -- 'spawn implement esc-test-x' "$ORDER_LOG" 2>/dev/null)"
+x_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
 [ "${x_esc_n:-0}" = 0 ] && ok "X: a spawn with no usable receipt never escalates" \
   || bad "X: model_escalated should be 0 with a suppressed receipt (got $x_esc_n)"
 [ "${x_failed_n:-0}" = 1 ] && ok "X: the hook-failed path fires — task held for the conductor, same as any other hook failure" \
   || bad "X: model_escalation_hook_failed count (got $x_failed_n)"
 [ -z "$x_pinned" ] && ok "X: no successor was ever pinned — the orphaned registry row is never silently adopted" \
   || bad "X: a successor was wrongly pinned despite the suppressed receipt: $x_pinned"
+[ "${x_spawn_count:-0}" = 1 ] && ok "X: R6 — exactly ONE real spawn attempt across this call's own retry loop (30398f8 spawned 3)" \
+  || bad "X: R6 spawn count within one call (got $x_spawn_count, want 1)"
+[ "$x_state" = blocked ] && ok "X: R6 — the task is explicitly marked blocked/held, not silently left running with an unverifiable writer" \
+  || bad "X: R6 task state (got [$x_state], want blocked)"
+
+# =============================================================== case Y ===
+# R6 (root-audit reject of R5/30398f8): a lost receipt on a spawn that
+# ACTUALLY SUCCEEDED is UNCERTAIN, not a plain retryable failure — the
+# fake spawn hook below writes a genuinely new, distinct task row on
+# every call (exactly case X's own setup) but never emits a receipt.
+# Independently reproduced by the reviewer: 6 real, untracked, running
+# successor rows for one task across just 2 esc_escalate calls, with the
+# old writer's pane already closed before any of them could ever be
+# confirmed. This case proves the fix caps it at exactly ONE real spawn
+# across THREE dimensions in a single run:
+#   - retry-within-call: the first triggering tick's own esc_escalate
+#     call retries up to the configured bound internally.
+#   - a later, separate tick: no_progress_detect's window stays "loop"
+#     on every following tick (commit_sha/artifact_fp unchanged), so
+#     ticks 4-6 each independently re-enter esc_escalate — nothing in
+#     no-progress-escalate.sh's cmd_tick gates on the task's state
+#     before calling it, and esc_already_escalated only ever gates on a
+#     real model_escalated event, which never lands here.
+#   - a simulated restart: every `bash "$CLI" tick ...` invocation in
+#     this harness IS already an independent process — a fresh bash
+#     interpreter with zero shared in-process memory with any prior
+#     tick, only the SQLite registry persisting between them — so ticks
+#     4-6 exercise "survives a restart" exactly as rigorously as this
+#     architecture allows, not merely "survives a retry".
+RUN=taskY; TASK=taskY; PANE=pane-Y; BRANCH=esc-test-y
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-suppress-receipt"
+for i in 1 2 3; do                       # ticks 1-2 fill the window; tick 3 triggers escalate (retry-within-call)
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpY --context-dir "$CTX" >/dev/null
+done
+for i in 1 2 3; do                       # 3 MORE, fully separate processes: later ticks + simulated restart
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpY --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-suppress-receipt"
+y_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label=$(_sq "implement:$BRANCH");" 2>/dev/null)"
+y_spawn_count="$(grep -c -- 'spawn implement esc-test-y' "$ORDER_LOG" 2>/dev/null)"
+y_close_count="$(grep -c -- 'close pane-Y' "$ORDER_LOG" 2>/dev/null)"
+y_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+y_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+y_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+[ "${y_spawn_count:-0}" = 1 ] && ok "Y: R6 — exactly ONE real spawn attempt across retry-within-call + later ticks + simulated restart" \
+  || bad "Y: R6 spawn count (got $y_spawn_count, want 1 — this is the exact bug 30398f8 was rejected for)"
+[ "${y_rows:-0}" = 1 ] && ok "Y: R6 — exactly one successor row exists in the registry, not an unbounded pile of orphans" \
+  || bad "Y: R6 successor row count (got $y_rows, want 1)"
+[ "${y_close_count:-0}" = 1 ] && ok "Y: R6 — the old writer was closed exactly once, never re-triggered by a later tick" \
+  || bad "Y: R6 close count (got $y_close_count, want 1)"
+[ "${y_esc_n:-0}" = 0 ] && ok "Y: R6 — never actually escalates on an uncertain receipt (the audit trail stays honest)" \
+  || bad "Y: R6 model_escalated should be 0 (got $y_esc_n)"
+[ "${y_failed_n:-0}" = 4 ] && ok "Y: R6 — all 4 independent re-entries (1 retry-within-call + 3 later ticks) each record their own hook-failed audit event" \
+  || bad "Y: R6 model_escalation_hook_failed count (got $y_failed_n, want 4)"
+[ "$y_state" = blocked ] && ok "Y: R6 — the original task is explicitly marked blocked/held, not silently left running with zero known owners" \
+  || bad "Y: R6 task state (got [$y_state], want blocked)"
 
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \

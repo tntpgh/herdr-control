@@ -529,24 +529,32 @@ _esc_pane_close() {
 }
 
 # _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
-# RECEIPT task_id on stdout, rc 0 only if one was actually parsed out of
-# the spawn command's own output (R5: "bind to the actual spawn receipt
-# ... no lookup by branch+label"). A real spawn-task.sh prints
-# `HERDR_SPAWN_RECEIPT task_id=... run_id=...` as its LAST line on every
-# real (non-dry-run) success path; HERDR_ESC_SPAWN_CMD overrides (tests,
-# operators) must emit the same line to be trusted the same way. Missing
-# or unparseable output is NOT "assume it worked and go look it up" — the
-# caller treats this as a hook failure like any other and holds the task
-# for the conductor (R3's existing retry-then-fail-closed path).
+# RECEIPT task_id on stdout, rc 0, when one was actually parsed out of the
+# spawn command's own output (R5: "bind to the actual spawn receipt ...
+# no lookup by branch+label"). Two DISTINCT non-zero outcomes (R6 —
+# root-audit on f1d7af4..30398f8 independently reproduced a spawn that
+# genuinely succeeded while its receipt was lost producing 6 untracked,
+# running successor rows for one task across 2 calls; see the spawn
+# journal below, which is what actually prevents that):
+#   rc 1  the spawn command's OWN exit code reported failure. Confirmed
+#         clean — nothing was created, safe for the caller to retry.
+#   rc 2  the command exited 0 (it believes it succeeded) but no receipt
+#         line could be parsed out of its output. UNCERTAIN — something
+#         may genuinely have been spawned; the caller MUST NOT retry.
+# A real spawn-task.sh prints `HERDR_SPAWN_RECEIPT task_id=... run_id=...`
+# as its LAST line on every real (non-dry-run) success path;
+# HERDR_ESC_SPAWN_CMD overrides (tests, operators) must emit the same
+# line to be trusted the same way.
 _esc_spawn_successor() {
-  local out task_id
+  local out rc task_id
   if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
-    out="$(bash "$HERDR_ESC_SPAWN_CMD" "$@" 2>/dev/null)" || return 1
+    out="$(bash "$HERDR_ESC_SPAWN_CMD" "$@" 2>/dev/null)"; rc=$?
   else
-    out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)" || return 1
+    out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)"; rc=$?
   fi
+  [ "$rc" = 0 ] || return 1
   task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
-  [ -n "$task_id" ] || return 1
+  [ -n "$task_id" ] || return 2
   printf '%s\n' "$task_id"
 }
 
@@ -626,6 +634,15 @@ _esc_quiesce_old_writer() {
 # and go look it up" — fail closed, hold the task for the conductor
 # (same path as any other hook failure).
 #
+# R6: a receipt can be lost on a spawn that ACTUALLY SUCCEEDED, and R5's
+# fail-closed was fail-closed only for the AUDIT TRAIL, not the real side
+# effect — root-audit independently reproduced 6 real, untracked, running
+# successor rows for one task across 2 calls, the old writer already
+# closed before any of them could ever be confirmed. The durable spawn
+# journal below (checked and claimed BEFORE _esc_spawn_successor is ever
+# called) is what actually caps this at one real attempt — see its own
+# comment for the state machine.
+#
 # _esc_task_json <task_id> -> that task's registry row as JSON, resolving
 # its run_id first (task_id alone is globally unique — same pattern
 # stall-watchdog.sh's cmd_ack already uses — so this is correct for a
@@ -639,10 +656,96 @@ _esc_task_json() {
   read_task "$run_id" "$task_id"
 }
 
+# ---- durable spawn request journal (R6) -------------------------------------
+# R5 bound first-successor discovery to the exact spawn receipt but left a
+# gap root-audit found and independently reproduced: a spawn that ACTUALLY
+# SUCCEEDS while its receipt is lost (never printed, truncated, a crash
+# between the real side effect and this process reading it back) was
+# treated as a plain retryable failure. Nothing recorded that a real spawn
+# command had already gone out, so the retry loop (bound attempts within
+# ONE esc_escalate call) and every LATER watchdog tick each called
+# _esc_spawn_successor again, unconditionally — independently confirmed: 6
+# real, distinct, state=running successor rows for one task across 2
+# calls, the old writer's pane already closed before any of them could
+# ever be confirmed. A task left with an unbounded number of untracked
+# real owners and, in the audit trail, zero.
+#
+# `escalation_spawn_journal` is the durable (SQLite — survives a process
+# restart, R6 fix 2), gating (checked and claimed BEFORE the spawn command
+# ever runs, R6 fix 1) record of "has a real spawn attempt already gone
+# out for this (task_id, to_tier), and what came of it":
+#   no row              genuinely never attempted — the ONLY state that
+#                        may claim the row and call _esc_spawn_successor.
+#   state='in_flight'    a spawn was issued and its outcome is UNCERTAIN
+#                        (the command exited 0 but no receipt parsed, or a
+#                        parsed receipt didn't resolve to a live task).
+#                        NOT a retryable failure — a second real spawn
+#                        command could easily be a second real writer. The
+#                        row stays 'in_flight' forever: every later check
+#                        (this call's own remaining retries, any later
+#                        tick, a restarted process) refuses to spawn again
+#                        and holds for the conductor, who alone can
+#                        actually reconcile "did that spawn really land,
+#                        and as what" by hand.
+#   state='bound'        the attempt that claimed this row got a receipt
+#                        that resolved to a real, live task — resolve
+#                        through successor_task_id, never spawn again.
+# A CONFIRMED clean failure (the spawn command's own exit code says it
+# failed) is NOT uncertain: nothing was created, so the claimed row is
+# deleted, freeing the next retry to claim fresh (case B/C: a transient
+# failure must still be retryable within the bound, and across a later
+# call). Only a command that exits 0 without a usable receipt — the one
+# shape that cannot be told apart from "it worked, I just didn't hear
+# back" — ever leaves a permanent 'in_flight' row.
+_esc_journal_schema() {
+  _sql "CREATE TABLE IF NOT EXISTS escalation_spawn_journal (
+    task_id TEXT NOT NULL, to_tier TEXT NOT NULL, state TEXT NOT NULL,
+    successor_task_id TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, to_tier));" >/dev/null 2>&1
+}
+# _esc_journal_status <task_id> <to_tier> -> "state<TAB>successor_task_id",
+# or empty (no row = never attempted).
+_esc_journal_status() {
+  registry_init || return 1
+  _esc_journal_schema
+  _sql "SELECT state || char(9) || successor_task_id FROM escalation_spawn_journal
+    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2");" 2>/dev/null
+}
+# _esc_journal_claim <task_id> <to_tier> -> rc 0 only if THIS call created
+# the row (genuinely first-ever attempt) — an atomic insert-if-absent, so
+# two racing callers never both believe they own the one real spawn.
+_esc_journal_claim() {
+  local task_id="$1" to_tier="$2" now changed
+  registry_init || return 1
+  _esc_journal_schema
+  now="$(_now_iso)"
+  changed="$(_sql "INSERT OR IGNORE INTO escalation_spawn_journal
+      (task_id, to_tier, state, successor_task_id, started_at, updated_at)
+    VALUES ($(_sq "$task_id"), $(_sq "$to_tier"), 'in_flight', '', $(_sq "$now"), $(_sq "$now"));
+    SELECT changes();" 2>/dev/null)"
+  [ "${changed:-0}" = 1 ]
+}
+# _esc_journal_bind <task_id> <to_tier> <successor_task_id> — the claimed
+# attempt got a receipt that resolved to a real task; permanent.
+_esc_journal_bind() {
+  _sql "UPDATE escalation_spawn_journal SET state='bound', successor_task_id=$(_sq "$3"),
+      updated_at=$(_sq "$(_now_iso)")
+    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2");" >/dev/null 2>&1
+}
+# _esc_journal_clear <task_id> <to_tier> — ONLY for a CONFIRMED clean
+# failure (the spawn command's own exit code said it failed): nothing was
+# created, so the next retry is free to claim fresh. Never called for an
+# uncertain outcome — that row must never clear itself.
+_esc_journal_clear() {
+  _sql "DELETE FROM escalation_spawn_journal
+    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2") AND state='in_flight';" >/dev/null 2>&1
+}
+
 _esc_spawn_next_tier() {
   local run_id="$1" task_id="$2" agent="$3" to_tier="$4" \
-        task_json repo branch job existing old_pane old_pane_birth \
-        pinned pinned_tier pinned_task succ_json succ_state succ_pane succ_birth
+        task_json repo branch job old_pane old_pane_birth \
+        pinned pinned_tier pinned_task succ_json succ_state succ_pane succ_birth \
+        j_line j_state j_succ receipt spawn_rc
   task_json="$(read_task "$run_id" "$task_id")"
   repo="$(printf '%s' "$task_json" | jq -r '.repo // empty' 2>/dev/null)"
   branch="$(printf '%s' "$task_json" | jq -r '.branch // empty' 2>/dev/null)"
@@ -663,31 +766,96 @@ _esc_spawn_next_tier() {
     # fall through and re-derive rather than silently fabricating one.
   fi
 
-  existing="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")" || {
-    printf 'escalation: %s/%s spawn produced no verifiable receipt — holding for the conductor rather than adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
+  # R6: the durable spawn journal is consulted BEFORE anything else below
+  # can touch the spawn command — a row already existing means a real
+  # spawn attempt already went out for this (task_id, to_tier), whether
+  # in this call's own earlier retry, an earlier call, or before a
+  # restart. Never spawn a second one.
+  j_line="$(_esc_journal_status "$task_id" "$to_tier")"
+  if [ -n "$j_line" ]; then
+    j_state="$(printf '%s' "$j_line" | cut -f1)"
+    j_succ="$(printf '%s' "$j_line" | cut -f2)"
+    if [ "$j_state" = bound ] && [ -n "$j_succ" ]; then
+      succ_json="$(_esc_task_json "$j_succ")"
+      if [ -n "$succ_json" ]; then
+        succ_pane="$(printf '%s' "$succ_json" | jq -r '.pane_id // empty' 2>/dev/null)"
+        succ_birth="$(printf '%s' "$succ_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
+        append_event "$run_id" "$task_id" writer_successor_pinned \
+          "$(jq -nc --arg t "$to_tier" --arg s "$j_succ" --arg op "$old_pane" --arg ob "$old_pane_birth" \
+              --arg np "$succ_pane" --arg nb "$succ_birth" \
+              '{to_tier:$t, successor_task_id:$s, old_pane_id:$op, old_pane_birth:$ob,
+                successor_pane_id:$np, successor_pane_birth:$nb}')" >/dev/null 2>&1
+        printf '%s\n' "$j_succ"
+        return 0
+      fi
+      printf 'escalation: %s/%s journal says bound to %s but it no longer resolves — holding for the conductor rather than spawning a replacement\n' "$task_id" "$to_tier" "$j_succ" >&2
+      return 1
+    fi
+    printf 'escalation: %s/%s has an UNCERTAIN prior spawn attempt outstanding (journal in_flight) — refusing to spawn again until a human reconciles it; holding for the conductor\n' "$task_id" "$to_tier" >&2
+    return 1
+  fi
+
+  # Genuinely first-ever attempt: claim the journal BEFORE the spawn
+  # command runs at all (R6 fix 1/2) — an insert-if-absent, so losing the
+  # claim race to a concurrent attempt (shouldn't happen under the lock
+  # esc_escalate already holds, but checked anyway) also refuses rather
+  # than risking a double spawn.
+  _esc_journal_claim "$task_id" "$to_tier" || {
+    printf 'escalation: %s/%s lost the spawn-journal claim — another attempt already owns it; refusing to spawn\n' "$task_id" "$to_tier" >&2
     return 1
   }
-  succ_json="$(_esc_task_json "$existing")"
-  [ -n "$succ_json" ] || {
-    printf 'escalation: %s/%s spawn receipt %s does not resolve to a registered task — holding for the conductor\n' "$task_id" "$to_tier" "$existing" >&2
+
+  receipt="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")"; spawn_rc=$?
+  if [ "$spawn_rc" = 1 ]; then
+    # Confirmed clean failure: the spawn command's own exit code said so,
+    # nothing was created. Safe to retry — free the claim.
+    _esc_journal_clear "$task_id" "$to_tier"
     return 1
-  }
+  fi
+  if [ "$spawn_rc" = 2 ]; then
+    # UNCERTAIN: the command exited 0 (believes it succeeded) but no
+    # receipt could be parsed. R6 fix 1/2: the journal row stays
+    # 'in_flight' permanently — never cleared, never retried blind. R6
+    # fix 3: the old writer may already be closed by the time we get
+    # here (esc_escalate's loop quiesces before calling this) with no
+    # successor ever confirmed, so mark the ORIGINAL task explicitly
+    # `blocked` rather than leaving it silently `running` with an
+    # unverifiable, possibly nonexistent, possibly duplicate owner.
+    set_task_state "$run_id" "$task_id" blocked "" "" \
+      "$(jq -nc --arg t "$to_tier" --arg op "$old_pane" --arg ob "$old_pane_birth" \
+          '{reason:"escalation_spawn_uncertain", to_tier:$t, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
+    printf 'escalation: %s/%s spawn exited 0 but produced no verifiable receipt — journal left in_flight (uncertain), task marked blocked, holding for the conductor rather than retrying blind or adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
+    return 1
+  fi
+
+  succ_json="$(_esc_task_json "$receipt")"
+  if [ -z "$succ_json" ]; then
+    set_task_state "$run_id" "$task_id" blocked "" "" \
+      "$(jq -nc --arg t "$to_tier" --arg r "$receipt" --arg op "$old_pane" --arg ob "$old_pane_birth" \
+          '{reason:"escalation_receipt_unresolved", to_tier:$t, receipt_task_id:$r, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
+    printf 'escalation: %s/%s spawn receipt %s does not resolve to a registered task — journal left in_flight (uncertain), task marked blocked, holding for the conductor\n' "$task_id" "$to_tier" "$receipt" >&2
+    return 1
+  fi
   succ_state="$(printf '%s' "$succ_json" | jq -r '.state // empty' 2>/dev/null)"
   case "$succ_state" in
     completed|failed|cancelled|lost|gone)
-      printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — holding for the conductor\n' "$task_id" "$to_tier" "$existing" "$succ_state" >&2
+      set_task_state "$run_id" "$task_id" blocked "" "" \
+        "$(jq -nc --arg t "$to_tier" --arg r "$receipt" --arg s "$succ_state" --arg op "$old_pane" --arg ob "$old_pane_birth" \
+            '{reason:"escalation_receipt_terminal", to_tier:$t, receipt_task_id:$r, receipt_state:$s, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
+      printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — journal left in_flight (uncertain), task marked blocked, holding for the conductor\n' "$task_id" "$to_tier" "$receipt" "$succ_state" >&2
       return 1
       ;;
   esac
 
+  _esc_journal_bind "$task_id" "$to_tier" "$receipt"
   succ_pane="$(printf '%s' "$succ_json" | jq -r '.pane_id // empty' 2>/dev/null)"
   succ_birth="$(printf '%s' "$succ_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
   append_event "$run_id" "$task_id" writer_successor_pinned \
-    "$(jq -nc --arg t "$to_tier" --arg s "$existing" --arg op "$old_pane" --arg ob "$old_pane_birth" \
+    "$(jq -nc --arg t "$to_tier" --arg s "$receipt" --arg op "$old_pane" --arg ob "$old_pane_birth" \
         --arg np "$succ_pane" --arg nb "$succ_birth" \
         '{to_tier:$t, successor_task_id:$s, old_pane_id:$op, old_pane_birth:$ob,
           successor_pane_id:$np, successor_pane_birth:$nb}')" >/dev/null 2>&1
-  printf '%s\n' "$existing"
+  printf '%s\n' "$receipt"
 }
 
 # esc_escalate <run_id> <task_id> <agent> <reason> <evidence_json> \
@@ -778,9 +946,13 @@ esc_escalate() {
 
   if [ -z "$successor_task" ]; then
     _esc_release_lock "$task_id" "$to_tier" "$fence"
+    local journal_state
+    journal_state="$(_esc_journal_status "$task_id" "$to_tier" | cut -f1)"
     append_event "$run_id" "$task_id" model_escalation_hook_failed \
-      "$(jq -nc --arg t "$to_tier" --argjson attempts "$bound" '{to_tier:$t, attempts:$attempts}')" >/dev/null 2>&1
-    printf 'escalation: hook failed for %s -> %s after %s attempt(s)\n' "$task_id" "$to_tier" "$bound" >&2
+      "$(jq -nc --arg t "$to_tier" --argjson attempts "$bound" --arg js "${journal_state:-}" \
+          '{to_tier:$t, attempts:$attempts, journal_state:$js}')" >/dev/null 2>&1
+    printf 'escalation: hook failed for %s -> %s after %s attempt(s)%s\n' "$task_id" "$to_tier" "$bound" \
+      "${journal_state:+ (spawn journal: $journal_state — uncertain attempts are never retried)}" >&2
     return 1
   fi
 
