@@ -1195,7 +1195,13 @@ if [ -n "$authorization_command_id" ]; then
     echo "spawn-task: authorization hold: launch acknowledgement lost; outcome_unknown, do not relaunch" >&2; exit 1;
   }
 fi
-herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
+if [ "$managed" != 1 ]; then
+  # Unmanaged literal commands (e.g. `quick /bin/true`) have no readiness
+  # signal to wait for at all (see the startup-failure reconciliation block
+  # below) — nothing to defer this stamp behind, so it fires at launch
+  # exactly as it always has.
+  herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
+fi
 
 # Best-effort agent_session capture — herdr reports this natively for
 # claude/codex (empty for omp today) once the CLI has actually started
@@ -1214,7 +1220,11 @@ done
 [ -n "$agent_session" ] && set_task_agent_session "$run_id" "$task_id" "$agent_session"
 
 # Startup-failure reconciliation (fix/offline-launch-profile, conductor
-# 2026-10-17): previously only the --brief kickoff path below waited for
+# 2026-10-17; hardened fix/launch-receipt-r2, conductor 2026-10-29 — see
+# tmp/conductor-supplied/registry-wB6p2.txt: a STALE copy of this file
+# (predating this whole block) left a registry row `running` with nothing
+# live behind it, and a later `send-to-agent.sh` typed a brief into the
+# dead shell). previously only the --brief kickoff path below waited for
 # any pane output before this flipped to "running" — a bound-launcher
 # die() (rc!=0, nothing ever reaches a prompt — v18's launcher rejecting
 # a 2nd --config did exactly this to every patched spawn) or a pane that
@@ -1237,24 +1247,63 @@ done
 # `quick /bin/true` spawns — a test-harness-shape problem this managed-
 # only, wait-output-only design does not have, since those spawns never
 # reach this branch).
+#
+# `launch_failed`, not `failed`: a distinct terminal state (lib/run-
+# registry.sh's `_legal_transition`) for "the agent never actually
+# started", so a later sweep or `mark-launch-failed.sh` can tell this
+# apart from a task that ran and then errored mid-work, without parsing
+# event payloads.
+#
+# `herdr pane report-agent --state working`: for a MANAGED spawn this now
+# fires only once readiness is confirmed below, not back at `herdr pane
+# run` time (conductor audit of 83f72c1/f836524e, 2026-10-29: the live
+# script stamped "working" on herdr's own tab bulletin board before the
+# readiness check that follows it ever ran, so a spawn whose launcher
+# die()s or whose pane vanishes showed "working" on the tab list with
+# nothing live behind it — correctable only by attention.sh's next live-
+# observation tick, or never, if the pane is already gone). An unmanaged
+# spawn has no readiness check to defer behind, so it keeps stamping at
+# launch, above.
+#
+# `HERDR_SPAWN_RECEIPT`: readiness output alone is not proof an AGENT is
+# live — it is omp's own startup banner, which could in principle paint
+# and then the process could still exit before a real foreground job
+# starts. `pane_is_agent` (lib/pane-guard.sh, the same allowlisted-process
+# check `send-to-agent.sh` now refuses a dead pane with) re-confirms a
+# recognized agent binary is the pane's live foreground process before
+# anything downstream infers liveness from "the registry says running and
+# nothing errored". The receipt itself is printed below, after the --brief
+# kickoff block, not here — its `verified=` value distinguishes
+# `launcher-verified-ready` (this check passed, no --brief requested) from
+# `brief-delivered` (this check passed AND, if --brief was requested, the
+# kickoff was confirmed delivered) — see that block for why an undelivered
+# kickoff is now fatal rather than a printed warning.
 if [ "$managed" = 1 ]; then
   first_output="$(herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort|^omp-herdr-bound: ' --timeout 60000 2>&1)"
   wait_rc=$?
   if printf '%s' "$first_output" | grep -q '^omp-herdr-bound: '; then
     launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
-    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1
     append_event "$run_id" "$task_id" "spawn_startup_failed" \
       "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" '{reason:$r, launcher_error:$e}')" >/dev/null 2>&1 || true
     echo "spawn-task: refusing — the bound omp launcher rejected this spawn at startup ($launcher_err); see registry task $task_id" >&2
     exit 1
   fi
   if [ "$wait_rc" != 0 ]; then
-    set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1
     append_event "$run_id" "$task_id" "spawn_startup_failed" \
       '{"reason":"no readiness output within 60s of launch (the process may have exited or the pane vanished)"}' >/dev/null 2>&1 || true
     echo "spawn-task: refusing — the worker produced no readiness output within 60s of launch; see registry task $task_id" >&2
     exit 1
   fi
+  if ! pane_is_agent "$pane" 2>/dev/null; then
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      '{"reason":"readiness output appeared but the pane'"'"'s foreground process is not a recognized agent (bare shell, or the agent already exited)"}' >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — readiness output appeared but no live agent process is running in pane $pane; see registry task $task_id" >&2
+    exit 1
+  fi
+  herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 fi
 set_task_state "$run_id" "$task_id" "running"
 
@@ -1263,7 +1312,15 @@ set_task_state "$run_id" "$task_id" "running"
 # could never come (2026-09-29, thurber-os #84 review: one hour lost; 60s once
 # prompted by hand). Deliver the kickoff here, after the agent's composer has
 # painted, via send-to-agent.sh so the submit is confirmed, not assumed.
+#
+# An undelivered kickoff is now FATAL (conductor audit, 2026-10-29): the
+# live script treated it as a soft warning folded into the printed summary
+# while leaving the task `running` — a worker nobody can reach and that
+# was never told what to do is the same class of lie this whole hardening
+# exists to close, so it transitions to `launch_failed` like every other
+# startup defect instead of waiting for a human to notice the note.
 kickoff_note="none (no --brief; send the first prompt yourself)"
+spawn_verified="launcher-verified-ready"
 if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
   if [ "$orchestrator_closes" = 1 ]; then
     kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json. Your write tool reaches only .handoffs/ANSWER.md (handoffs_write) — do NOT append to events.jsonl or try any other way to close this task yourself; that is refused and escalated for nothing. Write ANSWER.md, then stop: the orchestrator closes this task once it verifies and this session goes idle."
@@ -1275,9 +1332,19 @@ if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
   # exited before this point) — send the kickoff directly.
   if bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
     kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"
+    spawn_verified="brief-delivered"
   else
-    kickoff_note="⚠ NOT DELIVERED — the worker is idle. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\""
+    set_task_state "$run_id" "$task_id" launch_failed >/dev/null 2>&1
+    append_event "$run_id" "$task_id" "spawn_startup_failed" \
+      '{"reason":"brief_undelivered — the agent is live and ready but the initial kickoff could not be confirmed delivered; the worker never received its instructions"}' >/dev/null 2>&1 || true
+    echo "spawn-task: refusing — the worker is alive and ready but the kickoff brief could not be delivered; see registry task $task_id. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\"" >&2
+    exit 1
   fi
+fi
+if [ "$managed" = 1 ]; then
+  printf 'HERDR_SPAWN_RECEIPT run_id=%s task_id=%s pane=%s verified=%s\n' "$run_id" "$task_id" "$pane" "$spawn_verified"
+  append_event "$run_id" "$task_id" "spawn_receipt" \
+    "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
 fi
 
 bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"

@@ -15,9 +15,10 @@
 #      registry row (conductor_pane_id, kept live by conductor-handover.sh)
 #      when one exists, else the pane stamped into the env at spawn
 #   2. the conductor pane must still be running an agent (pane_is_agent) —
-#      send-to-agent.sh does not enforce that itself, so without this a stray
-#      HERDR_CONDUCTOR_PANE_ID types into a bare shell, where the text EXECUTES
-#      instead of landing in a composer
+#      `send-to-agent.sh` also refuses this itself now (fix/launch-receipt-r2,
+#      exit 3), but this check runs BEFORE wake_attempted is even recorded,
+#      so a dead conductor pane shows up as "skipped, no eligible conductor"
+#      rather than as an attempted-and-refused delivery
 #   3. the conductor pane's live terminal_id must still match the
 #      conductor_pane_birth recorded at registration — pane ids are RECYCLED, so
 #      a delayed wake on a bare pane id can land in an unrelated later session

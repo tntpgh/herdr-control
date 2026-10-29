@@ -73,6 +73,18 @@ herdr() {
         echo $((idx + 1)) >"$COUNTER"
       fi
       ;;
+    "pane process-info")
+      # require_agent_pane (lib/pane-guard.sh) is now checked unconditionally
+      # at the top of send_to_agent_run — default to a live agent so every
+      # scenario below, which is testing delivery/confirmation logic, not
+      # this gate, is unaffected. NO_AGENT=1 flips it for the scenarios that
+      # exist to prove the gate itself.
+      if [ "${NO_AGENT:-0}" = 1 ]; then
+        printf '{"result":{"process_info":{"foreground_processes":[{"name":"zsh","cmdline":"-zsh"}]}}}\n'
+      else
+        printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude"}]}}}\n'
+      fi
+      ;;
     *) return 0 ;;
   esac
 }
@@ -85,6 +97,7 @@ bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 reset_state() {
   rm -rf "$SCREEN_DIR" "$DETECTION_DIR"; mkdir -p "$SCREEN_DIR" "$DETECTION_DIR"
   echo 0 >"$COUNTER"; : >"$KEYS"; : >"$SENDTEXT"
+  unset NO_AGENT
 }
 screen() { cat >"$SCREEN_DIR/$1"; }              # screen <idx>  <<EOF ... EOF
 detection() { cat >"$DETECTION_DIR/$1"; }        # detection <idx> <<EOF ... EOF
@@ -509,5 +522,44 @@ PANE="w9:p9" send "hello there"; rc=$?
 n_after=$(_q "SELECT count(*) FROM events WHERE type='message_delivered';")
 [ "$n_after" = "$n_before" ] && ok "no message_delivered event for an unregistered pane" \
   || bad "expected $n_before message_delivered events, got $n_after"
+
+printf '== fix/launch-receipt-r2: a pane whose foreground process is NOT a recognized agent (bare shell) is refused, exit 3, zero input ==\n'
+reset_state
+screen 0 <<'EOF'
+% echo hi
+hi
+%
+EOF
+last_as 0
+NO_AGENT=1 send "some message"; rc=$?
+[ "$rc" -eq 3 ] && ok "exit 3 REFUSED on a bare-shell pane" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed into a bare shell" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed into a bare shell (it would EXECUTE as a command)" || bad "typed into a shell: $(cat "$SENDTEXT")"
+
+printf '== fix/launch-receipt-r2: --force does NOT bypass the live-agent-process refusal ==\n'
+reset_state
+screen 0 <<'EOF'
+% echo hi
+hi
+%
+EOF
+last_as 0
+NO_AGENT=1 send --force "some message"; rc=$?
+[ "$rc" -eq 3 ] && ok "exit 3 REFUSED even with --force" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed into a bare shell, even with --force" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed, even with --force" || bad "typed into a shell: $(cat "$SENDTEXT")"
+
+printf '== fix/launch-receipt-r2: --submit-only also refuses a bare-shell pane ==\n'
+reset_state
+screen 0 <<'EOF'
+% echo hi
+hi
+%
+EOF
+last_as 0
+NO_AGENT=1 send --submit-only; rc=$?
+[ "$rc" -eq 3 ] && ok "exit 3 REFUSED on --submit-only to a bare shell" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed" || bad "Enters=$(enters_pressed)"
+
 
 [ "$fail" -eq 0 ]

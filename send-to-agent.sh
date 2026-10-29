@@ -45,8 +45,12 @@
 #   text          the prompt to inject (literal; quote it) — omitted with
 #                 --submit-only
 #
-# Exit 0 SUBMITTED   — the composer's content changed after an Enter (works
-#                      for Claude TUI and shell panes).
+# Exit 0 SUBMITTED   — the composer's content changed after an Enter.
+# Exit 3 REFUSED     — the pane's foreground process is not a recognized agent
+#                      (a bare shell, or the agent already exited) —
+#                      lib/pane-guard.sh's require_agent_pane. Typed text in a
+#                      shell pane EXECUTES as a command; --force never bypasses
+#                      this (same as herdr-deliver.sh / herdr-select.sh).
 # Exit 4 UNSUBMITTED — the composer looked unchanged after every retry, or the
 #                      pane could not be read to confirm; either way the
 #                      caller MUST NOT assume the peer received it.
@@ -73,6 +77,7 @@ set -uo pipefail
 export HERDR_SANCTIONED_ANSWER=1
 _here=$(cd "$(dirname "$0")" && pwd)
 . "$_here/lib/prompt-parse.sh"
+. "$_here/lib/pane-guard.sh"   # require_agent_pane
 
 # Sourceable reuse: when SEND_TO_AGENT_LIB_SOURCED=1 is set BEFORE this file
 # is sourced (not executed), prompt-parse.sh loads above but
@@ -103,6 +108,15 @@ if [ "$submit_only" -eq 1 ]; then
 else
   text="${1:?text required (or pass --submit-only to submit what is already typed)}"
 fi
+
+# fix/launch-receipt-r2 (conductor, 2026-10-29): a dead/stale registry row
+# left `running` with no agent behind it used to accept a delivery anyway —
+# the text landed in a bare shell and EXECUTED as a command. Every other
+# raw-input path (herdr-deliver.sh, herdr-select.sh) already refuses here;
+# this one didn't (docs/control-plane-design.md's push-wake row used to say
+# so explicitly). No --force bypass, same as those two: an agent-shaped
+# pane is not something a caller should be able to override their way past.
+require_agent_pane "$pane" || exit 3
 
 # A pane whose agent is BLOCKED is usually sitting on a permission prompt, not an
 # empty composer. There, typed text is largely inert and the Enter we send lands

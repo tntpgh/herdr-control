@@ -74,6 +74,13 @@ herdr() {
     "pane send-keys")
       printf '%s\n' "$4" >>"$KEYS"
       ;;
+    "pane process-info")
+      # require_agent_pane (lib/pane-guard.sh) is checked unconditionally at
+      # the top of send_to_agent_run (fix/launch-receipt-r2) — this suite is
+      # about the typing-race guard that runs AFTER that, so the stub pane
+      # is always a live agent; it is never what any scenario here varies.
+      printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude"}]}}}\n'
+      ;;
     *) return 0 ;;
   esac
 }

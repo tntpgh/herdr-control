@@ -1154,12 +1154,19 @@ _legal_transition() {                   # from to -> 0 if allowed
   local from="$1" to="$2"
   [ "$from" = "$to" ] && return 0       # idempotent re-assert, always fine
   case "$from" in
-    ''|starting) case "$to" in running|blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
-    running)     case "$to" in blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    ''|starting) case "$to" in running|blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
+    running)     case "$to" in blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
     blocked)     case "$to" in running|completed|failed|cancelled|lost) return 0 ;; esac ;;
     # Terminal. Nothing leaves these; `lost` in particular must not be
     # resurrected by a stale hook firing after the sweep already buried it.
-    completed|failed|cancelled|lost) return 1 ;;
+    # `launch_failed` (fix/launch-receipt-r2): a DISTINCT terminal outcome
+    # from `failed` — the agent never actually started (spawn-task.sh's
+    # readiness/liveness check failed, or a conductor's mark-launch-
+    # failed.sh confirmed the registered pane is dead) — so a consumer can
+    # tell "never ran" apart from "ran and then errored" without parsing
+    # event payloads. Reachable only from `starting`/`running`, same shape
+    # as `failed`, never resurrected.
+    completed|failed|launch_failed|cancelled|lost) return 1 ;;
   esac
   return 1
 }
