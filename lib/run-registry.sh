@@ -1982,6 +1982,109 @@ claim_once() {                          # event_id [run_id] [task_id] [type] [pa
   [ "$changed" = "1" ]
 }
 
+# ---- completion harvest / successor queue (docs/design/completion- -------
+# harvest-dispatch.md): the conductor-notified half of "a worker finished,
+# what happens next" — never auto-dispatches anything, only makes an
+# already-existing wake (stall-watchdog.sh cmd_wake) carry a durable
+# receipt and a human-pre-planned next step. Plain `events` rows
+# throughout, same idiom `claim_once`/`append_event` already provide; no
+# new table, no migration.
+
+# record_completion_receipt <task_id> <artifact_path> <sha256> -> 0 the
+# FIRST time this exact (task_id, sha256) pair is seen (claim_once
+# semantics: a rewritten artifact with the SAME bytes after a restart
+# never double-fires; different bytes is a different event_id and
+# receipts again, same "a changed fingerprint re-arms" shape cmd_wake's
+# own wake dedup already uses).
+record_completion_receipt() {
+  local task_id="$1" artifact_path="$2" sha="$3"
+  [ -n "$task_id" ] && [ -n "$sha" ] || return 1
+  claim_once "completion_receipt_${task_id}_${sha}" "" "$task_id" completion_receipt \
+    "$(jq -nc --arg a "$artifact_path" --arg s "$sha" '{artifact:$a, sha:$s}')"
+}
+
+# assign_lane <task_id> <lane> -> 0 the first time this task is assigned a
+# lane (claim_once: immutable once set — a task does not change lanes
+# mid-flight).
+assign_lane() {
+  local task_id="$1" lane="$2"
+  [ -n "$task_id" ] && [ -n "$lane" ] || return 1
+  claim_once "lane_assignment_${task_id}" "" "$task_id" lane_assignment \
+    "$(jq -nc --arg l "$lane" '{lane:$l}')"
+}
+
+# read_lane_for_task <task_id> -> the assigned lane, or empty + rc1 if none.
+read_lane_for_task() {
+  local task_id="$1" lane
+  registry_init || return 1
+  lane="$(_sql "SELECT json_extract(payload,'\$.lane') FROM events
+        WHERE task_id=$(_sq "$task_id") AND type='lane_assignment' LIMIT 1;" 2>/dev/null)"
+  [ -n "$lane" ] || return 1
+  printf '%s\n' "$lane"
+}
+
+# queue_successor <lane> <next> <queued_by> -> records the pre-planned next
+# step for a lane. A FRESH row every call (not claim_once) -- the
+# conductor can replan; the latest row for this lane always wins on read.
+queue_successor() {
+  local lane="$1" next="$2" queued_by="${3:-}"
+  [ -n "$lane" ] && [ -n "$next" ] || return 1
+  append_event "" "" successor_queued \
+    "$(jq -nc --arg l "$lane" --arg n "$next" --arg q "$queued_by" '{lane:$l, next:$n, queued_by:$q}')"
+}
+
+# read_successor_for_lane <lane> -> the most recently queued `next` string
+# for this lane, or empty if none was ever queued.
+read_successor_for_lane() {
+  local lane="$1"
+  registry_init || return 1
+  _sql "SELECT json_extract(payload,'\$.next') FROM events
+        WHERE type='successor_queued' AND json_extract(payload,'\$.lane')=$(_sq "$lane")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
+# hold_lane <lane> <reason> [held_by] / release_lane <lane> [released_by] ->
+# a FRESH row every call; `lane_held` below reads whichever is most recent
+# for this lane. Scoped entirely by the `lane` key inside the payload, so
+# holding lane A never touches any row belonging to lane B.
+hold_lane() {
+  local lane="$1" reason="${2:-}" held_by="${3:-}"
+  [ -n "$lane" ] || return 1
+  append_event "" "" lane_hold \
+    "$(jq -nc --arg l "$lane" --arg r "$reason" --arg b "$held_by" '{lane:$l, state:"held", reason:$r, held_by:$b}')"
+}
+release_lane() {
+  local lane="$1" released_by="${2:-}"
+  [ -n "$lane" ] || return 1
+  append_event "" "" lane_hold \
+    "$(jq -nc --arg l "$lane" --arg b "$released_by" '{lane:$l, state:"released", released_by:$b}')"
+}
+
+# lane_held <lane> -> 0 iff the most recent lane_hold row for this lane has
+# state="held" (no row at all -> not held, rc1).
+lane_held() {
+  local lane="$1" state
+  registry_init || return 1
+  state="$(_sql "SELECT json_extract(payload,'\$.state') FROM events
+        WHERE type='lane_hold' AND json_extract(payload,'\$.lane')=$(_sq "$lane")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+  [ "$state" = held ]
+}
+
+# lane_successor_admits <lane> -> prints the queued successor for <lane>
+# and returns 0, UNLESS the lane is currently held (empty + rc1) or
+# nothing was ever queued for it (empty + rc1). The single read cmd_wake
+# uses: never surfaces a plan for a held lane, never invents one for a
+# lane with no plan.
+lane_successor_admits() {
+  local lane="$1" next
+  [ -n "$lane" ] || return 1
+  lane_held "$lane" && return 1
+  next="$(read_successor_for_lane "$lane")"
+  [ -n "$next" ] || return 1
+  printf '%s\n' "$next"
+}
+
 # task_input_required_command <run_id> <task_id> <prompt_id> -> the
 # untruncated command recorded on the input_required event for THIS exact
 # prompt, or empty.

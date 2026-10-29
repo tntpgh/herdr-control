@@ -82,6 +82,41 @@ _sw_digest() {                          # <text> -> short stable digest
   fi
 }
 
+# ---- completion harvest / successor queue (docs/design/completion- -------
+# harvest-dispatch.md) ---------------------------------------------------
+# `signal` in {artifact, handoff} is the one shape that actually means "a
+# worker finished something" (denied/unprocessed/conductor_prompt are not).
+# For those two signals only, before composing the wake text: record a
+# durable completion receipt (deduped by task + the artifact's own content
+# sha, lib/run-registry.sh's record_completion_receipt) and, if the task's
+# lane has a pre-planned successor and is not held, fold it into the SAME
+# message cmd_wake already sends — never a new send, never a spawn, never
+# new authority. A task with no assigned lane or no queued successor
+# degrades to exactly today's bare wake text.
+_sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
+  local path="$1/$2"
+  [ -f "$path" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" 2>/dev/null | awk '{print $1}'
+  fi
+}
+_sw_completion_harvest() {              # task_id signal artifact worktree -> prints "Pre-planned next: ..." or nothing
+  local task_id="$1" signal="$2" artifact="$3" worktree="$4" sha lane succ
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
+  if [ -n "$artifact" ] && [ -n "$worktree" ]; then
+    sha="$(_sw_artifact_sha "$worktree" "$artifact")"
+    [ -n "$sha" ] && record_completion_receipt "$task_id" "$artifact" "$sha" >/dev/null 2>&1
+  fi
+  lane="$(read_lane_for_task "$task_id" 2>/dev/null)" || return 0
+  succ="$(lane_successor_admits "$lane" 2>/dev/null)" || return 0
+  [ -n "$succ" ] && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
+}
+
 _sw_escalate_window_s() {
   local raw="${HERDR_STALL_WATCHDOG_ESCALATE_S:-}" thresh="${HERDR_STALL_WATCHDOG_THRESHOLD_S:-600}"
   case "$thresh" in ''|*[!0-9]*) thresh=600 ;; esac
@@ -298,13 +333,16 @@ cmd_wake() {
   task_json="$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$task_id");" 2>/dev/null)"
   [ -n "$task_json" ] || return 0   # task vanished between detection and delivery — nothing to wake
 
-  local run_id pane conductor conductor_birth label
+  local run_id pane conductor conductor_birth label worktree
   run_id="$(printf '%s' "$task_json" | jq -r '.run_id // empty')"
   pane="$(printf '%s' "$task_json" | jq -r '.pane_id // empty')"
   conductor="$(printf '%s' "$task_json" | jq -r '.conductor_pane_id // empty')"
   conductor_birth="$(printf '%s' "$task_json" | jq -r '.conductor_pane_birth // empty')"
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
+  worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty')"
   [ -n "$label" ] || label="$task_id"
+  local harvest_note
+  harvest_note="$(_sw_completion_harvest "$task_id" "$signal" "$artifact" "$worktree")"
 
   # feat/no-progress-model-escalation R2: every real cycle hub hands this
   # task to us, regardless of whether the stall-WAKE itself is deduped
@@ -350,7 +388,7 @@ cmd_wake() {
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
           local art_note=""
           [ -n "$artifact" ] && art_note=" ($artifact)"
-          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
           _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
       fi
@@ -386,7 +424,7 @@ cmd_wake() {
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
     local art_note=""
     [ -n "$artifact" ] && art_note=" ($artifact)"
-    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
     _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
 }
