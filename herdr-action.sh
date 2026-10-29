@@ -105,7 +105,7 @@ _ha_task_active() {                     # task-json -> 0 if active
 # Terminal states never come back (`lost` included: reconcile's verdict is
 # final by design, verify-reconcile.sh).
 _ha_task_terminal() {                   # task-json -> 0 if terminal
-  case "$(_ha_field "$1" state)" in completed|failed|cancelled|lost) return 0 ;; esac
+  case "$(_ha_field "$1" state)" in completed|failed|launch_failed|cancelled|lost) return 0 ;; esac
   return 1
 }
 

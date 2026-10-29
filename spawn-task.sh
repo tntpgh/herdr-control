@@ -1328,36 +1328,54 @@ done
 # task_id on the blocked task's event instead of discarding it.
 #
 # `_spawn_mark_startup_outcome`: every branch below that leaves `starting`/
-# `running` for `launch_failed` or `uncertain` goes through this one
-# helper. Round 2, M1 side issue: a push-wake hook can race ahead of this
-# whole block and move the row to `blocked` (an `input_required` prompt
-# during the agent's own startup) before any of these checks ever run —
-# `blocked` is now a legal source for both target states (lib/run-
-# registry.sh's `_legal_transition`), and a `set_task_state` refusal here
-# is reported, never silently swallowed (`>/dev/null 2>&1` on the old
-# script's 335f458 draft threw it away, so the event's "reason" and the
-# row's real state could permanently disagree with no one told).
-_spawn_mark_startup_outcome() {        # <state: launch_failed|uncertain> <event-type> <payload-json>
+# `running` for `launch_failed` goes through this one helper. Round 2, M1
+# side issue: a push-wake hook can race ahead of this whole block and move
+# the row to `blocked` (an `input_required` prompt during the agent's own
+# startup) before any of these checks ever run — `blocked` is a legal
+# source for `launch_failed` (lib/run-registry.sh's `_legal_transition`),
+# and a `set_task_state` refusal here is reported, never silently
+# swallowed (`>/dev/null 2>&1` on the old script's 335f458 draft threw it
+# away, so the event's "reason" and the row's real state could
+# permanently disagree with no one told).
+_spawn_mark_startup_outcome() {        # <state: launch_failed> <event-type> <payload-json>
   local state="$1" etype="$2" payload="$3"
   if ! set_task_state "$run_id" "$task_id" "$state"; then
     echo "spawn-task: warning — could not transition task $task_id to $state (run-registry's own refusal is above); the registry may not reflect this outcome" >&2
   fi
   append_event "$run_id" "$task_id" "$etype" "$payload" >/dev/null 2>&1 || true
 }
+# `_spawn_mark_uncertain`: round 2 review (e0c2e65, N1/N2) — an AMBIGUOUS
+# startup outcome is deliberately NOT a registry state transition at all
+# (see lib/run-registry.sh's `_legal_transition` comment for why: the
+# earlier `uncertain` state stranded a live agent nothing could approve or
+# complete, the exact failure M1 existed to fix). The row is left exactly
+# where it already is; only the event (and, below, the receipt) records
+# the ambiguity.
+_spawn_mark_uncertain() {              # <event-type> <payload-json>
+  append_event "$run_id" "$task_id" "$1" "$2" >/dev/null 2>&1 || true
+}
 if [ "$managed" = 1 ]; then
   first_output="$(herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort|^omp-herdr-bound: ' --timeout 60000 2>&1)"
   wait_rc=$?
   if printf '%s' "$first_output" | grep -q '^omp-herdr-bound: '; then
     launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
+    spawn_verified=launch_failed
     _spawn_mark_startup_outcome launch_failed spawn_startup_failed \
       "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" '{reason:$r, launcher_error:$e}')"
     echo "spawn-task: refusing — the bound omp launcher rejected this spawn at startup ($launcher_err); see registry task $task_id" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" \
+      "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
     exit 1
   fi
   if [ "$wait_rc" != 0 ]; then
+    spawn_verified=launch_failed
     _spawn_mark_startup_outcome launch_failed spawn_startup_failed \
       '{"reason":"no readiness output within 60s of launch (the process may have exited or the pane vanished)"}'
     echo "spawn-task: refusing — the worker produced no readiness output within 60s of launch; see registry task $task_id" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" \
+      "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
     exit 1
   fi
   # round 2, H1-shaped gap closed here too: pane_is_agent alone can't tell
@@ -1366,21 +1384,29 @@ if [ "$managed" = 1 ]; then
   # fail-closed-refuse-to-send callers) — ask pane_process_info_ok first,
   # same as mark-launch-failed.sh's H1 fix. Unlike a confirmed "not an
   # agent" below, herdr being unreachable here is exactly the "uncertain"
-  # shape: the agent may well be alive and fine.
+  # shape: the agent may well be alive and fine. Round 2 review (e0c2e65,
+  # N1/N2): this is NOT a registry state transition — the row is left
+  # exactly as `register_task` created it (`starting`, since this runs
+  # before the `running` transition below); only the event and the
+  # receipt record the ambiguity.
   if ! pane_process_info_ok "$pane"; then
     spawn_verified=uncertain
-    _spawn_mark_startup_outcome uncertain spawn_startup_uncertain \
+    _spawn_mark_uncertain spawn_startup_uncertain \
       '{"reason":"herdr itself could not be reached to confirm whether a live agent process is running after readiness output appeared"}'
-    echo "spawn-task: uncertain — herdr could not be reached to confirm pane $pane's foreground process; task $task_id left UNCERTAIN, not launch_failed (the agent may well be alive and ready). Re-check once herdr answers: bash $here/mark-launch-failed.sh $run_id $task_id marks it dead only if it is still unconfirmable or genuinely gone; otherwise resolve it by hand once you've confirmed it yourself." >&2
+    echo "spawn-task: uncertain — herdr could not be reached to confirm pane $pane's foreground process; task $task_id's registry row is left as-is ('uncertain' is not a registry state — only the event and this receipt record it), not launch_failed (the agent may well be alive and ready). Re-check once herdr answers: bash $here/mark-launch-failed.sh $run_id $task_id marks it dead only if it is still unconfirmable or genuinely gone; otherwise resolve it by hand once you've confirmed it yourself." >&2
     printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
     append_event "$run_id" "$task_id" "spawn_receipt" \
       "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
     exit 1
   fi
   if ! pane_is_agent "$pane" 2>/dev/null; then
+    spawn_verified=launch_failed
     _spawn_mark_startup_outcome launch_failed spawn_startup_failed \
       '{"reason":"readiness output appeared but the pane'"'"'s foreground process is not a recognized agent (bare shell, or the agent already exited)"}'
     echo "spawn-task: refusing — readiness output appeared but no live agent process is running in pane $pane; see registry task $task_id" >&2
+    printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+    append_event "$run_id" "$task_id" "spawn_receipt" \
+      "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
     exit 1
   fi
   herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
@@ -1429,14 +1455,9 @@ if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
     herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state idle >/dev/null 2>&1 || true
     spawn_verified=uncertain
     kickoff_note="UNCERTAIN ($kickoff_reason — see mark-launch-failed.sh)"
-    _spawn_mark_startup_outcome uncertain spawn_kickoff_uncertain "$(jq -nc --arg r "$kickoff_reason" '{reason:$r}')"
-    echo "spawn-task: uncertain — $kickoff_reason; task $task_id left UNCERTAIN, not launch_failed (the agent is alive and may well have the brief). The receipt below prints verified=uncertain and the script exits nonzero — re-check the pane by hand; once you know the real outcome, resolve with: bash $here/mark-launch-failed.sh $run_id $task_id (if genuinely dead or never reachable) — or clear it yourself once confirmed fine." >&2
+    _spawn_mark_uncertain spawn_kickoff_uncertain "$(jq -nc --arg r "$kickoff_reason" '{reason:$r}')"
+    echo "spawn-task: uncertain — $kickoff_reason; task $task_id's registry row is left as-is ('uncertain' is not a registry state — only the event and the final receipt record it), not launch_failed (the agent is alive and may well have the brief). The receipt printed at the end of this run has verified=uncertain and the script exits nonzero — re-check the pane by hand; once you know the real outcome, resolve with: bash $here/mark-launch-failed.sh $run_id $task_id (if genuinely dead or never reachable) — or clear it yourself once confirmed fine." >&2
   fi
-fi
-if [ "$managed" = 1 ]; then
-  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
-  append_event "$run_id" "$task_id" "spawn_receipt" \
-    "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
 fi
 
 bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
@@ -1486,6 +1507,19 @@ else
 fi
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"
+# --- final receipt + exit gate (round 2, N3) ---
+# round 2 review (e0c2e65, N3): the receipt is printed exactly once, as the
+# LAST line of this script's stdout, on every outcome that reaches this
+# point (success or kickoff-ambiguous) — matching escalation.sh:591's own
+# documented contract and the 3 launch_failed/herdr-unreachable branches
+# above, which print their own receipt as the last thing on their own
+# (earlier) exit path. Previously this printed BEFORE the whole
+# informational banner above, so the banner — not the receipt — was last.
+if [ "$managed" = 1 ]; then
+  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s verified=%s\n' "$task_id" "$run_id" "$spawn_verified"
+  append_event "$run_id" "$task_id" "spawn_receipt" \
+    "$(jq -nc --arg v "$spawn_verified" '{verified:$v}')" >/dev/null 2>&1 || true
+fi
 case "$spawn_verified" in
   uncertain) exit 1 ;;
 esac

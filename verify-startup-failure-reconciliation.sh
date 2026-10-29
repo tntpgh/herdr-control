@@ -3,12 +3,13 @@
 # registry task (never leaves it at "starting"/"running") when the bound omp
 # launcher dies, produces no readiness output, or produces readiness output
 # with no live agent process behind it — that an unmanaged literal-command
-# spawn is never held to that omp-shaped wait — and (round 2, M1/M2) that a
-# genuinely AMBIGUOUS startup (herdr unreachable mid-liveness-check, or a
-# kickoff whose delivery could not be confirmed) lands on the distinct
-# non-terminal `uncertain` state, WITH its own HERDR_SPAWN_RECEIPT
-# (verified=uncertain), never on `launch_failed` and never silently left
-# `running`.
+# spawn is never held to that omp-shaped wait — and that a genuinely
+# AMBIGUOUS startup (herdr unreachable mid-liveness-check, or a kickoff
+# whose delivery could not be confirmed) leaves the registry row's STATE
+# completely untouched (round 2 review of e0c2e65, N1/N2 — see below),
+# never on `launch_failed`, with its own HERDR_SPAWN_RECEIPT
+# (verified=uncertain) printed exactly once as the LAST line of output on
+# every outcome (N3), and never silently left `running`.
 #
 # fix/launch-receipt-r2 (conductor, 2026-10-29; tmp/conductor-supplied/
 # registry-wB6p2.txt): a STALE copy of spawn-task.sh predating this whole
@@ -27,23 +28,41 @@
 # (unmanaged, which has no readiness check to defer behind).
 #
 # Round 2 of round 2 (independent review REJECT of 335f458, conductor
-# 2026-10-29, fixed here): the `--brief` kickoff's delivery failure is
-# NEVER `launch_failed` (a live agent stranded on a terminal "never
-# started" row nothing can approve again) — it is the distinct non-
-# terminal `uncertain` (lib/run-registry.sh), same bucket as herdr itself
-# going unreachable mid-liveness-check (H1-shaped gap: `pane_process_info_
-# ok` must be checked before trusting `pane_is_agent`'s verdict, same as
-# mark-launch-failed.sh's own H1 fix). `HERDR_SPAWN_RECEIPT`'s `verified=`
-# value distinguishes `launcher-verified-ready` (no `--brief` requested),
-# `brief-delivered` (requested and confirmed SUBMITTED), and `uncertain`
-# (registered and possibly alive, but neither confirmed) — and (M2,
-# conductor follow-up) the receipt now prints on the `uncertain` path too
-# (never on `launch_failed`), so `lib/escalation.sh`'s `_esc_spawn_
-# successor` can still bind the task_id for an operator to reconcile, even
-# though it is hardened to never treat `verified=uncertain` as a safe
-# successor (see verify-no-progress-escalation.sh). spawn-task.sh itself
-# still exits nonzero on `uncertain` — a fail-safe default for any caller
-# that only checks `$?` and never reads the receipt.
+# 2026-10-29): the `--brief` kickoff's delivery failure must never be
+# `launch_failed` (a live agent stranded on a terminal "never started" row
+# nothing can approve again) — it is genuinely ambiguous, same bucket as
+# herdr itself going unreachable mid-liveness-check (H1-shaped gap:
+# `pane_process_info_ok` must be checked before trusting `pane_is_agent`'s
+# verdict, same as mark-launch-failed.sh's own H1 fix).
+#
+# Round 3 of round 2 (independent review REJECT of e0c2e65, conductor
+# 2026-10-29, fixed here — N1/N2/N3): e0c2e65 answered the ambiguity above
+# by adding a non-terminal `uncertain` registry STATE. The re-review found
+# that this STRANDED a live worker exactly the way the original M1 fix was
+# meant to prevent: a row parked at `uncertain` forever, reachable from no
+# further transition except the operator's manual `mark-launch-failed.sh`
+# escape hatch, is itself a new kind of stuck state. Fixed by deleting
+# `uncertain` from `lib/run-registry.sh`'s `_legal_transition` entirely —
+# an ambiguous outcome now leaves the row in WHATEVER state it already had
+# (`starting` or `running`), calls `append_event` only (no `set_task_state`
+# at all), and the ambiguity is queryable exclusively through the
+# `spawn_startup_uncertain`/`spawn_kickoff_uncertain` event plus
+# `HERDR_SPAWN_RECEIPT`'s `verified=uncertain` field. `HERDR_SPAWN_RECEIPT`'s
+# `verified=` value distinguishes `launcher-verified-ready` (no `--brief`
+# requested), `brief-delivered` (requested and confirmed SUBMITTED),
+# `uncertain` (alive and possibly fine, but neither confirmed), and (N3)
+# now also `launch_failed` — every outcome prints exactly one receipt, as
+# the literal last stdout action on its own exit path, so
+# `lib/escalation.sh`'s `_esc_spawn_successor` can always bind the task_id
+# for an operator to reconcile, even though it is hardened to never treat
+# `verified=uncertain` (or `launch_failed`) as a safe successor (see
+# verify-no-progress-escalation.sh). spawn-task.sh itself still exits
+# nonzero on `uncertain` — a fail-safe default for any caller that only
+# checks `$?` and never reads the receipt. N4 (same review): `launch_failed`
+# was added to the terminal-state lists in lib/push-wake.sh,
+# herdr-action.sh and lib/task-reservation.py, so a launch-failed row is
+# treated as terminal everywhere `completed|failed|cancelled|lost` already
+# were.
 #
 # Observed failure (conductor, 2026-10-17): v18's bound launcher allowlisted
 # only the worker overlay as --config, so 77193ae's offline overlay made
@@ -117,7 +136,7 @@ else
   bad "healthy: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted reconciliation block, managed, bound launcher dies at startup: launch_failed, never reaches running, working never stamped, no receipt ==\n'
+printf '== extracted reconciliation block, managed, bound launcher dies at startup: launch_failed, never reaches running, working never stamped, receipt verified=launch_failed prints last (N3) ==\n'
 capture=$(mktemp)
 (
   herdr() { case "$1 $2" in
@@ -134,13 +153,14 @@ capture=$(mktemp)
 rc=$?
 if [ "$rc" != 0 ] && grep -q '^state:launch_failed$' "$capture" && ! grep -q '^state:running$' "$capture" \
    && grep -q 'event:spawn_startup_failed' "$capture" && grep -q 'bound launcher refused' "$capture" \
-   && ! grep -q 'report-agent:called' "$capture" && ! grep -q 'HERDR_SPAWN_RECEIPT' "$capture"; then
-  ok "dead launcher: rc=$rc, set_task_state launch_failed (never running), reason recorded, working never stamped, no receipt"
+   && ! grep -q 'report-agent:called' "$capture" \
+   && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=launch_failed$' "$capture"; then
+  ok "dead launcher: rc=$rc, set_task_state launch_failed (never running), reason recorded, working never stamped, receipt verified=launch_failed"
 else
   bad "dead launcher: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted reconciliation block, managed, no readiness output (stall or vanished pane): launch_failed, never reaches running, working never stamped ==\n'
+printf '== extracted reconciliation block, managed, no readiness output (stall or vanished pane): launch_failed, never reaches running, working never stamped, receipt verified=launch_failed prints last (N3) ==\n'
 capture=$(mktemp)
 (
   herdr() { case "$1 $2" in
@@ -156,13 +176,14 @@ capture=$(mktemp)
 ) >>"$capture" 2>&1
 rc=$?
 if [ "$rc" != 0 ] && grep -q '^state:launch_failed$' "$capture" && ! grep -q '^state:running$' "$capture" \
-   && grep -q 'event:spawn_startup_failed' "$capture" && ! grep -q 'report-agent:called' "$capture"; then
-  ok "no readiness output (stall/vanish): rc=$rc, set_task_state launch_failed (never running), reason recorded, working never stamped"
+   && grep -q 'event:spawn_startup_failed' "$capture" && ! grep -q 'report-agent:called' "$capture" \
+   && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=launch_failed$' "$capture"; then
+  ok "no readiness output (stall/vanish): rc=$rc, set_task_state launch_failed (never running), reason recorded, working never stamped, receipt verified=launch_failed"
 else
   bad "no readiness output: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted reconciliation block, managed, herdr UNREACHABLE mid-liveness-check: uncertain (not launch_failed), receipt verified=uncertain, working never stamped ==\n'
+printf '== extracted reconciliation block, managed, herdr UNREACHABLE mid-liveness-check: no registry state transition at all (round 2 review, N1/N2: uncertain is not a state), receipt verified=uncertain still prints, working never stamped ==\n'
 capture=$(mktemp)
 (
   herdr() { case "$1 $2" in
@@ -178,16 +199,15 @@ capture=$(mktemp)
   eval "$block_src"
 ) >>"$capture" 2>&1
 rc=$?
-if [ "$rc" != 0 ] && grep -q '^state:uncertain$' "$capture" && ! grep -q '^state:launch_failed$' "$capture" \
-   && ! grep -q '^state:running$' "$capture" && grep -q 'event:spawn_startup_uncertain' "$capture" \
+if [ "$rc" != 0 ] && ! grep -q '^state:' "$capture" && grep -q 'event:spawn_startup_uncertain' "$capture" \
    && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=uncertain$' "$capture" \
    && ! grep -q 'UNEXPECTED' "$capture" && ! grep -q 'report-agent:called' "$capture"; then
-  ok "herdr unreachable mid-liveness-check: rc=$rc, uncertain (never launch_failed/running), receipt verified=uncertain still printed, working never stamped"
+  ok "herdr unreachable mid-liveness-check: rc=$rc, NO set_task_state call at all (row stays whatever it already was), event recorded, receipt verified=uncertain still printed, working never stamped"
 else
   bad "herdr unreachable mid-liveness-check: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted reconciliation block, managed, readiness output but NO live agent process (bare shell): launch_failed, never reaches running, working never stamped ==\n'
+printf '== extracted reconciliation block, managed, readiness output but NO live agent process (bare shell): launch_failed, never reaches running, working never stamped, receipt verified=launch_failed prints last (N3) ==\n'
 capture=$(mktemp)
 (
   herdr() { case "$1 $2" in
@@ -209,8 +229,9 @@ capture=$(mktemp)
 rc=$?
 if [ "$rc" != 0 ] && grep -q '^state:launch_failed$' "$capture" && ! grep -q '^state:running$' "$capture" \
    && ! grep -q '^state:uncertain$' "$capture" && grep -q 'event:spawn_startup_failed' "$capture" \
-   && grep -qi 'not a recognized agent' "$capture" && ! grep -q 'report-agent:called' "$capture"; then
-  ok "readiness ok but dead pane: rc=$rc, launch_failed (never running/uncertain), reason recorded, working never stamped — this is the wB6:p2 shape"
+   && grep -qi 'not a recognized agent' "$capture" && ! grep -q 'report-agent:called' "$capture" \
+   && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=launch_failed$' "$capture"; then
+  ok "readiness ok but dead pane: rc=$rc, launch_failed (never running/uncertain), reason recorded, working never stamped, receipt verified=launch_failed — this is the wB6:p2 shape"
 else
   bad "readiness ok but dead pane: rc=$rc capture=$(cat "$capture")"
 fi
@@ -236,8 +257,13 @@ fi
 
 block2_src="$(awk '/^kickoff_note="none \(no --brief/,/^bgtag="background"/' "$here/spawn-task.sh" | sed '$d')"
 case "$block2_src" in
-  *'HERDR_SPAWN_RECEIPT'*'spawn_verified'*) ;;
-  *) echo "FATAL: extraction markers no longer bracket spawn-task.sh's kickoff/receipt block — re-anchor this test" >&2; exit 2 ;;
+  *'spawn_verified="launcher-verified-ready"'*'kickoff_reason='*) ;;
+  *) echo "FATAL: extraction markers no longer bracket spawn-task.sh's kickoff block — re-anchor this test" >&2; exit 2 ;;
+esac
+block3_src="$(awk '/^# --- final receipt \+ exit gate \(round 2, N3\) ---$/,/^esac$/' "$here/spawn-task.sh")"
+case "$block3_src" in
+  *'HERDR_SPAWN_RECEIPT'*'uncertain) exit 1'*) ;;
+  *) echo "FATAL: extraction markers no longer bracket spawn-task.sh's final receipt/exit-code gate — re-anchor this test" >&2; exit 2 ;;
 esac
 stub2_dir=$(mktemp -d)
 cat > "$stub2_dir/send-to-agent.sh" <<'STUB'
@@ -246,13 +272,15 @@ exit "${FAKE_STA_RC:-0}"
 STUB
 chmod +x "$stub2_dir/send-to-agent.sh"
 
-printf '== extracted kickoff/receipt block, managed, no --brief requested: receipt verified=launcher-verified-ready, no send-to-agent call ==\n'
+
+printf '== extracted kickoff + final-receipt blocks, managed, no --brief requested: receipt verified=launcher-verified-ready, no send-to-agent call ==\n'
 capture=$(mktemp)
 (
   set_task_state() { printf 'state:%s\n' "$3" >> "$capture"; }
   append_event() { printf 'event:%s payload:%s\n' "$3" "$4" >> "$capture"; }
   run_id=r1 task_id=t1 pane=p1 managed=1 brief_file="" orchestrator_closes=0 here="$stub2_dir"
   eval "$block2_src"
+  eval "$block3_src"
 ) >>"$capture" 2>&1
 rc=$?
 if [ "$rc" = 0 ] && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=launcher-verified-ready$' "$capture" \
@@ -262,7 +290,7 @@ else
   bad "no --brief: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted kickoff/receipt block, managed, --brief delivered: receipt verified=brief-delivered ==\n'
+printf '== extracted kickoff + final-receipt blocks, managed, --brief delivered: receipt verified=brief-delivered ==\n'
 capture=$(mktemp)
 (
   set_task_state() { printf 'state:%s\n' "$3" >> "$capture"; }
@@ -270,37 +298,39 @@ capture=$(mktemp)
   export FAKE_STA_RC=0
   run_id=r1 task_id=t1 pane=p1 managed=1 brief_file=/tmp/fake-brief orchestrator_closes=0 here="$stub2_dir"
   eval "$block2_src"
+  eval "$block3_src"
 ) >>"$capture" 2>&1
 rc=$?
 if [ "$rc" = 0 ] && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=brief-delivered$' "$capture" \
-   && ! grep -q '^state:launch_failed$' "$capture" && ! grep -q '^state:uncertain$' "$capture"; then
-  ok "--brief delivered: receipt task_id=/run_id=/verified=brief-delivered"
+   && ! grep -q '^state:' "$capture"; then
+  ok "--brief delivered: receipt task_id=/run_id=/verified=brief-delivered, no state transition"
 else
   bad "--brief delivered: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted kickoff/receipt block, managed, --brief delivery AMBIGUOUS (send-to-agent exit 4 UNSUBMITTED): uncertain, receipt verified=uncertain still prints (round 2, M1: the agent is alive, never launch_failed) ==\n'
+printf '== extracted kickoff + final-receipt blocks, managed, --brief delivery AMBIGUOUS (send-to-agent exit 4 UNSUBMITTED): no state transition (round 2 review, N1/N2), event + receipt verified=uncertain still print (round 2, M1: the agent is alive, never launch_failed) ==\n'
 capture=$(mktemp)
 (
   set_task_state() { printf 'state:%s\n' "$3" >> "$capture"; }
   append_event() { printf 'event:%s payload:%s\n' "$3" "$4" >> "$capture"; }
   herdr() { case "$1 $2" in "pane report-agent") echo "report-agent-idle:called" >> "$capture" ;; esac; }
-  _spawn_mark_startup_outcome() { set_task_state "$run_id" "$task_id" "$1"; append_event "$run_id" "$task_id" "$2" "$3" >/dev/null 2>&1; }
+  _spawn_mark_uncertain() { append_event "$run_id" "$task_id" "$1" "$2" >/dev/null 2>&1; }
   export FAKE_STA_RC=4
   run_id=r1 task_id=t1 pane=p1 managed=1 brief_file=/tmp/fake-brief orchestrator_closes=0 label=impl:t1 HERDR_SOURCE=spawn-task here="$stub2_dir"
   eval "$block2_src"
+  eval "$block3_src"
 ) >>"$capture" 2>&1
 rc=$?
-if grep -q '^state:uncertain$' "$capture" && ! grep -q '^state:launch_failed$' "$capture" \
+if ! grep -q '^state:' "$capture" \
    && grep -q 'event:spawn_kickoff_uncertain' "$capture" && grep -qi 'UNSUBMITTED' "$capture" \
    && grep -q '^HERDR_SPAWN_RECEIPT task_id=t1 run_id=r1 verified=uncertain$' "$capture" \
    && grep -q 'report-agent-idle:called' "$capture"; then
-  ok "--brief delivery ambiguous (exit 4 UNSUBMITTED): uncertain, reason recorded, receipt verified=uncertain still printed, working badge cleared"
+  ok "--brief delivery ambiguous (exit 4 UNSUBMITTED): NO set_task_state call, reason recorded, receipt verified=uncertain still printed, working badge cleared"
 else
   bad "--brief delivery ambiguous: rc=$rc capture=$(cat "$capture")"
 fi
 
-printf '== extracted kickoff/receipt block, UNMANAGED: never attempts kickoff, no receipt, regardless of --brief ==\n'
+printf '== extracted kickoff + final-receipt blocks, UNMANAGED: never attempts kickoff, no receipt, regardless of --brief ==\n'
 capture=$(mktemp)
 (
   set_task_state() { printf 'state:%s\n' "$3" >> "$capture"; }
@@ -308,22 +338,17 @@ capture=$(mktemp)
   export FAKE_STA_RC=1
   run_id=r1 task_id=t1 pane=p1 managed=0 brief_file=/tmp/fake-brief orchestrator_closes=0 here="$stub2_dir"
   eval "$block2_src"
+  eval "$block3_src"
 ) >>"$capture" 2>&1
 rc=$?
 if [ "$rc" = 0 ] && [ ! -s "$capture" ]; then
-  ok "unmanaged: kickoff/receipt block is a complete no-op regardless of --brief"
+  ok "unmanaged: kickoff + final-receipt blocks are a complete no-op regardless of --brief"
 else
   bad "unmanaged: rc=$rc capture=$(cat "$capture")"
 fi
 
-block3_src="$(awk '/^case "\$spawn_verified" in$/,/^esac$/' "$here/spawn-task.sh")"
-case "$block3_src" in
-  *'uncertain) exit 1'*) ;;
-  *) echo "FATAL: extraction markers no longer bracket spawn-task.sh's final exit-code gate — re-anchor this test" >&2; exit 2 ;;
-esac
-
-printf '== extracted exit-code gate, spawn_verified=uncertain: exits nonzero (fail-safe default for a caller that only checks $?) ==\n'
-( spawn_verified=uncertain; eval "$block3_src" )
+printf '== extracted final-receipt + exit-code gate, spawn_verified=uncertain: exits nonzero (fail-safe default for a caller that only checks $?) ==\n'
+( managed=0 run_id=r1 task_id=t1 spawn_verified=uncertain; eval "$block3_src" )
 rc=$?
 if [ "$rc" = 1 ]; then
   ok "exit-code gate: verified=uncertain -> exit 1"
@@ -331,16 +356,84 @@ else
   bad "exit-code gate: verified=uncertain -> rc=$rc (expected 1)"
 fi
 
-printf '== extracted exit-code gate, spawn_verified=brief-delivered/launcher-verified-ready: falls through, no forced exit ==\n'
-( spawn_verified=brief-delivered; eval "$block3_src" )
+printf '== extracted final-receipt + exit-code gate, spawn_verified=brief-delivered/launcher-verified-ready: falls through, no forced exit ==\n'
+( managed=0 run_id=r1 task_id=t1 spawn_verified=brief-delivered; eval "$block3_src" )
 rc1=$?
-( spawn_verified=launcher-verified-ready; eval "$block3_src" )
+( managed=0 run_id=r1 task_id=t1 spawn_verified=launcher-verified-ready; eval "$block3_src" )
 rc2=$?
 if [ "$rc1" = 0 ] && [ "$rc2" = 0 ]; then
   ok "exit-code gate: confirmed verified values never force a nonzero exit"
 else
   bad "exit-code gate: rc1=$rc1 rc2=$rc2 (expected both 0)"
 fi
+
+printf '== REAL registry (no stubbed set_task_state/append_event), managed, herdr UNREACHABLE mid-liveness-check: row state genuinely unchanged, real event recorded (round 2 review N2: the extracted-block scenarios above stub set_task_state, which alone cannot catch an illegal-transition bug the way a real registry can) ==\n'
+rr_runs_dir=$(mktemp -d)/runs
+(
+  export HERDR_RUN_STATE_DIR="$rr_runs_dir"
+  . "$here/lib/run-registry.sh"
+  registry_init || exit 2
+  register_task rrun1 rtask1 w c cp cb p1 birth1 /repo/rr /wt/rr "implement:rtask1" || exit 2
+  herdr() { case "$1 $2" in
+    "pane wait-output") printf 'Model scope: write\n'; return 0 ;;
+    "pane report-agent") : ;;
+  esac; }
+  pane_is_agent() { echo "UNEXPECTED pane_is_agent call (should refuse before reaching it)" >&2; return 1; }
+  pane_process_info_ok() { [ "${HERDR_REACHABLE:-1}" = 1 ]; }
+  HERDR_REACHABLE=0
+  run_id=rrun1 task_id=rtask1 pane=p1 managed=1 here="$here"
+  eval "$block_src"
+)
+rc=$?
+rr_state="$(sqlite3 -noheader "$rr_runs_dir/registry.sqlite3" "SELECT state FROM tasks WHERE run_id='rrun1' AND task_id='rtask1';" 2>/dev/null)"
+rr_events="$(sqlite3 -noheader "$rr_runs_dir/registry.sqlite3" "SELECT type FROM events WHERE run_id='rrun1' AND task_id='rtask1';" 2>/dev/null)"
+if [ "$rc" != 0 ] && [ "$rr_state" = starting ] && printf '%s' "$rr_events" | grep -q spawn_startup_uncertain; then
+  ok "real registry: rc=$rc, row's real state genuinely unchanged (still starting, never uncertain/launch_failed/running), real spawn_startup_uncertain event recorded — N2 closed with the actual transition guard, not a stub that always succeeds"
+else
+  bad "real registry: rc=$rc rr_state=${rr_state:-<none>} rr_events=${rr_events:-<none>}"
+fi
+
+printf '== REAL registry + REAL escalation.sh, restart simulated (fresh process re-sources both libs), durable ambiguous-launch fence on the exact row the herdr-unreachable run above produced: refuses automatic respawn, approve/unblock/complete still work (owner criteria a/b/c) ==\n'
+sfr_fence_marker="$(mktemp)"
+(
+  export HERDR_RUN_STATE_DIR="$rr_runs_dir"
+  export SFR_FENCE_SPAWN_MARKER="$sfr_fence_marker"
+  export HERDR_ESC_SPAWN_CMD="$here/tmp/r4/sfr-fence-spawn-marker.sh"
+  export HERDR_ESC_PANE_CLOSE_CMD="$here/tmp/r4/sfr-fence-spawn-marker.sh"
+  export HERDR_ESC_AUTHORITY_CMD=""
+  # Fresh process, fresh sourcing of BOTH libs — nothing survives from the
+  # herdr-unreachable run above but the durable SQLite file at
+  # $HERDR_RUN_STATE_DIR/registry.sqlite3. This IS the restart.
+  . "$here/lib/run-registry.sh"
+  . "$here/lib/escalation.sh"
+  herdr() { echo "UNEXPECTED herdr call: $*" >&2; return 1; }
+  pre_state="$(read_task rrun1 rtask1 | jq -r .state)"
+  esc_escalate rrun1 rtask1 claude evidence_stub '{}' 0 "$(mktemp -d)" >/dev/null 2>&1
+  esc_rc=$?
+  post_state="$(read_task rrun1 rtask1 | jq -r .state)"
+  printf 'esc_rc=%s pre_state=%s post_state=%s\n' "$esc_rc" "$pre_state" "$post_state"
+  [ -s "$sfr_fence_marker" ] && printf 'SPAWN_OR_CLOSE_CALLED\n'
+  # criteria (c): approve/unblock/complete on the now-fenced (blocked) row.
+  file_approval_record rtask1 /fake/sfr-fence.sh deadbeefsfrfence00000000000000000000000000000000000000000000 security-reviewer >/dev/null 2>&1
+  printf 'approve_state=%s\n' "$(file_approval_state rtask1 /fake/sfr-fence.sh deadbeefsfrfence00000000000000000000000000000000000000000000)"
+  set_task_state rrun1 rtask1 running >/dev/null 2>&1
+  printf 'unblock_state=%s\n' "$(read_task rrun1 rtask1 | jq -r .state)"
+  set_task_state rrun1 rtask1 completed canceled >/dev/null 2>&1
+  printf 'complete_state=%s\n' "$(read_task rrun1 rtask1 | jq -r .state)"
+) > "$sfr_fence_marker.out" 2>&1
+fence_out="$(cat "$sfr_fence_marker.out")"
+if printf '%s' "$fence_out" | grep -q 'esc_rc=1' \
+   && printf '%s' "$fence_out" | grep -q 'pre_state=starting' \
+   && printf '%s' "$fence_out" | grep -q 'post_state=blocked' \
+   && ! printf '%s' "$fence_out" | grep -q 'SPAWN_OR_CLOSE_CALLED' \
+   && printf '%s' "$fence_out" | grep -q 'approve_state=approved' \
+   && printf '%s' "$fence_out" | grep -q 'unblock_state=running' \
+   && printf '%s' "$fence_out" | grep -q 'complete_state=completed'; then
+  ok "real registry + real escalation, restart simulated: fence refuses (rc=1, task went starting->blocked, never quiesced/spawned), approve/unblock/complete all still work, exact task_id=rtask1/run_id=rrun1 preserved throughout"
+else
+  bad "real registry + real escalation, restart simulated: $fence_out"
+fi
+rm -rf "$(dirname "$rr_runs_dir")"
 
 printf '== full pipeline (real, non-dry-run spawn-task.sh), UNMANAGED literal command: reaches running regardless of pane-list stub shape ==\n'
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null

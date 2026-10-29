@@ -1150,32 +1150,13 @@ file_approval_state() {                 # <task_id> <abs-path> <sha256>
 # `blocked` is deliberately NOT terminal even though it is reported like one:
 # a worker waiting on a prompt resolves back to `running` all the time.
 #
-# `uncertain` (root-audit, fix/launch-receipt-r2 round 2, conductor
-# 2026-10-29): a registered-but-AMBIGUOUS startup outcome — herdr itself
-# unreachable mid-liveness-check, or a kickoff `send-to-agent.sh` exit
-# that is neither a confirmed submit nor a confirmed refusal (exit 4
-# UNSUBMITTED: "the caller MUST NOT assume the peer received it", by
-# send-to-agent.sh's own doc) — where the agent may genuinely be alive
-# and fine. Distinct from `launch_failed` (a CONFIRMED "never started")
-# specifically so neither a human skimming the registry nor an automated
-# caller (lib/escalation.sh's `_esc_spawn_successor`/journal, completion-
-# harvest successor dispatch) reads this as either a clean success (no
-# `HERDR_SPAWN_RECEIPT` is ever printed on this path) or a confirmed
-# no-effect failure safe to retry (spawn-task.sh's own exit trap stays
-# silent too, since this always happens after `register_task` already
-# committed) — both would risk a second, duplicate writer on the same
-# worktree/branch. Like `blocked`, NOT terminal: a human or
-# `mark-launch-failed.sh` (the one supported lifecycle command that
-# re-verifies and resolves it, same as it does for a `running` row)
-# moves it onward once the real outcome is known.
 _legal_transition() {                   # from to -> 0 if allowed
   local from="$1" to="$2"
   [ "$from" = "$to" ] && return 0       # idempotent re-assert, always fine
   case "$from" in
     ''|starting) case "$to" in running|blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
-    running)     case "$to" in blocked|uncertain|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
-    blocked)     case "$to" in running|uncertain|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
-    uncertain)   case "$to" in running|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
+    running)     case "$to" in blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
+    blocked)     case "$to" in running|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
     # Terminal. Nothing leaves these; `lost` in particular must not be
     # resurrected by a stale hook firing after the sweep already buried it.
     # `launch_failed` (fix/launch-receipt-r2): a DISTINCT terminal outcome
@@ -1183,8 +1164,26 @@ _legal_transition() {                   # from to -> 0 if allowed
     # readiness/liveness check failed, or a conductor's mark-launch-
     # failed.sh confirmed the registered pane is dead) — so a consumer can
     # tell "never ran" apart from "ran and then errored" without parsing
-    # event payloads. Reachable only from `starting`/`running`/`blocked`/
-    # `uncertain`, same shape as `failed`, never resurrected.
+    # event payloads. Reachable only from `starting`/`running`/`blocked`,
+    # same shape as `failed`, never resurrected.
+    #
+    # round 2 review (e0c2e65, N1/N2): an AMBIGUOUS startup outcome
+    # (herdr unreachable mid-liveness-check, or a kickoff send-to-agent.sh
+    # exit that is neither a confirmed submit nor a confirmed refusal) is
+    # deliberately NOT a registry state at all — an earlier draft added a
+    # non-terminal `uncertain` state here, but nothing downstream (every
+    # approval gate, hook-approval, completion path, sweep/list query)
+    # accepted it, so the row became unapprovable and uncompletable: the
+    # exact "strands a live agent nothing can ever approve or complete
+    # again" failure M1 existed to fix, just moved to a new state name.
+    # The outcome is instead recorded ONLY in the `spawn_startup_uncertain`/
+    # `spawn_kickoff_uncertain` event and the `verified=uncertain`
+    # HERDR_SPAWN_RECEIPT line — the row itself simply stays wherever it
+    # already was (`starting` if ambiguity hit before the first
+    # `running` transition, `running` if after), so every existing
+    # approval/completion/sweep consumer keeps working on it unchanged. A
+    # human (or `mark-launch-failed.sh`, re-verifying the pane exactly as
+    # it does for a `running` row) is the one who resolves the ambiguity.
     completed|failed|launch_failed|cancelled|lost) return 1 ;;
   esac
   return 1

@@ -247,7 +247,7 @@ push_wake() {
       [ -n "$row_cpane" ] && cpane="$row_cpane"
     fi
     case "$own_state" in
-      completed|failed|cancelled|lost)
+      completed|failed|launch_failed|cancelled|lost)
         append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "stale_worker_hook_refused" \
           "$(jq -nc --arg s "$own_state" --arg prompt_id "$pid" \
              '{reason:"task_terminal", state:$s, prompt_id:$prompt_id}')" \

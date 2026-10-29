@@ -1217,6 +1217,81 @@ bb_close_count="$(grep -c -- 'close pane-BB' "$ORDER_LOG" 2>/dev/null)"
 [ -s "$WORK/herdr-violation-bb" ] && ok "BB: R8 — the REAL caller_pane_from_ancestry genuinely ran (isolated herdr-call proof, not a reimplementation returning a canned answer)" \
   || bad "BB: R8 the real gate never attempted a herdr call at all — suspicious, re-check the override is actually unset"
 
+
+# ============================================================== case DD ===
+# Round 2 review, owner criterion (a)/(b)/(c) (2026-10-29): a task whose
+# OWN launch (not a successor's) produced an ambiguous outcome — a real
+# `spawn_startup_uncertain`/`spawn_kickoff_uncertain` event, exactly what
+# spawn-task.sh itself records now (N1/N2) — must durably fence automatic
+# respawn: escalation/the stall watchdog must refuse to quiesce the old
+# writer or spawn a successor for it, even across a process restart, while
+# approve/unblock/complete keep working on it normally. No stub for
+# set_task_state/append_event anywhere in this case — seed_task and the
+# append_event call below both go through the REAL sourced
+# lib/run-registry.sh exactly like every other case in this file.
+RUN=taskDD; TASK=taskDD; PANE=pane-DD; BRANCH=esc-test-dd
+seed_task "$TASK" "$PANE" "$BRANCH"
+append_event "$RUN" "$TASK" spawn_startup_uncertain \
+  '{"reason":"herdr unreachable mid-liveness-check (simulated, case DD)"}' >/dev/null
+: >"$ORDER_LOG"
+dd_task_id_preserved="$TASK" dd_run_id_preserved="$RUN"
+# First 3 ticks: a real no-progress loop would normally escalate here
+# (same shape as case A) — the fence must refuse before any quiesce/spawn.
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpDD --context-dir "$CTX" >/dev/null
+done
+dd_state1="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+dd_spawn1="$(grep -c -- 'spawn implement esc-test-dd' "$ORDER_LOG" 2>/dev/null)"
+dd_close1="$(grep -c -- "close $PANE" "$ORDER_LOG" 2>/dev/null)"
+dd_detail1="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+dd_reason1="$(printf '%s' "$dd_detail1" | jq -r '.detail.reason // empty' 2>/dev/null)"
+# "restart" (criterion b): each `bash "$CLI" tick` above was ALREADY a
+# brand-new process re-sourcing config.sh/lib/escalation.sh from scratch
+# (no-progress-escalate.sh:30-31) against nothing but the durable SQLite
+# file — there is no in-memory fence state to lose. Make that explicit
+# with one more independent batch, as its own proof the fence survives
+# repeated fresh-process re-evaluation, not just the first tick's cache.
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpDD --context-dir "$CTX" >/dev/null
+done
+dd_state2="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+dd_spawn2="$(grep -c -- 'spawn implement esc-test-dd' "$ORDER_LOG" 2>/dev/null)"
+dd_close2="$(grep -c -- "close $PANE" "$ORDER_LOG" 2>/dev/null)"
+[ "$dd_state1" = blocked ] && ok "DD: ambiguous-launch fence marks the task blocked on the first tick, never silently left running" \
+  || bad "DD: state after first 3 ticks (got [$dd_state1], want blocked)"
+[ "${dd_spawn1:-0}" = 0 ] && ok "DD: zero spawn attempts — the fence refuses BEFORE any respawn, not after a failed one" \
+  || bad "DD: spawn count after first 3 ticks (got $dd_spawn1, want 0)"
+[ "${dd_close1:-0}" = 0 ] && ok "DD: the old writer's pane was never quiesced — the fence refuses before even that" \
+  || bad "DD: close count after first 3 ticks (got $dd_close1, want 0)"
+[ "$dd_reason1" = ambiguous_launch_fence ] && ok "DD: blocked reason is the specific, discoverable ambiguous_launch_fence" \
+  || bad "DD: blocked reason (got [$dd_reason1], want ambiguous_launch_fence)"
+[ "$dd_state2" = blocked ] && [ "${dd_spawn2:-0}" = 0 ] && [ "${dd_close2:-0}" = 0 ] \
+  && ok "DD (restart): a second independent batch of fresh-process ticks still refuses — the fence is durable (real SQLite events table), not an in-memory flag that a restart would lose" \
+  || bad "DD (restart): state=[$dd_state2] spawn=$dd_spawn2 close=$dd_close2 (want blocked/0/0)"
+[ "$TASK" = "$dd_task_id_preserved" ] && [ "$RUN" = "$dd_run_id_preserved" ] \
+  && ok "DD: request identity (task_id/run_id) is exactly preserved — the fence never substitutes or drops it" \
+  || bad "DD: identity drifted (task_id=[$TASK] run_id=[$RUN])"
+# criterion (c): approve, unblock and complete still work on a fenced task.
+dd_appr_sha="deadbeefcase0dd0000000000000000000000000000000000000000000000"
+file_approval_record "$TASK" "/fake/dd/path.sh" "$dd_appr_sha" "security-reviewer" >/dev/null 2>&1
+dd_appr_state="$(file_approval_state "$TASK" "/fake/dd/path.sh" "$dd_appr_sha" 2>/dev/null)"
+[ "$dd_appr_state" = approved ] && ok "DD: approve (file_approval_record) still works on a fenced task" \
+  || bad "DD: approve after fence (got [$dd_appr_state], want approved)"
+set_task_state "$RUN" "$TASK" running >/dev/null 2>&1
+dd_unblock_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+[ "$dd_unblock_state" = running ] && ok "DD: unblock (set_task_state blocked->running) still works on a fenced task" \
+  || bad "DD: unblock after fence (got [$dd_unblock_state], want running)"
+set_task_state "$RUN" "$TASK" completed canceled >/dev/null 2>&1
+dd_complete_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+[ "$dd_complete_state" = completed ] && ok "DD: complete (set_task_state running->completed) still works on a fenced task" \
+  || bad "DD: complete after fence (got [$dd_complete_state], want completed)"
+# A later tick against the now-completed task must still never spawn —
+# terminal states refuse escalation entirely regardless of the fence.
+bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpDD --context-dir "$CTX" >/dev/null
+dd_spawn3="$(grep -c -- 'spawn implement esc-test-dd' "$ORDER_LOG" 2>/dev/null)"
+[ "${dd_spawn3:-0}" = 0 ] && ok "DD: no spawn after completion either" \
+  || bad "DD: spawn count after completion (got $dd_spawn3, want 0)"
+
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \
   || bad "R: real herdr was invoked: $(cat "$WORK/herdr-violation" 2>/dev/null)"

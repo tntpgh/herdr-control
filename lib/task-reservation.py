@@ -16,7 +16,7 @@ from pathlib import Path
 import sqlite3
 import sys
 
-TERMINAL = {"completed", "failed", "cancelled", "lost", "gone"}
+TERMINAL = {"completed", "failed", "launch_failed", "cancelled", "lost", "gone"}
 _AUTH = None
 
 
