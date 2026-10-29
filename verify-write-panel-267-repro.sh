@@ -382,6 +382,49 @@ v="$(_prompt_footer_clipped_options options < "$SCREEN")"
 [ -z "$v" ] && ok "real footer present -> defers to the hardened parser, never doubles as a second source of truth" \
   || bad "fired even though the real footer was present: [$v]"
 
+printf '\n== footer-clipped menu detector: selected mode, highlight ambiguity refuses (HIGH, REVIEW-187fc9f) ==\n'
+hl_approve="$(printf '\033[48;2;42;47;65m Approve\033[0m')"
+hl_deny="$(printf '\033[48;2;42;47;65m Deny\033[0m')"
+win_both="$(printf 'Allow tool: write\nPath: x\nContent: g\n\n%s\n%s\n' "$hl_approve" "$hl_deny")"
+v="$(printf '%s' "$win_both" | _prompt_footer_clipped_options selected)"; rc=$?
+[ "$rc" -ne 0 ] && [ -z "$v" ] \
+  && ok "BOTH Approve and Deny highlighted -> refuses, never guesses (rc=$rc)" \
+  || bad "both-highlighted window did not refuse: rc=$rc v=[$v]"
+win_neither="$(printf 'Allow tool: write\nPath: x\nContent: g\n\n Approve\nDeny\n')"
+v="$(printf '%s' "$win_neither" | _prompt_footer_clipped_options selected)"; rc=$?
+[ "$rc" -ne 0 ] && [ -z "$v" ] \
+  && ok "NEITHER Approve nor Deny highlighted -> refuses, never guesses (rc=$rc)" \
+  || bad "neither-highlighted window did not refuse: rc=$rc v=[$v]"
+# Sanity control: each alone still resolves (the guard is "both or
+# neither", not "never" -- proves the two refusals above are the
+# ambiguity guard firing, not the function being broken outright).
+win_deny_only="$(printf 'Allow tool: write\nPath: x\nContent: g\n\n Approve\n%s\n' "$hl_deny")"
+v="$(printf '%s' "$win_deny_only" | _prompt_footer_clipped_options selected)"
+[ "$v" = 2 ] && ok "Deny alone highlighted -> resolves to 2 (sanity control for the two refusals above)" \
+  || bad "Deny-alone-highlighted did not resolve to 2: [$v]"
+
+printf '\n== footer-clipped menu detector: negative, G1 -- menu_gate=true still defers (MEDIUM, REVIEW-187fc9f) ==\n'
+# _menu_gate only requires the SUBSTRINGS "navigate" and "select" to
+# appear anywhere in the window (lib/prompt-parse.sh:596-599) -- here they
+# appear in ordinary prose, nowhere near a real footer, while Approve/Deny
+# are (coincidentally) still the last two lines. Correct code must defer
+# the instant _menu_gate is true, regardless of what follows: if the
+# early `if _menu_gate "$win"; then return 1; fi` is ever disabled, this
+# fixture resolves instead of deferring (G1 mutant, REVIEW-187fc9f).
+win_g1="$(printf 'Allow tool: write\nPath: x\nsome unrelated text: please navigate carefully and select your words\n\n Approve\nDeny\n')"
+v="$(printf '%s' "$win_g1" | _prompt_footer_clipped_options options)"
+[ -z "$v" ] && ok "_menu_gate true anywhere in the window -> defers even though Approve/Deny are still the trailing rows" \
+  || bad "G1 MUTANT-SHAPE: fired even though _menu_gate(win) is true: [$v]"
+
+printf '\n== footer-clipped menu detector: negative, G4 -- reversed Deny/Approve order refuses (MEDIUM, REVIEW-187fc9f) ==\n'
+# Real omp always renders Approve above Deny. The last-two-rows check
+# must require that exact order, not just "both labels present" -- if it
+# is ever loosened to accept either order (G4 mutant, REVIEW-187fc9f),
+# this reversed fixture would resolve instead of refusing.
+win_g4="$(printf 'Allow tool: write\nPath: x\nContent: g\n\nDeny\n Approve\n')"
+v="$(printf '%s' "$win_g4" | _prompt_footer_clipped_options options)"
+[ -z "$v" ] && ok "Deny-before-Approve (reversed order) -> refuses, order is significant" \
+  || bad "G4 MUTANT-SHAPE: reversed order resolved instead of refusing: [$v]"
 
 # ---- end-to-end, through the REAL (now wired) herdr-select.sh: the raw
 # detector tests above prove the function's own shape rules; these prove
