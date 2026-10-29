@@ -92,12 +92,33 @@ def fixture(base: Path):
     env = {"HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": lease_db,
            "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
            "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={root}", "HERDR_RESULT_AVAILABILITY_JOURNAL": str(J),
-           "HERDR_RESULT_AVAILABILITY": "1", "HERDR_DELIVER": str(fake)}
+           "HERDR_RESULT_AVAILABILITY": "1", "HERDR_DELIVER": str(fake),
+           # 2026-10-29 defect: without this override ra-sender.py's ALERTS
+           # falls back to pub.STATE/"remote-mcp" -- pub.STATE reads
+           # HERDR_STATE_DIR, which this fixture does NOT set (it has no
+           # reason to touch the publisher's state root at all), so alert()
+           # wrote 3 real rows into the LIVE
+           # ~/.local/state/herdr/remote-mcp/ra-sender-alerts.jsonl. Explicit
+           # injection here, plus LIVE_ALERTS snapshot-asserted untouched
+           # below, is the regression test for that.
+           "HERDR_RA_SENDER_ALERTS": str(base / "ra-sender-alerts.jsonl")}
     return lc, av, lease_db, root, typed, fake, env
+
+
+def _snapshot(p: Path):
+    """stat+content snapshot, or None if the file does not exist -- used to
+    PROVE the real, live ra-sender-alerts.jsonl is never touched by this
+    offline suite, regardless of what HERDR_STATE_DIR happens to resolve to."""
+    try:
+        return p.stat().st_mtime_ns, p.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 def main() -> int:
     import tempfile
+    live_alerts = Path.home() / ".local/state/herdr/remote-mcp/ra-sender-alerts.jsonl"
+    live_before = _snapshot(live_alerts)
     base = Path(os.path.realpath(tempfile.mkdtemp()))
     lc, av, lease_db, root, typed, fake, env = fixture(base)
     saved = {k: os.environ.get(k) for k in env}
@@ -219,6 +240,10 @@ def main() -> int:
         case("BUDGET: the deferred row is sent on the very next run, nothing lost",
              out2["r_budget_b"] == "notified" and len(typed.read_text().splitlines()) == before + 2)
 
+        live_after = _snapshot(live_alerts)
+        case("LIVE STATE: the real ~/.local/state/herdr/remote-mcp/ra-sender-alerts.jsonl is byte-for-byte untouched "
+             "(this suite forced HERDR_RA_SENDER_ALERTS to a disposable tmp path and generated real ALERT rows)",
+             live_after == live_before and rs.ALERTS != live_alerts)
         gate.close()
     finally:
         for k, v in saved.items():
