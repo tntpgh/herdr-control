@@ -101,7 +101,7 @@ HERDR_OMP_LAUNCHER_SHA256="e38de2325518ab33814fd0b67602a4d0c3b2366cb85b5e9362740
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
 # Format: "<model>:<reasoning-effort>".
-: "${HERDR_CODEX_DEEP:=gpt-5.6-sol:high}"     # plan / architect / design / deep-review
+: "${HERDR_CODEX_DEEP:=gpt-6-sol:high}"      # plan / architect / design / deep-review
 : "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code / review / docs
 : "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical
 
