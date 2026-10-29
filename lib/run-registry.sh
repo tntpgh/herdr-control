@@ -1007,6 +1007,37 @@ resident_grant_admits() {
   printf '%s\n' "$(printf '%s' "$row" | jq -r '.command_id // empty' 2>/dev/null)"
 }
 
+# resident_grant_allowed_repo <canonical_repo_root> -> 0 iff
+# <canonical_repo_root> is one of the explicitly approved repos this
+# grant may ever be minted for. Terrence's first-hand decision
+# (2026-10-29T16:24:10Z): exactly herdr-control, knowledge-base,
+# tntpgh-dev, tourguide -- anything else is refused. Fail-closed: an
+# EXPLICITLY empty allowlist (HERDR_RESIDENT_GRANT_REPO_ALLOWLIST set to
+# "") denies every repo, never silently falls back to permit-all --
+# `${VAR-default}` (no colon) is the one expansion that tells "unset"
+# apart from "set to empty", so only a genuinely UNSET var gets the real
+# default below; a test proving the fail-closed behavior sets it to ""
+# explicitly. <canonical_repo_root> must already be resolved by the
+# caller (lib/repo-root.sh's repo_root + `pwd -P`, worktree- and
+# path-traversal-safe via git's own --git-common-dir) -- this function
+# does no path resolution of its own, same "already normalized" contract
+# resident_grant_admits documents for its own <repo> argument. Called
+# ONLY by grant-resident-escalation.sh's own mint-time pre-flight, before
+# the pane-ancestry check -- never consulted at admission/spawn time,
+# which is unaffected (an already-minted grant for an approved repo
+# keeps working exactly as before this function existed).
+resident_grant_allowed_repo() {
+  local repo="$1" list entry
+  [ -n "$repo" ] || return 1
+  list="${HERDR_RESIDENT_GRANT_REPO_ALLOWLIST-$HOME/Code/herdr-control:$HOME/Code/knowledge-base:$HOME/Code/tntpgh-dev:$HOME/Code/tourguide}"
+  [ -n "$list" ] || return 1
+  local IFS=:
+  for entry in $list; do
+    [ -n "$entry" ] && [ "$entry" = "$repo" ] && return 0
+  done
+  return 1
+}
+
 # Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
 # enumeration/confirmation are read of the SAME protected registry row the
 # accept/register/launch adapters above already write -- no new storage,
