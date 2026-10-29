@@ -107,7 +107,18 @@ cat > "$stub_dir/herdr" <<STUB
 case "\$1 \$2" in
 	"tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
 	"pane run")   printf '%s\n' "\$4" >> "$run_log" ;;
-	"pane list")  printf '{"result":{"panes":[]}}\n' ;;
+	"pane list")
+		if [ -n "\${HERDR_FG_PANE:-}" ]; then
+			printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"}]}}\n' "\$HERDR_FG_PANE" "\${HERDR_FG_BIRTH:-birth}"
+		else
+			printf '{"result":{"panes":[]}}\n'
+		fi ;;
+	"pane process-info")
+		if [ -n "\${HERDR_FG_PID:-}" ]; then
+			printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp"}]}}}\n' "\$HERDR_FG_PID"
+		else
+			printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+		fi ;;
 	# ensure-workspace.sh runs first and EXITS the spawn if it cannot resolve a
 	# workspace id, which is why an empty-object catch-all captured nothing.
 	# (No backticks in this heredoc: it is unquoted so $run_log expands, which
@@ -117,7 +128,11 @@ esac
 STUB
 chmod +x "$stub_dir/herdr"
 probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
-env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$(mktemp -d)" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+# Ancestry gates (TRIAGE-23 #5, spawn-task.sh 001ab43/6cfed25): resolve a
+# fixture foreground pane/pid instead of leaking this test's own ambient
+# HERDR_PANE_ID, same pattern verify-spawn-scope.sh ports from.
+env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$(mktemp -d)" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+	HERDR_FG_PANE="fg-openv" HERDR_FG_BIRTH="fgbirth-openv" HERDR_FG_PID=$$ \
 	bash "$here/spawn-task.sh" "$probe_repo" verify-op-env quick /bin/true >/dev/null 2>&1
 typed=$(cat "$run_log" 2>/dev/null)
 if [ -z "$typed" ]; then

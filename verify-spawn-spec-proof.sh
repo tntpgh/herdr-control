@@ -19,12 +19,25 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2'
 # real-shaped, and "pane run" captures the composed launch line instead of
 # executing anything.
 stub_dir=$(mktemp -d)
+# Same ancestry-resolving fixture verify-spawn-scope.sh uses (TRIAGE-23
+# #8-19, spawn-task.sh 001ab43/6cfed25).
 cat > "$stub_dir/herdr" <<STUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
 	"tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
 	"pane run")   : ;;
-	"pane list")  printf '{"result":{"panes":[]}}\n' ;;
+	"pane list")
+		if [ -n "\${HERDR_FG_PANE:-}" ]; then
+			printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"}]}}\n' "\$HERDR_FG_PANE" "\${HERDR_FG_BIRTH:-birth}"
+		else
+			printf '{"result":{"panes":[]}}\n'
+		fi ;;
+	"pane process-info")
+		if [ -n "\${HERDR_FG_PID:-}" ]; then
+			printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp"}]}}}\n' "\$HERDR_FG_PID"
+		else
+			printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+		fi ;;
 	*)            printf '{"result":{"workspace":{"workspace_id":"w1"},"workspaces":[],"panes":[],"tabs":[]}}\n' ;;
 esac
 STUB
@@ -32,8 +45,9 @@ chmod +x "$stub_dir/herdr"
 
 WT_ROOT=$(mktemp -d); WT_ROOT=$(cd "$WT_ROOT" && pwd -P)
 run_spawn() {  # <branch> [extra args...]
-  env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
+  env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
     HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+    HERDR_FG_PANE="fg-specproof" HERDR_FG_BIRTH="fgbirth-specproof" HERDR_FG_PID=$$ \
     bash "$here/spawn-task.sh" "$probe_repo" "$@" quick /bin/true
 }
 
@@ -235,8 +249,9 @@ printf -- "-- end-to-end: a REAL spawn-task.sh run links a fresh task worktree's
 e2e_repo=$(mktemp -d); git -C "$e2e_repo" init -q -b main 2>/dev/null
 git -C "$e2e_repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 make_fake_bashlex_venv "$e2e_repo/.venv-bashlex" "$pinned_ver"
-env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_APP_DIR="$empty_app_dir" \
+env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_APP_DIR="$empty_app_dir" \
   HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+  HERDR_FG_PANE="fg-bashlex-e2e" HERDR_FG_BIRTH="fgbirth-bashlex-e2e" HERDR_FG_PID=$$ \
   bash "$here/spawn-task.sh" "$e2e_repo" bashlex-e2e-branch quick /bin/true >/tmp/spawn-bashlex-e2e-$$.log 2>&1 \
   || bad "end-to-end spawn failed: $(cat /tmp/spawn-bashlex-e2e-$$.log)"
 e2e_wt="$WT_ROOT/$(basename "$e2e_repo")/bashlex-e2e-branch"
