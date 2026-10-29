@@ -66,8 +66,13 @@ if str(LIB) not in sys.path:
 import owner_lease as ol  # noqa: E402
 import result_availability as ra  # noqa: E402
 
+# HERDR_RA_SENDER_ALERTS overrides the alert file path -- defense in depth
+# on top of HERDR_STATE_DIR: a test (or anything else reusing pub.STATE)
+# that forgets to redirect HERDR_STATE_DIR must still be unable to write
+# into the real ~/.local/state/herdr/remote-mcp/ (2026-10-29 defect: an
+# earlier version of verify-ra-sender.py wrote 3 real ALERT rows there).
 OUT = pub.STATE / "remote-mcp"
-ALERTS = OUT / "ra-sender-alerts.jsonl"
+ALERTS = Path(os.environ["HERDR_RA_SENDER_ALERTS"]) if os.environ.get("HERDR_RA_SENDER_ALERTS") else OUT / "ra-sender-alerts.jsonl"
 
 
 def log(msg: str) -> None:
@@ -86,7 +91,7 @@ def is_alertable(outcome: str) -> bool:
 
 def alert(rid: str, outcome: str, now: float | None = None) -> None:
     now = time.time() if now is None else now
-    OUT.mkdir(parents=True, exist_ok=True)
+    ALERTS.parent.mkdir(parents=True, exist_ok=True)
     row = {"at": now, "rid": rid, "outcome": outcome}
     fd = os.open(ALERTS, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
