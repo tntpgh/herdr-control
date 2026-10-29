@@ -28,20 +28,29 @@ CM="$WORK/cond.txt"
 export CM
 printf ' $ \n ready\n' > "$CM"
 
-# Minimal fake herdr: enough for stall-watchdog.sh's owner-resolution path
-# (process-info "is this pane alive and running omp", capture "is it the
-# same birth") to resolve a reachable, matching conductor pane.
+# Minimal fake herdr, the exact command-name shape verify-stall-watchdog.sh's
+# Section A already proves: process-info/list (reachable + birth match),
+# read (pane text), send-text/send-keys (typed delivery, unused here since
+# HERDR_STALL_WATCHDOG_SEND below bypasses it, kept for completeness).
 herdr() {
   case "$1 $2" in
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
-    "pane capture")
-      cat "$CM" ;;
-    "pane birth")
-      printf '%s\n' "$CONDB" ;;
+    "pane list")
+      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"}]}}\n' "$COND" "$CONDB" ;;
+    "pane read")
+      cat "$CM" 2>/dev/null ;;
     "pane send-text")
-      printf 'send-text %s\n' "$3" >> "$SENT" ;;
-    *) return 1 ;;
+      printf 'send-text %s\n' "$3" >> "$SENT"
+      printf '%s' "$4" > "$WORK/wake_pending.txt" ;;
+    "pane send-keys")
+      printf 'send-keys %s %s\n' "$3" "$4" >> "$SENT"
+      if [ "$4" = "Enter" ]; then
+        { printf ' %s\n' "$(cat "$WORK/wake_pending.txt" 2>/dev/null)"
+          printf '\n submitted\n $ \n ready\n'; } > "$CM"
+      fi
+      ;;
+    *) return 0 ;;
   esac
 }
 export -f herdr
@@ -158,6 +167,9 @@ grep -q "Pre-planned next (lane laneQ): spawn plan on herdr-control feat/next-th
 grep -q "/stall-ack.sh taskI artifact" "$WORK/last-msg.txt" \
   && ok "7: the existing ack instruction is still present -- additive, not a replacement" \
   || bad "7: ack instruction missing from the augmented message"
+n_dispatch7=$(successor_dispatch_count laneQ)
+[ "$n_dispatch7" = "1" ] && ok "7: idle+artifact with a queued successor records exactly ONE dispatch claim" \
+  || bad "7: expected 1 successor_dispatched row for laneQ, got $n_dispatch7"
 
 echo "== 8: a HELD lane's completion still receipts but never surfaces its successor in the real wake =="
 register_task runJ taskJ workerJ condJ "$COND" "$CONDB" paneJ paneJbirth repo/j "$WORK/wtJ" labelJ >/dev/null
@@ -177,6 +189,9 @@ n_receipt8=$(_q "SELECT count(*) FROM events WHERE task_id='taskJ' AND type='com
 grep -q "Pre-planned next" "$WORK/last-msg.txt" 2>/dev/null \
   && bad "8: a HELD lane's successor leaked into the wake message" \
   || ok "8: the held lane's queued successor was correctly withheld from the message"
+n_dispatch8=$(successor_dispatch_count laneHeld)
+[ "$n_dispatch8" = "0" ] && ok "8: a HELD lane -- NO dispatch claim is ever recorded, not just withheld from the message" \
+  || bad "8: expected 0 successor_dispatched rows for a held lane, got $n_dispatch8"
 
 echo "== 9: a non-completion signal (denied) never triggers a receipt or a successor lookup =="
 register_task runK taskK workerK condK "$COND" "$CONDB" paneK paneKbirth repo/k "$WORK/wtK" labelK >/dev/null
@@ -186,6 +201,37 @@ bash "$here/stall-watchdog.sh" wake taskK denied approvalZ "a deny was never fol
 n_receipt9=$(_q "SELECT count(*) FROM events WHERE task_id='taskK' AND type='completion_receipt';")
 [ "$n_receipt9" = "0" ] && ok "9: 'denied' is not a completion signal -- no receipt, no successor lookup attempted" \
   || bad "9: expected 0 completion_receipt rows for a denied signal, got $n_receipt9"
+
+echo "== 10: duplicate harvest (two tasks racing the SAME lane's one queued successor) -- a single dispatch =="
+register_task runL1 taskL1 workerL1 condL1 "$COND" "$CONDB" paneL1 paneL1birth repo/l1 "$WORK/wtL1" labelL1 >/dev/null
+register_task runL2 taskL2 workerL2 condL2 "$COND" "$CONDB" paneL2 paneL2birth repo/l2 "$WORK/wtL2" labelL2 >/dev/null
+mkdir -p "$WORK/wtL1/tmp" "$WORK/wtL2/tmp"
+printf 'first completion for shared lane\n' > "$WORK/wtL1/tmp/commit-msg.txt"
+printf 'second completion for shared lane\n' > "$WORK/wtL2/tmp/commit-msg.txt"
+assign_lane taskL1 laneDup >/dev/null
+assign_lane taskL2 laneDup >/dev/null
+queue_successor laneDup "spawn implement on herdr-control feat/shared-next" conductor >/dev/null
+: > "$SENT"; : > "$WORK/last-msg.txt"
+bash "$here/stall-watchdog.sh" wake taskL1 artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+cp "$WORK/last-msg.txt" "$WORK/last-msg-L1.txt"
+: > "$WORK/last-msg.txt"
+bash "$here/stall-watchdog.sh" wake taskL2 artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+cp "$WORK/last-msg.txt" "$WORK/last-msg-L2.txt"
+n_dispatch10=$(successor_dispatch_count laneDup)
+[ "$n_dispatch10" = "1" ] && ok "10: two independent completions racing the SAME lane's successor still record exactly ONE dispatch claim total" \
+  || bad "10: expected 1 successor_dispatched row for laneDup, got $n_dispatch10"
+notes10=0
+grep -q "Pre-planned next" "$WORK/last-msg-L1.txt" 2>/dev/null && notes10=$((notes10+1))
+grep -q "Pre-planned next" "$WORK/last-msg-L2.txt" 2>/dev/null && notes10=$((notes10+1))
+[ "$notes10" = "1" ] && ok "10: exactly ONE of the two wakes carried the pre-planned successor note, never both, never zero" \
+  || bad "10: expected exactly 1 of 2 messages to carry the note, got $notes10 (L1=$(cat "$WORK/last-msg-L1.txt" 2>/dev/null) | L2=$(cat "$WORK/last-msg-L2.txt" 2>/dev/null))"
+n_sent10=$(grep -c "send-text $COND" "$SENT" || true)
+[ "$n_sent10" = "2" ] && ok "10: both underlying wakes still sent normally -- the dispatch race affects only the successor note, never the wake itself" \
+  || bad "10: expected 2 sends (one per task), got $n_sent10"
+n_receipt10=$(( $(_q "SELECT count(*) FROM events WHERE task_id='taskL1' AND type='completion_receipt';") \
+               + $(_q "SELECT count(*) FROM events WHERE task_id='taskL2' AND type='completion_receipt';") ))
+[ "$n_receipt10" = "2" ] && ok "10: both completions are still independently, durably receipted regardless of who won the dispatch race" \
+  || bad "10: expected 2 total completion_receipt rows across taskL1+taskL2, got $n_receipt10"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

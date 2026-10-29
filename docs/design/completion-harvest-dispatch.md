@@ -84,24 +84,47 @@ already provide):
    immutable — a task does not change lanes mid-flight). A task with no
    assigned lane has, by construction, no queued successor; nothing here
    invents a lane for an unassigned task.
+5. **Successor dispatch claim** — `type=successor_dispatched`, `event_id =
+   dispatch_successor_<lane>_<sha of the successor content>`,
+   `claim_once`-backed: "one writer per scope" (the scope being the
+   lane), the same guarantee the resident-redemption token's atomic
+   consume relies on. Written the FIRST time a specific successor's
+   content is actually about to be handed to a live, reachable owner —
+   never on a merely-detected completion. A second, duplicate harvest of
+   the SAME completion (a wake retry, a restart, or — the race this
+   directly proves — two different tasks in the same lane completing in
+   quick succession) finds the claim already taken and is a no-op: the
+   successor note is included in the FIRST qualifying wake only, never a
+   second time. Replanning the lane (a genuinely different `next` string)
+   is a different event_id and dispatches again.
 
 ### Wake integration (the only code-flow change, confined to `cmd_wake`)
 
-Before composing `$msg` at EITHER existing wake call site, if `$signal` is
-`artifact` or `handoff` (the two completion-shaped signals — `denied`,
+Two phases, both scoped to `$signal` in `artifact`/`handoff` (`denied`,
 `unprocessed`, `conductor_prompt` are not "a worker finished" and are left
 alone):
 
-1. If an artifact path was given and the file exists in the task's
-   worktree, hash it and call `record_completion_receipt`.
-2. Look up the task's lane (`read_lane_for_task`); if assigned and not
-   held, look up its queued successor (`read_successor_for_lane`).
-3. If a successor was found, append it to the SAME wake message text as an
-   extra line: `Pre-planned next: <next>`. Nothing new is sent, delivered,
-   or dispatched — the existing `_sw_send_and_record` call is reused
-   unchanged, carrying a longer string. No new authority is exercised: the
-   conductor still reads the wake and decides to spawn it, exactly as
-   today for a wake with no pre-plan.
+1. **Receipt, unconditional and early** (`_sw_record_receipt`, called once
+   near the top of `cmd_wake`, independent of whether any owner is even
+   reachable): if an artifact path was given and the file exists in the
+   task's worktree, hash it and call `record_completion_receipt`. A
+   completion is durably recorded even if nobody was there to receive the
+   wake.
+2. **Successor note + dispatch claim** (`_sw_successor_note`, called at
+   EACH actual send site — both already gated on a live, identity-matched
+   conductor pane, so a successor is never silently burned on a wake
+   nobody received): look up the task's lane (`read_lane_for_task`); if
+   assigned and not held, look up its queued successor
+   (`lane_successor_admits`). If one is found, claim the dispatch
+   (`dispatch_successor_once`) and, ONLY on a fresh claim, append it to
+   the SAME wake message as an extra line: `Pre-planned next (lane L):
+   <next>`. Nothing new is sent, delivered, or dispatched beyond the
+   EXISTING `_sw_send_and_record` call, reused unchanged, carrying a
+   longer string, to the SAME owner already resolved for this task. No
+   new authority is exercised: the conductor still reads the wake and
+   decides to spawn it, exactly as today for a wake with no pre-plan —
+   "dispatch" here means "the successor was durably handed off to its
+   existing owner exactly once," never "a process was launched."
 
 ### What this does NOT do (authority boundary)
 

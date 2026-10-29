@@ -2085,6 +2085,59 @@ lane_successor_admits() {
   printf '%s\n' "$next"
 }
 
+# dispatch_successor_once <lane> <next> <dispatched_to> -> 0 the FIRST
+# time THIS EXACT successor content is dispatched for <lane> (claim_once
+# on event_id=dispatch_successor_<lane>_<sha256 of next>, scoped entirely
+# by the lane key the same way hold/release are -- "one writer per
+# scope": claim_once's underlying UNIQUE(event_id) constraint is what
+# makes two concurrent/duplicate harvest passes for the SAME completion
+# agree on exactly one winner, same guarantee the resident-redemption
+# token's atomic consume relies on). A duplicate harvest (same completion
+# re-detected, e.g. a wake retry or a restart) calling this again for the
+# identical content is a no-op (rc 1) -- the caller uses that to suppress
+# a second "Pre-planned next" line, not to send a second handoff. If the
+# lane is later replanned (a genuinely different `next`), that is a
+# different event_id and dispatches again, same "a changed fingerprint
+# re-arms" shape this whole feature already uses twice over (completion
+# receipts, stall-watchdog's own wake dedup).
+dispatch_successor_once() {
+  local lane="$1" next="$2" dispatched_to="${3:-}" sha
+  [ -n "$lane" ] && [ -n "$next" ] || return 1
+  sha="$(_sw_sha "$next")"
+  claim_once "dispatch_successor_${lane}_${sha}" "" "" successor_dispatched \
+    "$(jq -nc --arg l "$lane" --arg n "$next" --arg d "$dispatched_to" '{lane:$l, next:$n, dispatched_to:$d}')"
+}
+
+# successor_dispatch_count <lane> -> integer count of distinct successor_
+# dispatched claims ever recorded for this lane (test/audit helper: "one
+# writer per scope" proved by this never exceeding 1 across a duplicate
+# harvest for the same completion).
+successor_dispatch_count() {
+  local lane="$1" n
+  registry_init || { printf '0\n'; return 1; }
+  n="$(_sql "SELECT COUNT(*) FROM events WHERE type='successor_dispatched'
+        AND json_extract(payload,'\$.lane')=$(_sq "$lane");" 2>/dev/null)"
+  printf '%s\n' "${n:-0}"
+}
+
+# _sw_sha <text> -> short stable digest (text-content, not a file -- used
+# to key a dispatch claim on the successor STRING itself, since there is
+# no artifact file backing a queued plan the way a completion receipt has
+# one). Deliberately the same shasum/md5 fallback shape _sw_digest in
+# stall-watchdog.sh already uses for fingerprints, duplicated here (not
+# sourced from stall-watchdog.sh) because lib/run-registry.sh is sourced
+# by far more callers than just that one script and must not take on a
+# dependency the other direction.
+_sw_sha() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-16
+  elif command -v md5 >/dev/null 2>&1; then
+    printf '%s' "$1" | md5 | cut -c1-16
+  else
+    printf '%s' "$1" | cksum | tr -d ' \t'
+  fi
+}
+
 # task_input_required_command <run_id> <task_id> <prompt_id> -> the
 # untruncated command recorded on the input_required event for THIS exact
 # prompt, or empty.

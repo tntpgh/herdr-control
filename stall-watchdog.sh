@@ -86,13 +86,28 @@ _sw_digest() {                          # <text> -> short stable digest
 # harvest-dispatch.md) ---------------------------------------------------
 # `signal` in {artifact, handoff} is the one shape that actually means "a
 # worker finished something" (denied/unprocessed/conductor_prompt are not).
-# For those two signals only, before composing the wake text: record a
-# durable completion receipt (deduped by task + the artifact's own content
-# sha, lib/run-registry.sh's record_completion_receipt) and, if the task's
-# lane has a pre-planned successor and is not held, fold it into the SAME
-# message cmd_wake already sends — never a new send, never a spawn, never
-# new authority. A task with no assigned lane or no queued successor
-# degrades to exactly today's bare wake text.
+# For those two signals only:
+#   1. `_sw_record_receipt`, called ONCE early in cmd_wake, unconditional
+#      (independent of whether an owner is even reachable to wake) —
+#      records a durable completion receipt, deduped by task + the
+#      artifact's own content sha (lib/run-registry.sh's
+#      record_completion_receipt).
+#   2. `_sw_successor_note`, called at EACH actual send site (both already
+#      gated on a live, identity-matched conductor pane — never computed,
+#      let alone claimed, for an unreachable/dead owner, so a successor is
+#      never silently burned on a wake nobody received) — if the task's
+#      lane has a pre-planned successor and is not held, CLAIMS the
+#      dispatch exactly once per distinct successor content
+#      (dispatch_successor_once: "one writer per scope", the scope being
+#      the lane) and, only on a FRESH claim, folds it into the SAME
+#      message cmd_wake already sends. A duplicate harvest of the same
+#      completion (a wake retry, a restart) finds the claim already taken
+#      and omits the note the second time — exactly one dispatch per
+#      successor, never a repeated hand-off. Never a new send, never a
+#      spawn, never new authority: the successor is a string folded into
+#      the EXISTING wake to the EXISTING owner, nothing more. A task with
+#      no assigned lane, no queued successor, or an already-dispatched one
+#      degrades to exactly today's bare wake text.
 _sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
   local path="$1/$2"
   [ -f "$path" ] || return 1
@@ -102,8 +117,8 @@ _sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
     sha256sum "$path" 2>/dev/null | awk '{print $1}'
   fi
 }
-_sw_completion_harvest() {              # task_id signal artifact worktree -> prints "Pre-planned next: ..." or nothing
-  local task_id="$1" signal="$2" artifact="$3" worktree="$4" sha lane succ
+_sw_record_receipt() {                  # task_id signal artifact worktree
+  local task_id="$1" signal="$2" artifact="$3" worktree="$4" sha
   case "$signal" in
     artifact|handoff) ;;
     *) return 0 ;;
@@ -112,9 +127,18 @@ _sw_completion_harvest() {              # task_id signal artifact worktree -> pr
     sha="$(_sw_artifact_sha "$worktree" "$artifact")"
     [ -n "$sha" ] && record_completion_receipt "$task_id" "$artifact" "$sha" >/dev/null 2>&1
   fi
+}
+_sw_successor_note() {                  # task_id signal conductor -> prints "Pre-planned next: ..." or nothing
+  local task_id="$1" signal="$2" conductor="$3" lane succ
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
   lane="$(read_lane_for_task "$task_id" 2>/dev/null)" || return 0
   succ="$(lane_successor_admits "$lane" 2>/dev/null)" || return 0
-  [ -n "$succ" ] && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
+  [ -n "$succ" ] || return 0
+  dispatch_successor_once "$lane" "$succ" "$conductor" >/dev/null 2>&1 \
+    && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
 }
 
 _sw_escalate_window_s() {
@@ -341,8 +365,7 @@ cmd_wake() {
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
   worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty')"
   [ -n "$label" ] || label="$task_id"
-  local harvest_note
-  harvest_note="$(_sw_completion_harvest "$task_id" "$signal" "$artifact" "$worktree")"
+  _sw_record_receipt "$task_id" "$signal" "$artifact" "$worktree"
 
   # feat/no-progress-model-escalation R2: every real cycle hub hands this
   # task to us, regardless of whether the stall-WAKE itself is deduped
@@ -386,8 +409,9 @@ cmd_wake() {
       # window's own Slack fallback instead of compounding it.
       if ! _sw_wake_confirmed "$task_id" "$key" && ! _sw_wake_typed "$task_id" "$key"; then
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
-          local art_note=""
+          local art_note="" harvest_note
           [ -n "$artifact" ] && art_note=" ($artifact)"
+          harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
           local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
           _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
@@ -422,8 +446,9 @@ cmd_wake() {
   fi
 
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
-    local art_note=""
+    local art_note="" harvest_note
     [ -n "$artifact" ] && art_note=" ($artifact)"
+    harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
     local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
     _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
