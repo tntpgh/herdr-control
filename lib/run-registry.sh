@@ -949,6 +949,51 @@ accept_local_task_authorization() {
 read_task_authorization() {
   _task_authorization_adapter read "$1"
 }
+# ---- resident escalation launch grant (docs/design/resident-launch-grant.md) --
+# INERT: these wrappers exist so the storage layer is reachable, but nothing
+# in this repo calls accept_resident_escalation_grant yet -- only a future,
+# not-yet-written, human-run mint script would. read_resident_escalation_grant
+# and resident_grant_admits ARE reachable from lib/escalation.sh's pre-flight
+# check, but return {} / fail closed on every real repo until a grant is
+# minted, which nothing here does automatically.
+accept_resident_escalation_grant() {   # command_id pane birth repo job_classes_csv max_tier ttl_ms
+  registry_init || return 1
+  _task_authorization_adapter accept-resident "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+read_resident_escalation_grant() {     # repo -> grant JSON, or {} if none/expired/revoked-by-status
+  _task_authorization_adapter read-resident "$1"
+}
+accept_resident_escalation_spawn() {   # command_id grant_command_id repo manifest_json
+  registry_init || return 1
+  _task_authorization_adapter accept-resident-spawn "$1" "$2" "$3" "${4:-}"
+}
+# resident_grant_revoked -> 0 iff the global revocation sentinel is present.
+# Same "touch one file, instant effect on the next check" shape as the
+# house merge-delegation.revoked pattern (AGENTS.md). Checked fresh every
+# call, never cached in this process or any other.
+resident_grant_revoked() {
+  local f="${HERDR_RESIDENT_GRANT_REVOKED_FILE:-$HOME/.local/state/herdr/resident-escalation.revoked}"
+  [ -f "$f" ]
+}
+# resident_grant_admits <repo> <job_class> -> prints the admitting grant's
+# command_id and returns 0 iff an unrevoked, unexpired, accepted
+# resident_escalation_grant row exists for <repo> whose job_classes list
+# contains <job_class>. Read-only; never binds, never consumes the grant
+# row. <repo> must already be the caller's absolute, normalized real path.
+# Two independent callers (lib/escalation.sh's pre-flight AND
+# spawn-task.sh's own admission check) each call this fresh themselves --
+# defense in depth, not a decision passed from one process to the other.
+resident_grant_admits() {
+  local repo="$1" job="$2" row jc
+  resident_grant_revoked && return 1
+  [ -n "$repo" ] && [ -n "$job" ] || return 1
+  row="$(read_resident_escalation_grant "$repo" 2>/dev/null)"
+  [ -n "$row" ] && [ "$row" != '{}' ] || return 1
+  jc="$(printf '%s' "$row" | jq -r --arg j "$job" '.effective_scope.job_classes // [] | index($j) // empty' 2>/dev/null)"
+  [ -n "$jc" ] || return 1
+  printf '%s\n' "$(printf '%s' "$row" | jq -r '.command_id // empty' 2>/dev/null)"
+}
+
 # Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
 # enumeration/confirmation are read of the SAME protected registry row the
 # accept/register/launch adapters above already write -- no new storage,

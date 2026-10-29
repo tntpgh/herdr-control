@@ -534,30 +534,49 @@ _esc_pane_close() {
   herdr pane close "$pane" >/dev/null 2>&1
 }
 
-# _esc_check_launch_authority <repo> -> rc 0 ONLY if THIS process's own
-# real ancestry resolves, via spawn-task.sh's exact real gate
-# (lib/pane-guard.sh's caller_pane_from_ancestry + pane_is_conductor_eligible,
-# never reimplemented), to a pane eligible to launch a successor for
-# <repo> — an honest, READ-ONLY "can I even do this" probe that mutates
-# and consumes nothing. R8: called by esc_escalate ONCE, strictly
-# before the old writer is ever quiesced (see its own header comment).
+# _esc_check_launch_authority <repo> <to_tier> -> rc 0 when a real spawn for
+# <to_tier> is admissible, by EITHER of two independent routes, tried in
+# this order:
+#   1. docs/design/resident-launch-grant.md: an unrevoked, unexpired,
+#      accepted resident_escalation_grant row for <repo> whose job_classes
+#      admit esc_tier_job(<to_tier>) (lib/run-registry.sh's
+#      resident_grant_admits, checked fresh here — no caching). Prints the
+#      admitting grant's command_id on stdout when this route admits.
+#   2. THIS process's own real ancestry, via spawn-task.sh's exact real
+#      gate (lib/pane-guard.sh's caller_pane_from_ancestry +
+#      pane_is_conductor_eligible, never reimplemented), to a pane
+#      eligible to launch a successor for <repo> — today's unmodified
+#      behavior, unchanged. Prints nothing on stdout when this route
+#      admits (the caller distinguishes "admitted via grant" from
+#      "admitted via live ancestry" by whether stdout is empty).
+# An honest, READ-ONLY "can I even do this" probe either way — mutates
+# and consumes nothing, including the grant row (never bound, never
+# marked used). R8: called by esc_escalate ONCE, strictly before the old
+# writer is ever quiesced (see its own header comment).
 _esc_check_launch_authority() {
-  local repo="$1" root root_real source_pane
+  local repo="$1" to_tier="$2" root root_real source_pane job grant_id
   if [ -n "${HERDR_ESC_AUTHORITY_CMD:-}" ]; then
-    bash "$HERDR_ESC_AUTHORITY_CMD" "$repo"
+    bash "$HERDR_ESC_AUTHORITY_CMD" "$repo" "$to_tier"
     return $?
   fi
   [ -n "$repo" ] || return 1
   root="$(repo_root "$repo" 2>/dev/null)"
   root_real="$(cd "$root" 2>/dev/null && pwd -P)"
   [ -n "$root_real" ] || root_real="$root"
+  job="$(esc_tier_job "$to_tier" 2>/dev/null)"
+  if [ -n "$job" ]; then
+    grant_id="$(resident_grant_admits "$root_real" "$job" 2>/dev/null)" && [ -n "$grant_id" ] && {
+      printf '%s\n' "$grant_id"
+      return 0
+    }
+  fi
   source_pane="$(caller_pane_from_ancestry)" || return 1
   pane_is_conductor_eligible "$source_pane" "$root_real"
 }
 
-# _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
-# RECEIPT task_id on stdout, rc 0, when one was actually parsed out of the
-# spawn command's own output (R5: "bind to the actual spawn receipt ...
+# _esc_spawn_successor <repo> <branch> <job> <agent> [grant_id] -> prints
+# the RECEIPT task_id on stdout, rc 0, when one was actually parsed out of
+# the spawn command's own output (R5: "bind to the actual spawn receipt ...
 # no lookup by branch+label"). Two DISTINCT non-zero outcomes:
 #   rc 1  a DOCUMENTED pre-spawn no-effect receipt (`HERDR_SPAWN_NO_EFFECT`)
 #         was found in the output — the spawn command itself proved,
@@ -583,12 +602,32 @@ _esc_check_launch_authority() {
 # provable "nothing committed yet" boundary via its own exit trap, not a
 # guess from the exit code. HERDR_ESC_SPAWN_CMD overrides (tests,
 # operators) must emit the same two lines to be trusted the same way.
+# [grant_id]: docs/design/resident-launch-grant.md — when
+# _esc_check_launch_authority admitted via a resident grant rather than
+# live ancestry, its command_id is threaded through here and appended as
+# `--resident-grant-id <id>` so spawn-task.sh can independently re-verify
+# and self-mint its own per-spawn record (defense in depth; never trusts
+# this caller's decision blindly). Empty/absent -> no flag added, byte-
+# for-byte the same invocation as before this existed.
 _esc_spawn_successor() {
-  local out rc task_id
+  local repo="$1" branch="$2" job="$3" agent="$4" grant_id="${5:-}" out rc task_id
+  # No bash array here on purpose: the system bash on this platform is 3.2,
+  # where "${arr[@]}" on a DECLARED-BUT-EMPTY array throws "unbound
+  # variable" under set -u (this file's own set -uo pipefail) — branching
+  # on whether grant_id is set avoids it rather than relying on a 4.4+
+  # idiom this codebase otherwise never uses.
   if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
-    out="$(bash "$HERDR_ESC_SPAWN_CMD" "$@" 2>/dev/null)"; rc=$?
+    if [ -n "$grant_id" ]; then
+      out="$(bash "$HERDR_ESC_SPAWN_CMD" "$repo" "$branch" "$job" "$agent" --resident-grant-id "$grant_id" 2>/dev/null)"; rc=$?
+    else
+      out="$(bash "$HERDR_ESC_SPAWN_CMD" "$repo" "$branch" "$job" "$agent" 2>/dev/null)"; rc=$?
+    fi
   else
-    out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)"; rc=$?
+    if [ -n "$grant_id" ]; then
+      out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$repo" "$branch" "$job" "$agent" --resident-grant-id "$grant_id" 2>/dev/null)"; rc=$?
+    else
+      out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$repo" "$branch" "$job" "$agent" 2>/dev/null)"; rc=$?
+    fi
   fi
   if [ "$rc" = 0 ]; then
     task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
@@ -827,8 +866,12 @@ _esc_mark_blocked_uncertain() {
 }
 
 
+# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> [grant_id] ->
+# [grant_id]: threaded straight through to _esc_spawn_successor — see its
+# own header for what it does (resident-launch-grant.md). Empty/absent ->
+# unchanged from before this param existed.
 _esc_spawn_next_tier() {
-  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" \
+  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" grant_id="${5:-}" \
         task_json repo branch job old_pane old_pane_birth \
         pinned pinned_tier pinned_task succ_json succ_state succ_pane succ_birth \
         j_line j_state j_succ receipt spawn_rc
@@ -891,7 +934,7 @@ _esc_spawn_next_tier() {
     return 1
   }
 
-  receipt="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")"; spawn_rc=$?
+  receipt="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent" "$grant_id")"; spawn_rc=$?
   if [ "$spawn_rc" = 1 ]; then
     # R9 (conductor, blocking — review-ESC-R8 item 4, TOCTOU Scenario
     # A): a DOCUMENTED no-effect receipt proves nothing was CREATED,
@@ -1048,16 +1091,17 @@ esc_escalate() {
   # point (conductor's item (c)); other confirmed-clean failure causes
   # are unrelated to authority and remain correctly retryable via the
   # existing journal-clear path in _esc_spawn_next_tier.
-  local preflight_task_json preflight_repo preflight_old_pane preflight_old_pane_birth
+  local preflight_task_json preflight_repo preflight_old_pane preflight_old_pane_birth resident_grant_for_spawn
   preflight_task_json="$(read_task "$run_id" "$task_id")"
   preflight_repo="$(printf '%s' "$preflight_task_json" | jq -r '.repo // empty' 2>/dev/null)"
   preflight_old_pane="$(printf '%s' "$preflight_task_json" | jq -r '.pane_id // empty' 2>/dev/null)"
   preflight_old_pane_birth="$(printf '%s' "$preflight_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
-  if ! _esc_check_launch_authority "$preflight_repo"; then
+  if ! resident_grant_for_spawn="$(_esc_check_launch_authority "$preflight_repo" "$to_tier")"; then
     _esc_release_lock "$task_id" "$to_tier" "$fence"
     _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" no_launch_authority \
       "$preflight_old_pane" "$preflight_old_pane_birth"
     printf 'escalation: %s/%s has no admissible launch authority for a real spawn (no herdr-pane ancestry, or not an eligible conductor for this repo) — refusing before ever touching the old writer; task marked blocked, old writer left active, holding for the conductor (a NEW, separately-reviewed authorization grant — not inferred here — is the only way this path can succeed for an unattended caller)\n' "$task_id" "$to_tier" >&2
+    unset resident_grant_for_spawn
     return 1
   fi
   local renewer_pid
@@ -1091,7 +1135,7 @@ esc_escalate() {
         printf 'escalation: %s/%s lock (fence %s) was lost between quiesce and spawn — aborting before spawn, task preserved\n' "$task_id" "$to_tier" "$fence" >&2
         break
       }
-      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier")" && [ -n "$successor_task" ] && break
+      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier" "${resident_grant_for_spawn:-}")" && [ -n "$successor_task" ] && break
     fi
     successor_task=""
   done
