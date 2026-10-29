@@ -5233,7 +5233,7 @@ def render_overview(scope: str = "") -> str:
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
             f"<br><small>{_esc(x['url'])}</small></td><td class=age>{_age(x.get('created_at'))}</td></tr>" for x in f["open"]) + "</table>"
-    snapshot = hub_ui.ship_snapshot(h, f, pd, lo, live_data(), time.time(), PREVIEW_SYNTHETIC)
+    snapshot = hub_ui.ship_snapshot(h, f, pd, lo, live_data(), time.time(), PREVIEW_SYNTHETIC, scope)
     return page("hub", "/", hub_ui.home(chips, body, snapshot), scope=scope)
 
 

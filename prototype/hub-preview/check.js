@@ -7,6 +7,7 @@ var live = JSON.parse(readFile('tmp/hub-preview/ship-live.json'));
 var down = JSON.parse(readFile('tmp/hub-preview/ship-down.json'));
 var regerr = JSON.parse(readFile('tmp/hub-preview/ship-regerr.json'));
 var themes = JSON.parse(readFile('tmp/hub-preview/themes.json'));
+var scoped = JSON.parse(readFile('tmp/hub-preview/ship-scoped.json'));
 var fails = 0;
 function ok(name, cond) { print((cond ? 'ok   ' : 'FAIL ') + name); if (!cond) fails++; }
 var esc = HubUI.esc;
@@ -66,6 +67,21 @@ ok('worker agent kind shown, exactly what herdr reports (never relabelled as a m
 ok('model is said not-recorded, never shown as if known',
   workersHtml.indexOf('Model: not recorded') !== -1 && !/\bmodel\s*[:=]\s*"?(claude|gpt|opus|sonnet|haiku)/i.test(workersHtml));
 ok('no row claims a model value it does not have', live.workers.every(function (w) { return !('model' in w); }));
+// N1 (tmp/in/REVIEW-DASH.md round-2): /?repo=demo-app's real ship_snapshot()
+// output (check.py's "ship-scoped" dump, NOT a hand-built fixture) must
+// render only its own panes, state the hidden count, and never show a pane
+// with no owning task -- the static HTML fetch can't prove this (renderShip
+// runs client-side), so it is proven here against the real scoped data.
+var scopedHtml = HubUI.renderShip(scoped, themes.bebop, { reduce: false });
+var scopedWorkersHtml = (scopedHtml.split('id="workers"')[1] || '').split('id="holds"')[0];
+ok('scoped workers section lists only this repo\'s panes',
+  scoped.workers.length > 0 && scoped.workers.every(function (w) { return scopedWorkersHtml.indexOf(esc(w.pane)) !== -1; }));
+ok('scoped workers section never shows a pane dropped by scope',
+  scopedWorkersHtml.indexOf('w2:p1') === -1 && scopedWorkersHtml.indexOf('w3:p2') === -1);
+ok('scoped workers section states the hidden count', scoped.workers_hidden === 2 &&
+  scopedWorkersHtml.indexOf('2 pane(s) hidden by this scope') !== -1);
+ok('scoped workers section never lists a pane with an empty task',
+  scoped.workers.every(function (w) { return !!w.task; }));
 var holdsHtml = (h.split('id="holds"')[1] || '').split('id="escalation"')[0];
 ok('holds section lists every open decision', live.decisions.open.every(function (f) { return holdsHtml.indexOf(esc(f.title)) !== -1; }));
 var escHtml = h.split('id="escalation"')[1] || '';

@@ -290,7 +290,7 @@ def _epoch(iso) -> float | None:
 
 
 def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live: dict, now: float,
-                   synthetic: bool = False) -> dict:
+                   synthetic: bool = False, scope: str = "") -> dict:
     """Everything the Ship view draws, from cache values render_overview()
     already read. Field lists are allow-lists: no form token, port, worktree
     path or conductor id leaves this function. `synthetic` is
@@ -299,7 +299,13 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live: dict, n
     registry. `live` is hub.live_data()'s own dict (connected/agents/stats),
     the same source hub.py's _live_rows() reads for /herdr -- not just a
     connected flag, so the Ship workers section below can be built from a
-    cache value already held, not a second live read of its own."""
+    cache value already held, not a second live read of its own. `scope` is
+    the same repo-scope string render_overview() passes to scoped(h_all,
+    scope) -- `h` here is ALREADY that scoped dict, so h["tasks"] already
+    only contains this repo's tasks; `scope` itself is only needed to tell
+    "no scope, list every pane" apart from "scoped, drop panes with no task
+    in this repo" (a hand-started pane with no task at all is legitimately
+    shown under no scope)."""
     live_connected = bool(live.get("connected"))
     tasks = h.get("tasks") or []
     # Current workers (Ship's "workers" section): herdr's own live agent
@@ -314,9 +320,21 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live: dict, n
     # would be inventing a fact; the Ship workers section says so plainly
     # instead (tmp/in/REVIEW-DASH.md F2).
     tasks_by_pane = {t.get("pane_id"): t for t in tasks if t.get("pane_id")}
+    agents = live.get("agents") or []
+    workers_hidden = 0
+    # N1 fix (tmp/in/REVIEW-DASH.md round-2 finding): under a repo scope, a
+    # pane whose owning task is NOT in this repo must be dropped and
+    # counted, exactly like _live_rows() (hub.py ~5263-5268) -- the "scoped
+    # task list above an unscoped pane list" incident that function's own
+    # docstring (hub.py ~5248-5254) warns is a real, previously-shipped bug.
+    if scope:
+        mine = set(tasks_by_pane.keys())
+        kept = [p for p in agents if p.get("pane_id") in mine]
+        workers_hidden = len(agents) - len(kept)
+        agents = kept
     workers = []
     if live_connected:
-        for p in live.get("agents") or []:
+        for p in agents:
             task = tasks_by_pane.get(p.get("pane_id")) or {}
             reg = task.get("state")
             blocked = p.get("agent_status") == "blocked"
@@ -405,6 +423,7 @@ def ship_snapshot(h: dict, forms: dict, portal: dict, loops: dict, live: dict, n
             "projects": sorted(projects.values(), key=lambda p: (-p["attention"], p["name"])),
             "decisions": decisions, "suggestions": suggestions,
             "workers": workers, "workers_live_error": (live.get("stats") or {}).get("last_error"),
+            "workers_hidden": workers_hidden,
             "loops": {"total": len(lps), "bad": bad_loops}}
 
 

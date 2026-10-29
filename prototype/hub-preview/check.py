@@ -194,6 +194,28 @@ def main() -> int:
     check("bounty board renders inline on Ship", "class=\"bounty-board\"" in home)
     check("finished >24h hidden and counted", ship["hidden_finished"] == 1 and "implement:feat/old-thing" not in got)
     check("/ html carries no form token", "preview-token-not-real" not in home)
+    # N1 (tmp/in/REVIEW-DASH.md round-2): under a repo scope, a live pane
+    # whose owning task is NOT in that repo must be dropped and counted,
+    # never shown with an empty task (the exact regression _live_rows()
+    # guards against for /herdr; this round shipped it unguarded for Ship).
+    # Fixture ground truth (fixtures.py tasks()): of the 6 live panes, only
+    # w1:p1/w1:p3/w3:p1/w6:p1 own a demo-app task; w2:p1 owns demo-infra's
+    # plan:plan/q4-roadmap and w3:p2 owns demo-docs's deep-review:review/
+    # pr-38-r2, so scoping to demo-app must hide exactly those two.
+    check("unscoped / lists all 6 live panes", {w["pane"] for w in ship["workers"]} ==
+          {"w1:p1", "w2:p1", "w1:p3", "w3:p1", "w3:p2", "w6:p1"}, {w["pane"] for w in ship["workers"]})
+    shome = (OUT / "new" / new["/?repo=demo-app"]["file"]).read_text()
+    sship = json.loads(re.search(r"id=ship-data>(.*?)</script>", shome, re.S).group(1))
+    check("/?repo=demo-app keeps only demo-app panes",
+          {w["pane"] for w in sship["workers"]} == {"w1:p1", "w1:p3", "w3:p1", "w6:p1"},
+          {w["pane"] for w in sship["workers"]})
+    check("/?repo=demo-app hides the other repos' panes, counted (not silently dropped)",
+          sship["workers_hidden"] == 2, sship["workers_hidden"])
+    # The "N hidden" caption and per-row rendering happen client-side in
+    # renderShip() (host.innerHTML = ... in apply()); the static fetch
+    # above has no JS engine, so that text lives in check.js, not here.
+    check("/?repo=demo-app never lists a pane with an empty task",
+          all(w["task"] for w in sship["workers"]), [w for w in sship["workers"] if not w["task"]])
     dhome = (OUT / "down" / down["/"]["file"]).read_text()
     dship = json.loads(re.search(r"id=ship-data>(.*?)</script>", dhome, re.S).group(1))
     check("herdr-down snapshot says not connected", dship["live_connected"] is False)
@@ -202,7 +224,8 @@ def main() -> int:
     rship = json.loads(re.search(r"id=ship-data>(.*?)</script>", rhome, re.S).group(1))
     check("registry error reaches the Ship", bool(rship.get("error")))
     themes = json.loads(re.search(r"id=hub-themes>(.*?)</script>", home, re.S).group(1))
-    for name, obj in (("ship-live", ship), ("ship-down", dship), ("ship-regerr", rship), ("themes", themes)):
+    for name, obj in (("ship-live", ship), ("ship-down", dship), ("ship-regerr", rship),
+                       ("ship-scoped", sship), ("themes", themes)):
         (OUT / f"{name}.json").write_text(json.dumps(obj))
 
     print("== themes")
