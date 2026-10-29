@@ -99,6 +99,30 @@ the grant; reaching `deep` or `frontier` still requires a live human/
 conductor pane (today's behavior, unchanged — refused, task `blocked`,
 reason `no_launch_authority`).
 
+**Repo allowlist (both options, mint-time, fail-closed)** — Terrence's
+first-hand decision (2026-10-29T16:24:10Z): this grant may ONLY ever be
+minted for `herdr-control`, `knowledge-base`, `tntpgh-dev`, `tourguide` —
+exactly those four, regardless of which `max_tier` option a given grant
+uses. `grant-resident-escalation.sh`'s own pre-flight calls
+`resident_grant_allowed_repo` (`lib/run-registry.sh`) against the
+already-canonicalized `root_real` (worktree- and path-traversal-safe via
+`lib/repo-root.sh`'s `repo_root` + `pwd -P`, the same resolution the mint
+CLI already did for its own ancestry check) right after computing it and
+before the live-pane ancestry gate — a repo outside the four is refused
+before anything else is even checked. The allowlist itself fails closed:
+an explicitly empty `HERDR_RESIDENT_GRANT_REPO_ALLOWLIST` denies every
+repo, never silently permits everything; a genuinely UNSET one falls
+back to the real four-repo default baked into the function
+(`${VAR-default}`, no colon, is the one expansion that tells "unset"
+apart from "set to empty"). A worktree of an allowlisted repo, or a
+`..`-laden path inside one, resolves to the SAME canonical root as the
+main checkout before the allowlist is ever consulted — the check is
+keyed on that canonical identity, never a directory name or basename a
+differently-named clone could spoof. Never consulted at admission/spawn
+time — an already-minted grant for an approved repo is completely
+unaffected; this gate exists only at the one place a NEW grant could
+ever come into being.
+
 **Option B** is what Terrence described: `max_tier = frontier`, admitting
 escalation all the way up the real ladder — `esc_tier_job`
 (`lib/escalation.sh:189-196`) maps `fast→explore`, `standard→implement`,

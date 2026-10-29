@@ -69,6 +69,17 @@ root="$(repo_root "$repo" 2>/dev/null)"
 root_real="$(cd "$root" 2>/dev/null && pwd -P)"
 [ -n "$root_real" ] || root_real="$root"
 
+# Fail-closed hard cap, parallel to the ttl_hours cap above: this grant
+# may ONLY ever be minted for an explicitly approved repo. root_real is
+# already worktree- and path-traversal-safe (repo_root + pwd -P above),
+# so a worktree alias or a `..`-laden argument is refused or admitted
+# exactly as its canonical main-repo identity would be -- nothing here
+# does its own path resolution.
+resident_grant_allowed_repo "$root_real" || {
+  echo "grant-resident-escalation: refused — '$root_real' is not one of the explicitly approved repos for this grant" >&2
+  exit 1
+}
+
 # The SAME real gate spawn-task.sh itself uses for every local spawn — never
 # reimplemented, never loosened for this mint path.
 minting_pane="$(caller_pane_from_ancestry)" || {
