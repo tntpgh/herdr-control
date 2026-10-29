@@ -93,6 +93,14 @@
 #      stay UNCERTAIN: no retry (ever, including across a simulated
 #      restart), task held for the conductor. 827d6c1 treated any
 #      nonzero exit as confirmed-safe-to-retry and would reattempt.
+#   BB. R8 (conductor, blocking): the real production caller (hub.py's
+#      background watchdog thread) has NO herdr-pane ancestry, so
+#      spawn-task.sh's own authority gate refuses every automated spawn
+#      — this runs the REAL, unmodified gate (no override) from a
+#      non-pane caller and proves the old writer stays untouched and
+#      the task is marked blocked, never silently left `running` with
+#      zero owners. Must FAIL on 2c58dd2 (R7), which has no pre-flight
+#      check and would quiesce before ever discovering the refusal.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -306,11 +314,20 @@ if [ ! -f "$WORK/spawn-suppress-receipt" ]; then
 fi
 exit 0
 SH
+cat >"$WORK/fake-authority.sh" <<'SH'
+#!/usr/bin/env bash
+# R8: the default fake authority stub always reports admissible, so the
+# existing 108 cases above (none of which are about launch authority)
+# are unaffected by the new pre-flight gate. Case BB below deliberately
+# UNSETS HERDR_ESC_AUTHORITY_CMD to exercise the REAL, unmodified gate.
+exit 0
+SH
 
 export HERDR_ESC_PANE_ALIVE_CMD="$WORK/fake-pane-alive.sh"
 export HERDR_ESC_PANE_BIRTH_CMD="$WORK/fake-pane-birth.sh"
 export HERDR_ESC_PANE_CLOSE_CMD="$WORK/fake-pane-close.sh"
 export HERDR_ESC_SPAWN_CMD="$WORK/fake-spawn.sh"
+export HERDR_ESC_AUTHORITY_CMD="$WORK/fake-authority.sh"
 
 seed_task() {   # task_id pane branch [pane_birth] [job]
   local task_id="$1" pane="$2" branch="$3" birth="${4:-}" job="${5:-explore}" now
@@ -1030,6 +1047,80 @@ aa_jtbl="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_table // empty' 2>/
 aa_jkey_tier="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
 [ "$aa_jtbl" = escalation_spawn_journal ] && [ "$aa_jkey_tier" = standard ] && ok "AA: R7 fix 3 — the blocked event records the exact journal table/key for reconciliation, not just a free-text reason" \
   || bad "AA: R7 discoverability fields (journal_table=[$aa_jtbl] journal_key.to_tier=[$aa_jkey_tier])"
+
+# ============================================================== case BB ===
+# R8 (conductor, blocking, root-audit of R7/2c58dd2): the real
+# production caller (hub.py's background _stall_watchdog_loop thread)
+# has NO herdr-pane ancestry at all, so spawn-task.sh's own
+# caller_pane_from_ancestry gate deterministically refuses every
+# automated spawn — and until R8, that refusal was discovered only
+# AFTER the old writer was already quiesced, leaving the task looking
+# `running` with zero real owners. This case runs the REAL, unmodified
+# gate (lib/pane-guard.sh's caller_pane_from_ancestry +
+# pane_is_conductor_eligible — no HERDR_ESC_AUTHORITY_CMD override; no
+# HERDR_ESC_SPAWN_CMD override either, since spawn-task.sh must never
+# even be reached) from a process with no herdr-pane ancestry (this
+# test runner itself, genuinely — the same structural fact the review
+# verified by reading hub.py/lib/pane-guard.sh directly), and proves
+# the old writer's pane is left untouched (never quiesced, never
+# closed) and the task ends up explicitly `blocked`. Must FAIL against
+# 2c58dd2 (R7), which has no pre-flight check at all: it would instead
+# quiesce first and leave the task silently `running`.
+#
+# Safety: `herdr` is shadowed on PATH for this case too (own isolated
+# shadow dir + violation log, separate from the suite-wide one case R
+# checks) — this never touches the real live herdr/hub, same offline
+# guarantee as the rest of the suite; it only proves the REAL gate
+# function genuinely attempted the call and failed closed, which is
+# the production-accurate outcome either way (no live herdr session
+# reachable from an unattended background caller).
+RUN=taskBB; TASK=taskBB; PANE=pane-BB; BRANCH=esc-test-bb
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+BB_SHADOW="$WORK/shadow-bin-bb"; mkdir -p "$BB_SHADOW"
+rm -f "$WORK/herdr-violation-bb"
+cat >"$BB_SHADOW/herdr" <<SH
+#!/usr/bin/env bash
+printf 'herdr called: %s\\n' "\$*" >> "$WORK/herdr-violation-bb"
+exit 1
+SH
+chmod +x "$BB_SHADOW/herdr"
+for i in 1 2 3; do
+  ( unset HERDR_ESC_SPAWN_CMD HERDR_ESC_AUTHORITY_CMD
+    # config.sh (sourced fresh inside $CLI's own process) unconditionally
+    # rebuilds PATH as "$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}" —
+    # a plain `export PATH="$BB_SHADOW:$PATH"` here gets its shadow
+    # demoted behind config.sh's own $HERDR_EXTRA_PATH default
+    # (/opt/homebrew/bin, where herdr actually lives), silently letting
+    # the REAL herdr through. Overriding HERDR_EXTRA_PATH itself is the
+    # only override config.sh's rebuild actually honors.
+    export HERDR_EXTRA_PATH="$BB_SHADOW"
+    bash "$CLI" tick "$RUN" "$TASK" --commit-sha "$HEAD_SHA" --artifact-fp fpBB --context-dir "$CTX" >/dev/null )
+done
+bb_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+bb_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+bb_reason="$(printf '%s' "$bb_detail" | jq -r '.detail.reason // empty' 2>/dev/null)"
+bb_jtbl="$(printf '%s' "$bb_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+bb_jkey_tier="$(printf '%s' "$bb_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+bb_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+bb_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH");" 2>/dev/null)"
+bb_close_count="$(grep -c -- 'close pane-BB' "$ORDER_LOG" 2>/dev/null)"
+[ "$bb_state" = blocked ] && ok "BB: R8 — no admissible launch authority marks the task blocked explicitly" \
+  || bad "BB: R8 task state (got [$bb_state], want blocked)"
+[ "$bb_reason" = no_launch_authority ] && ok "BB: R8 — blocked reason is the specific, discoverable no_launch_authority" \
+  || bad "BB: R8 blocked reason (got [$bb_reason], want no_launch_authority)"
+[ "$bb_jtbl" = escalation_spawn_journal ] && [ "$bb_jkey_tier" = standard ] && ok "BB: R8 — the blocked event still records the journal table/key for reconciliation" \
+  || bad "BB: R8 discoverability fields (journal_table=[$bb_jtbl] journal_key.to_tier=[$bb_jkey_tier])"
+[ -z "$bb_journal" ] && ok "BB: R8 — the spawn journal was never claimed; the gate refused before _esc_journal_claim" \
+  || bad "BB: R8 journal row should not exist (got [$bb_journal])"
+[ "${bb_rows:-0}" = 1 ] && ok "BB: R8 — no successor row was ever created (spawn-task.sh never reached)" \
+  || bad "BB: R8 tasks-for-branch count (got $bb_rows, want 1 — the original only)"
+[ "${bb_close_count:-0}" = 0 ] && ok "BB: R8 — the old writer's pane was NEVER closed (quiesce never reached)" \
+  || bad "BB: R8 close count (got $bb_close_count, want 0)"
+[ -f "$PANES_DIR/$PANE.alive" ] && ok "BB: R8 — the old writer's pane is still alive/intact after refusal" \
+  || bad "BB: R8 old writer pane should still be alive"
+[ -s "$WORK/herdr-violation-bb" ] && ok "BB: R8 — the REAL caller_pane_from_ancestry genuinely ran (isolated herdr-call proof, not a reimplementation returning a canned answer)" \
+  || bad "BB: R8 the real gate never attempted a herdr call at all — suspicious, re-check the override is actually unset"
 
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \

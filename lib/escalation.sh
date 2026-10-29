@@ -90,6 +90,7 @@ _esc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_esc_dir/run-registry.sh"
 . "$_esc_dir/agent-profiles.sh"
 . "$_esc_dir/pane-guard.sh"
+. "$_esc_dir/repo-root.sh"
 
 # ---- ladder ------------------------------------------------------------------
 
@@ -498,6 +499,11 @@ _esc_lock_still_held() {                # task_id to_tier fence -> 0 unless know
 #                                        -> spawn the successor (prints
 #                                           nothing load-bearing; looked up
 #                                           in the registry afterward)
+#   HERDR_ESC_AUTHORITY_CMD <repo>      -> R8: exit 0 admissible / nonzero
+#                                           not — overrides the real
+#                                           caller_pane_from_ancestry +
+#                                           pane_is_conductor_eligible
+#                                           pre-flight check below
 
 _esc_pane_alive() {
   local pane="$1"
@@ -526,6 +532,27 @@ _esc_pane_close() {
     return $?
   fi
   herdr pane close "$pane" >/dev/null 2>&1
+}
+
+# _esc_check_launch_authority <repo> -> rc 0 ONLY if THIS process's own
+# real ancestry resolves, via spawn-task.sh's exact real gate
+# (lib/pane-guard.sh's caller_pane_from_ancestry + pane_is_conductor_eligible,
+# never reimplemented), to a pane eligible to launch a successor for
+# <repo> — an honest, READ-ONLY "can I even do this" probe that mutates
+# and consumes nothing. R8: called by esc_escalate ONCE, strictly
+# before the old writer is ever quiesced (see its own header comment).
+_esc_check_launch_authority() {
+  local repo="$1" root root_real source_pane
+  if [ -n "${HERDR_ESC_AUTHORITY_CMD:-}" ]; then
+    bash "$HERDR_ESC_AUTHORITY_CMD" "$repo"
+    return $?
+  fi
+  [ -n "$repo" ] || return 1
+  root="$(repo_root "$repo" 2>/dev/null)"
+  root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+  [ -n "$root_real" ] || root_real="$root"
+  source_pane="$(caller_pane_from_ancestry)" || return 1
+  pane_is_conductor_eligible "$source_pane" "$root_real"
 }
 
 # _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
@@ -763,17 +790,21 @@ _esc_journal_clear() {
 }
 # _esc_mark_blocked_uncertain <run_id> <task_id> <to_tier> <reason> \
 #   <old_pane_id> <old_pane_birth> [<receipt_task_id>] [<receipt_state>] —
-# R6/R7: the shared "hold this task for the conductor, uncertain spawn
-# outcome" transition, used by every _esc_spawn_next_tier failure branch
-# below. The journal row for (task_id, to_tier) stays 'in_flight' (R6) —
-# never cleared here, never retried blind; the OLD writer's pane is never
-# touched by this call (R7 fix 1: esc_escalate's retry loop only ever
-# calls _esc_quiesce_old_writer AFTER a successor is actually BOUND,
-# which by definition never happens on this path). R7 fix 3: every call
+# R6/R7/R8: the shared "hold this task for the conductor" transition,
+# used by every _esc_spawn_next_tier failure branch below AND by
+# esc_escalate's own R8 pre-flight authority check. The journal row for
+# (task_id, to_tier), when one was ever claimed, stays 'in_flight' (R6)
+# — never cleared here, never retried blind. This function itself never
+# touches the OLD writer's pane (it only ever calls set_task_state) —
+# for the post-quiesce uncertain-spawn callers below, that pane was
+# already independently confirmed quiesced before _esc_spawn_next_tier
+# was ever called (esc_escalate's own ordering, see its header); for
+# the R8 no-launch-authority caller, quiesce is never even reached, so
+# the pane stays genuinely active and untouched. R7 fix 3: every call
 # records the journal's own table/key (task_id/to_tier — always known,
-# even when nothing else is) AND, when available, the exact receipt
-# task_id/state the spawn returned, so an operator reconciling this
-# later has a concrete lookup
+# even when no journal row was ever claimed) AND, when available, the
+# exact receipt task_id/state the spawn returned, so an operator
+# reconciling this later has a concrete lookup
 # (`escalation_spawn_journal WHERE task_id=... AND to_tier=...`, plus
 # the exact orphan row when its id is known) instead of inferring it
 # from surrounding log lines.
@@ -975,6 +1006,42 @@ esc_escalate() {
     printf 'escalation: %s/%s is locked by a concurrent attempt\n' "$task_id" "$to_tier" >&2
     return 1
   }
+
+  # R8 (conductor, blocking, root-audit of R7/2c58dd2): the real
+  # production caller (hub.py's background _stall_watchdog_loop thread
+  # -> stall-watchdog.sh -> esc_escalate) has NO herdr-pane ancestry at
+  # all, so spawn-task.sh's own caller_pane_from_ancestry gate
+  # (lib/pane-guard.sh, unmodified, reused here READ-ONLY) refuses
+  # every such spawn deterministically. Before R8 this was discovered
+  # only AFTER _esc_quiesce_old_writer had already run (the loop below
+  # quiesces unconditionally first), so a doomed attempt left the task
+  # looking `running` with zero real owners once the loop exhausted its
+  # retries — quieter than even the uncertain-receipt case, since
+  # nothing marked the task at all. This check runs ONCE, strictly
+  # before the retry loop (the caller's own process ancestry cannot
+  # change between retries within one call, so retrying it would be
+  # pointless) and strictly before the old writer is ever touched: no
+  # admissible authority means the old writer stays active and the
+  # task is marked blocked explicitly, never quiesced first. Once this
+  # passes, spawn-task.sh's OWN internal gate (the identical two
+  # functions, the identical repo/ancestry inputs, the same process
+  # lifetime) cannot later disagree — a confirmed-clean spawn failure
+  # caused specifically by this gate is therefore unreachable past this
+  # point (conductor's item (c)); other confirmed-clean failure causes
+  # are unrelated to authority and remain correctly retryable via the
+  # existing journal-clear path in _esc_spawn_next_tier.
+  local preflight_task_json preflight_repo preflight_old_pane preflight_old_pane_birth
+  preflight_task_json="$(read_task "$run_id" "$task_id")"
+  preflight_repo="$(printf '%s' "$preflight_task_json" | jq -r '.repo // empty' 2>/dev/null)"
+  preflight_old_pane="$(printf '%s' "$preflight_task_json" | jq -r '.pane_id // empty' 2>/dev/null)"
+  preflight_old_pane_birth="$(printf '%s' "$preflight_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
+  if ! _esc_check_launch_authority "$preflight_repo"; then
+    _esc_release_lock "$task_id" "$to_tier" "$fence"
+    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" no_launch_authority \
+      "$preflight_old_pane" "$preflight_old_pane_birth"
+    printf 'escalation: %s/%s has no admissible launch authority for a real spawn (no herdr-pane ancestry, or not an eligible conductor for this repo) — refusing before ever touching the old writer; task marked blocked, old writer left active, holding for the conductor (a NEW, separately-reviewed authorization grant — not inferred here — is the only way this path can succeed for an unattended caller)\n' "$task_id" "$to_tier" >&2
+    return 1
+  fi
   local renewer_pid
   renewer_pid="$(_esc_start_lock_renewer "$task_id" "$to_tier" "$fence")"
 
