@@ -422,6 +422,85 @@ def accept_resident_spawn(db, command_id, grant_command_id, repo, raw_manifest):
     return _insert(db, claims, canonical(claims), expected)
 
 
+# ---- resident escalation redemption token (REVIEW-GRANT-9ac2fc4 HIGH fix) --
+# The standing grant (resident_escalation_grant, above) is deliberately
+# multi-use across many no-progress escalations for up to 24h -- but that
+# multi-use nature is exactly what made its OWN command_id a reusable
+# bearer credential once discovered via a spawned task's ordinary,
+# unauthenticated audit trail (claims.grant_command_id on any
+# resident_escalation_spawn row). This closes that gap WITHOUT making the
+# standing grant itself single-use: _esc_check_launch_authority mints a
+# FRESH, short-TTL, single-use REDEMPTION TOKEN for each individual
+# escalation attempt it admits, and ONLY that token (never the grant's own
+# command_id) is what spawn-task.sh's new admission branch accepts. A
+# token is structurally mintable only by _esc_check_launch_authority
+# itself (no other caller in this codebase calls accept_resident_
+# redemption), is consumed atomically on first use, and is never written
+# into any spawned task's own audit fields -- so recovering a past
+# grant_command_id from the audit trail no longer yields anything
+# redeemable.
+RESIDENT_REDEMPTION_TTL_MS = 5 * 60 * 1000  # 5 min: only the quiesce-then-spawn window, not the grant's own 24h
+
+
+def accept_resident_redemption(db, token_command_id, grant_command_id, repo, job_class):
+    for key, value in (("token command id", token_command_id), ("grant command id", grant_command_id)):
+        identifier(value, key)
+    if not os.path.isabs(repo) or os.path.normpath(repo) != repo:
+        raise Refused("resident redemption repository must be an absolute normalized path")
+    identifier(job_class, "resident redemption job class")
+    scope = {"grant_command_id": grant_command_id, "repo": repo, "job_class": job_class}
+    expected = canonical(scope)
+    payload_hash = digest(expected)
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, token_command_id)
+    if previous:
+        db.rollback()
+        raise Refused("resident redemption token command id collision")
+    issued = now_ms()
+    claims = {"version": 1, "source": "resident_escalation_redemption", "command_id": token_command_id,
+              "op": "resident_redemption", "remote_task_id": "", "requester_actor": "resident:" + grant_command_id,
+              "actor_pane_birth": "resident-redemption", "requester_client": "resident_escalation_grant",
+              "scope": "resident_escalation_redemption", "repo": repo, "mode": "",
+              "grant_command_id": grant_command_id, "job_class": job_class,
+              "effective_scope": parse(expected), "payload_sha256": payload_hash,
+              "issued_at": issued, "expires_at": issued + RESIDENT_REDEMPTION_TTL_MS}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def claim_resident_redemption(db, token_command_id, repo, job_class):
+    """The single-use choke point REVIEW-GRANT-9ac2fc4's HIGH finding
+    required: atomically consumes a redemption token minted ONLY by
+    _esc_check_launch_authority. A bare command_id that isn't a genuine
+    token row of THIS source (e.g. the standing grant's own id, or
+    anything else) is refused the same way an unknown token is -- it is
+    structurally never mintable by any other caller. status flips
+    accepted->bound in the SAME transaction as the check (an UPDATE with
+    `WHERE status='accepted'`, rowcount checked), so a concurrent or
+    replayed claim of the SAME token sees 0 rows affected and is refused.
+    The grant itself stays standing/multi-use; only each REDEMPTION is
+    single-use. Returns the verified grant_command_id on success."""
+    db.execute("BEGIN IMMEDIATE")
+    row = read(db, token_command_id)
+    if row is None or row["source"] != "resident_escalation_redemption":
+        db.rollback()
+        raise Refused("no such resident redemption token")
+    claims = _check_source(row)
+    if claims.get("repo") != repo or claims.get("job_class") != job_class:
+        db.rollback()
+        raise Refused("resident redemption token does not match this repo/job-class")
+    if row["status"] != "accepted" or row["expires_at"] <= now_ms():
+        db.rollback()
+        raise Refused("resident redemption token already consumed or expired")
+    cur = db.execute("UPDATE task_authorizations SET status='bound' WHERE command_id=? AND status='accepted'",
+                      (token_command_id,))
+    if cur.rowcount != 1:
+        db.rollback()
+        raise Refused("resident redemption token lost the single-use claim race")
+    grant_command_id = claims["grant_command_id"]
+    db.commit()
+    return grant_command_id
+
+
 def event(db, run_id, task_id, kind, payload):
     db.execute("INSERT INTO events(event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
                ("ev_" + uuid.uuid4().hex, run_id, task_id, kind, now_iso(), canonical(payload)))
@@ -450,6 +529,10 @@ def _check_source(row):
     elif row["source"] == "resident_escalation_spawn":
         expected = canonical(claims["effective_scope"])
         identifier(claims.get("grant_command_id"), "resident spawn grant command id")
+    elif row["source"] == "resident_escalation_redemption":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("grant_command_id"), "resident redemption grant command id")
+        identifier(claims.get("job_class"), "resident redemption job class")
     else:
         raise Refused("unknown authorization source")
     if expected != row["expected_manifest"]:
@@ -825,6 +908,10 @@ def main():
             print(canonical(read_resident_for_repo(db, *args)))
         elif op == "accept-resident-spawn":
             print(canonical(accept_resident_spawn(db, *args)))
+        elif op == "accept-resident-redemption":
+            print(canonical(accept_resident_redemption(db, *args)))
+        elif op == "claim-resident-redemption":
+            print(claim_resident_redemption(db, *args))
         elif op == "read":
             db.execute("BEGIN")
             row = read(db, *args)

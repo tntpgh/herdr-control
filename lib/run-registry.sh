@@ -967,6 +967,19 @@ accept_resident_escalation_spawn() {   # command_id grant_command_id repo manife
   registry_init || return 1
   _task_authorization_adapter accept-resident-spawn "$1" "$2" "$3" "${4:-}"
 }
+# REVIEW-GRANT-9ac2fc4 HIGH fix: the single-use redemption token.
+# mint_resident_redemption is called ONLY from lib/escalation.sh's
+# _esc_check_launch_authority -- never exposed as something spawn-task.sh
+# itself (or anything else) can mint, which is the structural half of the
+# fix (the atomic-consume half is claim_resident_redemption).
+mint_resident_redemption() {   # token_command_id grant_command_id repo job_class
+  registry_init || return 1
+  _task_authorization_adapter accept-resident-redemption "$1" "$2" "$3" "$4"
+}
+claim_resident_redemption() {   # token_command_id repo job_class -> prints grant_command_id on success
+  registry_init || return 1
+  _task_authorization_adapter claim-resident-redemption "$1" "$2" "$3"
+}
 # resident_grant_revoked -> 0 iff the global revocation sentinel is present.
 # Same "touch one file, instant effect on the next check" shape as the
 # house merge-delegation.revoked pattern (AGENTS.md). Checked fresh every

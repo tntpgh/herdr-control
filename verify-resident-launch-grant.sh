@@ -138,9 +138,13 @@ c4_gate_out="$(caller_pane_from_ancestry() { return 1; }; _esc_check_launch_auth
   && ok "4: the full launch-authority gate also refuses frontier under the same grant (falls through to the real, refusing ancestry check)" \
   || bad "4: gate under tier cap (rc=$c4_gate_rc out=[$c4_gate_out])"
 c4_standard_out="$(_esc_check_launch_authority "$REPO_A" standard 2>/dev/null)"
-[ "$c4_standard_out" = "$c4_id" ] \
-  && ok "4: the SAME grant DOES admit standard (fixture genuinely valid, not vacuous)" \
-  || bad "4: fixture sanity (got [$c4_standard_out], want [$c4_id])"
+[ -n "$c4_standard_out" ] && [ "$c4_standard_out" != "$c4_id" ] \
+  && ok "4: the SAME grant DOES admit standard (fixture genuinely valid, not vacuous) -- a real, non-empty TOKEN is returned, distinct from the grant's own command_id (REVIEW-GRANT-9ac2fc4)" \
+  || bad "4: fixture sanity (got token [$c4_standard_out], grant was [$c4_id])"
+c4_standard_claim="$(claim_resident_redemption "$c4_standard_out" "$REPO_A" implement 2>/dev/null)"
+[ "$c4_standard_claim" = "$c4_id" ] \
+  && ok "4: the returned token claims successfully and recovers the exact grant that admitted it" \
+  || bad "4: token claim (got [$c4_standard_claim], want [$c4_id])"
 
 # =============================================================== case 5 ===
 # Revocation sentinel refuses an otherwise fully valid, admitting grant --
@@ -161,12 +165,24 @@ c5_cleared_out="$(resident_grant_admits "$REPO_A" implement)"
 # =============================================================== case 6 ===
 # A grant row tampered with directly in storage (widening job_classes past
 # what was actually minted, without re-deriving expected_manifest) is
-# refused by the storage layer's own integrity check -- scope cannot be
-# silently widened after mint; only a fresh, separately-reviewed mint can
-# grant more. Minted narrow (standard only), then the stored `claims`
-# column alone is hand-edited to also claim frontier -- the realistic
-# tamper (editing the JSON blob) without also updating the separate
-# `effective_scope`/`expected_manifest` columns `_insert` set at mint time.
+# refused -- scope cannot be silently widened after mint; only a fresh,
+# separately-reviewed mint can grant more. Minted narrow (standard only),
+# then the stored `claims` column alone is hand-edited to also claim
+# frontier -- the realistic tamper (editing the JSON blob) without also
+# updating the separate `effective_scope`/`expected_manifest` columns
+# `_insert` set at mint time.
+#
+# LOW (REVIEW-GRANT-9ac2fc4): this refusal comes from ARCHITECTURE
+# (column/blob separation), not from `_check_source`'s hash/field
+# integrity cross-check as an earlier version of this comment claimed --
+# `resident_grant_admits` reads job_classes from the separate,
+# UNTOUCHED `effective_scope` column via `public(row)`, never from
+# `claims` at all, so this specific tamper is refused regardless of
+# whether the integrity cross-check runs. Confirmed by mutant: disabling
+# `_check_source`'s cross-check entirely does not flip this case. Both
+# layers independently prevent scope widening (genuine defense in
+# depth); this test proves the architectural one, not the integrity-
+# check one specifically.
 c6_id="$(mint_grant "$REPO_A" "explore,implement" standard)" || exit 1
 c6_before_out="$(resident_grant_admits "$REPO_A" deep-review)"
 c6_claims="$(_sql "SELECT claims FROM task_authorizations WHERE command_id=$(_sq "$c6_id");")"
@@ -185,12 +201,72 @@ c6_after_out="$(resident_grant_admits "$REPO_A" deep-review 2>/dev/null)"; c6_af
   && ok "6: a row tampered to claim a wider scope than it was minted with is refused, not silently honored" \
   || bad "6: tampered-widened grant (rc=$c6_after_rc out=[$c6_after_out])"
 
+# =============================================================== case 7 ===
+# design-doc item 5 (REVIEW-GRANT-9ac2fc4 HIGH): the standing grant's own
+# command_id -- discoverable later via any spawned task's ordinary,
+# unauthenticated audit record (claims.grant_command_id) -- is NOT a
+# redeemable token. Presenting it directly to claim_resident_redemption
+# (what spawn-task.sh's admission branch calls), bypassing
+# _esc_check_launch_authority entirely (the only place a genuine token is
+# ever minted), must refuse: it is a real row, but the wrong SOURCE
+# (resident_escalation_grant, not resident_escalation_redemption) --
+# structurally unreachable as a token, proving the grant is not a
+# general-purpose spawn bypass usable outside escalation's own call path.
+c7_grant_id="$(mint_grant "$REPO_A" "explore,implement" standard)" || exit 1
+c7_out="$(claim_resident_redemption "$c7_grant_id" "$REPO_A" implement 2>/dev/null)"; c7_rc=$?
+[ "$c7_rc" != 0 ] && [ -z "$c7_out" ] \
+  && ok "7: design-doc item 5 -- the standing grant's own (audit-trail-discoverable) command_id is refused when presented as a redemption token, bypassing the authority check that mints a genuine one" \
+  || bad "7: bare grant id as token (rc=$c7_rc out=[$c7_out], grant was $c7_grant_id)"
+
+# =============================================================== case 8 ===
+# design-doc item 9/positive baseline + the redemption token's own
+# single-use property: the full happy path through _esc_check_launch_
+# authority (grant exists and admits -> mints a fresh token -> token
+# independently claims -> recovers the correct grant_command_id), then
+# design-doc item 8: a SECOND claim of the SAME token is refused -- one
+# grant authorizing two concurrent spawns off a single redemption is not
+# possible, the token itself is the single-use choke point (REVIEW-
+# GRANT-9ac2fc4's structural fix), independent of the deeper, pre-
+# existing claim_task_worktree_mutation/task_id-UNIQUE machinery this
+# proposal reuses unchanged for the resulting resident_escalation_spawn
+# record.
+c8_grant_id="$(mint_grant "$REPO_A" "explore,implement" standard)" || exit 1
+c8_token="$(caller_pane_from_ancestry() { return 1; }; _esc_check_launch_authority "$REPO_A" standard 2>/dev/null)"; c8_gate_rc=$?
+[ "$c8_gate_rc" = 0 ] && [ -n "$c8_token" ] \
+  && ok "8: positive path -- a valid, admitting grant makes _esc_check_launch_authority mint and return a real token" \
+  || bad "8: positive path token mint (rc=$c8_gate_rc out=[$c8_token])"
+c8_first_claim="$(claim_resident_redemption "$c8_token" "$REPO_A" implement 2>/dev/null)"; c8_first_rc=$?
+[ "$c8_first_rc" = 0 ] && [ "$c8_first_claim" = "$c8_grant_id" ] \
+  && ok "8: positive path -- the token claims successfully and recovers the exact grant command_id that admitted it" \
+  || bad "8: first claim (rc=$c8_first_rc out=[$c8_first_claim], want [$c8_grant_id])"
+c8_second_claim="$(claim_resident_redemption "$c8_token" "$REPO_A" implement 2>/dev/null)"; c8_second_rc=$?
+[ "$c8_second_rc" != 0 ] && [ -z "$c8_second_claim" ] \
+  && ok "8: design-doc item 8 -- a second claim of the SAME token is refused (single-use, not two concurrent spawns off one redemption)" \
+  || bad "8: second claim (rc=$c8_second_rc out=[$c8_second_claim])"
+
+# =============================================================== case 9 ===
+# A redemption token is scoped to the EXACT (repo, job_class) it was
+# minted for -- presenting a genuine, unconsumed, unexpired token but for
+# the WRONG job_class (a different tier than what it actually authorizes)
+# is refused, same as a wrong-repo presentation would be. Proves the
+# token itself carries real scope, not just "any token admits anything."
+c9_grant_id="$(mint_grant "$REPO_A" "explore,implement" standard)" || exit 1
+c9_token="$(caller_pane_from_ancestry() { return 1; }; _esc_check_launch_authority "$REPO_A" standard 2>/dev/null)"
+c9_wrong_job="$(claim_resident_redemption "$c9_token" "$REPO_A" explore 2>/dev/null)"; c9_wrong_job_rc=$?
+[ "$c9_wrong_job_rc" != 0 ] && [ -z "$c9_wrong_job" ] \
+  && ok "9: a genuine token minted for 'implement' refuses a claim presenting a different job_class ('explore')" \
+  || bad "9: wrong job_class claim (rc=$c9_wrong_job_rc out=[$c9_wrong_job])"
+c9_right_job="$(claim_resident_redemption "$c9_token" "$REPO_A" implement 2>/dev/null)"
+[ "$c9_right_job" = "$c9_grant_id" ] \
+  && ok "9: the SAME token still claims correctly for its real job_class afterward (fixture genuinely valid, not vacuous)" \
+  || bad "9: fixture sanity (got [$c9_right_job], want [$c9_grant_id])"
+
 # ---- belt-and-suspenders: no test above ever reached the real herdr -----
 if [ -s "$WORK/herdr-violation" ]; then
-  bad "no real herdr call across all 6 cases"
+  bad "no real herdr call across all 9 cases"
   cat "$WORK/herdr-violation" >&2
 else
-  ok "no real herdr call across all 6 cases (shadow PATH clean)"
+  ok "no real herdr call across all 9 cases (shadow PATH clean)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

@@ -270,7 +270,9 @@ pilot starts with.
   `bash "$_esc_dir/../spawn-task.sh" --no-focus "$repo" "$branch" "$job"
   "$agent"` (`lib/escalation.sh:591`, inside `_esc_spawn_successor`), with one
   new argument added when a grant is admissible:
-  `--authorization-command-id <grant_command_id>`.
+  `--resident-redemption-id <token_command_id>` — **not** the grant's own
+  `command_id` (REVIEW-GRANT-9ac2fc4, HIGH: see §3 point 3 below for why a
+  bare grant id is never passed around after the fix).
 - **Job classes**: exactly the four `esc_tier_job` values
   (`lib/escalation.sh:189-196`) — `explore` (fast), `implement` (standard),
   `plan` (deep), `deep-review` (frontier). No other job class is ever passed
@@ -299,7 +301,16 @@ pilot starts with.
   that already has one in flight or bound. The grant only ever reaches
   `spawn-task.sh` from inside that already-gated call path — it is not a
   general-purpose spawn credential and must never be accepted outside
-  `_esc_spawn_successor`'s own invocation.
+  `_esc_spawn_successor`'s own invocation. **REVIEW-GRANT-9ac2fc4 (HIGH)**
+  found the first implementation only *intended* this and did not enforce
+  it: the grant's own `command_id`, once recovered from any spawned task's
+  ordinary audit record (`claims.grant_command_id`), was independently
+  presentable straight to `spawn-task.sh` with zero ancestry and zero
+  `esc_escalate` involvement, admitting a second, unrelated spawn. Fixed
+  structurally (§3 point 3): `_esc_check_launch_authority` now mints a
+  fresh, single-use redemption token per admitted escalation attempt, and
+  only that token — never the grant's own id — is what `spawn-task.sh`
+  will accept.
 - **Max tier**: the grant's `effective_scope` carries a `max_tier` field (one
   of `fast|standard|deep|frontier`). `_esc_check_launch_authority` refuses
   if `to_tier` (the tier `esc_escalate` is currently trying to reach) ranks
@@ -343,11 +354,37 @@ they are, reused read-only by the **mint** step instead:
    recent `status='accepted'` row with `source='resident_escalation_grant'`
    and `source_repo = <repo>` (a read, same transaction shape `read()`
    already provides, `lib/task-authorization.py:156-157`). If one exists,
-   unexpired, and its `max_tier` admits `to_tier`, pass its `command_id`
-   through to `_esc_spawn_successor` as `--authorization-command-id`.
-   `spawn-task.sh`'s own validation at line 420 gains the matching new
-   admissible `.source` branch with its own predicate (job_class, repo,
-   max_tier — never widened to the OAuth predicate's shape).
+   unexpired, and its `max_tier` admits `to_tier`, it does **not** pass that
+   row's own `command_id` onward — **REVIEW-GRANT-9ac2fc4 (HIGH)** proved
+   that id leaks via every spawn's own ordinary audit record
+   (`claims.grant_command_id` on the `resident_escalation_spawn` row below),
+   making it a reusable bearer credential for the grant's whole TTL once any
+   one spawn under it had happened. Instead it mints a brand-new,
+   short-TTL (5 min — just the quiesce-then-spawn window, not the grant's
+   own up-to-24h one), single-use row of a **third** source,
+   `resident_escalation_redemption` (`accept_resident_redemption`,
+   `lib/task-authorization.py`), scoped to `(grant_command_id, repo,
+   job_class)`, and passes *that* row's `command_id` through to
+   `_esc_spawn_successor` as `--resident-redemption-id`. This mint is the
+   **only** place in the codebase that ever produces a redemption token —
+   nothing else, including `grant-resident-escalation.sh` or any CLI,
+   mints this source, so a token cannot be pre-forged or requested on
+   demand by an unattended caller; it only ever exists as the byproduct of
+   a real admission decision. `spawn-task.sh`'s own validation gains a
+   matching new branch that calls `claim_resident_redemption(token, repo,
+   job_class)` — an ATOMIC, single-use consumption (`status`
+   `accepted`→`bound` inside one transaction, race-safe via the UPDATE's
+   own affected-row count) that returns the underlying `grant_command_id`
+   on success and refuses outright for anything that is not a genuine,
+   unconsumed, unexpired, matching-scope token of this exact source — a
+   bare grant `command_id` presented here fails the source check the same
+   way an unknown id does, closing the leak. `spawn-task.sh` then
+   independently re-verifies the recovered grant is *still* admissible
+   (`resident_grant_admits`, unchanged defense-in-depth from before this
+   fix) before self-minting its own per-spawn `resident_escalation_spawn`
+   record (unchanged) — a revocation or expiry in the gap between token
+   mint and claim still refuses here even though the token itself was
+   genuine.
 4. No environment variable ever carries a grant, a repo name, or a bypass
    flag. `HERDR_ESC_AUTHORITY_CMD` (the existing test seam) stays test-only
    and is never read in production; the grant lookup is a database read, not
@@ -469,10 +506,14 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
 4. A grant exists but its `max_tier` is below the tier `esc_escalate` is
    currently trying to reach → refused (tier-cap enforcement), including the
    boundary case (`to_tier == max_tier` must pass; one above must refuse).
-5. A grant is valid, unexpired, correctly scoped — but the authority check is
-   invoked directly, bypassing `esc_escalate`'s own no-progress gate — must
-   still refuse or be structurally unreachable, proving the grant is not a
-   general-purpose spawn bypass usable outside escalation's own call path.
+5. A grant is valid, unexpired, correctly scoped — but its own `command_id`
+   (not a genuine redemption token) is presented directly to the claim
+   step, bypassing `_esc_check_launch_authority`'s own token mint entirely
+   — must refuse (wrong `source`), proving the grant is not a general-
+   purpose spawn bypass usable outside escalation's own call path.
+   **REVIEW-GRANT-9ac2fc4 (HIGH)**: this exact test was missing from the
+   first implementation, and the gap it would have caught was real — now
+   covered (`verify-resident-launch-grant.sh` case 7).
 6. The revocation sentinel is present → refused even against an otherwise
    fully valid grant, and the sentinel is checked *before* the grant lookup
    (ordering test: a valid grant plus the sentinel must never spawn).
@@ -480,11 +521,16 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
    under a valid grant) and takes effect on the *next* tick without a
    process restart — directly proves "effective at the next tick," not
    "effective after redeploy."
-8. A grant that does authorize a spawn is consumed through the existing
-   once-only `claim_task_worktree_mutation` claim (`spawn-task.sh:435`) —
-   verify a grant cannot authorize two concurrent spawns (reuses the
-   existing once-only semantics; this proposal adds no new consumption
-   logic to re-prove, only a new way to reach the existing gate).
+8. **REVIEW-GRANT-9ac2fc4 (HIGH) superseded this item's original text**
+   ("reuses the existing once-only semantics, no new consumption logic to
+   re-prove") — the redemption-token fix adds genuinely new single-use
+   consumption logic (`claim_resident_redemption`'s atomic `accepted`→
+   `bound` transition) that sits IN FRONT OF the pre-existing
+   `claim_task_worktree_mutation` gate, not instead of it, and must be
+   proved on its own terms: a token claimed once succeeds and recovers the
+   correct grant id; a second claim of the SAME token is refused — a grant
+   cannot authorize two concurrent spawns off a single redemption
+   (`verify-resident-launch-grant.sh` case 8).
 9. The full existing `verify-no-progress-escalation.sh` suite (120
    assertions as of R9) stays green with the new lookup branch present but
    no grant ever minted in any fixture — the new code path must be
@@ -497,7 +543,9 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
 A positive "grant actually authorizes a successful spawn end-to-end"
 fixture test is also required once the mint/consume code exists, but it is
 not a *negative* test and does not gate activation by itself — items 1-10
-above do.
+above do. (Now present: `verify-resident-launch-grant.sh` case 8's first
+two assertions — grant admits, token mints, token claims and recovers the
+correct grant id — are what item 10's mutation probe targets.)
 
 ## Review boundary
 
