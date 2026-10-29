@@ -78,6 +78,154 @@ watchdog chain, which never has to prove its own ancestry because it is
 presenting a receipt instead — exactly how the OAuth remote path already
 works for a publisher that is never a herdr pane either.
 
+## Pilot scope: two options
+
+Terrence named a specific ladder he wants (Sonnet, then Opus, then the top
+Codex tier, triggered after 2-3 no-progress loops) — materially wider than
+this document's original default-recommended pilot (`standard` only). Both
+are laid out here so the choice is explicit, not defaulted past him.
+
+| | **A — restricted pilot** | **B — T's requested ladder** |
+|---|---|---|
+| Max tier | `standard` only (haiku→sonnet) | `frontier` (sonnet→opus→codex top tier) |
+| Tiers admitted | `fast`,`standard` | `fast`,`standard`,`deep`,`frontier` (full ladder — see below) |
+| Blast radius | One model step up, Claude family only | Three model steps, crosses into a second model family (codex) at the top |
+| Unattended spend/runtime | Lowest — one extra sonnet session per loop | Highest — can reach codex's most expensive configured tier unattended |
+| Operating experience needed first | None required | None required, but more to watch — recommend running A first even if B is the target end state |
+
+**Option A** is this document's original proposal, unchanged: `max_tier =
+standard`. A no-progress loop can escalate from `fast` to `standard` under
+the grant; reaching `deep` or `frontier` still requires a live human/
+conductor pane (today's behavior, unchanged — refused, task `blocked`,
+reason `no_launch_authority`).
+
+**Option B** is what Terrence described: `max_tier = frontier`, admitting
+escalation all the way up the real ladder — `esc_tier_job`
+(`lib/escalation.sh:189-196`) maps `fast→explore`, `standard→implement`,
+`deep→plan`, `frontier→deep-review`; `esc_tier_agent`
+(`lib/escalation.sh:206-212`) keeps the task's own model family for every
+tier except `frontier`, which always resolves to `codex` (opus is Claude's
+ceiling, so the one real step beyond it is the strongest model this config
+names for any family). `esc_tier_model` (`lib/escalation.sh:218-222`) reads
+the actual model id from the same table `spawn-task.sh` itself uses
+(`lib/agent-profiles.sh`'s `model_for_agent`):
+
+- `standard` → `claude:implement` → **sonnet** (`lib/agent-profiles.sh:188`)
+- `deep` → `claude:plan` → **opus** (`lib/agent-profiles.sh:186`)
+- `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**, defaulted to
+  **`gpt-5.6-sol:high`** (`config.sh:104`, `lib/agent-profiles.sh:201`) — "the
+  top Codex tier ('Sol high')" is this exact config value, not a separate
+  concept; it tracks whatever `config.sh:104` resolves to with no code
+  change here, same as every other tier already does.
+
+The loop threshold — "after 2-3 no-progress loops" — is
+`HERDR_NO_PROGRESS_CYCLES` (`lib/escalation.sh:272`, `${HERDR_NO_PROGRESS_
+CYCLES:-3}`), already defaulted to **3** identical ticks before
+`no_progress_detect` reports a loop at all (`lib/escalation.sh:82-85`) —
+this grant proposal does not change that threshold or the one-tier-per-
+escalation pacing; "2-3 loops" is already what today's detector requires
+per step, and each of the three steps in B still only fires on its OWN
+fresh 3-cycle (or configured) no-progress window for the NEW tier, not a
+single trigger that cascades through all three at once.
+
+A grant's `max_tier` admits every tier at or below it in `esc_ladder`'s
+order (`lib/escalation.sh:98`, default `fast standard deep frontier`), not
+a hand-picked subset — so Option B's `frontier` ceiling also admits `fast`
+and `standard` escalations for the same task, even though Terrence's own
+description starts at Sonnet (`standard`). That's consistent with how
+escalation already works (`esc_next_tier`, `lib/escalation.sh:166-...`,
+moves exactly one tier at a time from wherever the task currently sits) —
+nothing here lets a task skip from `fast` straight to `frontier` in one
+jump regardless of which option is chosen; each tier still needs its own
+fresh no-progress window.
+
+**Per-step scope, both options:**
+
+- **Repo**: one repo per grant, exactly as specified throughout this
+  document — unchanged by which ladder is granted.
+- **Task lineage**: a grant is never task-bound (no no-progress task exists
+  at mint time); scope is enforced structurally by `esc_escalate` only ever
+  running after `no_progress_detect` already reported a loop for a
+  SPECIFIC task (`stall-watchdog.sh:280-282`), and by `_esc_spawn_next_
+  tier`'s existing journal/pinning logic refusing a second spawn for a task
+  that already has one in flight or bound (`lib/escalation.sh:830-...`).
+  Each step up the ladder (standard→deep, deep→frontier) is a NEW spawn for
+  the SAME task lineage (the successor becomes the new task the next
+  no-progress window watches) — the grant authorizes the repo and tier
+  ceiling, not a specific task_id, by construction, in both options.
+- **Write scope**: unchanged by this proposal in either option — every
+  managed spawn (live-ancestry or grant-admitted) gets its own dedicated git
+  worktree keyed to one branch (`spawn-task.sh`'s worktree creation), and
+  `lib/command-policy.sh`'s grant-tokenizer already scopes action grants to
+  that task's own `branch`/`worktree` fields, failing closed on an empty
+  branch (`lib/run-registry.sh:242-247`'s comment on the `branch` column).
+  This proposal adds no new write-scope mechanism and narrows nothing
+  further than what every other managed spawn already gets.
+- **Spend or time caps**: **none exist today**, in either option. Grepping
+  `lib/escalation.sh`, `stall-watchdog.sh`, `no-progress-escalate.sh`,
+  `spawn-task.sh`, `config.sh` for any budget/spend/cost-cap mechanism
+  found none — `HERDR_ESCALATION_HOOK_RETRIES` (`config.sh:140`) bounds one
+  watchdog cycle's spawn *retry* attempts, not total spend, and nothing
+  bounds how long a spawned successor itself may run once launched (true
+  for every spawn today, not something this proposal changes). Option B's
+  wider ceiling reaches a more expensive model with the exact same absence
+  of a spend guard — if a time/spend cap is wanted, it is a separate,
+  unrelated piece of infrastructure this document does not propose and
+  should not be assumed to exist.
+- **Caller binding**: identical in both options — §3 below, live ancestry
+  proven once at mint time, never inferred from the unattended caller.
+- **Action-time revocation**: identical in both options — §5 below, the
+  sentinel file, checked before the grant lookup on every tick, so a mid-
+  run revoke stops the NEXT spawn attempt at whichever tier it was about to
+  reach, including a frontier/codex spawn already queued for this watchdog
+  tick. It does not stop or kill a successor already launched in an earlier
+  tick — revocation is "mint no more," not "recall what's running," in
+  both options (consistent with §6 rollback: this was never a live-agent
+  kill switch).
+- **Expiry**: identical in both options — §4 below, the same hard 24h cap.
+  B does not get a longer window for reaching further; the ceiling is tier,
+  not time.
+
+**Which steps need a step-up human approval, and why:**
+
+Neither option auto-approves anything beyond what minting the grant already
+decided. The three-step distinction is about WHEN Terrence's judgment is
+asked for, not whether it ever is:
+
+- **Minting the grant at all** — human-only in both options (§3, §8): this
+  is the one unavoidable step-up, because it is the only place live pane
+  ancestry is ever proven for this feature.
+- **Reaching `deep`/`frontier` specifically** needs its own, separate
+  step-up beyond "mint a grant for this repo" IF Option A ships first and
+  Option B is wanted later — raising `max_tier` above `standard` is already
+  listed as human-only (§8, "Raising `max_tier` above `standard`... requires
+  a code change to the mint command's own hard caps"). If B ships as the
+  initial design instead, this is folded into the single mint-time decision
+  — Terrence chooses `frontier` once, at mint time, and nothing asks again
+  per tier-step after that, which is the material difference from A: A asks
+  "is sonnet enough" once per repo at mint time and never risks more; B asks
+  "is the full ladder, unattended, acceptable for this repo" once at mint
+  time and then genuinely does not ask again before an unattended codex
+  spawn.
+- **Crossing model families (claude→codex) specifically** is not a separate
+  approval gate in either option as designed — `frontier` always resolves
+  to codex (`lib/escalation.sh:209`) as part of the existing, already-
+  shipped tier ladder, not something this grant introduces. If a distinct
+  approval step for the family crossing (not just the tier ceiling) is
+  wanted, that is a NEW control this document does not currently propose
+  and would need its own design, since today nothing — not escalation, not
+  this grant — treats a family crossing as materially different from a
+  same-family tier step.
+
+**Recommendation stands as originally written: default to Option A for the
+first repo, even if Option B is the eventual goal** — not because B is
+unsafe by design, but because neither option has any operating history yet,
+and A's smaller blast radius makes the first real-world failure mode (if
+any) cheaper to observe and fix. This is a recommendation, not a
+restriction the code enforces — the mint command's own hard cap (§8) is
+Terrence's to set per repo at mint time regardless of which option this
+pilot starts with.
+
 ## 1. Exact action
 
 - **Caller**: `_esc_check_launch_authority` (`lib/escalation.sh:544-556`),
@@ -127,11 +275,13 @@ works for a publisher that is never a herdr pane either.
   if `to_tier` (the tier `esc_escalate` is currently trying to reach) ranks
   above the grant's `max_tier` in the existing ladder order — the old writer
   stays active and the task is marked `blocked`, same shape as a missing
-  grant. **Default proposal: `standard` only** (haiku→sonnet). Reaching
-  `deep`/`frontier` unattended is a materially bigger blast radius (opus/
-  codex spend, longer unattended runtime) and should require either a
-  separate, explicitly wider grant or stay human-only until there is
-  operating experience with `standard`.
+  grant. **Default recommendation: `standard` only** (Option A, haiku→
+  sonnet) — see "Pilot scope: two options" above for the full comparison
+  against Terrence's requested wider ladder (Option B, `max_tier =
+  frontier`). Reaching `deep`/`frontier` unattended is a materially bigger
+  blast radius (opus/codex spend, longer unattended runtime); the mint
+  command's own hard cap is Terrence's to set per repo regardless of which
+  option a given grant uses.
 
 ## 3. Identity and binding — no spoofed ancestry, no env bypass
 
