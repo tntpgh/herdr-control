@@ -12,25 +12,37 @@
 #     both panels, per #277 — write/edit stays categorically human-only
 #     regardless of size. Unaffected by this work.
 #   - Deny SUCCEEDS (rc=0, one key pressed) for both peer and human
-#     authority on both the 7098 B and 7706 B panels, once the fixture
-#     starts with Deny already highlighted — the same convention
-#     verify-select-policy.sh uses for every Deny case (its stubbed pane
-#     never moves its own highlight on a keypress; see that file's
-#     set_menu_deny/set_rows_deny). A static "Deny also refused" code
-#     defect was NOT reproduced this way.
+#     authority on both the 7098 B and 7706 B panels WHEN the Approve/Deny
+#     footer is fully captured — once the fixture starts with Deny already
+#     highlighted (the same convention verify-select-policy.sh uses for
+#     every Deny case; its stubbed pane never moves its own highlight on a
+#     keypress — set_menu_deny/set_rows_deny).
+#   - Deny-not-pressable IS reproduced (herdr-control#267, live GBP wB4:p4
+#     ~03:45Z) once a "Steering · N" queued-message block sits above a
+#     write panel tall enough that the captured/visible window ends BEFORE
+#     the Approve/Deny footer: prompt_menu_options's _menu_gate (needs
+#     "navigate"/"select" from the footer) fails, so _current_offer falls
+#     through to the numbered-prompt parser, which DOES match the
+#     Steering block's own "N. Conductor: ..." rows. "option 2" then
+#     resolves to the steering row's text, not "Deny" — herdr-select.sh:477
+#     never sets `declining=1`, so the conductor/peer non-human-authority
+#     gates (:1015, :1063) apply classify_command's #267 ceiling verdict as
+#     if Deny were an Approve attempt. One root cause explains both halves
+#     of the live report (the byte ceiling AND the steering mis-resolution).
 #   - gap2 ("tool 'write' is not the write/edit tool on screen ('bash')")
-#     IS reproduced exactly, mechanically: `proposal_check`
+#     IS reproduced exactly, mechanically, two ways: (1) a direct --tool
+#     cross-check mismatch against `proposal_check`
 #     (lib/prompt-occurrence.py, called by herdr-select.sh:889-891 as the
 #     `proposal` subcommand — not `pending-bound`, a different, exact-
-#     binding-only lookup used later at :904-906) refuses whenever its
-#     --tool cross-check argument (task_input_required_tool's answer for
-#     the CURRENT screen prompt) disagrees with the tool recorded on the
-#     occurrence itself (from the hook's own `seen` call at dispatch time).
-#     This reproduction proves the MECHANISM; it does not prove WHY the two
-#     signals would disagree for a genuine write panel in production — that
-#     needs either the live incident's actual registry rows or tracing
-#     whatever derives task_input_required_tool's answer (a scrape-based
-#     signal, unlike `seen`'s hook-level one) for a real oversized panel.
+#     binding-only lookup used later at :904-906); (2) end-to-end (live
+#     incident, dashboard w9T:p4Q ~03:48Z) via the REAL
+#     task_input_required_tool lookup (lib/run-registry.sh:1968) against a
+#     stale bash Approve/Deny box still on screen: a deferred write
+#     occurrence (`seen` at dispatch, `screen` recording whatever the probe
+#     actually saw — the stale bash panel, since the write never painted
+#     its own) gets its cross-check tool resolved from the MOST RECENT
+#     on-screen panel, not from itself — any tool call that paints no panel
+#     of its own inherits whatever panel was already there.
 #
 #   bash verify-write-panel-267-repro.sh
 set -uo pipefail
@@ -152,6 +164,50 @@ case "$gap2_json" in
     bad "did not reproduce the exact gap2 message: $gap2_json" ;;
 esac
 
+# ---- gap2 v2 (live incident, w9T:p4Q ~03:48Z): a deferred write occurrence
+# with NO panel painted (tool=write, e.g. proc://preview-http/kill), while
+# the screen still shows the PREVIOUS bash command's complete Approve/Deny
+# box. Unlike the repro above (which hand-passed --tool bash), this drives
+# --tool through the REAL herdr-select.sh lookup
+# (task_input_required_tool, lib/run-registry.sh:1968) against the stale
+# bash panel's own prompt_id -- proving the mismatch arises from whichever
+# tool call most recently painted a panel, not from anything specific to
+# the write occurrence itself.
+printf '== gap2 repro v2: deferred write occurrence, stale bash box still on screen ==\n'
+printf 'Allow tool: bash\nCommand: pkill -f preview-http\n\n Approve\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
+stale_pid="$(prompt_id "$PANE" 2>/dev/null)"
+append_event run1 task1 input_required \
+  "$(jq -nc --arg msg "omp needs permission" --arg pid "$stale_pid" --arg tool "bash" \
+     '{message:$msg, prompt_id:$pid, command:"pkill -f preview-http", tool:$tool}')" >/dev/null 2>&1
+# The deferred write: 'seen' at dispatch, 'screen' records whatever the
+# probe actually saw -- the stale bash box, since the write never painted
+# its own panel. Same two-step write order production uses.
+write_call="occcall-write-$RANDOM"
+"$occ_py" "$here/lib/prompt-occurrence.py" seen \
+  --db "$(registry_db)" --run run1 --task task1 --pane "$PANE" \
+  --birth "$BIRTH" --session "native-sess-1" --call-id "$write_call" \
+  --tool write --source test --input-json "$(jq -nc '{path:"proc://preview-http/kill", content:""}')" >/dev/null
+"$occ_py" "$here/lib/prompt-occurrence.py" screen \
+  --db "$(registry_db)" --run run1 --task task1 --pane "$PANE" \
+  --birth "$BIRTH" --session "native-sess-1" --call-id "$write_call" \
+  --display pending_parseable --prompt-id "$stale_pid" >/dev/null
+
+current_pid="$(prompt_id "$PANE" 2>/dev/null)"
+registry_tool="$(task_input_required_tool run1 task1 "$current_pid" 2>/dev/null)"
+registry_tool_lc="$(printf '%s' "$registry_tool" | tr '[:upper:]' '[:lower:]')"
+echo "    current screen is still the stale bash panel: $([ "$current_pid" = "$stale_pid" ] && echo yes || echo no)"
+echo "    task_input_required_tool resolved: '$registry_tool_lc' (from the stale box, not the deferred write)"
+gap2_v2_json="$("$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
+  --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" \
+  --prompt-id "$current_pid" --worktree "$here" --tool "$registry_tool_lc" 2>&1)"
+echo "    $gap2_v2_json"
+case "$gap2_v2_json" in
+  *'is not the write/edit tool on screen'*)
+    ok "gap2 v2: reproduced end-to-end via task_input_required_tool against a real stale bash box" ;;
+  *)
+    bad "gap2 v2 did not reproduce: $gap2_v2_json" ;;
+esac
+
 printf '== GBP repro: SAME 7098 B write panel, Deny (peer authority) ==\n'
 seed_write_menu "$gbp_path" "$gbp_content" write deny
 reset_keys
@@ -191,6 +247,86 @@ if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" -gt 0 ]; then
   ok "Deny succeeded"
 else
   bad "DENY REFUSED: rc=$rc keys=$(keys_pressed)"
+fi
+
+# ---- Deny-not-pressable (live incident, GBP wB4:p4 ~03:45Z): herdr-select
+# wB4:p4 2 --expect-prompt-id ... was refused for TWO reasons that turn out
+# to be one root cause. omp paints a "Steering · N" queued-message block
+# ABOVE the write panel; when the panel's wrapped content is tall enough
+# that the visible/captured window (lib/prompt-parse.sh _PANE_WINDOW_LINES,
+# bounded in practice by the real pane's height) ends BEFORE the
+# Approve/Deny footer, prompt_menu_options's _menu_gate (needs "navigate"
+# and "select" from the footer) fails, so _current_offer falls through to
+# the numbered-prompt parser -- which DOES match the Steering block's own
+# "N. Conductor: ..." rows. "option 2" then resolves to the SECOND
+# steering row's text, not "Deny": herdr-select.sh:477's case statement
+# does not recognize that text, so `declining` stays 0. Downstream,
+# classify_command denies on the >4096-byte ceiling (#267's original bug)
+# and, because declining=0, the conductor/peer non-human-authority gates
+# (herdr-select.sh:1015, :1063) apply that refusal as if Deny were an
+# Approve attempt -- Deny becomes genuinely unpressable.
+printf '== Deny-not-pressable repro: Steering block above a truncated-viewport write panel ==\n'
+PANE="wB4:p4"; BIRTH="term-gbp-1"
+seed_write_menu_steering_truncated() {  # <path> <content_chars>
+  local content
+  content="$(printf 'g%.0s' $(seq 1 "$2"))"
+  {
+    printf ' Steering · 2\n'
+    printf '   1. Conductor: your oversized write was refused (herdr-control#267) -- split or shorten it\n'
+    printf '   2. Conductor: please retry once under the 4096-byte panel limit\n'
+    printf '\n'
+    # Real omp panel shape -- right-bordered, padded box, same convention
+    # as verify-select-policy.sh's boxed_panel (:1304-1314) -- a write
+    # panel shows only the first ~2000 UTF-16 units of content
+    # (docs/design/complete-approval-payload.md), so the >4KB total the
+    # live incident reported comes from this structural overhead (border,
+    # padding, one row per wrapped line), not from raw content bytes.
+    printf '╭─ Allow tool: write %s╮\n' "$(printf '─%.0s' $(seq 1 180))"
+    printf '│ %-198s │\n' "Path: $1"
+    printf '%s' "$content" | fold -w 198 | while IFS= read -r r; do printf '│ %-198s │\n' "$r"; done
+    # Truncated here: the viewport is tall enough to show the steering
+    # block and the start of the panel, but not tall enough to reach
+    # Approve/Deny/the footer -- the panel's own content pushed them out,
+    # same shape as the 2026-09-13 "header off-screen" precedent
+    # (lib/prompt-parse.sh:741-742) one layer further: here the FOOTER is
+    # off-screen instead, which the footer-anchored fallback cannot help
+    # with (it IS the footer).
+  } > "$SCREEN"
+  local pid owner run task
+  pid="$(prompt_id "$PANE" 2>/dev/null)"
+  owner="$(task_for_pane "$PANE" 2>/dev/null)"
+  run="$(printf '%s' "$owner" | jq -r '.run_id // empty')"
+  task="$(printf '%s' "$owner" | jq -r '.task_id // empty')"
+  append_event "$run" "$task" input_required \
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$pid" --arg tool write \
+       '{message:$msg, prompt_id:$pid, command:"", tool:$tool}')" >/dev/null 2>&1
+  local call="occcall-write-steer-$RANDOM"
+  "$occ_py" "$here/lib/prompt-occurrence.py" seen \
+    --db "$(registry_db)" --run "$run" --task "$task" --pane "$PANE" \
+    --birth "$BIRTH" --session "native-sess-1" --call-id "$call" \
+    --tool write --source test --input-json "$(jq -nc --arg p "$1" --arg c "$content" '{path:$p, content:$c}')" >/dev/null
+  "$occ_py" "$here/lib/prompt-occurrence.py" screen \
+    --db "$(registry_db)" --run "$run" --task "$task" --pane "$PANE" \
+    --birth "$BIRTH" --session "native-sess-1" --call-id "$call" \
+    --display pending_parseable --prompt-id "$pid" >/dev/null
+  printf '%s' "$pid"
+}
+steer_pid="$(seed_write_menu_steering_truncated "tmp/out/gbp-notes.md" 4000)"
+echo "    scraped bytes: $(wc -c < "$SCREEN" | tr -d ' '), rows: $(wc -l < "$SCREEN" | tr -d ' ')"
+menu_opts="$(prompt_menu_options "$PANE" 2>/dev/null)"
+numbered_opts="$(prompt_options "$PANE" 2>/dev/null)"
+echo "    prompt_menu_options: [${menu_opts:-<empty>}]"
+echo "    prompt_options (numbered fallback): [${numbered_opts:-<empty>}]"
+reset_keys
+sel 2 --authority peer --expect-prompt-id "$steer_pid"; rc=$?
+err_tail="$(tail -3 "$WORK/err.txt")"
+echo "    rc=$rc keys=$(keys_pressed) stderr: $err_tail"
+if [ -z "$menu_opts" ] && [ -n "$numbered_opts" ] \
+  && [ "$(printf '%s' "$numbered_opts" | awk -F'\t' '$1==2{print $2}')" != Deny ] \
+  && [ "$rc" -ne 0 ] && [ "$(keys_pressed)" = 0 ]; then
+  ok "REPRODUCED: menu detection fails, numbered fallback matches the steering row, Deny refused (rc=$rc, 0 keys)"
+else
+  bad "did not reproduce the full Deny-not-pressable chain: menu_opts=[$menu_opts] numbered_opts=[$numbered_opts] rc=$rc keys=$(keys_pressed)"
 fi
 
 echo

@@ -42,49 +42,87 @@ bytes, and effectively **no scanning of the content itself** (as opposed to
 the path) even below that line, beyond the single-`Content:`-occurrence
 anti-forgery check.
 
-## Deny — reproduced SAFE against the real herdr-select.sh
+## Deny-not-pressable — CONFIRMED, one root cause for both halves of the report
 
-`verify-write-panel-267-repro.sh` (committed, synthetic GBP/Intel fixture —
-never the live wB4/wB2 panes) runs the REAL, unmodified `herdr-select.sh`
-against a 7098 B and a 7706 B write panel, both authorities:
+Live evidence (conductor, GBP wB4:p4, ~03:45Z): `herdr-select wB4:p4 2
+--expect-prompt-id ...` was refused for what looked like two reasons —
+(a) "classified text was 7310 bytes, over the 4096 ceiling"; (b) it
+resolved "option 2" to a **Steering queue row**
+("Conductor: your oversized write was refused...") instead of the panel's
+Deny. Both are the **same bug**, reproduced end to end against the real
+`herdr-select.sh` and `lib/prompt-parse.sh`
+(`verify-write-panel-267-repro.sh`, "Deny-not-pressable repro"):
 
-| Panel | Choice | Authority | Result |
-|---|---|---|---|
-| GBP (7098 B) | Approve | peer | `rc=8`, 0 keys — refused (#277, write/edit human-only, expected) |
-| GBP (7098 B) | Deny | peer | `rc=0`, 1 key — **succeeds** |
-| GBP (7098 B) | Deny | human | `rc=0`, 1 key — **succeeds** |
-| Intel (7706 B) | Deny | peer | `rc=0`, 1 key — **succeeds** |
+1. omp paints a `Steering · N` queued-message block **above** the write
+   panel. When the panel's content is tall enough (wrapped across many
+   rows) that the captured/visible window ends **before** the Approve/Deny
+   footer, `prompt_menu_options`'s `_menu_gate` — which requires both
+   `navigate` and `select` from the footer text — fails, because the
+   footer simply never entered the window.
+2. `_current_offer` (`herdr-select.sh:420-436`) is "MENU FIRST" specifically
+   to avoid a steering block hijacking option resolution (a 2026-09-05
+   precedent, same file, same comment) — but that protection only holds
+   while `prompt_menu_options` actually returns something. When it returns
+   empty, `_current_offer` falls through to `prompt_options`, the
+   **numbered**-prompt parser — which DOES match the Steering block's own
+   `N. Conductor: ...` rows (they are within `_prompt_window`'s last-25-
+   non-blank-line scan).
+3. `label` for `choice=2` now resolves to the steering row's text
+   ("Conductor: please retry once under the 4096-byte panel limit"), not
+   "Deny". `herdr-select.sh:477`'s case statement
+   (`Deny|deny|No|no|...) declining=1 ;;`) does not match that text, so
+   `declining` **stays 0**.
+4. Downstream, `classify_command` denies on the >4096-byte ceiling (#267's
+   original bug) or escalates on garbled panel text (either verdict is
+   non-`allow`), and because `declining=0`, the conductor/peer non-human-
+   authority gates (`herdr-select.sh:1015`, `:1063`) apply that verdict as
+   if the human were trying to **Approve**, not Deny. Exact reproduced
+   output, byte-for-byte matching the live report:
+   ```
+   herdr-select: REFUSED (deny) — a human must answer this one.
+   herdr-select: classified text is 5092 bytes, over the 4096-byte safety
+   ceiling (herdr-control#267) — split the command or run a script file by
+   reference
+   herdr-select: option 2 (Conductor: please retry once under the
+   4096-byte panel limit) in wB4:p4 was NOT pressed.
+   ```
 
-A static "Deny also refused" code path was NOT reproduced against the real
-script. Every `policy_verdict`-driven refusal
-(`herdr-select.sh:981,991,1003,1015,1063`) is `declining=0`-gated, and
-`authority=human` is never gated on `policy_verdict` at all
-(`_require_current_authority` returns 0 immediately for `human`,
-`herdr-select.sh:649`). (The fixture itself must start with Deny already
-highlighted — the same convention `verify-select-policy.sh` uses for every
-Deny case, since a stubbed screen never moves its own highlight on a
-keypress; an earlier draft of this reproduction used the default
-Approve-highlighted fixture for Deny too and got a `rc=6` navigation
-timeout — a harness artifact, not a `herdr-select.sh` behavior, since
-real terminal navigation updates the highlight on every keypress and this
-stub does not.)
+**This falsifies this document's earlier §3 claim** ("Deny is always
+pressable... codifies today's already-true behavior"). That claim is true
+only for the `declining=1`-gated refusal sites themselves — every one of
+them really is `declining=0`-gated, exactly as stated. The bug is one layer
+**upstream**: `declining` can be silently left at `0` for an actual Deny
+keypress, because mechanism resolution (`lib/prompt-parse.sh`) mis-detects
+which menu is on screen. `_cp_write_content_verdict` (this proposal's
+prototype) cannot fix this — it is never reached; the failure is entirely
+in prompt/option resolution, before `classify_command` is even the
+relevant layer. **This needs its own, separate proposal** against
+`lib/prompt-parse.sh`'s `_current_offer`/`prompt_options` fallback, not
+`lib/command-policy.sh`. Candidate direction (not implemented, not
+reviewed): when `prompt_menu_options` returns empty but the captured window
+contains an `Allow tool:` header with no matching footer, that is
+*evidence of a truncated omp panel*, not *evidence of no omp panel at
+all* — `_current_offer` should fail closed (escalate/refuse to navigate)
+rather than silently falling through to the numbered-prompt parser, which
+can match unrelated numbered content (steering, or ordinary numbered agent
+prose) with no indication anything was mis-resolved. This mirrors the
+fail-closed principle `_prompt_menu_parse` already applies to its own two
+passes (`lib/prompt-parse.sh:748-752`: "the risk it removes is a real menu
+that cannot be answered at all").
 
-`[INFERENCE]`, now narrower: the "refuses both Approve and Deny" field
-report is most likely the *absence* of automated resolution in either
-direction, not a code path that blocks Deny. `peer-answer.sh` (lines 25–34)
-presses **only** a complete panel whose command classifies `allow` — it
-never auto-Denies by design — so an oversize write panel that classifies
-`deny`/`escalate` on size alone just sits until a human answers it directly
-on the real terminal, outside `herdr-select.sh`. Recommend confirming
-against the actual wB4/wB2 incident's `selections.jsonl` / hub event log to
-see whether a human-attempted Deny ever actually reached `herdr-select.sh`
-at all, versus the prompt simply never getting a Deny attempt from anyone.
+`verify-select-policy.sh`'s existing `boxed_panel` convention (bordered,
+padded, same shape as a real omp panel) is what let this reproduce
+precisely — the fixture needs the SAME bordered/padded overhead a real
+panel paints, since omp's write panel preview caps at ~2000 UTF-16 units
+of raw content (`docs/design/complete-approval-payload.md`), so most of
+the >4KB scraped-text size the live incident saw must be structural
+(border/padding/one-row-per-wrapped-line), not raw content bytes.
 
-## Deferred-occurrence tool mismatch — reproduced, mechanism confirmed
+## Deferred-occurrence tool mismatch — CONFIRMED, two reproductions
 
-Reproduced exactly (`verify-write-panel-267-repro.sh`, "gap2 repro" case),
-against the real `proposal_check` (`lib/prompt-occurrence.py:1138`, called
-by `herdr-select.sh:889-891` as the `proposal` subcommand — **not**
+Reproduced exactly (`verify-write-panel-267-repro.sh`, "gap2 repro"), against
+the real `proposal_check` (`lib/prompt-occurrence.py:1138`, called by
+`herdr-select.sh:889-891` as the `proposal` subcommand — **not**
 `pending-bound`, a different, exact-binding-only lookup used later at
 `:904-906`, which the first draft of this investigation mistakenly called
 instead and so failed to reproduce anything):
@@ -93,35 +131,38 @@ instead and so failed to reproduce anything):
 {"ok": false, "reason": "occurrence tool 'write' is not the write/edit tool on screen ('bash')"}
 ```
 
-Mechanism: `proposal_check` refuses whenever its `--tool` cross-check
-argument disagrees with the tool recorded on the matching occurrence. The
-cross-check argument is `$registry_tool_lc`
+**Mechanism, now confirmed end to end** (live incident, dashboard pane
+w9T:p4Q, ~03:48Z — a deferred write occurrence `508d50d8`, tool=write,
+`proc://preview-http/kill`, no panel ever painted for it; the screen still
+showed the previous bash command's box; "gap2 repro v2" reproduces this
+exact shape, not a hand-passed `--tool`): `proposal_check` refuses whenever
+its `--tool` cross-check argument disagrees with the tool recorded on the
+matching occurrence. The cross-check argument is `$registry_tool_lc`
 (`herdr-select.sh:836-837` → `task_input_required_tool`, reading the
-`input_required` event's own `tool` field) — a **separate, independently
-recorded** signal from the occurrence's own tool (recorded by the hook's
-`seen` call at dispatch time, `agent-hooks/omp-herdr-control.ts`). These are
-two different registry writes with two different sources of truth for "what
-tool is this", and `proposal_check` requires them to agree.
+`input_required` event recorded for the **current on-screen prompt_id** —
+here, the stale bash panel's). A deferred write occurrence registers its
+own `seen` tool at dispatch time, but its `screen` correlation (the probe
+that runs after dispatch) records **whatever is actually on screen at that
+moment** — here, the still-rendered bash panel, since the write never
+painted its own. So the write occurrence's own `screen_prompt_id` equals
+the stale bash panel's prompt_id, and when something later asks "what tool
+is pending for this prompt_id", `task_input_required_tool` correctly
+answers for the **panel that is actually there** ("bash"), which
+legitimately disagrees with the deferred write's own recorded tool
+("write"). This is not two signals racing or disagreeing about the SAME
+call — it is one signal (the painted panel) correctly describing a
+DIFFERENT, earlier call than the one a reviewer is asking about. **Any**
+tool call that paints no panel of its own inherits whatever panel was
+already on screen when something probes the cross-check — not specific to
+write panels, large content, or #267's size ceiling at all.
 
-This reproduction proves the **mechanism** — two independently-sourced tool
-signals disagreeing causes exactly this refusal — but does NOT prove *why*
-they disagreed for the real GBP panel. `[INFERENCE]`: `task_input_required_tool`'s
-signal is populated from whatever derives the `input_required` event's
-`tool` field (a push-wake/panel-level signal), unlike `seen`'s, which is
-the hook's own dispatch-time knowledge of the actual tool call — a scrape-
-or detection-based signal is exactly the kind of thing a large/complex
-panel could plausibly confuse (the same class of issue as the documented
-2026-09-13 precedent at `lib/prompt-parse.sh:741-742`, "a ~1.2 kB eval body"
-pushing the header off-screen and requiring the footer-anchored parse
-fallback — a precedent for large content breaking panel detection, at a
-size an order of magnitude below GBP/Intel's). Confirming that specific
-chain needs either the live incident's actual registry rows (what
-`task_input_required_tool` returned and why) or tracing whatever populates
-it end to end; out of scope for this proposal without that evidence.
-Recommend **not** silently loosening the cross-check — if the two signals
-really do disagree in production, whichever one is wrong needs the fix, not
-a bypass of a refusal that is correct whenever they genuinely describe two
-different occurrences.
+Recommend **not** silently loosening the cross-check (it is correctly
+catching a real mismatch in this exact case): whoever resolves a deferred,
+no-panel-painted write occurrence needs to stop asking "what does the
+CURRENT screen say", and instead check whether the occurrence has a
+`screen_prompt_id` at all / whether a NEW panel for it has since appeared
+— a proposal for `herdr-select.sh`'s `pending-bound`/`proposal` call sites
+around `:884-906`, not for this one (`lib/command-policy.sh`).
 
 ## Design, addressing every stated constraint
 
@@ -152,15 +193,19 @@ if [ "$declining" = 1 ]; then
   : # fall straight to the existing record-and-send path (~line 1095)
 fi
 ```
-This codifies today's *already-true* behavior (every `policy_verdict` gate
-is `declining=0`-conditioned) as an explicit invariant instead of an
-emergent property of scattered conditionals, so a reviewer of any future
-diff sees the guarantee in one place.
+This codifies today's *already-true* behavior for the refusal sites
+themselves (every `policy_verdict` gate really is `declining=0`-
+conditioned, confirmed by grep) as an explicit invariant instead of an
+emergent property of scattered conditionals. **It does not fix
+Deny-not-pressable** — see "Deny-not-pressable" above: `declining` itself
+can be wrongly left at `0` for a genuine Deny keypress, one layer upstream
+in `lib/prompt-parse.sh`'s mechanism resolution, before any of these gates
+run. That needs its own separate proposal.
 
 **4. Tests: truncation + prompt injection + windowing + normalization.**
 `verify-write-content-verdict-267.sh` (committed; converted from a `tmp/`
 scratch script) exercises the prototype directly — it has no live caller,
-so this is the only way to exercise it — 13/13 checks pass:
+so this is the only way to exercise it — 16/16 checks pass:
 - 7 KB write panel, path inside worktree → `allow` (not an automatic
   `deny` from size).
 - 7 KB bash command (not a write panel) → still hits
@@ -182,6 +227,16 @@ so this is the only way to exercise it — 13/13 checks pass:
   `policy_verdict`-driven refusal sites in `herdr-select.sh` (grep for each
   site's exact `declining" = 0` gate, not a line-distance heuristic — that
   false-positived on comment prose during drafting).
+- A reserved pattern straddling each window boundary (4000 B and 7488 B)
+  still denies, plus a same-shaped negative control that allows — proves
+  the windowed `conductor_reserved_reason` scan has no blind spot at a
+  seam, and that windowing did not introduce a false positive either.
+- A case-insensitive credential-path variant past 4096 B still denies
+  (`~/.SSH/ID_RSA`) — the reserved-pattern scan stays case-insensitive at
+  any content size, matching `conductor_reserved_reason`'s own behavior.
+- A regression marker: `classify_command`/`peer_decide`, UNCHANGED by this
+  commit, still deny the same 7 KB write panel on size alone today — this
+  flips only once activation (checklist below) wires the prototype in.
 
 ### Prototype implementation (inert, zero callers)
 
@@ -234,15 +289,18 @@ design.
    at `lib/command-policy.sh:7215-7232`, not a new dispatch mechanism.
 2. Extend `verify-command-policy.sh`'s existing `#267` suite
    (`:4612-4656`) with the cases from `verify-write-content-verdict-267.sh`.
-3. Confirm the wB4/wB2 incident's actual `selections.jsonl` rows / hub event
-   log: did a Deny attempt ever reach `herdr-select.sh` for either prompt,
-   or did the prompt sit with no automated resolution attempted in either
-   direction (the likelier explanation per `verify-write-panel-267-repro.sh`,
-   which reproduces Deny succeeding against the real script).
-4. Trace what populates `task_input_required_tool`'s answer end to end (the
-   push-wake/panel-level tool signal, distinct from the hook's own `seen`
-   tool) to confirm whether it can genuinely mis-detect "write" as "bash"
-   for a real oversized panel, before deciding whether gap2 needs a fix at
-   all, and if so, which signal is the wrong one.
+3. **Separate proposal, before or alongside this one**: fix
+   Deny-not-pressable in `lib/prompt-parse.sh`'s `_current_offer` (see
+   "Deny-not-pressable" above) — `declining` must never stay `0` for an
+   actual Deny keypress because a Steering block got matched instead of
+   the omp menu. This is the live incident's actual root cause and is
+   independent of `lib/command-policy.sh`; this proposal's prototype does
+   not touch it.
+4. **Separate proposal**: fix the deferred-occurrence tool cross-check
+   (`herdr-select.sh:884-906`) to stop comparing a no-panel-painted
+   occurrence against whatever panel happens to be on screen (see
+   "Deferred-occurrence tool mismatch" above) — resolve by the
+   occurrence's own `screen_prompt_id` presence/absence, not by
+   `task_input_required_tool` on the CURRENT prompt.
 5. Security review (auth/money/external-comms-adjacent: approval policy)
    before merge, per team rules.
