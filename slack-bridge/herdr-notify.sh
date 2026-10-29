@@ -121,6 +121,8 @@ cwd_hint=""
 dry=0
 choices=0
 class=""
+bound_request_id=""
+bound_sha=""
 while :; do
   case "${1:-}" in
     # ${2:?} not ${2:-}: with a trailing flag and no value, `shift 2` FAILS and
@@ -142,6 +144,20 @@ while :; do
     --dry-run) dry=1; shift ;;
     # Show the agent's actual options and make them answerable.
     --choices) choices=1; shift ;;
+    # SOURCE ONLY, default OFF (HERDR_BOUND_CLEARANCE_SLACK=1 required,
+    # enforced below — a caller passing these flags with the var unset gets
+    # a plain informational post, same as omitting them, never buttons).
+    # Part B (thurber-os .handoffs/frozen/approval-classification-repair-
+    # 5d6e094a.md): an action_requests row for a deferred bound request has
+    # no pane/prompt_id/numbered-choice shape at all, so it cannot go
+    # through --choices above (that branch reads a LIVE pane prompt via
+    # lib/prompt-parse.sh; a bound request has none). --bound-request/
+    # --bound-sha post a two-button Approve/Deny block whose value is
+    # "<request_id>|<action_sha256>" instead of "<pane>|<n>|<prompt_id>".
+    --bound-request) [ $# -ge 2 ] || { echo "herdr-notify: --bound-request needs a value" >&2; exit 2; }
+            bound_request_id="$2"; shift 2 ;;
+    --bound-sha) [ $# -ge 2 ] || { echo "herdr-notify: --bound-sha needs a value" >&2; exit 2; }
+            bound_sha="$2"; shift 2 ;;
     # What KIND of alert this is — decides whether it reaches Slack at all
     # (lib/slack-level.sh). Absent means unclassified, which is suppressed at
     # the default level.
@@ -350,6 +366,24 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   fi
 fi
 
+# Part B Route 1 (SOURCE ONLY, default OFF): a bound-request clearance has no
+# live pane prompt to read, so it cannot share the --choices machinery above
+# — it posts its own fixed two-button Approve/Deny block instead. Gated on
+# the same kill switch herdr-select.sh and herdr-action.sh check, so a
+# caller passing --bound-request with the var unset gets the plain
+# informational post this script already sends for any other unclassified
+# call, never buttons it cannot honour end to end.
+if [ -n "$bound_request_id" ] && [ "${HERDR_BOUND_CLEARANCE_SLACK:-0}" = 1 ]; then
+  blocks=$(jq -nc --arg body "$body" --arg id "$bound_request_id" --arg sha "$bound_sha" '
+    [ {type:"section", text:{type:"mrkdwn", text:$body}},
+      {type:"actions", elements: [
+        {type:"button", style:"primary", text:{type:"plain_text", text:"Approve"},
+         value:($id + "|" + $sha), action_id:"herdr_bound_approve"},
+        {type:"button", style:"danger", text:{type:"plain_text", text:"Deny"},
+         value:($id + "|" + $sha), action_id:"herdr_bound_deny"}
+      ]} ]')
+fi
+
 # ---- drop: the prompt this call was about is already gone -----------------
 # choices=1 with no numbered/menu options AND no plain context means nothing
 # is actually on screen to alert about — the common cause is the prompt was
@@ -443,7 +477,13 @@ if [ -n "$pane" ]; then
   # with no record, which is precisely the un-retractable state this queue
   # exists to prevent. If the wait is exhausted, append anyway and say so: a
   # possibly-lost record beats never recording a live question at all.
-  if [ -n "$blocks" ]; then
+  # Bound-request alerts are excluded: herdr-resolve.sh's sweep retracts a
+  # tracked message once the PANE's live prompt is gone, but a bound
+  # request's pane never painted one in the first place (herdr-select.sh's
+  # own header: "OMP's v1 deferred resolver deliberately paints no terminal
+  # approval panel") — tracking it here would retract the clearance button
+  # on the very next sweep, before anyone could click it.
+  if [ -n "$blocks" ] && [ -z "$bound_request_id" ]; then
     . "$_lib/pending-queue.sh"
     _pl="$reg_dir/.pending.lock"
     pending_lock "$_pl" || echo "herdr-notify: pending queue locked; appending unserialised" >&2

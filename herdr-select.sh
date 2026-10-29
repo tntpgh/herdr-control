@@ -250,6 +250,51 @@ if [ -n "$bound_request_id" ]; then
     _refuse_bound "bound requests require registered conductor authority"
     exit 8;
   }
+  printf '%s' "$bound_payload_sha" | grep -Eq '^[0-9a-f]{64}$' || {
+    echo "herdr-select: bound request requires the reviewed full payload sha256." >&2; exit 2;
+  }
+  [ -n "$bound_tool_call_id" ] || {
+    echo "herdr-select: bound request requires the exact tool call id." >&2; exit 2;
+  }
+  if [ "$authority" != conductor ]; then
+    # SOURCE ONLY, default OFF (HERDR_BOUND_CLEARANCE_SLACK=1 required).
+    # Design: thurber-os .handoffs/frozen/approval-classification-repair-
+    # 5d6e094a.md Part B. A non-conductor bound request used to be a bare
+    # dead end (exit 8, nothing else reachable). Behind the flag, file a
+    # human-route action_requests row instead, reusing the existing
+    # action_request_create/herdr-action.sh CAS machinery unchanged — so the
+    # request becomes answerable (Slack button or the hub form) rather than
+    # only refused. action_sha256 binds ALL FOUR bound identity fields (not
+    # just request_id): a re-issued call with a changed digest makes a
+    # different row, and an answer computed against the old digest is
+    # refused downstream by herdr-action.sh's exact-match check.
+    #
+    # No real tool name reaches this script for a bound request (only
+    # request_id/tool_call_id/digest/payload_sha are passed) — `tool` is
+    # recorded as the literal string "bound", a known gap, not a claim of
+    # the actual tool.
+    if [ "${HERDR_BOUND_CLEARANCE_SLACK:-0}" = 1 ]; then
+      bound_task_json="$(task_for_pane "$pane" 2>/dev/null)"
+      bound_run=$(printf '%s' "$bound_task_json" | jq -r '.run_id // empty')
+      bound_task=$(printf '%s' "$bound_task_json" | jq -r '.task_id // empty')
+      if [ -n "$bound_run" ] && [ -n "$bound_task" ]; then
+        bound_action_sha="$(printf '%s\n%s\n%s\n%s' "$bound_request_id" "$bound_tool_call_id" "$bound_arguments_digest" "$bound_payload_sha" | shasum -a 256 | cut -d' ' -f1)"
+        bound_ar_id="$(action_request_create "$bound_run" "$bound_task" bound "$bound_action_sha" \
+          "bound request $bound_request_id (tool_call $bound_tool_call_id)" reserved \
+          "OMP deferred bound resolver: no live conductor authority" human once "" "" 2>/dev/null)" || true
+        if [ -n "$bound_ar_id" ]; then
+          bash "$(dirname "$0")/slack-bridge/herdr-notify.sh" --class human-action --pane "$pane" \
+            --bound-request "$bound_ar_id" --bound-sha "$bound_action_sha" \
+            "bound request $bound_ar_id needs YOUR Approve/Deny — decide in Slack or at http://127.0.0.1:8600/decisions" \
+            >/dev/null 2>&1 || true
+          echo "herdr-select: bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance." >&2
+          exit 8
+        fi
+      fi
+    fi
+    echo "herdr-select: bound requests require registered conductor authority." >&2
+    exit 8
+  fi
   case "$choice" in
     1) label=Approve ;;
     2) label=Deny ;;
@@ -260,15 +305,6 @@ if [ -n "$bound_request_id" ]; then
   esac
   [ -n "${review_reason//[[:space:]]/}" ] || {
     echo "herdr-select: conductor requires --review-reason after reviewing the complete payload." >&2; exit 2;
-  }
-  printf '%s' "$bound_arguments_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
-    echo "herdr-select: bound request requires an exact sha256 arguments digest." >&2; exit 2;
-  }
-  printf '%s' "$bound_payload_sha" | grep -Eq '^[0-9a-f]{64}$' || {
-    echo "herdr-select: bound request requires the reviewed full payload sha256." >&2; exit 2;
-  }
-  [ -n "$bound_tool_call_id" ] || {
-    echo "herdr-select: bound request requires the exact tool call id." >&2; exit 2;
   }
 
   [ -n "$own_run" ] && [ -n "$own_task" ] && [ -n "$own_worktree" ] || {

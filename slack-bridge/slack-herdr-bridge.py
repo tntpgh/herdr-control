@@ -136,7 +136,8 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 SELECT = os.environ.get("HERDR_SELECT_BIN") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "herdr-select.sh")
-
+ACTION = os.environ.get("HERDR_ACTION_BIN") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "herdr-action.sh")
 
 def select_option(pane, choice, via, alert_ts=None, prompt_id=None):
     """Answer a numbered prompt. ONE implementation for both the threaded-number
@@ -366,6 +367,78 @@ def on_choice_button(ack, body, say, logger):
     thread_ts = (body.get("message") or {}).get("ts")
     ok, info = select_option(pane, choice, "slack-button", alert_ts=thread_ts,
                              prompt_id=prompt_id or None)
+    say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}", thread_ts=thread_ts)
+
+
+# value is "<request_id>|<action_sha256>" for the two bound-clearance
+# buttons (herdr_bound_approve/herdr_bound_deny), written by herdr-notify.sh
+# --bound-request/--bound-sha. Distinct shape from on_choice_button's
+# "<pane>|<n>|<prompt_id>" on purpose (SPEC: approval-classification-repair
+# Part B — "a bound-request button needs an entirely new value/handler
+# shape, not a reuse of the existing one").
+_BOUND_VALUE_RE = re.compile(r"^(ar_[A-Za-z0-9_]+)\|([0-9a-f]{64})$")
+
+
+def decide_bound_request(request_id, action_sha, verb, slack_user, slack_team):
+    """Call herdr-action.sh <verb> <request_id> --authority human --via
+    slack-button for a bound-clearance Approve/Deny click. ONE subprocess
+    call, synchronous with the click itself — no decoupled form-POST step
+    for anything to race (Route 1's whole point: the click IS the
+    decision). herdr-action.sh itself refuses unless
+    HERDR_BOUND_CLEARANCE_SLACK=1 is set in ITS OWN environment (source
+    only, default OFF — this bridge does not set it; an operator must, to
+    activate the route at all) and unless action_sha matches the row's
+    action_sha256 exactly (wrong/stale digest refused downstream, not here
+    — this function never trusts its own input, only what herdr-action.sh's
+    own CAS decides). Returns (ok, message)."""
+    argv = ["bash", ACTION, verb, request_id, "--authority", "human",
+            "--via", "slack-button", "--slack-user", slack_user,
+            "--slack-team", slack_team or "", "--action-sha256", action_sha]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                            env=os.environ.copy())
+    except subprocess.TimeoutExpired:
+        return False, "herdr-action timed out"
+    out = (r.stdout + r.stderr).strip().splitlines()
+    if r.returncode == 0:
+        return True, (out[-1] if out else f"{verb}d")
+    return False, (out[-1] if out else f"exit {r.returncode}")
+
+
+@app.action(re.compile(r"^herdr_bound_(approve|deny)$"))
+def on_bound_choice_button(ack, body, say, logger):
+    """Route 1: the Slack bridge's own OAuth-allowlisted click clears a
+    deferred bound request directly — synchronous, no decoupled hub-form
+    step. SOURCE ONLY, default OFF: herdr-action.sh itself still refuses
+    unless HERDR_BOUND_CLEARANCE_SLACK=1 is set in its environment; this
+    handler registering is not itself an activation.
+    """
+    if (body.get("channel") or {}).get("id") in IGNORE_CHANNELS:
+        return
+    ack()
+    user = (body.get("user") or {}).get("id", "")
+    team = (body.get("team") or {}).get("id") or body.get("team_id")
+    # Never infer human identity from a flag or a peer message: the ONLY
+    # identity proof this route has is the same allowlist+workspace check
+    # every other button/message here goes through. No shortcut for this
+    # action_id, no "trust the value", nothing conveyed.
+    if not authorized(user, team, logger, "bound-clearance button click"):
+        return
+    if CHANNEL and (body.get("channel") or {}).get("id") != CHANNEL:
+        return
+    action = (body.get("actions") or [{}])[0]
+    action_id = action.get("action_id", "")
+    value = action.get("value", "")
+    m = _BOUND_VALUE_RE.match(value)
+    thread_ts = (body.get("message") or {}).get("ts")
+    if not m:
+        logger.warning("ignoring bound-clearance button with malformed value %r", value)
+        say(text=":warning: malformed bound-clearance button value — ignored",
+            thread_ts=thread_ts)
+        return
+    request_id, action_sha = m.group(1), m.group(2)
+    verb = "approve" if action_id == "herdr_bound_approve" else "decline"
+    ok, info = decide_bound_request(request_id, action_sha, verb, user, team)
     say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}", thread_ts=thread_ts)
 
 
