@@ -7,7 +7,7 @@ the hub's inbox the form sits in an iframe, and an iframe resolves
 never declared, so the form showed light on a dark page.
 
 Applied when a form is SERVED (hub + formserve), not when it is written, so
-it also covers every form already on disk. Three cases, by what the form has:
+it also covers every form already on disk. Four cases, by what the form has:
 
 1. A `@media (prefers-color-scheme: dark)` block: its OWN dark rules are
    re-emitted unconditionally at the end of <head>. The form looks exactly
@@ -15,9 +15,18 @@ it also covers every form already on disk. Three cases, by what the form has:
 2. The template's variables (`--ground`, ...) with no dark block (older KB
    guide forms): the template's dark palette is set on those variables.
 3. Already dark by declaration (`color-scheme: dark`): only the meta is added.
-4. Light-only (no dark variant at all): the page is colour-inverted, with
-   media re-inverted so photos stay true. Recolouring such a form by hand
-   would leave its hard-coded light backgrounds under forced light text.
+4. Light-only (no dark variant at all): a literal dark palette is forced
+   over every element with `!important` (body/legend/label text
+   rgb(242,245,246) on rgb(12,19,22); dimmer text — `small`, `.help`,
+   `.hint` — rgb(185,200,204); form controls rgb(242,245,246) on
+   rgb(19,30,34)). Until 2026-10-29 this case used
+   `filter:invert(.92) hue-rotate(180deg)` instead: cheap, but the
+   inverted page did not survive being embedded in the hub's own
+   /decisions iframe (Terrence, 2026-10-29: "decisions arent correct...
+   just needs white font" — a case-4 form showed black-on-near-black body
+   text and black-on-light-grey inputs there). Literal colours have no
+   such failure mode: they do not depend on an ancestor's composited
+   filter state the way `filter` does.
 """
 from __future__ import annotations
 
@@ -25,8 +34,25 @@ import re
 
 MARKER = 'id="herdr-force-dark"'
 _META = '<meta name="color-scheme" content="dark">'
-_INVERT = ("html{filter:invert(.92) hue-rotate(180deg);background:#fff}"
-           "img,video,picture,canvas,svg image{filter:invert(1) hue-rotate(180deg)}")
+# Light-only fallback palette (Terrence, 2026-10-29: verified both
+# standalone and in the hub's own /decisions iframe). Literal colours,
+# not CSS variables -- a light-only form has no palette of its own to
+# hook, so every rule needs !important to beat its hard-coded light
+# styles, and `body *` strips every descendant's own background before
+# re-colouring its text, or dark-forced text would sit on an untouched
+# light box (the same readability bug, inverted).
+_INK = "rgb(242,245,246)"
+_GROUND = "rgb(12,19,22)"
+_INK_DIM = "rgb(185,200,204)"
+_SURFACE = "rgb(19,30,34)"
+_LINE = "rgb(44,59,65)"
+_FORCE_PALETTE = (
+    f"html,body{{background:{_GROUND} !important}}"
+    f"body *{{background-color:transparent !important;color:{_INK} !important}}"
+    f"small,.help,.hint{{color:{_INK_DIM} !important}}"
+    f"input,textarea,select,button{{background-color:{_SURFACE} !important;"
+    f"color:{_INK} !important;border-color:{_LINE} !important}}"
+)
 
 _DARK_MEDIA = re.compile(r"@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{", re.I)
 # examples/form-template.html's palette
@@ -64,7 +90,7 @@ def force_dark(html: str) -> str:
     elif _DECLARED_DARK.search(html):
         css = ":root{color-scheme:dark}"
     else:
-        css = _INVERT
+        css = _FORCE_PALETTE
     block = f"{_META}<style {MARKER}>{css}</style>"
     m = _HEAD_END.search(html)
     if m:  # last in <head>: later rules win over the form's own at equal specificity
