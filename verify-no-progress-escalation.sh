@@ -57,9 +57,14 @@
 #   U. R4 residual (a): a slow close/spawn hook that outlasts the raw
 #      lock TTL does NOT let a second writer in — a background renewer
 #      keeps the fence fresh for the whole attempt
-#   V. R4 residual (b): first-successor discovery correlates to this
-#      attempt's own spawn request, not bare branch+label — a
-#      pre-existing decoy on the same branch+label is never adopted
+#   V/W. R5: first-successor discovery binds to the spawn's own
+#      RECEIPT (task_id echoed back by the spawn call itself), never a
+#      branch+label scan at any timestamp filter — a decoy on the same
+#      branch+label is never adopted whether created at the same moment
+#      as the request (V) or later, mid-loop (W)
+#   X. R5: a spawn whose registry row lands but whose receipt is missing
+#      or unparseable fails CLOSED — no adoption, no escalation, task
+#      held for the conductor like any other hook failure
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -79,7 +84,7 @@ export HERDR_ESCALATION_QUIESCE_POLLS=3
 PANES_DIR="$WORK/panes"; mkdir -p "$PANES_DIR"
 rm -f "$PANES_DIR"/*.alive "$PANES_DIR"/*.lag "$PANES_DIR"/*.indeterminate "$PANES_DIR"/*.birth "$PANES_DIR"/*.birth-unreachable 2>/dev/null
 ORDER_LOG="$WORK/order.log"; : >"$ORDER_LOG"
-rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane"
+rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected"
 export PANES_DIR ORDER_LOG HERE_REPO="$here"
 
 # R3 #5 ("offline only: no live close or spawn") belt-and-suspenders: every
@@ -212,6 +217,25 @@ now="$(_now_iso)"
 registry_init
 _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
   VALUES ($(_sq "$succ_task"), $(_sq "$succ_task"), '', '', '', '', $(_sq "$succ_pane"), $(_sq "$succ_birth"), '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
+# Case W (R5): a decoy lands on this EXACT branch+label strictly AFTER
+# the real successor's own row — the realistic "arrives right behind
+# it" race a highest-rowid/latest-timestamp heuristic cannot defend
+# against, only a true receipt binding can.
+di="$WORK/decoy-inject-branch"
+if [ -f "$di" ] && [ "$(cat "$di")" = "$branch" ] && [ ! -f "$WORK/decoy-injected" ]; then
+  : > "$WORK/decoy-injected"
+  decoy_task="$(cat "$WORK/decoy-inject-task-id" 2>/dev/null)"
+  decoy_now="$(_now_iso)"
+  _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
+    VALUES ($(_sq "$decoy_task"), $(_sq "$decoy_task"), '', '', '', '', '', '', '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$decoy_now"), $(_sq "$decoy_now"));"
+fi
+# R5: the receipt IS the discovery mechanism now — suppressible for the
+# missing-receipt fail-closed test (case X), which still creates the row
+# above (a real spawn can succeed at the registry write and still fail
+# to deliver a usable receipt, e.g. truncated output).
+if [ ! -f "$WORK/spawn-suppress-receipt" ]; then
+  printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s\n' "$succ_task" "$succ_task"
+fi
 exit 0
 SH
 
@@ -716,13 +740,15 @@ grep -q 'locked by a concurrent attempt' "$WORK/nested-probe-out.log" 2>/dev/nul
   || bad "U: nested attempt lock-refusal message missing: $(cat "$WORK/nested-probe-out.log" 2>/dev/null)"
 
 # =============================================================== case V ===
-# R4 residual (b): first-successor discovery must correlate to THIS
-# escalation's own spawn request, not a bare branch+label match — a
-# PRE-EXISTING unrelated task already sitting on the exact branch+label
-# the real successor would get (a decoy) must never be adopted.
+# R5: first-successor discovery binds to the spawn's own RECEIPT, never
+# a branch+label scan at any filter. Prove it against the SHARPEST case
+# a timestamp filter could never exclude: a decoy whose created_at is
+# forced far in the FUTURE (so `created_at >= request time` is true no
+# matter what "now" ever resolves to) — not relying on wall-clock luck
+# to land in the same second.
 RUN=taskV; TASK=taskV; PANE=pane-V; BRANCH=esc-test-v; DECOY=taskV_decoy
 seed_task "$DECOY" "pane-V-decoy" "$BRANCH" "" implement
-sleep 1   # guarantee the decoy's created_at predates this attempt's spawn request by a full second
+_sql "UPDATE tasks SET created_at='2099-01-01T00:00:00Z' WHERE task_id=$(_sq "$DECOY");" >/dev/null
 seed_task "$TASK" "$PANE" "$BRANCH"
 : >"$ORDER_LOG"
 for i in 1 2 3; do
@@ -731,13 +757,58 @@ done
 v_payload="$(escalated_payload "$RUN" "$TASK" standard)"
 v_successor="$(printf '%s' "$v_payload" | jq -r '.successor_task_id // empty')"
 v_spawn_count="$(grep -c -- 'spawn implement esc-test-v' "$ORDER_LOG" 2>/dev/null)"
-v_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label='implement:$BRANCH';" 2>/dev/null)"
-[ -n "$v_successor" ] && [ "$v_successor" != "$DECOY" ] && ok "V: the pre-existing decoy on the same branch+label is never adopted as the successor" \
+[ -n "$v_successor" ] && [ "$v_successor" != "$DECOY" ] && ok "V: a decoy no timestamp filter could ever exclude (created_at forced to the future) is still never adopted" \
   || bad "V: successor_task_id wrongly resolved to the decoy (got [$v_successor] decoy=[$DECOY])"
-[ "${v_spawn_count:-0}" = 1 ] && ok "V: a genuinely NEW successor was spawned despite the branch+label match existing" \
-  || bad "V: spawn count for the real attempt (got $v_spawn_count, expected 1 — the decoy's presence must not skip spawning)"
-[ "${v_rows:-0}" = 2 ] && ok "V: both the decoy and the real successor now exist as distinct rows" \
-  || bad "V: branch+label row count (got $v_rows, want 2: decoy + real successor)"
+[ "${v_spawn_count:-0}" = 1 ] && ok "V: a genuinely new successor was spawned and its own receipt was what resolved it" \
+  || bad "V: spawn count for the real attempt (got $v_spawn_count)"
+
+# =============================================================== case W ===
+# R5: a decoy injected from INSIDE the real attempt's own spawn call,
+# immediately before the real successor's own row — the most realistic
+# "concurrent, strictly after the request" scenario there is, not a
+# wall-clock guess about ordering between separate ticks.
+RUN=taskW; TASK=taskW; PANE=pane-W; BRANCH=esc-test-w; DECOY=taskW_decoy
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+printf '%s' "$BRANCH" > "$WORK/decoy-inject-branch"
+printf '%s' "$DECOY" > "$WORK/decoy-inject-task-id"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpW --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id"
+w_payload="$(escalated_payload "$RUN" "$TASK" standard)"
+w_successor="$(printf '%s' "$w_payload" | jq -r '.successor_task_id // empty')"
+w_spawn_count="$(grep -c -- 'spawn implement esc-test-w' "$ORDER_LOG" 2>/dev/null)"
+w_decoy_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE task_id=$(_sq "$DECOY");" 2>/dev/null)"
+[ -f "$WORK/decoy-injected" ] && [ "${w_decoy_rows:-0}" = 1 ] && ok "W: the decoy actually landed mid-spawn (test is exercising the real race, not a no-op)" \
+  || bad "W: decoy injection never happened — test setup broken"
+[ -n "$w_successor" ] && [ "$w_successor" != "$DECOY" ] && ok "W: a decoy injected strictly during the real attempt's own spawn is never adopted" \
+  || bad "W: successor_task_id wrongly resolved to the decoy (got [$w_successor] decoy=[$DECOY])"
+[ "${w_spawn_count:-0}" = 1 ] && ok "W: a genuinely new successor was spawned despite the concurrent decoy" \
+  || bad "W: spawn count for the real attempt (got $w_spawn_count)"
+
+# =============================================================== case X ===
+# R5: a spawn that writes its registry row but delivers no usable
+# receipt (truncated output, a non-conforming HERDR_ESC_SPAWN_CMD) must
+# fail CLOSED — no adoption via any fallback lookup, no model_escalated,
+# the task held for the conductor exactly like any other hook failure.
+RUN=taskX; TASK=taskX; PANE=pane-X; BRANCH=esc-test-x
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-suppress-receipt"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpX --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-suppress-receipt"
+x_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+x_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+x_pinned="$(task_last_event_payload "$RUN" "$TASK" writer_successor_pinned 2>/dev/null)"
+[ "${x_esc_n:-0}" = 0 ] && ok "X: a spawn with no usable receipt never escalates" \
+  || bad "X: model_escalated should be 0 with a suppressed receipt (got $x_esc_n)"
+[ "${x_failed_n:-0}" = 1 ] && ok "X: the hook-failed path fires — task held for the conductor, same as any other hook failure" \
+  || bad "X: model_escalation_hook_failed count (got $x_failed_n)"
+[ -z "$x_pinned" ] && ok "X: no successor was ever pinned — the orphaned registry row is never silently adopted" \
+  || bad "X: a successor was wrongly pinned despite the suppressed receipt: $x_pinned"
 
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \

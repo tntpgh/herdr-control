@@ -174,14 +174,17 @@ esc_next_tier() {
 # esc_tier_job <tier> -> the job-class esc_tier_model uses for it, and the
 # label prefix spawn-task.sh registers the successor under
 # (spawn-task.sh: label="${job}:${branch}") — reusing that existing field
-# is what lets a successor be looked up idempotently without a second
-# table. frontier uses "deep-review", NOT "plan": it resolves to the SAME
-# target model as deep for every agent model_for_agent already defines
-# deep-review for (claude:deep-review = opus, codex:deep-review =
-# $HERDR_CODEX_DEEP) while keeping its OWN distinct label
-# ("deep-review:branch" vs deep's "plan:branch") — sharing "plan" between
-# the two tiers would collide in _esc_find_successor's label lookup (deep's
-# successor would be mistaken for frontier's).
+# is what lets a successor's spawn-record job-class be mapped back to a
+# tier (esc_job_tier) without a second table. frontier uses
+# "deep-review", NOT "plan": it resolves to the SAME target model as
+# deep for every agent model_for_agent already defines deep-review for
+# (claude:deep-review = opus, codex:deep-review = $HERDR_CODEX_DEEP)
+# while keeping its OWN distinct label ("deep-review:branch" vs deep's
+# "plan:branch") — sharing "plan" between the two tiers would make a
+# successor spawned for one indistinguishable from the other by label
+# alone (R5 no longer discovers successors by label at all, but
+# esc_job_tier's reverse mapping and esc_starting_tier still rely on
+# each tier having its own unambiguous job-class).
 esc_tier_job() {
   case "$1" in
     fast)     printf 'explore\n' ;;
@@ -525,12 +528,26 @@ _esc_pane_close() {
   herdr pane close "$pane" >/dev/null 2>&1
 }
 
-_esc_spawn_successor() {                # repo branch job agent
+# _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
+# RECEIPT task_id on stdout, rc 0 only if one was actually parsed out of
+# the spawn command's own output (R5: "bind to the actual spawn receipt
+# ... no lookup by branch+label"). A real spawn-task.sh prints
+# `HERDR_SPAWN_RECEIPT task_id=... run_id=...` as its LAST line on every
+# real (non-dry-run) success path; HERDR_ESC_SPAWN_CMD overrides (tests,
+# operators) must emit the same line to be trusted the same way. Missing
+# or unparseable output is NOT "assume it worked and go look it up" — the
+# caller treats this as a hook failure like any other and holds the task
+# for the conductor (R3's existing retry-then-fail-closed path).
+_esc_spawn_successor() {
+  local out task_id
   if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
-    bash "$HERDR_ESC_SPAWN_CMD" "$@"
-    return $?
+    out="$(bash "$HERDR_ESC_SPAWN_CMD" "$@" 2>/dev/null)" || return 1
+  else
+    out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)" || return 1
   fi
-  bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" >/dev/null 2>&1
+  task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
+  [ -n "$task_id" ] || return 1
+  printf '%s\n' "$task_id"
 }
 
 # _esc_quiesce_old_writer <run_id> <task_id> -> 0 once the OLD incarnation
@@ -589,51 +606,25 @@ _esc_quiesce_old_writer() {
   return 1
 }
 
-# _esc_spawn_request <run_id> <task_id> <to_tier> -> prints
-# "request_id\trequested_at", and records an `escalation_spawn_requested`
-# event carrying both, BEFORE the successor is ever spawned. R4 residual
-# (b): first-successor discovery correlates against `requested_at`
-# instead of trusting a bare branch+label match — a PRE-EXISTING task
-# that already happens to sit on this exact branch+label (a decoy, or a
-# leftover from an unrelated earlier run) necessarily has an older
-# created_at and is never adopted as if we had spawned it.
-_esc_spawn_request() {
-  local run_id="$1" task_id="$2" to_tier="$3" request_id at
-  request_id="esc_req_$$_$(_now_iso)_$RANDOM"
-  at="$(_now_iso)"
-  append_event "$run_id" "$task_id" escalation_spawn_requested \
-    "$(jq -nc --arg r "$request_id" --arg t "$to_tier" --arg at "$at" \
-        '{request_id:$r, to_tier:$t, requested_at:$at}')" >/dev/null 2>&1
-  printf '%s\t%s\n' "$request_id" "$at"
-}
-
-# _esc_find_successor <branch> <to_tier> [not_before] -> task_id of a
-# non-terminal task already registered on this exact branch at this
-# tier's label, or empty. `not_before` (an ISO timestamp from
-# `_esc_spawn_request`), when given, excludes any candidate whose
-# created_at predates it — see R4 residual (b) above. Used ONLY for the
-# first-ever discovery of a successor — see _esc_spawn_next_tier's
-# pinned-first check for every later lookup (R3 #2: "not a branch+label
-# lookup ... alone").
-_esc_find_successor() {
-  local branch="$1" to_tier="$2" not_before="${3:-}" job label extra
-  job="$(esc_tier_job "$to_tier")" || return 1
-  label="${job}:${branch}"
-  extra=""
-  [ -n "$not_before" ] && extra="AND created_at >= $(_sq "$not_before")"
-  _sql "SELECT task_id FROM tasks WHERE branch=$(_sq "$branch") AND label=$(_sq "$label")
-    AND state NOT IN ('completed','failed','cancelled','lost','gone') $extra
-    ORDER BY rowid DESC LIMIT 1;" 2>/dev/null
-}
-
-# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> <not_before> ->
-# prints the successor's task_id on success, having PINNED it (old+new
-# task_id, old+new pane_id/pane_birth) in a `writer_successor_pinned`
-# event the first time it is identified. Every call after that resolves
-# through the pin, not a fresh branch+label guess — satisfies R3 #2's
-# "pin the old and new task and session incarnation". `not_before` (from
-# this attempt's `_esc_spawn_request`) is passed through to the
-# first-discovery `_esc_find_successor` call only — R4 residual (b).
+# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> -> prints the
+# successor's task_id on success, having PINNED it (old+new task_id,
+# old+new pane_id/pane_birth) in a `writer_successor_pinned` event the
+# first time it is identified. Every call after that resolves through
+# the pin, not a fresh discovery — satisfies R3 #2's "pin the old and
+# new task and session incarnation".
+#
+# R5: the FIRST-ever discovery binds STRICTLY to the spawn's own
+# receipt (_esc_spawn_successor's stdout) — never a branch+label scan of
+# the registry, at any filter. A timestamp filter (the R4 residual (b)
+# approach this replaces) is still a SELECT over a shared table: an
+# unrelated task created at the exact same instant as the request, or
+# any time after it, on that same branch+label, would still match and
+# be silently adopted as if we had spawned it. The receipt has no such
+# window — it is the literal return value of the exact spawn call this
+# attempt made, correlated by process, not by scanning shared state
+# afterward. A missing or unparseable receipt is NOT "assume it worked
+# and go look it up" — fail closed, hold the task for the conductor
+# (same path as any other hook failure).
 #
 # _esc_task_json <task_id> -> that task's registry row as JSON, resolving
 # its run_id first (task_id alone is globally unique — same pattern
@@ -649,9 +640,9 @@ _esc_task_json() {
 }
 
 _esc_spawn_next_tier() {
-  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" not_before="$5" \
+  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" \
         task_json repo branch job existing old_pane old_pane_birth \
-        pinned pinned_tier pinned_task succ_json succ_pane succ_birth
+        pinned pinned_tier pinned_task succ_json succ_state succ_pane succ_birth
   task_json="$(read_task "$run_id" "$task_id")"
   repo="$(printf '%s' "$task_json" | jq -r '.repo // empty' 2>/dev/null)"
   branch="$(printf '%s' "$task_json" | jq -r '.branch // empty' 2>/dev/null)"
@@ -672,14 +663,23 @@ _esc_spawn_next_tier() {
     # fall through and re-derive rather than silently fabricating one.
   fi
 
-  existing="$(_esc_find_successor "$branch" "$to_tier" "$not_before")"
-  if [ -z "$existing" ]; then
-    _esc_spawn_successor "$repo" "$branch" "$job" "$agent" || return 1
-    existing="$(_esc_find_successor "$branch" "$to_tier" "$not_before")"
-    [ -n "$existing" ] || { printf 'escalation: spawn command exited 0 but no successor task is registered for %s/%s\n' "$branch" "$to_tier" >&2; return 1; }
-  fi
-
+  existing="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")" || {
+    printf 'escalation: %s/%s spawn produced no verifiable receipt — holding for the conductor rather than adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
+    return 1
+  }
   succ_json="$(_esc_task_json "$existing")"
+  [ -n "$succ_json" ] || {
+    printf 'escalation: %s/%s spawn receipt %s does not resolve to a registered task — holding for the conductor\n' "$task_id" "$to_tier" "$existing" >&2
+    return 1
+  }
+  succ_state="$(printf '%s' "$succ_json" | jq -r '.state // empty' 2>/dev/null)"
+  case "$succ_state" in
+    completed|failed|cancelled|lost|gone)
+      printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — holding for the conductor\n' "$task_id" "$to_tier" "$existing" "$succ_state" >&2
+      return 1
+      ;;
+  esac
+
   succ_pane="$(printf '%s' "$succ_json" | jq -r '.pane_id // empty' 2>/dev/null)"
   succ_birth="$(printf '%s' "$succ_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
   append_event "$run_id" "$task_id" writer_successor_pinned \
@@ -758,11 +758,6 @@ esc_escalate() {
   local renewer_pid
   renewer_pid="$(_esc_start_lock_renewer "$task_id" "$to_tier" "$fence")"
 
-  local req_line request_id requested_at
-  req_line="$(_esc_spawn_request "$run_id" "$task_id" "$to_tier")"
-  request_id="${req_line%%	*}"
-  requested_at="${req_line#*	}"
-
   local bound attempt successor_task=""
   bound="${HERDR_ESCALATION_HOOK_RETRIES:-3}"
   for ((attempt = 1; attempt <= bound; attempt++)); do
@@ -775,7 +770,7 @@ esc_escalate() {
         printf 'escalation: %s/%s lock (fence %s) was lost between quiesce and spawn — aborting before spawn, task preserved\n' "$task_id" "$to_tier" "$fence" >&2
         break
       }
-      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier" "$requested_at")" && [ -n "$successor_task" ] && break
+      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier")" && [ -n "$successor_task" ] && break
     fi
     successor_task=""
   done

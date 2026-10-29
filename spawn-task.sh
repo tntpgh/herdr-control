@@ -1302,3 +1302,11 @@ else
 fi
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"
+# A programmatic caller (lib/escalation.sh's successor discovery, R5) needs
+# to bind to the EXACT task this call created, not re-derive it by
+# scanning the registry for a branch+label match afterward (racy against
+# any unrelated task sharing that same branch+label). This one line is
+# the receipt: always printed, last, on every real (non-dry-run) success
+# path above. Purely additive — existing callers that only read the
+# human-facing block above are unaffected.
+printf 'HERDR_SPAWN_RECEIPT task_id=%s run_id=%s\n' "$task_id" "$run_id"
