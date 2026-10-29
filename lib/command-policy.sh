@@ -8201,8 +8201,16 @@ conductor_reserved_reason() {
   # `alert-gate.sh` — and skipped when the whole command only READS
   # (_cp_policy_mention_harmless: read-only verbs, or `sh -n <one path>`).
   # Every other alternative on this list is unchanged.
+  # Part A, approval-classification-repair-5d6e094a.md (.handoffs/SPEC.md,
+  # task feat/readonly-git-classifier): a strictly read-only `git show
+  # REF:PATH` naming a governance file, plus a fixed sed/grep/wc pipeline,
+  # is a READ — `_cp_registry_git_show_readonly` carves it back out of this
+  # branch exactly like `_cp_policy_mention_harmless` already does for the
+  # plain read-only-verb shape. SOURCE ONLY: gated on
+  # HERDR_REGISTRY_GIT_SHOW_READONLY=1, unset/0 by default, so this `&&`
+  # changes nothing about today's live verdicts until a human flips it on.
   elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
-       { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
+       { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw" && ! _cp_registry_git_show_readonly "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   # Registry-write-reserved (herdr-control#253 round-2 review probe 5c,
   # hardened round 2 / PR #258 by the SPEC at .handoffs/SPEC.md and its
@@ -8236,7 +8244,10 @@ conductor_reserved_reason() {
   # existing verdict (SPEC item 3) — this is not a by-name exemption, it
   # structurally never matches.
   #
-  elif _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$action_norm" && ! _cp_registry_read_allowed "$1"; then
+  # Same Part A carve-out as the governance branch above, reused unchanged
+  # (one predicate, not two implementations that could drift) — SOURCE
+  # ONLY, HERDR_REGISTRY_GIT_SHOW_READONLY=1 gated, default OFF.
+  elif _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$action_norm" && ! _cp_registry_read_allowed "$1" && ! _cp_registry_git_show_readonly "$1"; then
     printf 'registry writes remain human-only\n'
   fi
 }
@@ -8491,6 +8502,195 @@ _cp_fleet_mention_harmless() {          # raw
       esac
     else
       case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+    fi
+  done <<EOF
+$segments
+EOF
+  [ "$n" -gt 0 ]
+}
+
+# `_cp_registry_git_show_readonly <raw>` -> 0 only for the exact shape
+# approval-classification-repair-5d6e094a.md item (A) specifies (SOURCE
+# ONLY, .handoffs/SPEC.md, task feat/readonly-git-classifier): a single,
+# strictly read-only `git show REF:PATH` — git's own exec-capable config
+# surface (alias, `-c`, system/global config, pager, textconv) forced
+# closed on the command line itself — piped through zero or more of a
+# fixed `sed`/`grep`/`wc` chain. Modeled on `_cp_fleet_mention_harmless`'s
+# exact tidy/split/@PIPE@ discipline just above, but deliberately NARROWER
+# than either existing mention-harmless carve-out: only `git show` itself
+# (not `git log|show|diff`), and only `sed`/`grep`/`wc` downstream (not
+# the full `_CP_READONLY_VERBS` list) — the three tools the two live
+# denials this design repairs actually used, nothing broader.
+#
+# Gated on HERDR_REGISTRY_GIT_SHOW_READONLY=1 — unset/0 (the default)
+# makes this return 1 unconditionally, so wiring it into the two
+# conductor_reserved_reason branches above changes NOTHING about today's
+# live verdicts. Never flipped on by this change; a human reviews and
+# flips it (Hard limits: "No install, no live policy change").
+#
+# Required on the `git show` segment itself, ALL of them, or refuse:
+#   - prefixed with the literal env assignments, in this exact order,
+#     nothing else skipped: `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=
+#     /dev/null` — closes a malicious system/global gitconfig defining
+#     `core.pager`/`alias.show`/etc with no `-c` on the command line at
+#     all (requires git >= 2.32 for GIT_CONFIG_GLOBAL; not checked here).
+#   - `-c alias.show=show` may appear at most once, this EXACT literal
+#     value only — forces any configured `show` alias back to the
+#     builtin; no other `-c` key or value of any kind is ever accepted
+#     (closes both the alias and the general config-override vector).
+#   - `--no-pager` present — git's documented unconditional pager-disable,
+#     not trusted implicitly even though a pipe already disables it.
+#   - `show` the subcommand.
+#   - `--no-textconv` present — git's documented unconditional
+#     textconv-disable, regardless of `.gitattributes` content.
+#   - exactly one trailing positional, `REF:PATH`
+#     (`^[^-][^[:space:]]*:[^[:space:]]+$` — no leading `-`, so it can
+#     never be a disguised flag), and nothing after it — no `-o`/
+#     `--output`/`-O` of any kind, no third argument; `git show` has no
+#     safe write form, so any flag beyond the bare positional fails
+#     closed by simply not matching this fixed shape.
+#
+# NOT closed by this predicate, by design (approval-classification-
+# repair-5d6e094a.md item (A)6 / Open Questions, restated here on
+# purpose): `git show` can still run a configured
+# `filter.<driver>.smudge` on the blob via `.gitattributes` — whether
+# `--no-textconv` also suppresses smudge filtering is UNKNOWN, not
+# verified by that document or this one. No known git flag neutralizes
+# it, so this predicate does not attempt to; that case is deliberately
+# left caught by the default-OFF gate above instead of by anything in
+# the shape check below. Do not set HERDR_REGISTRY_GIT_SHOW_READONLY=1
+# until that question is resolved.
+#
+# Also NOT closed (same document, Open Questions, not resolved here
+# either): a `sed` script's own embedded `w` command is a write that no
+# shell-redirection check below can see — refusing `-i`/`--in-place` and
+# requiring `-n` closes the observed-denial shape, not every possible
+# sed invocation. Fails closed on anything this cannot parse with
+# confidence, same discipline as every sibling predicate in this file.
+_cp_registry_git_show_readonly() {      # raw
+  [ "${HERDR_REGISTRY_GIT_SHOW_READONLY:-0}" = 1 ] || return 1
+  local raw="$1" seg bare n=0 segments tidy
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*|*'<'*) return 1 ;; esac
+  segments="$(_cp_coderef_split "$tidy")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 1 ;; esac
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    n=$((n + 1))
+    bare="$seg"
+    case "$seg" in @PIPE@*) bare="${seg#@PIPE@}" ;; esac
+    if [ "$n" -eq 1 ]; then
+      case "$seg" in @PIPE@*) return 1 ;; esac   # piped INTO the git show -- reserved
+      # `_cp_locate_command_word` is NOT used here: for a `git` command
+      # word it unconditionally strips a leading `--no-pager`/`-P` (see
+      # its own header, "`_CP_LOC[0]` ... is kept; only repeated exact
+      # `-P`/`--no-pager` tokens right after it are dropped") so presence
+      # vs absence of the flag this predicate must REQUIRE becomes
+      # unobservable in its output. `_cp_simple_words` does no such
+      # normalization — it is the literal token list, env assignments
+      # included — so every position below is checked against exactly
+      # what was typed.
+      _cp_simple_words "$bare" "" || return 1
+      local -a w=("${_CP_W[@]}")
+      [ "${#w[@]}" -ge 6 ] || return 1
+      [ "${w[0]}" = "GIT_CONFIG_NOSYSTEM=1" ] || return 1
+      [ "${w[1]}" = "GIT_CONFIG_GLOBAL=/dev/null" ] || return 1
+      [ "${w[2]:-}" = git ] || return 1
+      local gi=3 saw_pager=0 saw_c=0
+      while [ "$gi" -lt "${#w[@]}" ] && [ "${w[$gi]}" != show ]; do
+        case "${w[$gi]}" in
+          --no-pager)
+            [ "$saw_pager" -eq 0 ] || return 1
+            saw_pager=1; gi=$((gi + 1)) ;;
+          -c)
+            [ "$saw_c" -eq 0 ] || return 1
+            [ "${w[$((gi + 1))]:-}" = "alias.show=show" ] || return 1
+            saw_c=1; gi=$((gi + 2)) ;;
+          *) return 1 ;;
+        esac
+      done
+      [ "$saw_pager" -eq 1 ] || return 1
+      [ "$gi" -lt "${#w[@]}" ] && [ "${w[$gi]}" = show ] || return 1
+      gi=$((gi + 1))
+      [ "${w[$gi]:-}" = --no-textconv ] || return 1
+      gi=$((gi + 1))
+      local refpath="${w[$gi]:-}"
+      [ -n "$refpath" ] || return 1
+      [[ "$refpath" =~ ^[^-][^[:space:]]*:[^[:space:]]+$ ]] || return 1
+      gi=$((gi + 1))
+      [ "$gi" -eq "${#w[@]}" ] || return 1
+    else
+      case "$seg" in @PIPE@*) ;; *) return 1 ;; esac
+      case "$bare" in *--output*|*--pre*|*--hostname-bin*) return 1 ;; esac
+      _cp_locate_command_word "$bare" || return 1
+      case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
+      [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$bare" | awk '{print $1}')" ] || return 1
+      case "$_cp_wcmd" in
+        sed)
+          # Only `-n` and `-E` are identical in BSD and GNU sed; any other
+          # flag (including `-i`/`-i.*`/`--in-place`/`--in-place=*`,
+          # `-f`/--file (script-from-file), `-r`/`-R`, and the attached
+          # no-dot suffix form `-ibak` the old `-i|-i.*` pattern missed)
+          # is refused outright. At most one non-flag token — the sed
+          # script itself — is allowed; a second positional is the
+          # trailing-filename bypass (sed reads it instead of stdin) and
+          # is refused.
+          #
+          # The script content itself is also a read/write/exec surface
+          # independent of any flag: `r`/`R` read an arbitrary file into
+          # the output stream, `w`/`W` (and `s///w`) write an arbitrary
+          # file, and GNU sed's `e` command (or `s///e` flag) executes a
+          # shell command. None of those are flags this loop can catch,
+          # so the script is additionally required to match a strict
+          # print-only allowlist: a line number, a line range, `$` (last
+          # line), or a `/regex/` address, each followed by nothing but
+          # the bare `p` command. Anything else — including multiple
+          # semicolon-joined commands — fails closed.
+          local -a s=("${_CP_LOC[@]:1}") si has_n=0 saw_script=0 script=""
+          for si in "${s[@]}"; do
+            case "$si" in
+              -n) has_n=1 ;;
+              -E) ;;
+              -*) return 1 ;;
+              *)
+                [ "$saw_script" -eq 0 ] || return 1
+                saw_script=1; script="$si" ;;
+            esac
+          done
+          [ "$has_n" -eq 1 ] && [ "$saw_script" -eq 1 ] || return 1
+          [[ "$script" =~ ^([0-9]+(,([0-9]+|\$))?|\$|/[^/]*/)p$ ]] || return 1 ;;
+        grep)
+          # Only `-n` is allowed; `-f`/`--file` (pattern-from-file),
+          # `-r`/`-R` (recursive directory read) and every other flag are
+          # refused. At most one non-flag token — the pattern — is
+          # allowed; a second positional is the trailing-filename/
+          # directory bypass and is refused.
+          local -a s=("${_CP_LOC[@]:1}") si has_n=0 saw_pattern=0
+          for si in "${s[@]}"; do
+            case "$si" in
+              -n) has_n=1 ;;
+              -*) return 1 ;;
+              *)
+                [ "$saw_pattern" -eq 0 ] || return 1
+                saw_pattern=1 ;;
+            esac
+          done
+          [ "$has_n" -eq 1 ] && [ "$saw_pattern" -eq 1 ] || return 1 ;;
+        wc)
+          # No operand is ever legitimate here — wc on stdin takes none.
+          # Only its counting flags are allowed (restricted to the set
+          # identical in BSD and GNU wc — `-L`, max line length, is a
+          # GNU-only extension and is excluded); any positional (the
+          # trailing-filename bypass) is refused.
+          local -a s=("${_CP_LOC[@]:1}") si
+          for si in "${s[@]}"; do
+            case "$si" in
+              -l|-w|-c|-m) ;;
+              *) return 1 ;;
+            esac
+          done ;;
+        *) return 1 ;;
+      esac
     fi
   done <<EOF
 $segments
