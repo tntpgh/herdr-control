@@ -531,20 +531,24 @@ _esc_pane_close() {
 # _esc_spawn_successor <repo> <branch> <job> <agent> -> prints the
 # RECEIPT task_id on stdout, rc 0, when one was actually parsed out of the
 # spawn command's own output (R5: "bind to the actual spawn receipt ...
-# no lookup by branch+label"). Two DISTINCT non-zero outcomes (R6 —
-# root-audit on f1d7af4..30398f8 independently reproduced a spawn that
-# genuinely succeeded while its receipt was lost producing 6 untracked,
-# running successor rows for one task across 2 calls; see the spawn
-# journal below, which is what actually prevents that):
-#   rc 1  the spawn command's OWN exit code reported failure. Confirmed
-#         clean — nothing was created, safe for the caller to retry.
-#   rc 2  the command exited 0 (it believes it succeeded) but no receipt
-#         line could be parsed out of its output. UNCERTAIN — something
-#         may genuinely have been spawned; the caller MUST NOT retry.
+# no lookup by branch+label"). Two DISTINCT non-zero outcomes:
+#   rc 1  a DOCUMENTED pre-spawn no-effect receipt (`HERDR_SPAWN_NO_EFFECT`)
+#         was found in the output — the spawn command itself proved,
+#         before touching the registry at all, that nothing was created.
+#         Safe for the caller to retry.
+#   rc 2  everything else: the command exited 0 with no receipt, OR
+#         exited nonzero with no no-effect receipt either (R7 root-audit:
+#         "a nonzero exit does NOT prove no side effect" — a failure
+#         AFTER the registry write, a timeout, or a kill all exit
+#         nonzero too, with a real row/pane already live). UNCERTAIN —
+#         the caller MUST NOT retry.
 # A real spawn-task.sh prints `HERDR_SPAWN_RECEIPT task_id=... run_id=...`
-# as its LAST line on every real (non-dry-run) success path;
-# HERDR_ESC_SPAWN_CMD overrides (tests, operators) must emit the same
-# line to be trusted the same way.
+# as its LAST line on every real (non-dry-run) success path, and
+# `HERDR_SPAWN_NO_EFFECT reason=...` on any exit before `register_task`
+# (the one place a `tasks` row is actually created) has succeeded — a
+# provable "nothing committed yet" boundary via its own exit trap, not a
+# guess from the exit code. HERDR_ESC_SPAWN_CMD overrides (tests,
+# operators) must emit the same two lines to be trusted the same way.
 _esc_spawn_successor() {
   local out rc task_id
   if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
@@ -552,10 +556,13 @@ _esc_spawn_successor() {
   else
     out="$(bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" 2>/dev/null)"; rc=$?
   fi
-  [ "$rc" = 0 ] || return 1
-  task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
-  [ -n "$task_id" ] || return 2
-  printf '%s\n' "$task_id"
+  if [ "$rc" = 0 ]; then
+    task_id="$(printf '%s\n' "$out" | sed -n 's/^HERDR_SPAWN_RECEIPT task_id=\([^ ]*\) run_id=.*/\1/p' | tail -n1)"
+    [ -n "$task_id" ] && { printf '%s\n' "$task_id"; return 0; }
+    return 2
+  fi
+  printf '%s\n' "$out" | grep -q '^HERDR_SPAWN_NO_EFFECT' && return 1
+  return 2
 }
 
 # _esc_quiesce_old_writer <run_id> <task_id> -> 0 once the OLD incarnation
@@ -642,6 +649,20 @@ _esc_quiesce_old_writer() {
 # journal below (checked and claimed BEFORE _esc_spawn_successor is ever
 # called) is what actually caps this at one real attempt — see its own
 # comment for the state machine.
+#
+# R7: two further gaps root-audit on R6/827d6c1 found, neither about
+# ordering (quiesce still runs, and must still be CONFIRMED, strictly
+# before this function is ever called — see esc_escalate's own header):
+# (a) an uncertain outcome here gave an operator nothing concrete to
+# reconcile against beyond a free-text reason — every blocked-marking
+# branch below now also records the journal's own table/key and, when
+# known, the exact receipt task_id/state (fix #3: "record its task_id or
+# the journal key on the blocked task's event"); (b) a nonzero exit from
+# the spawn command was treated as proof nothing was created, which is
+# not actually true (a failure after registration, a timeout, a kill all
+# exit nonzero too, with a real row/pane already live) — see
+# _esc_spawn_successor's HERDR_SPAWN_NO_EFFECT contract, which is now
+# the ONLY thing that marks an attempt safely retryable.
 #
 # _esc_task_json <task_id> -> that task's registry row as JSON, resolving
 # its run_id first (task_id alone is globally unique — same pattern
@@ -740,6 +761,36 @@ _esc_journal_clear() {
   _sql "DELETE FROM escalation_spawn_journal
     WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2") AND state='in_flight';" >/dev/null 2>&1
 }
+# _esc_mark_blocked_uncertain <run_id> <task_id> <to_tier> <reason> \
+#   <old_pane_id> <old_pane_birth> [<receipt_task_id>] [<receipt_state>] —
+# R6/R7: the shared "hold this task for the conductor, uncertain spawn
+# outcome" transition, used by every _esc_spawn_next_tier failure branch
+# below. The journal row for (task_id, to_tier) stays 'in_flight' (R6) —
+# never cleared here, never retried blind; the OLD writer's pane is never
+# touched by this call (R7 fix 1: esc_escalate's retry loop only ever
+# calls _esc_quiesce_old_writer AFTER a successor is actually BOUND,
+# which by definition never happens on this path). R7 fix 3: every call
+# records the journal's own table/key (task_id/to_tier — always known,
+# even when nothing else is) AND, when available, the exact receipt
+# task_id/state the spawn returned, so an operator reconciling this
+# later has a concrete lookup
+# (`escalation_spawn_journal WHERE task_id=... AND to_tier=...`, plus
+# the exact orphan row when its id is known) instead of inferring it
+# from surrounding log lines.
+_esc_mark_blocked_uncertain() {
+  local run_id="$1" task_id="$2" to_tier="$3" reason="$4" \
+        old_pane="$5" old_pane_birth="$6" receipt="${7:-}" receipt_state="${8:-}"
+  set_task_state "$run_id" "$task_id" blocked "" "" \
+    "$(jq -nc --arg reason "$reason" --arg t "$to_tier" \
+        --arg op "$old_pane" --arg ob "$old_pane_birth" \
+        --arg jtbl escalation_spawn_journal --arg jtid "$task_id" \
+        --arg r "$receipt" --arg rs "$receipt_state" \
+        '{reason:$reason, to_tier:$t, old_pane_id:$op, old_pane_birth:$ob,
+          journal_table:$jtbl, journal_key:{task_id:$jtid, to_tier:$t}} +
+         (if $r != "" then {receipt_task_id:$r} else {} end) +
+         (if $rs != "" then {receipt_state:$rs} else {} end)')" >/dev/null 2>&1
+}
+
 
 _esc_spawn_next_tier() {
   local run_id="$1" task_id="$2" agent="$3" to_tier="$4" \
@@ -807,42 +858,37 @@ _esc_spawn_next_tier() {
 
   receipt="$(_esc_spawn_successor "$repo" "$branch" "$job" "$agent")"; spawn_rc=$?
   if [ "$spawn_rc" = 1 ]; then
-    # Confirmed clean failure: the spawn command's own exit code said so,
-    # nothing was created. Safe to retry — free the claim.
+    # Confirmed clean: a DOCUMENTED no-effect receipt proved nothing was
+    # created (R7 — the spawn command's own exit code alone never proves
+    # this). Safe to retry — free the claim.
     _esc_journal_clear "$task_id" "$to_tier"
     return 1
   fi
   if [ "$spawn_rc" = 2 ]; then
-    # UNCERTAIN: the command exited 0 (believes it succeeded) but no
-    # receipt could be parsed. R6 fix 1/2: the journal row stays
-    # 'in_flight' permanently — never cleared, never retried blind. R6
-    # fix 3: the old writer may already be closed by the time we get
-    # here (esc_escalate's loop quiesces before calling this) with no
-    # successor ever confirmed, so mark the ORIGINAL task explicitly
-    # `blocked` rather than leaving it silently `running` with an
-    # unverifiable, possibly nonexistent, possibly duplicate owner.
-    set_task_state "$run_id" "$task_id" blocked "" "" \
-      "$(jq -nc --arg t "$to_tier" --arg op "$old_pane" --arg ob "$old_pane_birth" \
-          '{reason:"escalation_spawn_uncertain", to_tier:$t, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
-    printf 'escalation: %s/%s spawn exited 0 but produced no verifiable receipt — journal left in_flight (uncertain), task marked blocked, holding for the conductor rather than retrying blind or adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
+    # UNCERTAIN: either the command exited 0 with no receipt, or exited
+    # nonzero with no documented no-effect receipt either — R7: a
+    # nonzero exit alone does not prove nothing was created. The journal
+    # row stays 'in_flight' permanently — never cleared, never retried
+    # blind. By this point esc_escalate's loop has already confirmed
+    # the OLD writer quiesced (that is what gated this call in the
+    # first place) — so this is a genuinely writer-less hold, not an
+    # ambiguous one, and never a two-writer state.
+    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_spawn_uncertain "$old_pane" "$old_pane_birth"
+    printf 'escalation: %s/%s spawn produced no verifiable receipt — journal left in_flight (uncertain), task marked blocked (old writer already confirmed quiesced), holding for the conductor rather than retrying blind or adopting an unrelated branch+label match\n' "$task_id" "$to_tier" >&2
     return 1
   fi
 
   succ_json="$(_esc_task_json "$receipt")"
   if [ -z "$succ_json" ]; then
-    set_task_state "$run_id" "$task_id" blocked "" "" \
-      "$(jq -nc --arg t "$to_tier" --arg r "$receipt" --arg op "$old_pane" --arg ob "$old_pane_birth" \
-          '{reason:"escalation_receipt_unresolved", to_tier:$t, receipt_task_id:$r, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
-    printf 'escalation: %s/%s spawn receipt %s does not resolve to a registered task — journal left in_flight (uncertain), task marked blocked, holding for the conductor\n' "$task_id" "$to_tier" "$receipt" >&2
+    _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_receipt_unresolved "$old_pane" "$old_pane_birth" "$receipt"
+    printf 'escalation: %s/%s spawn receipt %s does not resolve to a registered task — journal left in_flight (uncertain), task marked blocked (old writer already confirmed quiesced), holding for the conductor\n' "$task_id" "$to_tier" "$receipt" >&2
     return 1
   fi
   succ_state="$(printf '%s' "$succ_json" | jq -r '.state // empty' 2>/dev/null)"
   case "$succ_state" in
     completed|failed|cancelled|lost|gone)
-      set_task_state "$run_id" "$task_id" blocked "" "" \
-        "$(jq -nc --arg t "$to_tier" --arg r "$receipt" --arg s "$succ_state" --arg op "$old_pane" --arg ob "$old_pane_birth" \
-            '{reason:"escalation_receipt_terminal", to_tier:$t, receipt_task_id:$r, receipt_state:$s, old_pane_id:$op, old_pane_birth:$ob}')" >/dev/null 2>&1
-      printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — journal left in_flight (uncertain), task marked blocked, holding for the conductor\n' "$task_id" "$to_tier" "$receipt" "$succ_state" >&2
+      _esc_mark_blocked_uncertain "$run_id" "$task_id" "$to_tier" escalation_receipt_terminal "$old_pane" "$old_pane_birth" "$receipt" "$succ_state"
+      printf 'escalation: %s/%s spawn receipt %s resolved to a terminal task (%s) — journal left in_flight (uncertain), task marked blocked (old writer already confirmed quiesced), holding for the conductor\n' "$task_id" "$to_tier" "$receipt" "$succ_state" >&2
       return 1
       ;;
   esac
@@ -862,19 +908,25 @@ _esc_spawn_next_tier() {
 #   <dry_run 0|1> <context_dir> -> escalates to the next ladder tier.
 #
 # Order of operations (R3 #1): acquire the releasable lock before QUIESCE
-# — the first action that touches a live pane or spawns a process. (The
-# context packet write just above that, and the from_tier/to_tier/model
-# resolution before it, are local reads/a file write, not a live side
-# effect on the task's pane or process, so the lock does not need to cover
-# them — an earlier version of this comment overstated that ordering.) A
-# concurrent second attempt for the same
-# (task_id, to_tier) finds the lock held and returns immediately with NO
-# side effect of its own (see verify case K: a nested attempt fired from
-# inside the fake spawn hook, mid-flight of the first attempt, is refused
-# before it ever calls close/spawn). The lock is released on failure (so
-# the next watchdog cycle retries cleanly) and stays claimed on success
-# (harmless — esc_already_escalated's pre-check blocks every future
-# attempt for that tier before it would ever be consulted again).
+# — the first action that touches a live pane or spawns a process. R7
+# (conductor, blocking): a spawn-before-quiesce reordering was tried and
+# reverted — the successor REUSES the original's exact worktree path
+# (spawn-task.sh keys it by repo+branch, "create or reuse"), so spawning
+# before the old writer is CONFIRMED gone would put two live agents in
+# the same files, not merely two bookkeeping rows; see case Z, the
+# direct concurrent-write-attempt proof. (The context packet write just
+# above that, and the from_tier/to_tier/model resolution before it, are
+# local reads/a file write, not a live side effect on the task's pane or
+# process, so the lock does not need to cover them — an earlier version
+# of this comment overstated that ordering.) A concurrent second attempt
+# for the same (task_id, to_tier) finds the lock held and returns
+# immediately with NO side effect of its own (see verify case K: a
+# nested attempt fired from inside the fake spawn hook, mid-flight of
+# the first attempt, is refused before it ever calls close/spawn). The
+# lock is released on failure (so the next watchdog cycle retries
+# cleanly) and stays claimed on success (harmless —
+# esc_already_escalated's pre-check blocks every future attempt for
+# that tier before it would ever be consulted again).
 #
 # Only on real success (quiesce confirmed + successor pinned) does the
 # audit event (`model_escalated`) get written and claim_once consume the
@@ -933,6 +985,22 @@ esc_escalate() {
       printf 'escalation: %s/%s lock (fence %s) was lost mid-attempt (renewal lapsed past the TTL) — aborting before any further side effect, task preserved\n' "$task_id" "$to_tier" "$fence" >&2
       break
     }
+    # R7 (conductor, blocking — "don't fix the early close by introducing
+    # overlapping write authority"): quiesce MUST be confirmed BEFORE the
+    # successor is ever spawned, not after. A spawned successor REUSES
+    # the exact same worktree path as the original (spawn-task.sh keys
+    # it by repo+branch alone, "create or reuse") — spawning before the
+    # old writer's process is actually confirmed stopped would put two
+    # live agents editing the SAME files on disk, not merely two
+    # bookkeeping rows. _esc_quiesce_old_writer already polls after
+    # closing (HERDR_ESCALATION_QUIESCE_POLLS) until genuinely confirmed
+    # gone — "killing a pane is not on its own proof of ownership", so
+    # this never trusts the close call alone. An R7 restructure that
+    # moved spawn BEFORE this was tried and reverted — see case Z, the
+    # direct concurrent-write-attempt proof, and _esc_spawn_next_tier's
+    # own fix #3 (discoverability) for how an uncertain spawn AFTER a
+    # confirmed-clean quiesce is handled instead (held for the
+    # conductor, never left ambiguous, never blindly retried).
     if _esc_quiesce_old_writer "$run_id" "$task_id"; then
       _esc_lock_still_held "$task_id" "$to_tier" "$fence" || {
         printf 'escalation: %s/%s lock (fence %s) was lost between quiesce and spawn — aborting before spawn, task preserved\n' "$task_id" "$to_tier" "$fence" >&2

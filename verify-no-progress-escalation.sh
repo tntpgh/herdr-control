@@ -74,6 +74,25 @@
 #      with zero or an unbounded number of real owners. Independently
 #      reproduced by the reviewer against 30398f8: 6 orphaned running
 #      successor rows for one task across just 2 calls.
+#   Z. R7 (conductor, blocking): a direct proof that at most ONE writer
+#      ever has an actual chance to write, grounded in the fact that a
+#      successor REUSES the original's exact worktree path — not just
+#      log-line ordering ("killing a pane is not on its own proof of
+#      ownership"). A dedicated global violation log (checked at the
+#      very end, across the WHOLE suite, not just this case) records
+#      any moment fake-spawn.sh would begin "writing" (creating its
+#      task row) while the task's recorded old-writer pane is still
+#      alive. This case specifically covers the two paths no other case
+#      exercises: quiesce TIMEOUT (close issued, the pane genuinely
+#      never goes away even after the full poll bound — no spawn is
+#      ever attempted at all) and RECOVERY once the pane does go away.
+#   AA. R7 (conductor addition, blocking): a nonzero exit from the spawn
+#      command does NOT by itself prove no side effect occurred — a
+#      real row/pane created and then killed/timed out/failed late,
+#      with neither a receipt nor a documented no-effect marker, must
+#      stay UNCERTAIN: no retry (ever, including across a simulated
+#      restart), task held for the conductor. 827d6c1 treated any
+#      nonzero exit as confirmed-safe-to-retry and would reattempt.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -93,7 +112,7 @@ export HERDR_ESCALATION_QUIESCE_POLLS=3
 PANES_DIR="$WORK/panes"; mkdir -p "$PANES_DIR"
 rm -f "$PANES_DIR"/*.alive "$PANES_DIR"/*.lag "$PANES_DIR"/*.indeterminate "$PANES_DIR"/*.birth "$PANES_DIR"/*.birth-unreachable 2>/dev/null
 ORDER_LOG="$WORK/order.log"; : >"$ORDER_LOG"
-rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected"
+rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane" "$WORK/spawn-suppress-receipt" "$WORK/decoy-inject-branch" "$WORK/decoy-inject-task-id" "$WORK/decoy-injected" "$WORK/spawn-kill-after-effect" "$WORK/concurrent-write-violations.log"
 export PANES_DIR ORDER_LOG HERE_REPO="$here"
 
 # R3 #5 ("offline only: no live close or spawn") belt-and-suspenders: every
@@ -213,10 +232,42 @@ if [ -f "$fail_f" ]; then
   if [ "${n:-0}" -gt 0 ]; then
     printf '%s' "$((n-1))" > "$fail_f"
     printf 'spawn-fail %s %s\n' "$job" "$branch" >> "$ORDER_LOG"
+    # R7: this failure happens BEFORE any registry row is created below
+    # -- matches real spawn-task.sh's own pre-registration exit trap
+    # exactly: a documented, provable no-effect receipt, not just a
+    # bare nonzero exit (which R7 no longer trusts by itself).
+    printf 'HERDR_SPAWN_NO_EFFECT reason=simulated_pre_registration_failure\n'
     exit 1
   fi
 fi
 printf 'spawn %s %s\n' "$job" "$branch" >> "$ORDER_LOG"
+# R7 (conductor, blocking): a direct, mechanism-level proof that the
+# successor's own first real side effect (creating its row -- the
+# moment it would begin doing real work) never happens while the
+# ORIGINAL task's recorded old-writer pane is still alive. Independent
+# of event-log ordering ("killing a pane is not on its own proof of
+# ownership") -- this queries the LIVE liveness marker at the exact
+# instant the new writer is about to activate. Checked globally, once,
+# at the very end of the whole suite (case R's sibling check) so every
+# scenario in every case — not just a hand-picked subset — is covered.
+orig_pane="$(cat "$WORK/orig-pane-$branch" 2>/dev/null)"
+if [ -n "$orig_pane" ]; then
+  orig_birth="$(cat "$WORK/orig-pane-birth-$branch" 2>/dev/null)"
+  violate=0
+  if [ -n "$orig_birth" ]; then
+    # Mirror _esc_quiesce_old_writer's OWN birth check exactly: a LIVE
+    # birth that no longer matches the recorded one means a different
+    # incarnation now occupies that pane_id (case L) -- genuinely NOT
+    # our old writer, never a violation.
+    live_birth="$(bash "$HERDR_ESC_PANE_BIRTH_CMD" "$orig_pane" 2>/dev/null)"
+    [ "$live_birth" = "$orig_birth" ] && [ -f "$PANES_DIR/$orig_pane.alive" ] && violate=1
+  else
+    [ -f "$PANES_DIR/$orig_pane.alive" ] && violate=1
+  fi
+  if [ "$violate" = 1 ]; then
+    printf 'CONCURRENT_WRITE_VIOLATION old_pane=%s branch=%s job=%s\n' "$orig_pane" "$branch" "$job" >> "$WORK/concurrent-write-violations.log"
+  fi
+fi
 succ_task="task_succ_${job}_$$_${RANDOM}"
 succ_pane="pane_succ_${job}_$$_${RANDOM}"
 succ_birth="birth_succ_${job}_$$_${RANDOM}"
@@ -226,6 +277,14 @@ now="$(_now_iso)"
 registry_init
 _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
   VALUES ($(_sq "$succ_task"), $(_sq "$succ_task"), '', '', '', '', $(_sq "$succ_pane"), $(_sq "$succ_birth"), '', $(_sq "$repo"), $(_sq "$repo"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
+# R7 (conductor addition, blocking): a nonzero exit does NOT by itself
+# prove nothing was created -- simulate a kill/timeout/late failure
+# AFTER the row above (a real tasks row, same as a success) is already
+# committed, with no receipt and no no-effect marker either. The caller
+# must treat this as UNCERTAIN, never as confirmed-safe-to-retry.
+if [ -f "$WORK/spawn-kill-after-effect" ]; then
+  exit 137
+fi
 # Case W (R5): a decoy lands on this EXACT branch+label strictly AFTER
 # the real successor's own row — the realistic "arrives right behind
 # it" race a highest-rowid/latest-timestamp heuristic cannot defend
@@ -261,6 +320,12 @@ seed_task() {   # task_id pane branch [pane_birth] [job]
     VALUES ($(_sq "$task_id"), $(_sq "$task_id"), '', '', '', '', $(_sq "$pane"), $(_sq "$birth"), '', $(_sq "$REPO"), $(_sq "$REPO"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
   : > "$PANES_DIR/$pane.alive"
   [ -n "$birth" ] && printf '%s' "$birth" > "$PANES_DIR/$pane.birth"
+  # R7: a precise lookup for fake-spawn.sh's concurrent-write-violation
+  # check (which pane was this escalation's ORIGINAL writer) — a SQL
+  # heuristic over `tasks` is ambiguous once a decoy (case V/W) or a
+  # recycled pane (case L) is in play; this is exact.
+  printf '%s' "$pane" > "$WORK/orig-pane-$branch"
+  printf '%s' "$birth" > "$WORK/orig-pane-birth-$branch"
 }
 
 escalated_payload() {   # run_id task_id tier -> payload json (empty if none)
@@ -551,6 +616,7 @@ esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
 [ "${esc_n2:-0}" = 1 ] && ok "M: a later retry succeeds exactly once once birth becomes verifiable again" \
   || bad "M: recovery retry (got $esc_n2)"
 export HERDR_ESCALATION_HOOK_RETRIES=3
+
 
 # =============================================================== case N ===
 # R3 #5/#6: a genuine loop (real no-progress) WITH an open denial carries
@@ -885,9 +951,95 @@ y_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/n
 [ "$y_state" = blocked ] && ok "Y: R6 — the original task is explicitly marked blocked/held, not silently left running with zero known owners" \
   || bad "Y: R6 task state (got [$y_state], want blocked)"
 
+# =============================================================== case Z ===
+# R7 (conductor, blocking — concurrent-write-attempt proof, timeout +
+# recovery legs): a quiesce TIMEOUT — the close command genuinely runs,
+# but the old pane refuses to go away even after the full poll bound
+# (HERDR_ESCALATION_QUIESCE_POLLS) — must NEVER reach spawn at all: no
+# second writer is ever given a chance to exist alongside a writer we
+# cannot confirm is gone. Recovery, once the old writer actually does
+# quiesce (a later, separate tick), still succeeds exactly once.
+RUN=taskZ; TASK=taskZ; PANE=pane-Z; BRANCH=esc-test-z
+seed_task "$TASK" "$PANE" "$BRANCH"
+printf '100' > "$PANES_DIR/$PANE.lag"   # never actually exhausts within this case -> the close hook's own "no .lag -> clear .alive" shortcut never fires, so the pane genuinely never reports dead
+: >"$ORDER_LOG"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpZ --context-dir "$CTX" >/dev/null
+done
+z_spawn_count="$(grep -c -- 'spawn implement esc-test-z' "$ORDER_LOG" 2>/dev/null)"
+z_close_count="$(grep -c -- 'close pane-Z' "$ORDER_LOG" 2>/dev/null)"
+z_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+z_failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+[ "${z_spawn_count:-0}" = 0 ] && ok "Z: a quiesce TIMEOUT (the pane genuinely never goes away, even after the full poll bound) never reaches spawn at all" \
+  || bad "Z: spawn count during quiesce timeout (got $z_spawn_count, want 0)"
+[ "${z_close_count:-0}" -ge 1 ] && ok "Z: the close WAS attempted (quiesce does not skip it) — it just never confirms gone" \
+  || bad "Z: close attempted during timeout (got $z_close_count)"
+[ "${z_esc_n:-0}" = 0 ] && ok "Z: no model_escalated while the old writer refuses to quiesce" \
+  || bad "Z: model_escalated should be 0 during timeout (got $z_esc_n)"
+[ "${z_failed_n:-0}" -ge 1 ] && ok "Z: hook failure recorded for the quiesce timeout" \
+  || bad "Z: model_escalation_hook_failed recorded for timeout"
+_esc_pane_alive "$PANE" && ok "Z: the old pane genuinely still shows alive — the close never actually took effect" \
+  || bad "Z: old pane should still report alive after a timed-out quiesce"
+rm -f "$PANES_DIR/$PANE.alive" "$PANES_DIR/$PANE.lag"   # it finally goes away on its own
+bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpZ --context-dir "$CTX" >/dev/null
+z_esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
+[ "${z_esc_n2:-0}" = 1 ] && ok "Z: once the old writer actually quiesces, a later retry succeeds exactly once" \
+  || bad "Z: recovery after a quiesce timeout (got $z_esc_n2)"
+
+# ============================================================== case AA ===
+# R7 (conductor addition, blocking): a nonzero exit from the spawn command
+# does NOT by itself prove no side effect occurred — the fake hook here
+# genuinely creates a real, distinct task row (exactly like a successful
+# spawn) and THEN dies (simulating a kill/timeout/late failure) without
+# ever printing a receipt OR a documented no-effect marker. Must stay
+# UNCERTAIN: no retry (within this call, across a later tick, or across a
+# simulated restart), the task marked blocked, with the exact journal
+# table/key recorded for reconciliation (fix #3). Must FAIL against
+# 827d6c1, which treated ANY nonzero exit as confirmed-safe-to-retry.
+RUN=taskAA; TASK=taskAA; PANE=pane-AA; BRANCH=esc-test-aa
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+: > "$WORK/spawn-kill-after-effect"
+for i in 1 2 3; do                       # ticks 1-2 fill the window; tick 3 triggers (retry-within-call)
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpAA --context-dir "$CTX" >/dev/null
+done
+for i in 1 2 3; do                       # 3 MORE fully separate processes: later ticks + simulated restart
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpAA --context-dir "$CTX" >/dev/null
+done
+rm -f "$WORK/spawn-kill-after-effect"
+aa_spawn_count="$(grep -c -- 'spawn implement esc-test-aa' "$ORDER_LOG" 2>/dev/null)"
+aa_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label=$(_sq "implement:$BRANCH");" 2>/dev/null)"
+aa_close_count="$(grep -c -- 'close pane-AA' "$ORDER_LOG" 2>/dev/null)"
+aa_esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+aa_state="$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$TASK");" 2>/dev/null)"
+aa_journal="$(_sql "SELECT state FROM escalation_spawn_journal WHERE task_id=$(_sq "$TASK") AND to_tier='standard';" 2>/dev/null)"
+[ "${aa_spawn_count:-0}" = 1 ] && ok "AA: R7 — a nonzero exit AFTER a real side effect never triggers a second real spawn attempt" \
+  || bad "AA: R7 spawn count (got $aa_spawn_count, want 1 — a nonzero exit alone is not proof of no side effect)"
+[ "${aa_rows:-0}" = 1 ] && ok "AA: R7 — exactly one successor row exists, not a reattempted pile" \
+  || bad "AA: R7 successor row count (got $aa_rows, want 1)"
+[ "${aa_close_count:-0}" = 1 ] && ok "AA: the old writer is still closed normally — quiesce runs before any spawn is ever attempted" \
+  || bad "AA: R7 close count (got $aa_close_count, want 1)"
+[ "${aa_esc_n:-0}" = 0 ] && ok "AA: R7 — never actually escalates on an uncertain outcome" \
+  || bad "AA: R7 model_escalated should be 0 (got $aa_esc_n)"
+[ "$aa_state" = blocked ] && ok "AA: R7 — the task is explicitly marked blocked/held" \
+  || bad "AA: R7 task state (got [$aa_state], want blocked)"
+[ "$aa_journal" = in_flight ] && ok "AA: R7 — the journal stays in_flight (uncertain) permanently, never cleared by a bare nonzero exit" \
+  || bad "AA: R7 journal state (got [$aa_journal], want in_flight)"
+aa_detail="$(_sql "SELECT payload FROM events WHERE run_id=$(_sq "$RUN") AND task_id=$(_sq "$TASK") AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+aa_jtbl="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_table // empty' 2>/dev/null)"
+aa_jkey_tier="$(printf '%s' "$aa_detail" | jq -r '.detail.journal_key.to_tier // empty' 2>/dev/null)"
+[ "$aa_jtbl" = escalation_spawn_journal ] && [ "$aa_jkey_tier" = standard ] && ok "AA: R7 fix 3 — the blocked event records the exact journal table/key for reconciliation, not just a free-text reason" \
+  || bad "AA: R7 discoverability fields (journal_table=[$aa_jtbl] journal_key.to_tier=[$aa_jkey_tier])"
+
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \
   || bad "R: real herdr was invoked: $(cat "$WORK/herdr-violation" 2>/dev/null)"
+# R7 (conductor, blocking): checked ONCE across the WHOLE suite — every
+# scenario in every case above (success, lost-receipt, timeout, kill-
+# after-effect, recovery) ran through fake-spawn.sh's own write-authority
+# check (see its own comment). Any violation anywhere fails the run.
+[ ! -s "$WORK/concurrent-write-violations.log" ] && ok "R: no concurrent-write violation anywhere in the whole suite — at most one writer ever had a chance to write" \
+  || bad "R: concurrent write violation(s): $(cat "$WORK/concurrent-write-violations.log" 2>/dev/null)"
 printf '%s passed, %s failed\n' "$pass" "$fail"
 # WORK lives under tmp/ (gitignored) — left in place rather than recursively
 # removed; rerunning resets the registry/order-log/pane state it depends on.

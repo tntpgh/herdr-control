@@ -64,6 +64,28 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/claims.sh"
 . "$here/lib/bashlex-preflight.sh"
 
+# ---- R7 (escalation root-audit): a documented pre-spawn no-effect receipt ---
+# The sibling of HERDR_SPAWN_RECEIPT (the success signal, R5) for the OTHER
+# side of the same trust boundary: lib/escalation.sh's _esc_spawn_successor
+# used to treat ANY nonzero exit as "confirmed, no side effect, safe to
+# retry" — but a nonzero exit does not by itself prove nothing was created
+# (a failure AFTER register_task, a timeout, or a kill all exit nonzero
+# too, with a real `tasks` row/pane already live). This trap prints
+# HERDR_SPAWN_NO_EFFECT on the last line of output for every exit that
+# happens before `register_task` (the one place a row is actually
+# created, and a real transaction — see its own comment in
+# lib/run-registry.sh) has succeeded: the provable "nothing committed
+# yet" boundary, not a guess from the exit code. `_spawn_committed` flips
+# to 1 immediately after that call succeeds; every exit before that point
+# still sees it at 0, including one bash itself forces (e.g. an unset
+# variable under `set -u`). A clean (exit 0) path — including --dry-run,
+# which never registers anything either — stays silent: `$?` is captured
+# as the FIRST statement in the trap body, before anything else can
+# clobber it, so existing callers that parse a dry run's stdout verbatim
+# see no new noise.
+_spawn_committed=0
+trap '_spawn_exit_rc=$?; [ "$_spawn_committed" = 1 ] || [ "$_spawn_exit_rc" = 0 ] || printf "HERDR_SPAWN_NO_EFFECT reason=exited_before_registration\n"' EXIT
+
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
 # spawned with --no-secrets exports HERDR_SECRETS_WITHHELD=1, so a child spawn
@@ -1031,6 +1053,9 @@ if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor
   echo "spawn-task: registration or source binding failed; worker was not launched" >&2
   exit 1
 fi
+# R7: the provable "something now exists" boundary for the EXIT trap
+# above — every exit from here on is NOT a documented no-effect exit.
+_spawn_committed=1
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone
