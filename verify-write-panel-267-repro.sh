@@ -329,6 +329,100 @@ else
   bad "did not reproduce the full Deny-not-pressable chain: menu_opts=[$menu_opts] numbered_opts=[$numbered_opts] rc=$rc keys=$(keys_pressed)"
 fi
 
+# ---------------------------------------------------------------------------
+# Operational fix (proposal, herdr-control#267 follow-up):
+# docs/design/stuck-save-operational-fix.md. Both pieces below are
+# zero-caller additions -- herdr-select.sh's live _current_offer and the
+# #277/gap2 blocks (:834-931) are untouched, so nothing here changes any
+# live pane's resolution.
+# ---------------------------------------------------------------------------
+
+# ---- (a) Deny stays pressable on a tall write panel whose FOOTER (not its
+# Approve/Deny rows) is what got clipped -- lib/prompt-parse.sh's new
+# _prompt_footer_clipped_options(), a narrower detector alongside the
+# hardened pass-1/pass-2 parser, not a change to it.
+printf '\n== footer-clipped menu detector: positive (header + Approve/Deny, no footer) ==\n'
+printf '╭─ Allow tool: write ─────────╮\n│ Path: tmp/out/x.md          │\n│ some wrapped content row    │\n\n Approve\nDeny\n' > "$SCREEN"
+clipped_opts="$(_prompt_footer_clipped_options options < "$SCREEN")"
+if [ "$clipped_opts" = "$(printf '1\tApprove\n2\tDeny\n')" ]; then
+  ok "_prompt_footer_clipped_options resolves Approve/Deny when the footer is clipped"
+else
+  bad "_prompt_footer_clipped_options did not resolve: [$clipped_opts]"
+fi
+
+printf '\n== footer-clipped menu detector: mutant (same fixture, OLD code still fails) ==\n'
+old_menu_opts="$(_menu_gate "$(cat "$SCREEN")" && prompt_menu_options "$PANE" 2>/dev/null)"
+if [ -z "$old_menu_opts" ]; then
+  ok "mutant confirmed: the existing hardened parser (unmodified) still returns nothing for this fixture -- the new detector does genuine new work"
+else
+  bad "mutant did not confirm the gap: old parser unexpectedly resolved [$old_menu_opts]"
+fi
+
+printf '\n== footer-clipped menu detector: negative, no allow-widening (no header at all) ==\n'
+printf 'just some ordinary pane output\nthat happens to end in\n Approve\nDeny\n' > "$SCREEN"
+v="$(_prompt_footer_clipped_options options < "$SCREEN")"
+[ -z "$v" ] && ok "no 'Allow tool:' header present -> refuses, does not widen allow" \
+  || bad "FALSE POSITIVE on header-less text: [$v]"
+
+printf '\n== footer-clipped menu detector: negative, refuses a poisoned (two-header) window ==\n'
+printf '╭─ Allow tool: write ─╮\n│ some row            │\nAllow tool: bash\n\n Approve\nDeny\n' > "$SCREEN"
+v="$(_prompt_footer_clipped_options options < "$SCREEN")"
+[ -z "$v" ] && ok "two 'Allow tool:' headers (injection shape) -> refuses" \
+  || bad "FALSE POSITIVE on a poisoned/double-header window: [$v]"
+
+printf '\n== footer-clipped menu detector: negative, still refuses when Approve/Deny are ALSO clipped ==\n'
+printf 'Allow tool: write\nPath: x\nSteering · 1\n  1. Conductor: hi\n' > "$SCREEN"
+v="$(_prompt_footer_clipped_options options < "$SCREEN")"
+[ -z "$v" ] && ok "header present but no Approve/Deny rows visible -> correctly refuses (nothing to resolve)" \
+  || bad "FALSE POSITIVE with no Approve/Deny rows at all: [$v]"
+
+printf '\n== footer-clipped menu detector: negative, defers when the real footer IS present ==\n'
+printf 'Allow tool: write\nPath: x\n\n Approve\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
+v="$(_prompt_footer_clipped_options options < "$SCREEN")"
+[ -z "$v" ] && ok "real footer present -> defers to the hardened parser, never doubles as a second source of truth" \
+  || bad "fired even though the real footer was present: [$v]"
+
+# ---- (b) Deny on the deferred path (no panel of its own) resolves
+# truthfully via the EXISTING authorized/record_authorized primitive,
+# which needs no screen state at all (identity-only: run/task/pane/birth/
+# session/call-id) and is UNAFFECTED by the stale-panel cross-check gap2
+# reproduces above -- confirmed directly against the real
+# prompt-occurrence.py, same db/identity shape as the gap2 v2 fixture.
+printf '\n== deferred-occurrence Deny: authorized --choice deny resolves truthfully, no screen dependency ==\n'
+DPANE="wB4:p4"; DBIRTH="term-gbp-1"
+deferred_call="occcall-deferred-deny-$RANDOM"
+"$occ_py" "$here/lib/prompt-occurrence.py" seen \
+  --db "$(registry_db)" --run run1 --task task1 --pane "$DPANE" \
+  --birth "$DBIRTH" --session "native-sess-1" --call-id "$deferred_call" \
+  --tool write --source test --input-json "$(jq -nc '{path:"proc://preview-http/kill", content:""}')" >/dev/null
+"$occ_py" "$here/lib/prompt-occurrence.py" screen \
+  --db "$(registry_db)" --run run1 --task task1 --pane "$DPANE" \
+  --birth "$DBIRTH" --session "native-sess-1" --call-id "$deferred_call" \
+  --display pending_parseable --prompt-id "some-unrelated-stale-prompt-id" >/dev/null
+# Mutant / regression proof: the normal proposal cross-check genuinely
+# cannot resolve this occurrence (same shape as gap2 v2 above) -- proving
+# a keypress-navigation path has nothing to act on for it.
+deferred_proposal_json="$("$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
+  --run run1 --task task1 --pane "$DPANE" --birth "$DBIRTH" \
+  --prompt-id "some-unrelated-stale-prompt-id" --worktree "$here" --tool bash 2>&1)"
+case "$deferred_proposal_json" in
+  *'"ok": false'*|*'"ok":false'*)
+    ok "mutant confirmed: the stale-screen cross-check cannot resolve the deferred occurrence (reason: $(printf '%s' "$deferred_proposal_json" | jq -r .reason 2>/dev/null))" ;;
+  *)
+    bad "expected the cross-check to fail for the deferred occurrence: $deferred_proposal_json" ;;
+esac
+# The fix: authorized --choice deny needs none of that -- identity alone.
+authorized_json="$("$occ_py" "$here/lib/prompt-occurrence.py" authorized --db "$(registry_db)" \
+  --run run1 --task task1 --pane "$DPANE" --birth "$DBIRTH" --session "native-sess-1" \
+  --call-id "$deferred_call" --decided-by "human:test" --choice deny 2>&1)"
+echo "    $authorized_json"
+case "$authorized_json" in
+  *'"written": "authorized"'*|*'"written":"authorized"'*)
+    ok "authorized --choice deny resolved the deferred occurrence truthfully, independent of screen state" ;;
+  *)
+    bad "authorized --choice deny did not resolve: $authorized_json" ;;
+esac
+
 echo
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

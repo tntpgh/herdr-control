@@ -1767,3 +1767,60 @@ prompt_occurrence_display() {           # <pane>
     printf 'no_prompt\n'
   fi
 }
+
+# ---- operational fix (proposal, herdr-control#267 follow-up): Deny is
+# always pressable on tall write panels, even when the footer is clipped
+# -------------------------------------------------------------------------
+# docs/design/stuck-save-operational-fix.md. `_menu_gate`/`prompt_menu_options`
+# above require the LITERAL "navigate"/"select" footer hint text; a write
+# panel tall enough to push that one trailing line out of the capture makes
+# both fail, and `_current_offer` (herdr-select.sh:420-436) then falls
+# through to the numbered-prompt parser, which can match an unrelated
+# Steering block instead -- the "Deny-not-pressable" bug (confirmed,
+# verify-write-panel-267-repro.sh's "Deny-not-pressable repro").
+#
+# This is a SEPARATE, narrower detector, not a change to the hardened
+# pass-1/pass-2 state machine above (poisoning checks, F8/F9 fixes,
+# multiple security-review rounds) -- rewriting that in place was the
+# explicit "not small/local" call in the design doc. It is zero-caller:
+# `_current_offer` is untouched, so no live pane's resolution changes.
+# Deliberately conservative, narrower than loosening pass 2 would be:
+#   - requires a real "Allow tool:" header line, so it never fires on
+#     ordinary pane text that happens to end in the words Approve/Deny;
+#   - requires EXACTLY ONE such header in the window -- two is the
+#     injection shape pass 1's poisoning defense exists for, so this
+#     refuses rather than risk being fooled by a fake second header;
+#   - requires the window to NOT already satisfy `_menu_gate` -- if the
+#     footer IS present, the existing hardened parser is authoritative,
+#     never bypassed by this;
+#   - requires Deny then (going up, blanks only between) Approve as the
+#     last two non-blank content rows, same adjacency rule pass 2 uses
+#     for its footer-anchored walk, just without the footer requirement.
+# Activating this means wiring it as a fallback in `_current_offer` only
+# AFTER both existing passes fail and the numbered-prompt parser also
+# fails to gate ambiguously (a separate, reviewed change) -- not done here.
+_prompt_footer_clipped_options() {       # <mode>; window on stdin
+  local win header_count last_two
+  win="$(cat)"
+  if _menu_gate "$win"; then
+    return 1  # the real footer is present; defer to the hardened parser
+  fi
+  case "$win" in *"Allow tool:"*) ;; *) return 1 ;; esac
+  header_count="$(printf '%s\n' "$win" \
+    | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+    | grep -c 'Allow tool:')"
+  [ "$header_count" = 1 ] || return 1
+  last_two="$(printf '%s\n' "$win" \
+    | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//' \
+    | awk 'NF' | tail -n 2)"
+  case "$last_two" in
+    $'Approve\nDeny')
+      case "$1" in
+        options) printf '1\tApprove\n2\tDeny\n' ;;
+        *) : ;;
+      esac
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}

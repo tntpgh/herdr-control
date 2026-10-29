@@ -70,15 +70,20 @@ write/edit-specific:
   loosening it to tolerate a stale screen reopens exactly the identity-
   spoofing class that design closed.
 
-Per the conductor's own framing ("if the fix is small and local") — it is
-not. Both remain the two separate, explicit, human-reviewed follow-up
-proposals already named in `docs/design/write-panel-ceiling-267.md`'s
-activation checklist (items 5 and 6): fail `_current_offer` closed instead
-of falling through to the numbered parser when a truncated omp header is
-detected without its footer; and resolve a deferred, no-panel-painted
-occurrence by its own `screen_prompt_id` presence/absence rather than by
-cross-checking against whatever happens to be on screen right now. Neither
-is implemented here.
+Per the conductor's own framing ("if the fix is small and local") — editing
+`_current_offer`/`proposal_check` IN PLACE is not. Both remain the two
+separate, explicit, human-reviewed follow-up proposals already named in
+`docs/design/write-panel-ceiling-267.md`'s activation checklist (items 5
+and 6), and neither live function is touched here.
+
+What IS implemented, inert, in the same zero-caller posture as everything
+else in this proposal — see "Implemented (R7)" below — is a narrower
+ADDITION beside each, not a rewrite of either: a second, separate menu
+detector for the footer-clipped shape, and direct use of an existing,
+already-reviewed, screen-independent primitive for deferred-occurrence
+Deny. Both stop short of changing `_current_offer` or `proposal_check`
+themselves, so the blast-radius argument above still holds for THOSE
+functions; what changed is that the fix no longer requires touching them.
 
 ## The minimal operational fix through the supported path — small, local, implemented here
 
@@ -148,13 +153,65 @@ hash-recognition shortcut); and a structural confirmation that
 (grep-based, same convention as the existing four `declining=0` gate
 checks).
 
+## Implemented (R7): (a) footer-clipped Deny, (b) deferred-occurrence Deny
+
+Both committed as inert, zero-caller additions — no live call site changed.
+
+**(a) `_prompt_footer_clipped_options()`** (`lib/prompt-parse.sh`, appended
+after `prompt_occurrence_display`). A second, narrower menu detector beside
+the existing hardened pass-1/pass-2 parser, not a modification to it:
+requires exactly one real `Allow tool:` header, requires `_menu_gate` to
+have already FAILED (defers entirely once the real footer is present —
+never a second source of truth for the common case), and requires Deny
+then Approve as the last two non-blank rows. Deliberately narrower than
+loosening pass 2 itself would be: a poisoned window with two `Allow tool:`
+headers refuses, Approve/Deny text with no header at all refuses, and the
+original Steering-block fixture (where Approve/Deny are ALSO clipped, not
+just the footer) still correctly refuses — it only resolves the one shape
+pass 2 cannot: header and Approve/Deny rows visible, footer line alone
+missing. `verify-write-panel-267-repro.sh` adds 6 cases: the positive
+resolution; a mutant proving the existing hardened parser (unmodified)
+still fails the same fixture (so this is genuine new coverage, not
+redundant); and four negative/no-widening controls (no header, poisoned
+double header, Approve/Deny also clipped, real footer present). Activating
+this still means wiring it into `_current_offer` as a fallback AFTER both
+existing passes fail — a separate, reviewed change, not done here.
+
+**(b) Deferred-occurrence Deny via the existing `authorized` primitive.**
+No code change — `record_authorized` (`lib/prompt-occurrence.py:527`,
+reached via the `authorized` subcommand) already takes only identity
+(run/task/pane/birth/session/call-id) plus `--choice`/`--decided-by`; it
+has no dependency on `screen_prompt_id`, the painted panel, or
+`task_input_required_tool` at all, and for a `DENY_CHOICES` choice it
+calls `_drop_proposal` to correctly clear the occurrence. This is already
+the mechanism `herdr-select.sh` itself calls after a real keypress
+(`approval_confirmed` → `authorized`); the fix is recognizing that
+Deny never needed the stale-screen cross-check `gap2` reproduces, because
+refusing an action needs no proof of what the action's content is, only
+proof of which occurrence is being refused — proof `authorized` already
+requires via the five-part identity, independent of what is painted.
+`verify-write-panel-267-repro.sh` adds 2 cases against a fresh
+gap2-shaped deferred occurrence: a mutant confirming the normal
+screen-cross-check genuinely cannot resolve it (same failure shape as the
+gap2 v2 repro above), and the positive case — `authorized --choice deny`
+resolves it truthfully regardless. No new caller exists today; this
+documents and proves the primitive, it does not wire anything new into
+`herdr-select.sh`'s own Deny path.
+
 ## Status
 
-- Still inert: `_cp_write_content_verdict` has zero callers; no change to
-  `classify_command`, `peer_decide`, `conductor_reserved_reason`,
-  `herdr-select.sh`, or `lib/prompt-parse.sh`/`lib/prompt-occurrence.py`.
-- Deny-not-pressable and the deferred-occurrence stale-screen mismatch
-  remain unfixed, as explained above — tracked as
-  `write-panel-ceiling-267.md`'s activation checklist items 5 and 6.
-- GBP (wB4:p4) and Intel (wB2:p7) are untouched; this change cannot affect
+- Still inert: no live call site changed. `_current_offer`
+  (`herdr-select.sh:420-436`) and `proposal_check`
+  (`lib/prompt-occurrence.py:1138`) are byte-for-byte unmodified;
+  `_prompt_footer_clipped_options` has zero callers; `authorized` is an
+  existing, already-live subcommand used here only via direct test
+  invocation, not from any new automated caller.
+- `_cp_write_content_verdict` additions (empty content, elision markers)
+  also remain zero-caller, as established in the earlier rounds of this
+  proposal.
+- GBP (wB4:p4) and Intel (wB2:p7) are untouched; nothing here can affect
   their panes (zero callers, no network, no live state writes).
+- Still open, by design, as separate reviewed changes: wiring
+  `_prompt_footer_clipped_options` into `_current_offer`'s fallback order,
+  and wiring `authorized --choice deny` as an automated resolution path
+  for a deferred occurrence (today it is proven safe but has no caller).
