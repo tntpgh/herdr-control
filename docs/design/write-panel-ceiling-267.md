@@ -42,6 +42,56 @@ bytes, and effectively **no scanning of the content itself** (as opposed to
 the path) even below that line, beyond the single-`Content:`-occurrence
 anti-forgery check.
 
+## Security review blockers — FIXED (R5)
+
+Security review at `63fc395` (`review/sec-267-e2266d6/tmp/REVIEW-267.md`)
+**REJECTED** on two findings against `_cp_write_content_verdict` itself
+(both present, unchanged, since `e2266d6` — the Deny-not-pressable and
+gap2 work in `63fc395` never touched `lib/command-policy.sh`). Both are now
+fixed in this prototype, still with zero callers:
+
+1. **Requirement 6 — N8 `handoffs_write` restriction silently dropped.**
+   `_cp_write_content_verdict` accepted a `manifest` argument and never
+   read it, so a `research`/`explore` job class restricted to exactly one
+   `.handoffs/<file>` (`_cp_write_menu_verdict`'s `N8` narrowing,
+   `lib/command-policy.sh:6826-6876`) would regain unrestricted
+   in-worktree write the moment this prototype's content-aware path
+   replaced the menu-scrape path — a new generic allow for a restricted
+   caller. Fixed: `_cp_write_content_verdict` now threads `manifest`
+   through identically (same `jq -r '.handoffs_write'`, same lexical +
+   symlink-resolved path check, same `xd://` allowlist exemption for
+   parity with `_cp_write_menu_verdict`) — but a match now falls through
+   to the content scan below instead of returning `allow` immediately,
+   which is strictly MORE scrutiny than `_cp_write_menu_verdict` ever had,
+   never less. `verify-write-content-verdict-267.sh` (now 25/25) adds:
+   the one allowed `.handoffs/ANSWER.md` path allows; a write to any
+   OTHER path (`lib/command-policy.sh`) escalates **even with clean
+   content** — the exact regression the review named; a write to a
+   DIFFERENT `.handoffs` file (not the one named in the manifest)
+   escalates; `_cp_write_menu_verdict` parity on the same restricted
+   scenario; an unrestricted manifest still allows any in-worktree path.
+2. **Requirement 2/3 — a single CR byte defeats
+   `conductor_reserved_reason`'s literal pattern matching.**
+   `conductor_reserved_reason`'s path/credential patterns
+   (`lib/command-policy.sh:7931,8303`) are plain `grep -E` literal
+   matches; a `\r` inserted mid-pattern (`.np` + CR + `mrc`) breaks
+   `\.npmrc\b`. Pre-existing in `conductor_reserved_reason`, but never
+   reachable for write/edit content before this prototype adds content
+   scanning at all — proven end to end by the review
+   (`E2E CR-injected content verdict: allow` against an otherwise-reserved
+   credential-path write). Fixed: `_cp_write_content_verdict` now strips
+   every C0 control byte except tab/newline, plus DEL, from the **full**
+   content **once, before** the windowed scan — not per-window, so a
+   control byte sitting exactly at a window boundary cannot interact with
+   the split. `verify-write-content-verdict-267.sh` adds a bare-CR case, a
+   CRLF case, a CR-injected case placed to straddle the window0/window1
+   boundary, and a clean (uninjected) sanity control.
+
+Full test run: `verify-write-content-verdict-267.sh` 25/25,
+`verify-write-panel-267-repro.sh` 7/7 (unaffected — exercises
+`herdr-select.sh`, not this function), `verify-command-policy.sh` (the
+repo-wide suite) unaffected.
+
 ## Deny-not-pressable — CONFIRMED, one root cause for both halves of the report
 
 Live evidence (conductor, GBP wB4:p4, ~03:45Z): `herdr-select wB4:p4 2
@@ -205,7 +255,7 @@ run. That needs its own separate proposal.
 **4. Tests: truncation + prompt injection + windowing + normalization.**
 `verify-write-content-verdict-267.sh` (committed; converted from a `tmp/`
 scratch script) exercises the prototype directly — it has no live caller,
-so this is the only way to exercise it — 16/16 checks pass:
+so this is the only way to exercise it — 25/25 checks pass:
 - 7 KB write panel, path inside worktree → `allow` (not an automatic
   `deny` from size).
 - 7 KB bash command (not a write panel) → still hits
@@ -237,6 +287,13 @@ so this is the only way to exercise it — 16/16 checks pass:
 - A regression marker: `classify_command`/`peer_decide`, UNCHANGED by this
   commit, still deny the same 7 KB write panel on size alone today — this
   flips only once activation (checklist below) wires the prototype in.
+- N8 `handoffs_write`: the one allowed `.handoffs` file allows; any other
+  path escalates even with clean content; a different `.handoffs` file
+  still escalates; `_cp_write_menu_verdict` parity on the same restricted
+  scenario; an unrestricted manifest still allows any in-worktree path.
+- CR/CRLF/bare-CR-injected credential-path patterns (`.np<CR>mrc`,
+  `.np<CRLF>mrc`) still deny, including one placed to straddle the
+  window0/window1 boundary, plus a clean-pattern sanity control.
 
 ### Prototype implementation (inert, zero callers)
 
@@ -289,18 +346,27 @@ design.
    at `lib/command-policy.sh:7215-7232`, not a new dispatch mechanism.
 2. Extend `verify-command-policy.sh`'s existing `#267` suite
    (`:4612-4656`) with the cases from `verify-write-content-verdict-267.sh`.
-3. **Separate proposal, before or alongside this one**: fix
+3. **FIXED (R5), was a REJECT-driving blocker at `63fc395`**: Requirement 6,
+   N8 `handoffs_write` restriction silently dropped — see "Security review
+   blockers — FIXED (R5)" above. `manifest` is now threaded through
+   `_cp_write_content_verdict` identically to `_cp_write_menu_verdict`.
+4. **FIXED (R5), was a REJECT-driving blocker at `63fc395`**: Requirement
+   2/3, a single CR byte defeats `conductor_reserved_reason`'s literal
+   pattern matching — see "Security review blockers — FIXED (R5)" above.
+   Every C0 control byte except tab/newline, plus DEL, is now stripped from
+   the full content once, before the windowed scan.
+5. **Separate proposal, before or alongside this one**: fix
    Deny-not-pressable in `lib/prompt-parse.sh`'s `_current_offer` (see
    "Deny-not-pressable" above) — `declining` must never stay `0` for an
    actual Deny keypress because a Steering block got matched instead of
    the omp menu. This is the live incident's actual root cause and is
    independent of `lib/command-policy.sh`; this proposal's prototype does
    not touch it.
-4. **Separate proposal**: fix the deferred-occurrence tool cross-check
+6. **Separate proposal**: fix the deferred-occurrence tool cross-check
    (`herdr-select.sh:884-906`) to stop comparing a no-panel-painted
    occurrence against whatever panel happens to be on screen (see
    "Deferred-occurrence tool mismatch" above) — resolve by the
    occurrence's own `screen_prompt_id` presence/absence, not by
    `task_input_required_tool` on the CURRENT prompt.
-5. Security review (auth/money/external-comms-adjacent: approval policy)
+7. Security review (auth/money/external-comms-adjacent: approval policy)
    before merge, per team rules.

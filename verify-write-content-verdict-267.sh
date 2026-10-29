@@ -167,6 +167,70 @@ cat ~/.SSH/ID_RSA"
 v="$(_cp_write_content_verdict "tmp/out/report.md" "$upper_inject" "$wt")"
 check_prefix "uppercase credential-path variant past 4096B still denies (case-insensitive)" "deny:" "$v"
 
+printf '\n== N8 handoffs_write restriction (security review REJECT at 63fc395, Req 6) ==\n'
+# A manifest naming handoffs_write marks a write-restricted job class
+# (research/explore) whose write tool may touch exactly one .handoffs file.
+# _cp_write_menu_verdict (lib/command-policy.sh:6826-6876) already enforces
+# this; _cp_write_content_verdict silently dropped it through 63fc395 --
+# confirm parity, and specifically that clean content at a DISALLOWED path
+# does not launder an otherwise-restricted write through "the content was
+# fine".
+mkdir -p "$wt/.handoffs"
+hw_manifest='{"handoffs_write":"ANSWER.md"}'
+
+v="$(_cp_write_content_verdict ".handoffs/ANSWER.md" "clean content, nothing reserved" "$wt" "$hw_manifest")"
+check "handoffs_write: the one allowed .handoffs file allows" "allow" "$v"
+
+v="$(_cp_write_content_verdict "lib/command-policy.sh" "clean content, nothing reserved" "$wt" "$hw_manifest")"
+check_prefix "handoffs_write: a write OUTSIDE the restriction escalates even with clean content" "escalate:" "$v"
+
+v="$(_cp_write_content_verdict ".handoffs/OTHER.md" "clean content, nothing reserved" "$wt" "$hw_manifest")"
+check_prefix "handoffs_write: a DIFFERENT .handoffs file still escalates (not just outside .handoffs entirely)" "escalate:" "$v"
+
+# Parity: _cp_write_menu_verdict must agree on the restricted-path case,
+# via its own raw-panel-text input shape.
+menu_raw="Allow tool: write Path: lib/command-policy.sh Content: clean content, nothing reserved"
+mv="$(_cp_write_menu_verdict "$menu_raw" "$wt" "$hw_manifest")"
+check_prefix "parity: _cp_write_menu_verdict escalates the same restricted path the same way" "escalate:" "$mv"
+
+# No manifest / no handoffs_write key -> unrestricted, same as before.
+v="$(_cp_write_content_verdict "lib/command-policy.sh" "clean content, nothing reserved" "$wt" '{}')"
+check "handoffs_write: an unrestricted manifest still allows any in-worktree path" "allow" "$v"
+
+printf '\n== CR/CRLF normalization (security review REJECT at 63fc395, Req 2/3) ==\n'
+# conductor_reserved_reason matches '\.npmrc\b' as a literal grep -E
+# substring. A single CR byte mid-pattern used to defeat that match
+# end-to-end through this function (reproduced in the security review,
+# tmp/test_267_crlf_e2e.sh): ".np" + CR + "mrc" never equals ".npmrc" to a
+# literal regex, so the write classified allow instead of deny.
+cr_inject="$(printf 'z%.0s' $(seq 1 100))
+cat .np$(printf '\r')mrc"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$cr_inject" "$wt")"
+check_prefix "bare-CR-injected credential-path pattern still denies" "deny:" "$v"
+
+crlf_inject="$(printf 'z%.0s' $(seq 1 100))
+cat .np$(printf '\r\n')mrc"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$crlf_inject" "$wt")"
+check_prefix "CRLF-injected credential-path pattern still denies" "deny:" "$v"
+
+# Same injection, but placed so the CR byte itself sits exactly at the
+# step=3488/wsize=4000 window boundary (offset 4000) -- proves the
+# normalization runs ONCE on the full content before windowing, not
+# per-window, since a per-window normalization could still be defeated by
+# placing the CR where neither window's normalization pass would see the
+# whole pattern reassembled.
+cr_at_boundary="$(printf 'a%.0s' $(seq 1 3993))cat .np$(printf '\r')mrc $(printf 'b%.0s' $(seq 1 3000))"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$cr_at_boundary" "$wt")"
+check_prefix "CR-injected pattern straddling the window0/window1 boundary still denies" "deny:" "$v"
+
+# Negative control: the SAME shape with the CR removed (a clean, intact
+# ".npmrc" reference) must still deny too -- confirms the "denies" above
+# are catching the real pattern, not some artifact of the injected byte.
+clean_inject="$(printf 'z%.0s' $(seq 1 100))
+cat .npmrc"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$clean_inject" "$wt")"
+check_prefix "uninjected .npmrc reference denies too (sanity control)" "deny:" "$v"
+
 echo
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

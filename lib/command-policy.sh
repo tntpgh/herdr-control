@@ -6925,25 +6925,81 @@ _cp_write_content_verdict() {
         printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
         return 0
       fi
+      # N8 (round-2 security review; security-review REJECT at 63fc395,
+      # Requirement 6): threaded through identically to
+      # `_cp_write_menu_verdict` (`:6826-6876`) -- a manifest naming
+      # `handoffs_write` marks a write-restricted job class (research/
+      # explore) whose write tool may touch exactly that one `.handoffs`
+      # file and nothing else. Unlike `_cp_write_menu_verdict`, a match
+      # here does NOT return `allow` immediately -- it falls through to
+      # the content scan below, which is strictly MORE scrutiny than the
+      # menu path ever had, never less.
+      local hw
+      hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
+      if [ -n "$hw" ]; then
+        local abs wt_abs rel
+        case "$path" in
+          /*) abs="$path" ;;
+          *) abs="$wt/$path" ;;
+        esac
+        abs="$(_cp_lexical_abspath "$abs")"
+        wt_abs="$(_cp_lexical_abspath "$wt")"
+        rel="${abs#"$wt_abs"/}"
+        if [ "$rel" != ".handoffs/$hw" ]; then
+          printf 'escalate:this task'"'"'s manifest restricts its write tool to .handoffs/%s only' "$hw"
+          return 0
+        fi
+        # R3-4/R4-2 parity: refuse when the one allowed path is actually a
+        # symlink elsewhere (checked against the REAL, resolved worktree
+        # root, not the lexical one -- see `_cp_write_menu_verdict` for why).
+        if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
+          local real real_wt
+          real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
+          real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+          if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
+            printf 'escalate:this task'"'"'s one allowed .handoffs file is a symlink to somewhere else — remains human-only'
+            return 0
+          fi
+        fi
+      fi
       ;;
   esac
+  # Security review (Requirement 2/3, REJECT at 63fc395): a single CR byte
+  # mid-pattern (`.np` + \r + `mrc`) defeats `conductor_reserved_reason`'s
+  # literal `grep -E` matching the same way it would any literal-substring
+  # scanner -- pre-existing in that function, but never reachable for
+  # write/edit content until this prototype adds content scanning at all.
+  # Normalize on the FULL content, ONCE, before windowing -- not per-window
+  # -- so a CR sitting exactly at a window boundary cannot interact with
+  # the split. Strips every C0 control byte except tab/newline (which have
+  # legitimate structural meaning in real text) and DEL: CR/CRLF/bare-CR
+  # are the proven case, but any other C0 byte breaks a literal match the
+  # identical way, so the whole class is normalized, not just \r.
+  local normalized
+  normalized="$(printf '%s' "$content" | python3 -c '
+import sys
+data = sys.stdin.buffer.read()
+drop = bytes(b for b in range(0x20) if b not in (0x09, 0x0A)) + bytes([0x7F])
+sys.stdout.buffer.write(bytes(b for b in data if b not in drop))
+')"
   # Reuse the SAME reserved-pattern / secret-path scanner a shell command
-  # gets, against the full content, never a clipped prefix -- but
-  # `conductor_reserved_reason` has its OWN unconditional 4096-byte ceiling
-  # (`lib/command-policy.sh` ~line 8205) that this prototype must not
-  # silently inherit (that would just reproduce #267 one level down, as
-  # verified while drafting this). Reuse the function completely
-  # UNMODIFIED -- never touch its pattern list -- by scanning it in
-  # <=4000-byte windows with a 512-byte overlap (comfortably longer than
-  # any reserved pattern below) so a match sitting across a window
-  # boundary is still caught by the window that contains it whole. This is
-  # the scan write/edit content has never gotten at any size until wired
-  # in; splitting is scan-granularity only, never a new allow rule.
+  # gets, against the full (now control-char-normalized) content, never a
+  # clipped prefix -- but `conductor_reserved_reason` has its OWN
+  # unconditional 4096-byte ceiling (`lib/command-policy.sh` ~line 8205)
+  # that this prototype must not silently inherit (that would just
+  # reproduce #267 one level down, as verified while drafting this). Reuse
+  # the function completely UNMODIFIED -- never touch its pattern list --
+  # by scanning it in <=4000-byte windows with a 512-byte overlap
+  # (comfortably longer than any reserved pattern below) so a match sitting
+  # across a window boundary is still caught by the window that contains it
+  # whole. This is the scan write/edit content has never gotten at any size
+  # until wired in; splitting is scan-granularity only, never a new allow
+  # rule.
   local reserved clen off win step=3488 wsize=4000
-  clen=${#content}
+  clen=${#normalized}
   off=0
   while :; do
-    win="${content:$off:$wsize}"
+    win="${normalized:$off:$wsize}"
     reserved="$(conductor_reserved_reason "$win")"
     if [ -n "$reserved" ]; then
       printf 'deny:%s' "$reserved"
