@@ -6906,6 +6906,26 @@ _cp_write_content_verdict() {
     *[!A-Za-z0-9._/-]*)
       printf 'deny:path contains characters no real filesystem write target can'; return 0 ;;
   esac
+  # Security-review-adjacent hardening (stuck-save operational fix,
+  # docs/design/stuck-save-operational-fix.md): empty content has nothing
+  # to review, so "the content was judged" is never actually true for it --
+  # this is exactly the shape of "approve by asserting a hash matches,
+  # without supplying real content", not just one hash-shaped payload.
+  if [ -z "${content//[[:space:]]/}" ]; then
+    printf 'deny:empty content — nothing to review'
+    return 0
+  fi
+  # The established codebase convention for "this text is a clipped view,
+  # not the real thing" (herdr-select.sh:1008-1012, lib/alert-gate.sh:89-90)
+  # is a literal elided/truncated substring check, applied today only to
+  # the SCRAPED panel text. Apply the same guard here, defense-in-depth: a
+  # caller that passed through an already-clipped payload instead of the
+  # real structured content must not have it judged as if it were complete.
+  case "$content" in
+    *elided*|*truncated*)
+      printf 'escalate:content carries an elision/truncation marker — this is not the complete payload, refusing to judge a partial view'
+      return 0 ;;
+  esac
   # Reject content that is not valid UTF-8 or ends mid multi-byte sequence --
   # a structured-input path has no terminal scrape to be torn, so a bad
   # encoding here means the recorded payload itself is suspect, not a

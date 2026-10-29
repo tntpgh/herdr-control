@@ -231,6 +231,57 @@ cat .npmrc"
 v="$(_cp_write_content_verdict "tmp/out/report.md" "$clean_inject" "$wt")"
 check_prefix "uninjected .npmrc reference denies too (sanity control)" "deny:" "$v"
 
+printf '\n== stuck-save operational fix: no hash-only allow, no truncated-content allow ==\n'
+# docs/design/stuck-save-operational-fix.md. Both gaps were reachable
+# today, independent of the Deny-not-pressable/gap2 bugs that doc
+# correctly leaves unfixed here.
+
+# 1. Empty content has nothing to review -- must never allow (this is the
+#    structural shape of "approve by asserting a hash matches, without
+#    supplying real content for review").
+v="$(_cp_write_content_verdict "tmp/out/report.md" "" "$wt")"
+check_prefix "empty content denies (nothing to review)" "deny:" "$v"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "   " "$wt")"
+check_prefix "whitespace-only content denies" "deny:" "$v"
+
+# 2. A hash-shaped string used AS content is ordinary text to this
+#    function -- no special recognition, no bypass. Clean hash text
+#    allows (same as any other clean content would); a hash-shaped
+#    string that ALSO happens to carry a reserved pattern still denies,
+#    proving there is no hash-recognition short-circuit either way.
+hash_content="sha256:$(printf 'a%.0s' $(seq 1 64))"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$hash_content" "$wt")"
+check "a bare hash-shaped string is judged as ordinary (clean) content, not specially trusted" "allow" "$v"
+hash_plus_reserved="sha256:$(printf 'a%.0s' $(seq 1 64))
+cat ~/.ssh/id_rsa"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "$hash_plus_reserved" "$wt")"
+check_prefix "a hash-shaped string cannot mask a reserved pattern alongside it" "deny:" "$v"
+
+# 3. A painted-panel elision/truncation marker embedded in content means
+#    this is NOT the complete payload -- escalate, never allow, even
+#    though the marker text itself is otherwise harmless.
+v="$(_cp_write_content_verdict "tmp/out/report.md" "clean prefix […247ch elided…] clean suffix" "$wt")"
+check_prefix "content carrying an elision marker escalates, never allows" "escalate:" "$v"
+v="$(_cp_write_content_verdict "tmp/out/report.md" "approval arguments are clipped (truncated)" "$wt")"
+check_prefix "content carrying a truncation marker escalates, never allows" "escalate:" "$v"
+
+# 4. Structural: _cp_write_content_verdict is a pure classifier -- it must
+#    never itself write to the run registry, append an event, or
+#    reference herdr-select.sh's declining/keypress state. Same
+#    grep-based convention as the four declining=0 gate checks above
+#    (never a behavioral probe that could false-positive on comment
+#    prose) -- confirms its own classification can never corrupt or
+#    interact with Deny resolution, even though it cannot fix it either.
+fn_body="$(sed -n '/^_cp_write_content_verdict() {/,/^}/p' lib/command-policy.sh)"
+case "$fn_body" in
+  *append_event*|*registry_db*|*declining*|*"pane send-keys"*)
+    fail=$((fail+1))
+    printf '  FAIL  _cp_write_content_verdict references registry/event/declining state (should be a pure classifier)\n' ;;
+  *)
+    pass=$((pass+1))
+    printf '  ok    _cp_write_content_verdict makes no registry/event/declining writes (pure classifier)\n' ;;
+esac
+
 echo
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]
