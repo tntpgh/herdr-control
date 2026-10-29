@@ -173,9 +173,8 @@ missing. `verify-write-panel-267-repro.sh` adds 6 cases: the positive
 resolution; a mutant proving the existing hardened parser (unmodified)
 still fails the same fixture (so this is genuine new coverage, not
 redundant); and four negative/no-widening controls (no header, poisoned
-double header, Approve/Deny also clipped, real footer present). Activating
-this still means wiring it into `_current_offer` as a fallback AFTER both
-existing passes fail — a separate, reviewed change, not done here.
+double header, Approve/Deny also clipped, real footer present). R8 (below)
+wires this into `_current_offer` as the live fallback.
 
 **(b) Deferred-occurrence Deny via the existing `authorized` primitive.**
 No code change — `record_authorized` (`lib/prompt-occurrence.py:527`,
@@ -198,20 +197,83 @@ resolves it truthfully regardless. No new caller exists today; this
 documents and proves the primitive, it does not wire anything new into
 `herdr-select.sh`'s own Deny path.
 
+## Implemented (R8): (a) wired live into `_current_offer`; (b) unchanged
+
+The conductor's R8 round judged R7 accepted only as inert primitives, not
+an end-to-end fix (`_prompt_footer_clipped_options` had zero callers; (b)
+only reused the existing `--choice deny` directly in tests). This round
+wires (a) into the real caller path, keeping (b) as-is — (b) never needed
+a new caller to be a complete fix; it IS the fix, demonstrated against the
+live primitive, not a prototype awaiting activation.
+
+**`_current_offer`** (`herdr-select.sh:420-454`) now tries, in order:
+the hardened pass-1/pass-2 parser (`prompt_menu_options`, unchanged) →
+`prompt_footer_clipped_options` (new fallback, only after the hardened
+parser has already failed) → the numbered-prompt parser
+(`prompt_options`, unchanged, now reached strictly less often). A
+footer-clipped detection reports `mechanism=menu`, identical in shape to
+the hardened parser's own output, so every downstream gate
+(`omp_panel=1`, the #277 human-only block, gap2's cross-check) treats it
+exactly as it already treats a normal menu — nothing downstream needed to
+change.
+
+**The navigation loop's highlight reads** (`herdr-select.sh:1352-1357`,
+`:1371-1377`, and the pre-Enter `_require_unchanged_after_close` check at
+`:1262-1274`) needed the SAME fallback: `prompt_menu_selected` (the
+hardened parser's "which row is highlighted" query) also fails on a
+footer-clipped panel, so each of these three call sites now tries the new
+`prompt_footer_clipped_selected` (`lib/prompt-parse.sh`) when the
+hardened one returns empty. This detects highlight the same way pass 2
+does (`\x1b[48;2;R;G;Bm`, a 24-bit background SGR, checked on each row's
+raw ansi-carrying text before stripping) and refuses — never guesses —
+when both or neither row is highlighted. Missing this was caught by
+testing, not inspection: the first wiring attempt detected the menu
+shape correctly but then refused with "cannot tell which option is
+currently highlighted" (missed `prompt_menu_selected` call sites) and
+then "the prompt ... changed while its answer was being recorded"
+(missed the THIRD call site, inside `_require_unchanged_after_close`,
+which has its own independent `prompt_menu_selected` call) — both fixed,
+both now covered by the end-to-end regression tests below.
+
+**Regression tests**, `verify-write-panel-267-repro.sh`, run through the
+REAL (now-wired) `herdr-select.sh`, not the raw detector:
+- a generic footer-clipped write panel: Deny resolves (rc=0, 1 key);
+- the GBP-sized (7098 B) and Intel-sized (7706 B) panels specifically,
+  footer-clipped: Deny resolves for both, same mechanism;
+- the ORIGINAL Steering-block incident shape (Approve/Deny themselves
+  ALSO clipped, not just the footer) — re-asserted still fails closed
+  through the now-wired `_current_offer`: the existing "Deny-not-
+  pressable repro" fixture is unmodified and runs after the wiring in
+  the same suite, so its own unchanged PASS is the proof, not a separate
+  code path;
+- negative: a header-only panel (no Approve/Deny at all) still refuses
+  (exit 6, "not showing a prompt this script recognises");
+- negative: requesting a choice not on offer (3, when only 1/2 exist)
+  still refuses by name ("option '3' is not on offer"), never guesses.
+
+No allow was widened anywhere in this wiring: every new code path either
+resolves Deny (never Approve — the #277 human-only block is untouched and
+still runs unconditionally ahead of any mechanism) or falls through to
+the existing refusal behavior, identical to before R8.
+
 ## Status
 
-- Still inert: no live call site changed. `_current_offer`
-  (`herdr-select.sh:420-436`) and `proposal_check`
-  (`lib/prompt-occurrence.py:1138`) are byte-for-byte unmodified;
-  `_prompt_footer_clipped_options` has zero callers; `authorized` is an
-  existing, already-live subcommand used here only via direct test
-  invocation, not from any new automated caller.
-- `_cp_write_content_verdict` additions (empty content, elision markers)
-  also remain zero-caller, as established in the earlier rounds of this
-  proposal.
-- GBP (wB4:p4) and Intel (wB2:p7) are untouched; nothing here can affect
-  their panes (zero callers, no network, no live state writes).
-- Still open, by design, as separate reviewed changes: wiring
-  `_prompt_footer_clipped_options` into `_current_offer`'s fallback order,
-  and wiring `authorized --choice deny` as an automated resolution path
-  for a deferred occurrence (today it is proven safe but has no caller).
+- (a) is now live: `_current_offer`, the navigation loop, and
+  `_require_unchanged_after_close` (`herdr-select.sh`) call
+  `prompt_footer_clipped_options`/`prompt_footer_clipped_selected`
+  (`lib/prompt-parse.sh`) as a real fallback. `prompt_menu_options`,
+  `prompt_menu_selected`, and the hardened pass-1/pass-2 parser itself
+  are byte-for-byte unmodified, tried first, and authoritative whenever
+  they succeed.
+- (b) needed no wiring: `authorized --choice deny` is already live,
+  already the mechanism `herdr-select.sh` calls post-keypress; this
+  proposal only proved it also works with no panel/keypress at all.
+- `proposal_check` (`lib/prompt-occurrence.py:1138`) is untouched — gap2's
+  cross-check still exists and is still accurate for what it checks; this
+  work routes around needing it for Deny, not through it.
+- `_cp_write_content_verdict` (the #267 ceiling fix itself) remains
+  zero-caller, unaffected by and unrelated to this round.
+- GBP (wB4:p4) and Intel (wB2:p7) are untouched directly — no live pane
+  was read, written, or keyed — but their SHAPE of failure (a footer-
+  clipped write panel) is now handled if it recurs, since `_current_offer`
+  is live code every pane's Deny goes through.

@@ -1800,27 +1800,73 @@ prompt_occurrence_display() {           # <pane>
 # AFTER both existing passes fail and the numbered-prompt parser also
 # fails to gate ambiguously (a separate, reviewed change) -- not done here.
 _prompt_footer_clipped_options() {       # <mode>; window on stdin
-  local win header_count last_two
+  local mode="$1" win
   win="$(cat)"
   if _menu_gate "$win"; then
     return 1  # the real footer is present; defer to the hardened parser
   fi
   case "$win" in *"Allow tool:"*) ;; *) return 1 ;; esac
+  local header_count
   header_count="$(printf '%s\n' "$win" \
     | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
     | grep -c 'Allow tool:')"
   [ "$header_count" = 1 ] || return 1
-  last_two="$(printf '%s\n' "$win" \
-    | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//' \
-    | awk 'NF' | tail -n 2)"
-  case "$last_two" in
-    $'Approve\nDeny')
-      case "$1" in
-        options) printf '1\tApprove\n2\tDeny\n' ;;
-        *) : ;;
-      esac
+  # Walk the window as an array so the highlight check (below, selected
+  # mode) can look at the ORIGINAL ansi-carrying line for the two rows
+  # options mode already located by their stripped text -- stripping ansi
+  # globally up front, as the old implementation did, throws away exactly
+  # the byte that tells Approve from Deny apart as "currently highlighted".
+  local -a raw clean
+  local i=0 line stripped
+  while IFS= read -r line || [ -n "$line" ]; do
+    raw[i]="$line"
+    stripped="$(printf '%s' "$line" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//')"
+    clean[i]="$stripped"
+    i=$((i + 1))
+  done <<EOF_WIN
+$win
+EOF_WIN
+  local n=$i j
+  local -a idx=()
+  for ((j = 0; j < n; j++)); do
+    [ -n "${clean[j]}" ] && idx+=("$j")
+  done
+  local cnt=${#idx[@]}
+  [ "$cnt" -ge 2 ] || return 1
+  local approve_i="${idx[cnt-2]}" deny_i="${idx[cnt-1]}"
+  [ "${clean[approve_i]}" = Approve ] && [ "${clean[deny_i]}" = Deny ] || return 1
+  case "$mode" in
+    options)
+      printf '1\tApprove\n2\tDeny\n'
       return 0
       ;;
-    *) return 1 ;;
+    selected)
+      # Same highlight signal pass 2 uses (lib/prompt-parse.sh:785,
+      # \x1b[48;2;R;G;Bm, a 24-bit background colour SGR): checked on the
+      # row's RAW (ansi-carrying) text, before the stripping above. Both or
+      # neither highlighted -> empty, same as the hardened parser's own
+      # `invalid = invalid or bool(selected)` rule -- never guess.
+      local approve_hl=0 deny_hl=0
+      printf '%s' "${raw[approve_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && approve_hl=1
+      printf '%s' "${raw[deny_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && deny_hl=1
+      if [ "$approve_hl" = 1 ] && [ "$deny_hl" = 0 ]; then printf '1'; return 0; fi
+      if [ "$deny_hl" = 1 ] && [ "$approve_hl" = 0 ]; then printf '2'; return 0; fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
   esac
+}
+
+# Pane-level wrappers, same shape as prompt_menu_options()/prompt_menu_selected()
+# above -- each reads the window itself so a caller never has to know
+# _menu_window exists. Used by herdr-select.sh's _current_offer and its
+# navigation loop AFTER the hardened parser has already failed, so neither
+# competes with or duplicates it.
+prompt_footer_clipped_options() {        # <pane>
+  _menu_window "$1" | _prompt_footer_clipped_options options
+}
+prompt_footer_clipped_selected() {       # <pane>
+  _menu_window "$1" | _prompt_footer_clipped_options selected
 }

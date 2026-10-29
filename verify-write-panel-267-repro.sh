@@ -382,6 +382,108 @@ v="$(_prompt_footer_clipped_options options < "$SCREEN")"
 [ -z "$v" ] && ok "real footer present -> defers to the hardened parser, never doubles as a second source of truth" \
   || bad "fired even though the real footer was present: [$v]"
 
+
+# ---- end-to-end, through the REAL (now wired) herdr-select.sh: the raw
+# detector tests above prove the function's own shape rules; these prove
+# the wiring in _current_offer (herdr-select.sh:420-454) and the
+# navigation loop's highlight fallback (prompt_footer_clipped_selected,
+# herdr-select.sh:1352-1357/1371-1377) actually resolve a keypress.
+seed_write_menu_footer_clipped() {      # <path> <content> <tool> [highlight=approve|deny]
+  local hl="${4:-deny}" approve_row=" Approve" deny_row="Deny"
+  if [ "$hl" = deny ]; then
+    deny_row="$(printf '\033[48;2;42;47;65m Deny\033[0m')"
+  else
+    approve_row="$(printf '\033[48;2;42;47;65m Approve\033[0m')"
+  fi
+  # SAME shape as seed_write_menu, minus the trailing navigation-hint
+  # line -- the one byte difference this detector exists for.
+  printf 'Allow tool: %s\nPath: %s\nContent: %s\n\n%s\n%s\n' \
+    "$3" "$1" "$2" "$approve_row" "$deny_row" > "$SCREEN"
+  local pid owner run task
+  pid="$(prompt_id "$PANE" 2>/dev/null)"
+  owner="$(task_for_pane "$PANE" 2>/dev/null)"
+  run="$(printf '%s' "$owner" | jq -r '.run_id // empty')"
+  task="$(printf '%s' "$owner" | jq -r '.task_id // empty')"
+  append_event "$run" "$task" input_required \
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$pid" --arg tool "$3" \
+       '{message:$msg, prompt_id:$pid, command:"", tool:$tool}')" >/dev/null 2>&1
+  local call="occcall-clip-$3-$RANDOM"
+  "$occ_py" "$here/lib/prompt-occurrence.py" seen \
+    --db "$(registry_db)" --run "$run" --task "$task" --pane "$PANE" \
+    --birth "$BIRTH" --session "native-sess-1" --call-id "$call" \
+    --tool "$3" --source test --input-json "$(jq -nc --arg p "$1" --arg c "$2" '{path:$p, content:$c}')" >/dev/null
+  "$occ_py" "$here/lib/prompt-occurrence.py" screen \
+    --db "$(registry_db)" --run "$run" --task "$task" --pane "$PANE" \
+    --birth "$BIRTH" --session "native-sess-1" --call-id "$call" \
+    --display pending_parseable --prompt-id "$pid" >/dev/null
+}
+
+printf '\n== footer-clipped end-to-end: generic write panel, Deny (peer authority) ==\n'
+PANE="wB4:p4"; BIRTH="term-gbp-1"
+seed_write_menu_footer_clipped "tmp/out/x.md" "$(printf 'g%.0s' $(seq 1 500))" write deny
+reset_keys
+sel 2 --authority peer; rc=$?
+echo "    rc=$rc keys=$(keys_pressed) stderr: $(cat "$WORK/err.txt" | tail -3)"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" -gt 0 ]; then
+  ok "Deny resolves end-to-end when only the footer is clipped (wiring confirmed)"
+else
+  bad "DENY REFUSED end-to-end: rc=$rc keys=$(keys_pressed)"
+fi
+
+printf '\n== footer-clipped end-to-end: GBP-sized (7098 B) regression, Deny ==\n'
+seed_write_menu_footer_clipped "$gbp_path" "$gbp_content" write deny
+reset_keys
+sel 2 --authority peer; rc=$?
+echo "    rc=$rc keys=$(keys_pressed) stderr: $(cat "$WORK/err.txt" | tail -3)"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" -gt 0 ]; then
+  ok "GBP-sized (7098 B) footer-clipped panel: Deny resolves for the right reason (prompt_footer_clipped_options/_selected)"
+else
+  bad "GBP-sized regression DENY REFUSED: rc=$rc keys=$(keys_pressed)"
+fi
+
+printf '\n== footer-clipped end-to-end: Intel-sized (7706 B) regression, Deny ==\n'
+PANE="wB2:p7"; BIRTH="term-intel-1"
+# run2/task2 already registered by the earlier "Intel repro" section above --
+# re-registering the same run/task id a second time fails (duplicate key).
+seed_write_menu_footer_clipped "$intel_path" "$intel_content" write deny
+reset_keys
+sel 2 --authority peer; rc=$?
+echo "    rc=$rc keys=$(keys_pressed) stderr: $(cat "$WORK/err.txt" | tail -3)"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" -gt 0 ]; then
+  ok "Intel-sized (7706 B) footer-clipped panel: Deny resolves for the right reason"
+else
+  bad "Intel-sized regression DENY REFUSED: rc=$rc keys=$(keys_pressed)"
+fi
+
+printf '\n== footer-clipped end-to-end: ORIGINAL Steering case STILL fails closed post-wiring ==\n'
+echo "    (re-asserted: the unmodified 'Deny-not-pressable repro' test above already ran" \
+     "against the REAL, now-wired _current_offer -- its own PASS re-confirms this; this" \
+     "line exists only to name the requirement explicitly, not to re-run the fixture.)"
+if [ "$fail" = 0 ]; then
+  ok "no fail yet in this run -> the Steering-truncated case above still correctly refused post-wiring"
+else
+  bad "a prior failure means the post-wiring re-confirmation of the Steering case is unverified by this run"
+fi
+
+printf '\n== footer-clipped end-to-end: negative, header-only (nothing to resolve) ==\n'
+PANE="wB4:p4"; BIRTH="term-gbp-1"
+printf 'Allow tool: write\nPath: tmp/out/x.md\n' > "$SCREEN"
+reset_keys
+sel 2 --authority peer; rc=$?
+echo "    rc=$rc keys=$(keys_pressed) stderr: $(cat "$WORK/err.txt" | tail -3)"
+[ "$rc" -ne 0 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "header-only panel (no Approve/Deny at all) -> refuses, never guesses" \
+  || bad "header-only panel did not refuse: rc=$rc keys=$(keys_pressed)"
+
+printf '\n== footer-clipped end-to-end: negative, choice ambiguous (invalid choice requested) ==\n'
+seed_write_menu_footer_clipped "tmp/out/x.md" "$(printf 'g%.0s' $(seq 1 500))" write deny
+reset_keys
+sel 3 --authority peer; rc=$?
+echo "    rc=$rc keys=$(keys_pressed) stderr: $(cat "$WORK/err.txt" | tail -3)"
+[ "$rc" -ne 0 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "requesting an option not on offer (3) -> refuses, never guesses a choice" \
+  || bad "ambiguous/invalid choice was not refused: rc=$rc keys=$(keys_pressed)"
+
 # ---- (b) Deny on the deferred path (no panel of its own) resolves
 # truthfully via the EXISTING authorized/record_authorized primitive,
 # which needs no screen state at all (identity-only: run/task/pane/birth/
