@@ -345,6 +345,67 @@ ack_reconcile condJ "$(printf '%s' "$env2" | jq -c '.task_states')" "$(printf '%
 env3=$(run_reconciliation condJ SessionStart --quiet-if-empty --no-hook-json --defer-ack)
 [ -z "$env3" ] && ok "acked report does not replay" || bad "replayed after ack: $env3"
 
+printf '== pane ALIVE + a quiet _done line -> completed via the CAS-gated path, not left running forever (reconcile.sh:248-307) ==\n'
+WTQ="$(dirname "$HERDR_RUN_STATE_DIR")/wt-quiet-alive"; mkdir -p "$WTQ/.handoffs"
+printf '%s\n' '{"event":"implement:feat/quiet_done","reason":"no-follow-on"}' > "$WTQ/.handoffs/events.jsonl"
+register_task runQ taskQ w condQ cpQ cbQ paneQ birthQ /repo/q "$WTQ" "quiet-alive" || bad "register taskQ failed"
+set_task_state runQ taskQ running || bad "taskQ -> running failed"
+_PANES=$'paneQ\tbirthQ\t'    # pane is LIVE and matches -- nobody closed the tab after the worker finished
+run_reconciliation condQ SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "quiet done-while-alive worker marked completed" "$(read_task runQ taskQ | jq -r .state)" "completed"
+check "completion event cites the live-pane path" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.pane_reason') FROM events WHERE task_id='taskQ' AND type='completion_recorded';")" \
+  "pane_alive_done"
+check "no lost_detected for an alive worker that finished" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskQ' AND type='lost_detected';")" "0"
+
+printf '== race: _done followed by MORE pane output -> stays running until quiet past the done line ==\n'
+WTRACE="$(dirname "$HERDR_RUN_STATE_DIR")/wt-race"; mkdir -p "$WTRACE/.handoffs"
+printf '%s\n' '{"event":"implement:feat/race_done","reason":"no-follow-on"}' '{"event":"implement:feat/race_retry_started"}' \
+  > "$WTRACE/.handoffs/events.jsonl"
+register_task runRace taskRace w condRace cpR cbR paneRace birthRace /repo/race "$WTRACE" "race-alive" || bad "register taskRace failed"
+set_task_state runRace taskRace running || bad "taskRace -> running failed"
+_PANES=$'paneRace\tbirthRace\t'
+run_reconciliation condRace SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "not yet quiet: stays running, not completed" "$(read_task runRace taskRace | jq -r .state)" "running"
+check "not yet quiet: no completion_recorded" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskRace' AND type='completion_recorded';")" "0"
+# The pane goes quiet past the done line (the retry finished writing, nothing
+# more follows it): the very next sweep must now close it.
+printf '%s\n' '{"event":"implement:feat/race_done","reason":"no-follow-on"}' > "$WTRACE/.handoffs/events.jsonl"
+run_reconciliation condRace SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "quiet on a later sweep: now completed" "$(read_task runRace taskRace | jq -r .state)" "completed"
+
+printf '== pane ALIVE + quiet _done but an invalid proof ref -> refused, stays running (item 1 gate on the live-pane path too) ==\n'
+WTBP="$(dirname "$HERDR_RUN_STATE_DIR")/wt-badproof-alive"; mkdir -p "$WTBP/.handoffs"
+printf '%s\n' '{"event":"implement:feat/badproof_done","reason":"shipped","proof":".handoffs/PROOF.md#nope"}' > "$WTBP/.handoffs/events.jsonl"
+register_task runBP taskBP w condBP cpBP cbBP paneBP birthBP /repo/bp "$WTBP" "badproof-alive" || bad "register taskBP failed"
+set_task_state runBP taskBP running || bad "taskBP -> running failed"
+_PANES=$'paneBP\tbirthBP\t'
+run_reconciliation condBP SessionStart --quiet-if-empty --no-hook-json >/dev/null 2>&1
+check "invalid proof on the live-pane path: stays running" "$(read_task runBP taskBP | jq -r .state)" "running"
+check "rejection recorded for the live-pane path" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskBP' AND type='completion_evidence_rejected';")" \
+  "shipped proof missing/invalid or PROOF.md still empty"
+
+printf '== generation mismatch -> set_task_state_if_generation refuses, task stays running (CAS, not a plain write) ==\n'
+WTGEN="$(dirname "$HERDR_RUN_STATE_DIR")/wt-gen-mismatch"; mkdir -p "$WTGEN/.handoffs"
+printf '%s\n' '{"event":"implement:feat/gen_done","reason":"no-follow-on"}' > "$WTGEN/.handoffs/events.jsonl"
+register_task runGen taskGen w condGen cpG2 cbG2 paneGen birthGen /repo/gen "$WTGEN" "gen-mismatch-alive" || bad "register taskGen failed"
+set_task_state runGen taskGen running || bad "taskGen -> running failed"
+_PANES=$'paneGen\tbirthGen\t'
+_CAS_CALLS=""
+set_task_state_if_generation() { _CAS_CALLS="$_CAS_CALLS|$*"; return 1; }   # simulate a lost CAS race
+run_reconciliation condGen SessionStart --quiet-if-empty --no-hook-json >/dev/null
+. "$here/lib/run-registry.sh"   # restore the real CAS implementation immediately after
+check "lost CAS race: stays running, never silently overwritten" "$(read_task runGen taskGen | jq -r .state)" "running"
+printf '%s' "$_CAS_CALLS" | grep -q "runGen taskGen completed running [0-9]" \
+  && ok "reconcile.sh closes the live-pane path THROUGH set_task_state_if_generation, with a numeric generation" \
+  || bad "CAS path not invoked as expected: $_CAS_CALLS"
+check "refusal recorded with a specific why, not silent" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskGen' AND type='completion_evidence_rejected';")" \
+  "state changed before this sweep could close it"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

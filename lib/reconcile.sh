@@ -304,6 +304,63 @@ run_reconciliation() {
             fi
             task_json="$(read_task "$run_id" "$task_id")"
             state=$(printf '%s' "$task_json" | jq -r '.state // empty')
+          else
+            # The pane is still ALIVE here (no pane_gone/pane_recycled verdict
+            # above) -- previously this whole closure path was gated on
+            # `reason` being set, so a worker whose own `_done` line landed
+            # while nobody closed its tab stayed `running` forever. Worktree
+            # evidence is independent of which process currently occupies the
+            # pane slot (the gone-pane branch above already relies on exactly
+            # that), so this reuses its evidence-then-gates check verbatim,
+            # just triggered by a live pane instead of a dead one.
+            local done_ev
+            done_ev="$(_done_event_for_task "$task_json")"
+            if [ -n "$done_ev" ]; then
+              # RACE: a worker that appended `_done` and then kept going
+              # (retry, cleanup, a stray second task) is not actually
+              # finished -- closing on the first `_done` line the moment a
+              # live pane is observed would complete a task still doing live
+              # work. Require the done line be the worktree's own LAST word,
+              # across every scheme in the same append order
+              # _done_event_for_task reads: anything appended after it means
+              # stay running and let a later, quieter sweep try again.
+              local last_ev="" _f _line
+              while IFS= read -r _f; do
+                while IFS= read -r _line || [ -n "$_line" ]; do
+                  [ -n "$_line" ] && last_ev="$_line"
+                done < "$_f"
+              done < <(handoff_event_files "$(printf '%s' "$task_json" | jq -r '.worktree // empty')")
+              if [ -n "$last_ev" ] && printf '%s' "$last_ev" | jq -e --argjson d "$done_ev" '. == $d' >/dev/null 2>&1; then
+                local ev_reason ev_proof ev_why=""
+                ev_reason="$(printf '%s' "$done_ev" | jq -r '.reason // empty')"
+                ev_proof="$(printf '%s' "$done_ev" | jq -r '.proof // empty')"
+                if ! _valid_closure_reason "$ev_reason"; then
+                  ev_why="closure reason missing/invalid: ${ev_reason:-<empty>}"
+                elif [ "$ev_reason" = shipped ] && ! _valid_proof_ref "$ev_proof" "$(printf '%s' "$task_json" | jq -r '.worktree // empty')"; then
+                  ev_why="${_PROOF_REF_WHY:-shipped proof missing/invalid or PROOF.md still empty}"
+                fi
+                # CAS-gated via set_task_state_if_generation, not a plain
+                # set_task_state: this task's state was read for this
+                # sweep's classification above, before the done-line
+                # evidence was even looked at. A concurrent writer (another
+                # conductor's sweep, a human's explicit close) between then
+                # and now must be re-seen, never silently overwritten.
+                if [ -z "$ev_why" ] && set_task_state_if_generation "$run_id" "$task_id" "completed" "$state" "$(task_state_generation "$run_id" "$task_id")"; then
+                  append_event "$run_id" "$task_id" "completion_recorded" \
+                    "$(jq -nc --arg r "pane_alive_done" --arg pane "$pane_id" --argjson ev "$done_ev" \
+                      '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
+                    "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+                  task_json="$(read_task "$run_id" "$task_id")"
+                  state=$(printf '%s' "$task_json" | jq -r '.state // empty')
+                else
+                  [ -n "$ev_why" ] || ev_why="state changed before this sweep could close it"
+                  append_event "$run_id" "$task_id" "completion_evidence_rejected" \
+                    "$(jq -nc --arg r "pane_alive_done" --arg pane "$pane_id" --argjson ev "$done_ev" --arg why "$ev_why" \
+                      '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev, why:$why}')" \
+                    "reject_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+                fi
+              fi
+            fi
           fi
         fi
 
