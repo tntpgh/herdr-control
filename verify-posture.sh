@@ -87,10 +87,10 @@ posture_is_enforced_for omc   && ok "omc (claude-launched) reports posture enfor
 posture_is_enforced_for mytool && bad "unknown agent (literal command) must report NOT enforced" || ok "unknown agent reports posture not enforced"
 
 printf '== omp cross-family model lookup (Ctrl+P swap target) ==\n'
-check "claude opus -> codex deep tier"     "$(omp_cross_family_model claude opus)"   "openai-codex/gpt-5.6-sol high"
+check "claude opus -> codex deep tier"     "$(omp_cross_family_model claude opus)"   "openai-codex/gpt-6-sol high"
 check "claude sonnet -> codex std tier"    "$(omp_cross_family_model claude sonnet)" "openai-codex/gpt-5.5 medium"
 check "claude haiku -> codex fast tier"    "$(omp_cross_family_model claude haiku)"  "openai-codex/gpt-5.4-mini low"
-check "codex deep tier -> claude opus"     "$(omp_cross_family_model codex gpt-5.6-sol)"   "opus high"
+check "codex deep tier -> claude opus"     "$(omp_cross_family_model codex gpt-6-sol)"   "opus high"
 check "codex std tier -> claude sonnet"    "$(omp_cross_family_model codex gpt-5.5)"       "sonnet medium"
 check "codex fast tier -> claude haiku"    "$(omp_cross_family_model codex gpt-5.4-mini)"  "haiku low"
 
@@ -127,14 +127,14 @@ printf '== 2026-08-08 bug: a spec with NO ":effort" must OMIT the flag, never pa
 # (invalid_enum_value), silently, with no crash and no obvious signal. Same
 # hazard now applies to omp's --thinking, guarded the same way.
 check "codex with no effort in the spec omits --thinking entirely" \
-  "$(cli_for_agent codex gpt-5.6-sol)" \
-  "omp --model openai-codex/gpt-5.6-sol --models openai-codex/gpt-5.6-sol,opus --approval-mode write"
+  "$(cli_for_agent codex gpt-6-sol)" \
+  "omp --model openai-codex/gpt-6-sol --models openai-codex/gpt-6-sol,opus --approval-mode write"
 check "omp with no effort in the spec omits --thinking entirely" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet)" \
   "omp --model sonnet --approval-mode write"
 check "codex with an effort still works (no regression)" \
-  "$(cli_for_agent codex gpt-5.6-sol:high)" \
-  "omp --model openai-codex/gpt-5.6-sol --thinking high --models openai-codex/gpt-5.6-sol,opus --approval-mode write"
+  "$(cli_for_agent codex gpt-6-sol:high)" \
+  "omp --model openai-codex/gpt-6-sol --thinking high --models openai-codex/gpt-6-sol,opus --approval-mode write"
 if cli_for_agent definitely-not-an-agent x >/dev/null 2>&1; then
   bad "unknown agent should exit 1"
 else
