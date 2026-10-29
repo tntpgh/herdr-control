@@ -1396,8 +1396,8 @@ def publisher_tick_cases(base: Path) -> None:
     root.mkdir(); J.mkdir()
     lease_db = str(base / "lease.db")
     lc = ol.connect(lease_db); ol.migrate(lc)
-    ol.register_owner(lc, KB, "tntpgh/knowledge-base", now=_t.time())
-    ol.register_owner(lc, "conductor", "tntpgh/thurber-os", now=_t.time())
+    ol.register_owner(lc, KB, "tntpgh/knowledge-base", max_open=10, now=_t.time())  # headroom: 6 rids dispatched across this fixture (DEFAULT_MAX_OPEN=5 would QueueFull)
+    ol.register_owner(lc, "conductor", "tntpgh/thurber-os", max_open=10, now=_t.time())  # headroom: owner_lease.OPEN includes blocked/delivering, never released here (no on_reply/resolve in the RA path) -- 6 RA attempts across this fixture would hit DEFAULT_MAX_OPEN=5
     typed = base / "typed.log"
     fake = base / "fake-deliver.sh"
     fake.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$1" "$2" >> {typed}\n')
@@ -1487,8 +1487,8 @@ def publisher_tick_cases(base: Path) -> None:
             pass
         real_prepare = ra.GatedNotice.prepare
 
-        def crash_after_prepare(self, rid, text):
-            r = real_prepare(self, rid, text)
+        def crash_after_prepare(self, rid, text, **kw):
+            r = real_prepare(self, rid, text, **kw)
             if rid != "r_tick4":
                 return r
             raise Crash()  # killed after begin_notice, before the notifying CAS
@@ -1503,6 +1503,29 @@ def publisher_tick_cases(base: Path) -> None:
         case("CRASH after begin_notice, before CAS: row staged, gate delivering, next tick held duplicate, never typed",
              out["r_tick4"] == "held:not_dispatched:owner_lease_duplicate:delivering" and av.state("r_tick4")[0] == "staged"
              and gate.record(xid(t4))[2] == "delivering" and len(typed.read_text().splitlines()) == 1)
+        # SPEED (tmp/in/BRIEF.md #3): two requests BOTH ready to notify in the
+        # SAME tick must still produce exactly one herdr-deliver.sh call --
+        # the other stays admitted/staged and is delivered on the very next
+        # tick, never starved, never double-sent. r_tick and r_tick4 (above)
+        # both stay perpetually staged, permanently duplicate-blocked/
+        # duplicate-delivering in the gate -- proves neither stuck row ever
+        # eats the one slot (admit() refuses both before the budget check).
+        assert d.dispatch(KB, "r_budget_a", b"REQ budget a\n", ["result.md"]) == "dispatched"
+        assert d.dispatch(KB, "r_budget_b", b"REQ budget b\n", ["result.md"]) == "dispatched"
+        (root / "r_budget_a" / "result.md").write_text("ACK budget a")
+        (root / "r_budget_b" / "result.md").write_text("ACK budget b")
+        pub.result_availability_tick(); pub.result_availability_tick()
+        case("BUDGET: both requests reach staged before the shared tick",
+             av.state("r_budget_a")[0] == "staged" and av.state("r_budget_b")[0] == "staged")
+        before_lines = len(typed.read_text().splitlines()) if typed.exists() else 0
+        out = pub.result_availability_tick()
+        case("BUDGET: one tick with two ready rows notifies exactly ONE (lowest rid first), exactly one new typed line",
+             out["r_budget_a"] == "notified" and out["r_budget_b"] == "held:not_dispatched:rate_limited_one_notice_per_tick"
+             and len(typed.read_text().splitlines()) == before_lines + 1 and av.state("r_budget_b")[0] == "staged")
+        out2 = pub.result_availability_tick()
+        case("BUDGET: the deferred row is notified on the very next tick, nothing lost",
+             out2["r_budget_b"] == "notified" and len(typed.read_text().splitlines()) == before_lines + 2)
+
         gate.close()
         av.close()
     finally:
