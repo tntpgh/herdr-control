@@ -417,6 +417,45 @@ fi
 # if a prompt somehow flipped shape between them (it can't in practice —
 # one agent, one prompt style — but "somehow" is exactly what re-checking
 # from scratch each time protects against).
+# herdr-control security review REVIEW-PARSER-a1f9feb.md (REJECT, HIGH):
+# prompt_footer_clipped_options/_selected cannot tell a genuine omp menu
+# row from attacker-controlled Content that merely reads "Approve"/"Deny"
+# -- they now REQUIRE the occurrence's own recorded Content, verified
+# independent of the screen (the same #277 complete-payload source a human
+# reviewer already reads via prompt-occurrence.py proposal --show), before
+# trusting anything found in the window. Resolved ONCE per invocation, not
+# once per navigation keypress (the lookup is a Python subprocess) --
+# every one of the four call sites below shares this single cached result.
+_FC_TRUSTED_RESOLVED=0
+_FC_TRUSTED_OK=0
+_FC_TRUSTED_CONTENT=""
+_footer_clipped_trusted_content() {
+  [ "$_FC_TRUSTED_RESOLVED" = 1 ] && return 0
+  _FC_TRUSTED_RESOLVED=1
+  [ -f "$here/lib/prompt-occurrence.py" ] || return 0
+  local t_json t_run t_task t_worktree t_birth t_occ_py t_payload t_prompt_id
+  t_json="$(task_for_pane "$pane" 2>/dev/null)"
+  t_run="$(printf '%s' "$t_json" | jq -r '.run_id // empty' 2>/dev/null)"
+  t_task="$(printf '%s' "$t_json" | jq -r '.task_id // empty' 2>/dev/null)"
+  t_worktree="$(printf '%s' "$t_json" | jq -r '.worktree // empty' 2>/dev/null)"
+  t_birth="$(printf '%s' "$t_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
+  [ -n "$t_run" ] && [ -n "$t_task" ] && [ -n "$t_worktree" ] || return 0
+  t_prompt_id="$(prompt_id "$pane" 2>/dev/null)"
+  [ -n "$t_prompt_id" ] || return 0
+  t_occ_py="$(_registry_python 2>/dev/null)" || return 0
+  # No --tool: proposal_check already requires the occurrence's OWN
+  # registered tool to be write/edit (PROPOSAL_TOOLS) -- this is exactly
+  # "whatever write/edit content is pending for this pane," not a guess at
+  # which tool is on screen, which is the ambiguity this detector exists
+  # to resolve in the first place.
+  t_payload="$("$t_occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
+    --run "$t_run" --task "$t_task" --pane "$pane" --birth "$t_birth" \
+    --prompt-id "$t_prompt_id" --worktree "$t_worktree" 2>/dev/null)"
+  [ "$(printf '%s' "$t_payload" | jq -r '.ok == true' 2>/dev/null)" = true ] || return 0
+  _FC_TRUSTED_OK=1
+  _FC_TRUSTED_CONTENT="$(printf '%s' "$t_payload" | jq -r '.body // empty' 2>/dev/null)"
+}
+
 _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
   local opts key
   # MENU FIRST. omp paints a queued-message list ("1. Conductor: ...") under
@@ -443,8 +482,11 @@ _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
   # above to have already failed, and refuses outright (same as this
   # function falling through today) whenever Approve/Deny themselves are
   # ALSO clipped -- the original Steering-truncated incident shape stays
-  # fail-closed, unchanged by this addition.
-  opts=$(prompt_footer_clipped_options "$pane")
+  # fail-closed, unchanged by this addition. REVIEW-PARSER-a1f9feb: also
+  # requires the occurrence's own verified Content before trusting anything
+  # it finds -- see _footer_clipped_trusted_content above.
+  _footer_clipped_trusted_content
+  opts=$(prompt_footer_clipped_options "$pane" "$_FC_TRUSTED_OK" "$_FC_TRUSTED_CONTENT")
   if [ -n "$opts" ]; then
     printf 'menu\t%s' "$opts"
     return
@@ -1262,7 +1304,7 @@ _reopen_blocked_period() {
 _require_unchanged_after_close() {
   local menu_selected
   menu_selected="$(prompt_menu_selected "$pane")"
-  [ -n "$menu_selected" ] || menu_selected="$(prompt_footer_clipped_selected "$pane")"
+  [ -n "$menu_selected" ] || { _footer_clipped_trusted_content; menu_selected="$(prompt_footer_clipped_selected "$pane" "$_FC_TRUSTED_OK" "$_FC_TRUSTED_CONTENT")"; }
   _require_current_authority && require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
     { [ "$mechanism" = numbered ] ||
       { [ "$mechanism" = keyhint ] && [ "$(prompt_keyhint_action_key "$pane" "$choice" 2>/dev/null)" = "$action_key" ]; } ||
@@ -1353,7 +1395,7 @@ else
   # presses — generous for any real menu, finite so a pathological/wrapping
   # menu can't spin forever.
   cur=$(prompt_menu_selected "$pane")
-  [ -n "$cur" ] || cur=$(prompt_footer_clipped_selected "$pane")
+  [ -n "$cur" ] || { _footer_clipped_trusted_content; cur=$(prompt_footer_clipped_selected "$pane" "$_FC_TRUSTED_OK" "$_FC_TRUSTED_CONTENT"); }
   [ -n "$cur" ] || {
     echo "herdr-select: cannot tell which option is currently highlighted in $pane — refusing to navigate blind." >&2
     exit 6
@@ -1373,7 +1415,7 @@ else
     }
     sleep 0.1
     cur=$(prompt_menu_selected "$pane")
-    [ -n "$cur" ] || cur=$(prompt_footer_clipped_selected "$pane")
+    [ -n "$cur" ] || { _footer_clipped_trusted_content; cur=$(prompt_footer_clipped_selected "$pane" "$_FC_TRUSTED_OK" "$_FC_TRUSTED_CONTENT"); }
     [ -n "$cur" ] || {
       echo "herdr-select: the prompt in $pane vanished or its highlight became unreadable mid-navigation — aborting." >&2
       exit 6
