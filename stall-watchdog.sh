@@ -64,6 +64,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib/run-registry.sh"
 . "$here/lib/pane-guard.sh"
 . "$here/lib/alert-gate.sh"       # alert_claim — the escalation post-dedupe
+. "$here/lib/escalation.sh"       # feat/no-progress-model-escalation R2:
+                                   # same resident watchdog feeds the
+                                   # stronger-model detector every real
+                                   # cycle — no second daemon.
 
 SW_SEND="${HERDR_STALL_WATCHDOG_SEND:-$here/send-to-agent.sh}"
 SW_NOTIFY="${HERDR_STALL_WATCHDOG_NOTIFY:-$here/slack-bridge/herdr-notify.sh}"
@@ -232,6 +236,41 @@ _sw_escalate() {                        # task_id run_id signal label pane condu
        '{signal:$s, reason:$r, notify_exit:$rc}')" >/dev/null 2>&1 || true
 }
 
+# _sw_escalation_tick <run_id> <task_id> <signal> <fingerprint> <detail> —
+# feed one real watchdog cycle into lib/escalation.sh's detector. Called
+# unconditionally from cmd_wake's first sighting of EVERY candidate hub.py
+# hands it (hub dispatches a wake every tick the task is still an
+# unresolved candidate — see hub.py's _stall_watchdog_tick — so a task that
+# stays stalled produces one tick per real cycle here, not a synthetic
+# poll). `commit_sha` is the task worktree's actual HEAD; `artifact_fp` is
+# a digest of hub's own progress fingerprint for this signal (already
+# computed upstream, reused rather than re-derived); `tool_fail_sig` is set
+# only for a `denied` signal (BRIEF #1's "repeated identical tool-failure
+# signature"); `conductor_prompt` is the one signal that means "waiting on
+# the conductor/human", so it alone sets waiting_on_human (BRIEF #1: that
+# is explicitly NOT a loop). Never lets a detector failure break the real
+# stall-wake path below it.
+_sw_escalation_tick() {
+  [ "${HERDR_ESCALATION_ENABLED:-1}" = 1 ] || return 0
+  local run_id="$1" task_id="$2" signal="$3" fingerprint="$4" detail="$5"
+  local task_json worktree commit_sha="" artifact_fp tool_fail_sig="" waiting_on_human=0
+  task_json="$(read_task "$run_id" "$task_id" 2>/dev/null)" || return 0
+  worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty' 2>/dev/null)"
+  [ -n "$worktree" ] && [ -d "$worktree/.git" ] && commit_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null)"
+  artifact_fp="$(_sw_digest "$fingerprint")"
+  [ "$signal" = denied ] && tool_fail_sig="$(_sw_digest "$detail")"
+  [ "$signal" = conductor_prompt ] && waiting_on_human=1
+  no_progress_tick "$run_id" "$task_id" "$commit_sha" "$artifact_fp" "$tool_fail_sig" "$waiting_on_human" >/dev/null 2>&1 || return 0
+  local verdict loop reason evidence
+  verdict="$(no_progress_detect "$run_id" "$task_id" 2>/dev/null)" || return 0
+  loop="$(printf '%s' "$verdict" | jq -r '.loop' 2>/dev/null)"
+  [ "$loop" = true ] || return 0
+  reason="$(printf '%s' "$verdict" | jq -r '.reason' 2>/dev/null)"
+  evidence="$(printf '%s' "$verdict" | jq -c '{cycles:.cycles, window:.window}' 2>/dev/null)"
+  esc_escalate "$run_id" "$task_id" "${HERDR_ESCALATION_AGENT:-claude}" "$reason" "${evidence:-{\}}" \
+    "${HERDR_ESCALATION_DRY_RUN:-0}" "$here/.handoffs/escalations" >/dev/null 2>&1
+}
+
 cmd_wake() {
   local task_id="${1:?usage: stall-watchdog.sh wake <task_id> <signal> <fingerprint> <detail> [artifact]}"
   local signal="${2:?signal required}"
@@ -252,6 +291,11 @@ cmd_wake() {
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
   [ -n "$label" ] || label="$task_id"
 
+  # feat/no-progress-model-escalation R2: every real cycle hub hands this
+  # task to us, regardless of whether the stall-WAKE itself is deduped
+  # below — the escalation window needs one tick per cycle, not one per
+  # distinct fingerprint.
+  _sw_escalation_tick "$run_id" "$task_id" "$signal" "$fingerprint" "$detail"
   local digest key payload
   digest="$(_sw_digest "$fingerprint")"
   key="stall_${task_id}_${signal}_${digest}"

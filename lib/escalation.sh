@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # lib/escalation.sh — "this worker is looping, hand it to a stronger model."
 #
-# BRIEF (feat/no-progress-model-escalation): 2-3 genuine no-progress loops
-# hand off to the next tier on a fixed, reviewed ladder — same pane/worktree,
-# same manifest, same approval mode — without ever clearing a recorded tool
-# denial or pending approval, with an audit event per escalation and a cap
-# of one escalation per tier per task.
+# BRIEF + BRIEF-R2 (feat/no-progress-model-escalation): 2-3 genuine
+# no-progress loops hand off to the next tier on a fixed, reviewed ladder —
+# same pane/worktree, same manifest, same approval mode — without ever
+# clearing a recorded tool denial or pending approval, with an audit event
+# per escalation and a cap of one escalation per tier per task. R2: the
+# hook is REAL (quiesce the old pane, verify it stopped, spawn the
+# successor through spawn-task.sh, all idempotent/bounded-retry), not an
+# optional external command left unset.
 #
 # Reuses, does not reinvent:
 #   - lib/run-registry.sh's events table + claim_once for detection evidence,
@@ -14,9 +17,14 @@
 #   - lib/agent-profiles.sh's model_for_agent for tier -> model name, so the
 #     tier vocabulary (fast/standard/deep) stays the ONE definition
 #     spawn-task.sh's job-class table already uses, not a second one.
+#   - lib/pane-guard.sh's pane_is_agent for the real "is the old writer
+#     still alive" check, and spawn-task.sh itself (not a reimplementation)
+#     to actually create the successor in the SAME worktree/branch.
 #   - config.sh's HERDR_ESCALATION_LADDER / HERDR_NO_PROGRESS_CYCLES /
-#     HERDR_ESCALATION_HANDOFF_CMD for the reviewed, fixed-in-config ladder
-#     and the pluggable "actually stop/start the pane" action.
+#     HERDR_ESCALATION_HOOK_RETRIES for the reviewed, fixed-in-config ladder
+#     and the bound on the real hook's retry loop.
+#   - stall-watchdog.sh IS the resident watchdog this wires into (see its
+#     `_sw_escalation_tick`) — no second daemon.
 #
 # ---- evidence model ----------------------------------------------------------
 # One `no_progress_tick` event per watchdog cycle (cmd_tick in
@@ -42,6 +50,7 @@ set -uo pipefail
 _esc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_esc_dir/run-registry.sh"
 . "$_esc_dir/agent-profiles.sh"
+. "$_esc_dir/pane-guard.sh"
 
 # ---- ladder ------------------------------------------------------------------
 
@@ -141,8 +150,9 @@ no_progress_detect() {
 
 # esc_already_escalated <run_id> <task_id> <tier> -> 0 if this task already
 # has a model_escalated event landing on that tier (the "one escalation per
-# tier per task" cap, read-side; esc_escalate's claim_once below is the
-# atomic enforcement — this is the cheap pre-check callers can use too).
+# tier per task" cap, read-side; the claim_once at the bottom of esc_escalate
+# is the atomic enforcement — this is the cheap pre-check that also lets a
+# dry run or a detect-only caller ask "would this be a no-op" for free).
 esc_already_escalated() {
   local run_id="$1" task_id="$2" tier="$3" n
   registry_init || return 1
@@ -157,7 +167,11 @@ esc_already_escalated() {
 # must never touch these; this is what BRIEF #3's "recorded denials persist
 # and are re-checked" means in practice — nothing here deletes or supersedes
 # the row, so the count a caller saw before an escalation is exactly the
-# count it sees after.
+# count it sees after. R2's own proof goes further — see
+# verify-no-progress-escalation.sh's denial case, which re-runs the real
+# `conductor_reserved_reason`/`classify_command` classifier against the
+# denied command AFTER the handoff and asserts it is STILL refused, not
+# just that this count held steady.
 esc_open_denials() {
   local run_id="$1" task_id="$2"
   registry_init || return 1
@@ -200,50 +214,224 @@ esc_context_packet() {
   printf '%s\n' "$out"
 }
 
+# ---- the real quiesce-before-spawn hook -------------------------------------
+# Three injection points, same shape as stall-watchdog.sh's own SW_SEND/
+# SW_NOTIFY: a real default wired to the real binary, overridable by a test
+# or an operator. Each is invoked via `bash "$VAR" args` so the override
+# need not be executable, matching the house precedent.
+#   HERDR_ESC_PANE_ALIVE_CMD <pane_id>          -> exit 0 if an agent is
+#                                                   still running there
+#   HERDR_ESC_PANE_CLOSE_CMD <pane_id>           -> ask herdr to close it
+#   HERDR_ESC_SPAWN_CMD <repo> <branch> <job> <agent>
+#                                                 -> spawn the successor
+#                                                   (prints nothing load-
+#                                                   bearing; esc_escalate
+#                                                   looks the new task up
+#                                                   in the registry by
+#                                                   label afterward)
+
+_esc_pane_alive() {
+  local pane="$1"
+  if [ -n "${HERDR_ESC_PANE_ALIVE_CMD:-}" ]; then
+    bash "$HERDR_ESC_PANE_ALIVE_CMD" "$pane"
+    return $?
+  fi
+  pane_is_agent "$pane"
+}
+
+_esc_pane_close() {
+  local pane="$1"
+  if [ -n "${HERDR_ESC_PANE_CLOSE_CMD:-}" ]; then
+    bash "$HERDR_ESC_PANE_CLOSE_CMD" "$pane"
+    return $?
+  fi
+  herdr pane close "$pane" >/dev/null 2>&1
+}
+
+_esc_spawn_successor() {                # repo branch job agent
+  if [ -n "${HERDR_ESC_SPAWN_CMD:-}" ]; then
+    bash "$HERDR_ESC_SPAWN_CMD" "$@"
+    return $?
+  fi
+  bash "$_esc_dir/../spawn-task.sh" --no-focus "$@" >/dev/null 2>&1
+}
+
+# _esc_quiesce_old_writer <run_id> <task_id> -> 0 once the task's own pane
+# is confirmed NOT running an agent (BRIEF-R2 #2: "it stops, and you verify
+# it stopped"). A pane already dead (no pane_id recorded, or pane_is_agent
+# already false) is a no-op success — this is what makes a retried call
+# idempotent: it never re-closes an already-closed pane, it only verifies.
+_esc_quiesce_old_writer() {
+  local run_id="$1" task_id="$2" task_json pane bound i
+  task_json="$(read_task "$run_id" "$task_id")"
+  pane="$(printf '%s' "$task_json" | jq -r '.pane_id // empty' 2>/dev/null)"
+  [ -n "$pane" ] || return 0
+  _esc_pane_alive "$pane" || return 0
+  _esc_pane_close "$pane"
+  bound="${HERDR_ESCALATION_QUIESCE_POLLS:-5}"
+  for ((i = 0; i < bound; i++)); do
+    _esc_pane_alive "$pane" || {
+      append_event "$run_id" "$task_id" writer_quiesced \
+        "$(jq -nc --arg p "$pane" '{pane:$p}')" >/dev/null 2>&1
+      return 0
+    }
+  done
+  printf 'escalation: %s pane %s still alive after close + %s checks\n' "$task_id" "$pane" "$bound" >&2
+  return 1
+}
+
+# esc_tier_job <tier> -> the job-class esc_tier_model already uses for it,
+# and also the label prefix spawn-task.sh will register the successor
+# under (spawn-task.sh: label="${job}:${branch}") — reusing that existing
+# field is what lets the next function look a successor up idempotently
+# without a second table.
+esc_tier_job() {
+  case "$1" in
+    fast)     printf 'explore\n' ;;
+    standard) printf 'implement\n' ;;
+    deep)     printf 'plan\n' ;;
+    *)        return 1 ;;
+  esac
+}
+
+# _esc_find_successor <branch> <to_tier> -> task_id of a non-terminal task
+# already registered on this exact branch at this tier's label, or empty.
+# This is the idempotency check BRIEF-R2 #3 asks for ("a re-run doesn't
+# double-spawn"): a prior attempt that spawned the successor but was
+# interrupted (hub's 25s subprocess timeout, a crash) before emitting
+# model_escalated leaves exactly this row behind, and the retry finds it
+# instead of spawning a second one.
+_esc_find_successor() {
+  local branch="$1" to_tier="$2" job label
+  job="$(esc_tier_job "$to_tier")" || return 1
+  label="${job}:${branch}"
+  _sql "SELECT task_id FROM tasks WHERE branch=$(_sq "$branch") AND label=$(_sq "$label")
+    AND state NOT IN ('completed','failed','cancelled','lost','gone')
+    ORDER BY rowid DESC LIMIT 1;" 2>/dev/null
+}
+
+# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> -> prints the
+# successor's task_id on success. Idempotent: checks _esc_find_successor
+# BEFORE calling the spawn command, and again after (spawn-task.sh itself
+# reuses an existing worktree/branch rather than erroring — see its own
+# "worktree: create or reuse" section — so a retried spawn call is safe
+# even if the first one actually landed but this process never saw it).
+_esc_spawn_next_tier() {
+  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" task_json repo branch job existing
+  task_json="$(read_task "$run_id" "$task_id")"
+  repo="$(printf '%s' "$task_json" | jq -r '.repo // empty' 2>/dev/null)"
+  branch="$(printf '%s' "$task_json" | jq -r '.branch // empty' 2>/dev/null)"
+  [ -n "$repo" ] && [ -n "$branch" ] || { printf 'escalation: %s has no repo/branch recorded — cannot spawn a successor\n' "$task_id" >&2; return 1; }
+  job="$(esc_tier_job "$to_tier")" || return 1
+
+  existing="$(_esc_find_successor "$branch" "$to_tier")"
+  if [ -n "$existing" ]; then
+    printf '%s\n' "$existing"
+    return 0
+  fi
+
+  _esc_spawn_successor "$repo" "$branch" "$job" "$agent" || return 1
+
+  existing="$(_esc_find_successor "$branch" "$to_tier")"
+  [ -n "$existing" ] || { printf 'escalation: spawn command exited 0 but no successor task is registered for %s/%s\n' "$branch" "$to_tier" >&2; return 1; }
+  printf '%s\n' "$existing"
+}
+
 # esc_escalate <run_id> <task_id> <agent> <reason> <evidence_json> \
-#   <dry_run 0|1> <context_dir> -> escalates to the next ladder tier, or
-# returns 1 (no event written) when the task is already at the ceiling or
-# already escalated for that tier (BRIEF #4's cap, enforced atomically via
-# claim_once so a concurrent/duplicate tick cannot double-escalate — this is
-# also BRIEF #5's "idempotent re-tick"). On success prints the
-# model_escalated payload as JSON.
+#   <dry_run 0|1> <context_dir> -> escalates to the next ladder tier.
 #
-# BRIEF #2's "no duplicate writer: old stops before new starts" is the
-# HERDR_ESCALATION_HANDOFF_CMD contract: it is invoked exactly once, after
-# the audit event lands, and it alone is responsible for stopping the prior
-# session before starting the replacement — this module only guarantees it
-# is called at most once per tier and never when dry_run is set.
+# Ordering (BRIEF-R2 #2/#3): quiesce-and-verify the old pane, THEN spawn the
+# successor (idempotently), and ONLY on real success does the audit event
+# (`model_escalated`) get written and the tier's claim_once get consumed —
+# a failed attempt leaves no trace that would stop a later retry, and the
+# whole quiesce+spawn step is retried up to HERDR_ESCALATION_HOOK_RETRIES
+# times within this call before giving up for this tick (the next tick's
+# own call retries again, picking up via the idempotent checks above —
+# this is also how a hub subprocess timeout mid-hook is survived: nothing
+# committed, nothing lost, next cycle just tries again).
+#
+# "No duplicate writer" is enforced by construction, not by a separate
+# mutex: _esc_spawn_next_tier is never reached until
+# _esc_quiesce_old_writer has POLLED and CONFIRMED the old pane is no
+# longer running an agent, so there is no window in this call where both
+# the old and new writer pane are alive. A concurrent SECOND call for the
+# same task cannot happen in practice — the resident stall watchdog itself
+# dedupes its own wake-per-fingerprint before ever reaching the tick hook
+# (stall-watchdog.sh's own claim_once on signal+fingerprint) — so no
+# additional cross-process lock is added for a race that does not occur
+# in the one real caller (ladder rule: justify complexity against a
+# concrete failure mode, not a speculative one).
+#
+# dry_run NEVER quiesces, spawns, claims the tier, or writes
+# `model_escalated` (BRIEF-R2 #4: "must not mutate the live ladder or
+# consume tiers") — it writes a separate `model_escalation_dry_run` event
+# carrying what WOULD happen, and nothing esc_already_escalated/claim_once
+# look at, so an arbitrary number of dry runs never blocks the real thing.
 esc_escalate() {
   local run_id="$1" task_id="$2" agent="$3" reason="$4" evidence="$5" \
         dry_run="${6:-0}" context_dir="${7:-.}"
   registry_init || return 1
-  local from_tier to_tier from_model to_model claim_key packet
+  local from_tier to_tier
   from_tier="$(esc_current_tier "$run_id" "$task_id")"
   to_tier="$(esc_next_tier "$from_tier")" || { printf 'escalation: %s is already at the ladder ceiling\n' "$task_id" >&2; return 1; }
-  claim_key="escalate_${task_id}_${to_tier}"
-  claim_once "$claim_key" "$run_id" "$task_id" model_escalation_claim \
-    "$(jq -nc --arg f "$from_tier" --arg t "$to_tier" '{from_tier:$f, to_tier:$t}')" \
-    || { printf 'escalation: %s already escalated to %s (cap: one per tier)\n' "$task_id" "$to_tier" >&2; return 1; }
+  esc_already_escalated "$run_id" "$task_id" "$to_tier" && { printf 'escalation: %s already escalated to %s (cap: one per tier)\n' "$task_id" "$to_tier" >&2; return 1; }
 
+  printf '%s' "${evidence:-{\}}" | jq -e . >/dev/null 2>&1 || evidence='{}'
+  local from_model to_model
   from_model="$(esc_tier_model "$agent" "$from_tier")" || from_model=""
   to_model="$(esc_tier_model "$agent" "$to_tier")" || to_model=""
   mkdir -p "$context_dir" 2>/dev/null || true
+  local packet
   packet="$(esc_context_packet "$run_id" "$task_id" "$from_tier" "$to_tier" "$reason" \
     "$context_dir/escalation-${task_id}-${to_tier}.md")"
 
-  printf '%s' "${evidence:-{\}}" | jq -e . >/dev/null 2>&1 || evidence='{}'
+  if [ "$dry_run" = 1 ]; then
+    local dry_payload
+    dry_payload="$(jq -nc --arg from_tier "$from_tier" --arg to_tier "$to_tier" \
+      --arg from_model "$from_model" --arg to_model "$to_model" \
+      --arg reason "$reason" --arg packet "$packet" --argjson evidence "$evidence" \
+      '{from_tier:$from_tier, to_tier:$to_tier, from_model:$from_model, to_model:$to_model,
+        reason:$reason, evidence:$evidence, context_packet:$packet}')"
+    append_event "$run_id" "$task_id" model_escalation_dry_run "$dry_payload" >/dev/null 2>&1
+    printf '%s\n' "$dry_payload"
+    return 0
+  fi
+
+  local bound attempt successor_task=""
+  bound="${HERDR_ESCALATION_HOOK_RETRIES:-3}"
+  for ((attempt = 1; attempt <= bound; attempt++)); do
+    if _esc_quiesce_old_writer "$run_id" "$task_id"; then
+      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$agent" "$to_tier")" && [ -n "$successor_task" ] && break
+    fi
+    successor_task=""
+  done
+
+  if [ -z "$successor_task" ]; then
+    append_event "$run_id" "$task_id" model_escalation_hook_failed \
+      "$(jq -nc --arg t "$to_tier" --argjson attempts "$bound" '{to_tier:$t, attempts:$attempts}')" >/dev/null 2>&1
+    printf 'escalation: hook failed for %s -> %s after %s attempt(s)\n' "$task_id" "$to_tier" "$bound" >&2
+    return 1
+  fi
+
+  # The commit point: claimed ONLY after a verified quiesce + a confirmed
+  # successor. A second successful caller (race, or a retried tick after
+  # this one's event already landed) finds the claim taken and does
+  # nothing further — the successor it would have "spawned" already exists
+  # per _esc_find_successor, so there is no double-spawn either way.
+  claim_once "escalate_${task_id}_${to_tier}" "$run_id" "$task_id" model_escalation_claim \
+    "$(jq -nc --arg f "$from_tier" --arg t "$to_tier" '{from_tier:$f, to_tier:$t}')" || {
+    printf '%s\n' "$(jq -nc --arg t "$to_tier" --arg s "$successor_task" '{to_tier:$t, successor_task_id:$s, already_claimed:true}')"
+    return 0
+  }
+
   local payload
   payload="$(jq -nc --arg from_tier "$from_tier" --arg to_tier "$to_tier" \
     --arg from_model "$from_model" --arg to_model "$to_model" \
-    --arg reason "$reason" --arg packet "$packet" \
-    --argjson evidence "$evidence" --argjson dry_run "$([ "$dry_run" = 1 ] && echo true || echo false)" \
+    --arg reason "$reason" --arg packet "$packet" --arg successor "$successor_task" \
+    --argjson evidence "$evidence" \
     '{from_tier:$from_tier, to_tier:$to_tier, from_model:$from_model, to_model:$to_model,
-      reason:$reason, evidence:$evidence, context_packet:$packet, dry_run:$dry_run}')"
+      reason:$reason, evidence:$evidence, context_packet:$packet, successor_task_id:$successor,
+      dry_run:false}')"
   append_event "$run_id" "$task_id" model_escalated "$payload" || return 1
-
-  if [ "$dry_run" != 1 ] && [ -n "${HERDR_ESCALATION_HANDOFF_CMD:-}" ]; then
-    bash "$HERDR_ESCALATION_HANDOFF_CMD" "$run_id" "$task_id" "$from_tier" "$to_tier" "$to_model" "$packet" \
-      || printf 'escalation: handoff command failed for %s (audit event already recorded)\n' "$task_id" >&2
-  fi
   printf '%s\n' "$payload"
 }

@@ -22,9 +22,9 @@
 #     Prints the current no_progress_detect verdict without recording a new
 #     tick or escalating. For inspection / tests.
 #
-# --dry-run (or HERDR_ESCALATION_DRY_RUN=1) still writes the audit event and
-# context packet, but never calls HERDR_ESCALATION_HANDOFF_CMD — the actual
-# stop-old/start-new pane action stays off.
+# --dry-run (or HERDR_ESCALATION_DRY_RUN=1) records the audit event and
+# context packet but never quiesces the old pane or spawns a successor —
+# no tier is consumed, so the real escalation can still happen later.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/config.sh"

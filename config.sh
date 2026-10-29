@@ -116,18 +116,33 @@ HERDR_OMP_LAUNCHER_SHA256="11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403
 # stall-watchdog cycle) with identical evidence required before a loop
 # counts as "no progress" and may trigger an escalation. 2-3 per BRIEF.
 : "${HERDR_NO_PROGRESS_CYCLES:=3}"
-# 1 = record the escalation decision and context packet but never invoke
-# HERDR_ESCALATION_HANDOFF_CMD (no pane stop/start). --dry-run on the CLI
-# overrides this per call in either direction.
+# 1 = record the escalation decision and context packet but never actually
+# quiesce the old pane or spawn a successor. --dry-run on the CLI overrides
+# this per call in either direction. A dry run never claims a tier.
 : "${HERDR_ESCALATION_DRY_RUN:=0}"
-# Command invoked to perform the actual handoff: stop the old session,
-# start the new one at the escalated model, same worktree/manifest/approval
-# mode. Receives: <run_id> <task_id> <from_tier> <to_tier> <to_model>
-# <context_packet_path>. Empty (the default) means escalation is
-# audit-only — the registry event and context packet are the deliverable,
-# and whatever drives real pane handoff (spawn-task.sh respawn, a
-# conductor) is wired in later by setting this.
-: "${HERDR_ESCALATION_HANDOFF_CMD:=}"
+# Claude/omp/codex/omc family the successor is spawned under — the
+# registry does not track which family a task's own pane is running, so
+# this is the one place that choice is made for an automated escalation.
+: "${HERDR_ESCALATION_AGENT:=claude}"
+# How many times esc_escalate retries its quiesce+spawn hook in one call
+# before giving up for this tick (the NEXT tick's call retries again from
+# scratch — nothing is committed on failure, so this bound only limits how
+# long one watchdog cycle spends retrying, not how many cycles may retry).
+: "${HERDR_ESCALATION_HOOK_RETRIES:=3}"
+# How many times esc_escalate polls pane_is_agent after asking herdr to
+# close the old pane before concluding the close did not take and failing
+# this attempt.
+: "${HERDR_ESCALATION_QUIESCE_POLLS:=5}"
+# Test/operator overrides for the three real actions the hook performs —
+# empty (the default) means the real `herdr pane`/spawn-task.sh commands.
+# See lib/escalation.sh's header for the exact contract of each.
+: "${HERDR_ESC_PANE_ALIVE_CMD:=}"
+: "${HERDR_ESC_PANE_CLOSE_CMD:=}"
+: "${HERDR_ESC_SPAWN_CMD:=}"
+# 1 = stall-watchdog.sh's cmd_wake feeds every wake into the escalation
+# detector (lib/escalation.sh). 0 = detection-only code stays loaded but
+# inert — set when rolling this out gradually.
+: "${HERDR_ESCALATION_ENABLED:=1}"
 
 # ---- shared state (smart-name.sh ownership/debounce, attention.sh stalls) ---
 # Where the tools remember what they've done. Removable at any time; the tools
