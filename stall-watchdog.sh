@@ -244,23 +244,38 @@ _sw_escalate() {                        # task_id run_id signal label pane condu
 # stays stalled produces one tick per real cycle here, not a synthetic
 # poll). `commit_sha` is the task worktree's actual HEAD; `artifact_fp` is
 # a digest of hub's own progress fingerprint for this signal (already
-# computed upstream, reused rather than re-derived); `tool_fail_sig` is set
-# only for a `denied` signal (BRIEF #1's "repeated identical tool-failure
-# signature"); `conductor_prompt` is the one signal that means "waiting on
-# the conductor/human", so it alone sets waiting_on_human (BRIEF #1: that
-# is explicitly NOT a loop). Never lets a detector failure break the real
-# stall-wake path below it.
+# computed upstream, reused rather than re-derived).
+#
+# R3 (root audit of 7bb9fba): a `denied` signal is a tool/approval-policy
+# denial, not a tool EXECUTION failure — it is fed as `denial_sig`, kept
+# OUT of `tool_fail_sig`, so a repeated denial can never by itself drive a
+# loop verdict (escalating on a denial alone would look like routing
+# around it with a stronger model; lib/escalation.sh's
+# esc_carry_forward_denials is the explicit "stays held" path instead).
+# `tool_fail_sig` is reserved for a genuine repeated tool EXECUTION
+# failure signature, which this resident wiring does not currently have a
+# source for (no stall-watchdog signal reports one) — left empty here on
+# purpose rather than fed from signal=denied.
+#
+# waiting_on_human is set here for the one signal stall-watchdog itself
+# names for it (`conductor_prompt`); no_progress_tick ALSO ORs in
+# esc_task_awaiting_human's registry-grounded check unconditionally, so a
+# task blocked on an `input_required` prompt is excluded regardless of
+# which signal happened to trigger this particular wake (R3: the
+# conductor_prompt-only exclusion alone was too narrow).
+#
+# Never lets a detector failure break the real stall-wake path below it.
 _sw_escalation_tick() {
   [ "${HERDR_ESCALATION_ENABLED:-1}" = 1 ] || return 0
   local run_id="$1" task_id="$2" signal="$3" fingerprint="$4" detail="$5"
-  local task_json worktree commit_sha="" artifact_fp tool_fail_sig="" waiting_on_human=0
+  local task_json worktree commit_sha="" artifact_fp tool_fail_sig="" denial_sig="" waiting_on_human=0
   task_json="$(read_task "$run_id" "$task_id" 2>/dev/null)" || return 0
   worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty' 2>/dev/null)"
   [ -n "$worktree" ] && [ -d "$worktree/.git" ] && commit_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null)"
   artifact_fp="$(_sw_digest "$fingerprint")"
-  [ "$signal" = denied ] && tool_fail_sig="$(_sw_digest "$detail")"
+  [ "$signal" = denied ] && denial_sig="$(_sw_digest "$detail")"
   [ "$signal" = conductor_prompt ] && waiting_on_human=1
-  no_progress_tick "$run_id" "$task_id" "$commit_sha" "$artifact_fp" "$tool_fail_sig" "$waiting_on_human" >/dev/null 2>&1 || return 0
+  no_progress_tick "$run_id" "$task_id" "$commit_sha" "$artifact_fp" "$tool_fail_sig" "$waiting_on_human" "$denial_sig" >/dev/null 2>&1 || return 0
   local verdict loop reason evidence
   verdict="$(no_progress_detect "$run_id" "$task_id" 2>/dev/null)" || return 0
   loop="$(printf '%s' "$verdict" | jq -r '.loop' 2>/dev/null)"
