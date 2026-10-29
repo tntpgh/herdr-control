@@ -24,15 +24,26 @@ repo=$(cd "$repo" && pwd -P)
 # workspace yet; `workspace create` returns w1 with auto root tab tRoot — and a
 # second spawn racing us has already added its own tab (tRace) whose agent has
 # not reported yet.
+# Same ancestry-resolving fixture verify-spawn-scope.sh uses (TRIAGE-23 #6-7,
+# spawn-task.sh 001ab43/6cfed25): "pCaller" is the test's OWN identity pane,
+# separate from "pOld" (the fixture's finished-worker pane under test); only
+# "pCaller"'s process-info answers with a real pid/agent name, so ancestry
+# resolves to it specifically, never to pOld.
 cat > "$work/herdr" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$work/herdr.log"
 case "\$1 \$2" in
   "pane list")
     if [ "\${EXISTING:-0}" = 1 ]; then
-      printf '{"result":{"panes":[{"pane_id":"pOld","tab_id":"tOld","workspace_id":"w1","cwd":"$repo"}]}}\n'
+      printf '{"result":{"panes":[{"pane_id":"pOld","tab_id":"tOld","workspace_id":"w1","cwd":"$repo"},{"pane_id":"\${HERDR_FG_PANE:-}","terminal_id":"\${HERDR_FG_BIRTH:-birth}"}]}}\n'
     else
-      printf '{"result":{"panes":[]}}\n'
+      printf '{"result":{"panes":[{"pane_id":"\${HERDR_FG_PANE:-}","terminal_id":"\${HERDR_FG_BIRTH:-birth}"}]}}\n'
+    fi ;;
+  "pane process-info")
+    if [ "\$4" = "\${HERDR_FG_PANE:-}" ] && [ -n "\${HERDR_FG_PID:-}" ]; then
+      printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp"}]}}}\n' "\$HERDR_FG_PID"
+    else
+      printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
     fi ;;
   "tab list")
     if [ "\${EXISTING:-0}" = 1 ]; then
@@ -49,8 +60,9 @@ chmod +x "$work/herdr"
 
 spawn() {  # <EXISTING> <branch>
   : > "$work/herdr.log"
-  env EXISTING="$1" HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt-$2" \
+  env -u HERDR_PANE_ID -u HERDR_PANE_BIRTH EXISTING="$1" HERDR_EXTRA_PATH="$work" PATH="$work:$PATH" HERDR_WT_DIR="$work/wt-$2" \
     HERDR_RUN_STATE_DIR="$work/state-$2" \
+    HERDR_FG_PANE="pCaller" HERDR_FG_BIRTH="pCallerBirth" HERDR_FG_PID=$$ \
     bash "$here/spawn-task.sh" "$repo" "$2" quick /bin/true >/dev/null 2>&1
 }
 
