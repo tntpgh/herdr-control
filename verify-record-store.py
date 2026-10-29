@@ -118,6 +118,36 @@ with tempfile.TemporaryDirectory() as td:
         check("expiry refused on an answered form", e.state, "answered")
     check("the answer is still the answer", json.loads(p.read_text())["status"], "answered")
 
+    print("== a withdrawal may claim either an OPEN or an EXPIRED record ==")
+    # herdr-action.sh's _ha_retire_form withdraws a pending request whose task
+    # already ended. Before this, it only ever passed require_status="open"
+    # (the default), so a form that had already expired — a real, common case
+    # once formserve's own timeout fires before the terminal-task tick runs —
+    # could never be withdrawn: NotClaimable("expired", ...) every time, and
+    # the form stayed listed on the hub forever. require_status now takes a
+    # collection of acceptable source statuses, not just one.
+    p = new_form(d, "exp3")
+    claim_and_update(p, lambda r: {**r, "status": "expired"})
+    try:
+        claim_and_update(p, lambda r: {**r, "status": "withdrawn"}, require_status="open")
+        check("withdrawing an expired form with require_status='open' alone",
+              "accepted", "NotClaimable")
+    except NotClaimable as e:
+        check("withdrawing an expired form with require_status='open' alone", e.state, "expired")
+    check("still expired, not withdrawn", json.loads(p.read_text())["status"], "expired")
+    claim_and_update(p, lambda r: {**r, "status": "withdrawn"}, require_status=("open", "expired"))
+    check("withdrawing with require_status=('open','expired') succeeds",
+          json.loads(p.read_text())["status"], "withdrawn")
+
+    p = new_form(d, "exp4")
+    claim_and_update(p, lambda r: {**r, "status": "answered", "answers": {"pick": "merge"},
+                                   "answered_via": "port"})
+    try:
+        claim_and_update(p, lambda r: {**r, "status": "withdrawn"}, require_status=("open", "expired"))
+        check("an answered form is still never withdrawable", "accepted", "NotClaimable")
+    except NotClaimable as e:
+        check("an answered form is still never withdrawable", e.state, "answered")
+
     print("== a killed writer never leaves a half-written decision ==")
     p = new_form(d, "crash")
     before = p.read_text()

@@ -2311,5 +2311,55 @@ class FormServerIdentity(unittest.TestCase):
         self.assertEqual(out["k1"], {"status": "open", "url": "http://127.0.0.1:8737"})
 
 
+class WithdrawnFormsHidden(unittest.TestCase):
+    """A withdrawn form is resolved and unanswerable -- herdr-action.sh's
+    _ha_retire_form already recorded why, in withdrawn_reason/withdrawn_from.
+    Before this fix every non-open status, including withdrawn, fell into
+    "history" and stayed there indefinitely (the 30-row cap meant a burst of
+    withdrawals could even crowd out real answered/declined history)."""
+
+    def _form(self, forms_dir, *, form_id, status, hub_servable=False):
+        row = {"id": form_id, "title": "t", "url": "http://127.0.0.1:9", "port": 9,
+               "pid": 999999, "status": status, "token": "tok",
+               "form_path": str(forms_dir / f"{form_id}.srcform"),
+               "created_at": 0, "expires_at": None}
+        if status == "withdrawn":
+            row.update(withdrawn_reason="task ended before a decision",
+                       withdrawn_from="open", withdrawn_at=0)
+        (forms_dir / f"{form_id}.json").write_text(json.dumps(row))
+        if hub_servable:
+            (forms_dir / f"{form_id}.html").write_text("<html><body>x</body></html>")
+        return row
+
+    def _run(self, forms_dir):
+        orig = hub.FORMS_DIR
+        hub.FORMS_DIR = forms_dir
+        try:
+            return hub.forms_data()
+        finally:
+            hub.FORMS_DIR = orig
+
+    def test_withdrawn_form_excluded_from_open_and_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261030T000000-1", status="withdrawn")
+            self._form(forms_dir, form_id="20261030T000001-2", status="answered")
+            data = self._run(forms_dir)
+        ids = {f["id"] for f in data["open"] + data["history"]}
+        self.assertNotIn("20261030T000000-1", ids,
+                          "a withdrawn form must not appear in open or history")
+        self.assertIn("20261030T000001-2", ids, "an answered form still appears in history")
+
+    def test_withdrawn_form_does_not_inflate_open_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261030T000002-3", status="open", hub_servable=True)
+            self._form(forms_dir, form_id="20261030T000003-4", status="withdrawn")
+            data = self._run(forms_dir)
+        self.assertEqual(data["open_count"], 1)
+        self.assertEqual({f["id"] for f in data["open"]}, {"20261030T000002-3"})
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

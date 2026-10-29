@@ -1264,6 +1264,13 @@ def forms_data() -> dict:
                 f = json.loads(p.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
+            if f.get("status") == "withdrawn":
+                # A withdrawn form is resolved and unanswerable (herdr-action.sh
+                # already recorded why in withdrawn_reason/withdrawn_from);
+                # nobody can act on it, so it is dropped entirely — not moved
+                # from "open" into "history", excluded from both, so it does
+                # not stay listed forever either way.
+                continue
             # formserve lifts the title out of the form's <h1> and strips tags but
             # not entities, so a title with "&" arrives as "&amp;" and _esc() then
             # double-escapes it into a visible "&amp;". Decode once, here, so every

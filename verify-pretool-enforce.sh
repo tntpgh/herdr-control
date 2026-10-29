@@ -489,6 +489,25 @@ bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
 wdo() { q "SELECT json_extract(payload,'\$.form_outcome') FROM events WHERE type='action_withdrawn' AND json_extract(payload,'\$.request_id')='$1';"; }
 [ "$(wdo "${wd[0]}")" = withdrawn ] && [ "$(wdo "${wd[1]}")" = kept:answered:approve ] \
   && ok "the event records the form outcome, including an approve that arrived too late" || not_ok "form_outcome: '$(wdo "${wd[0]}")' '$(wdo "${wd[1]}")'"
+# wd4: formserve's own timeout fires and expires the form BEFORE the task
+# ends -- expired is not a terminal form state by itself (still unanswered,
+# docs/design/pretool-approval.md), but once the task also ends there is
+# nothing left to answer it, and it must not stay stuck listed forever.
+wd4="$(bashc "chmod -R u+rw tmp/wd4" | field request_id)"
+q "UPDATE action_requests SET route='human', verdict='reserved' WHERE request_id='$wd4';"
+bash "$here/herdr-action.sh" tick
+w4="$(wrec "$wd4")"
+[ "$(jq -r .status "$w4")" = open ] && ok "setup: wd4 form open" || not_ok "setup: wd4 form $(jq -c . "$w4")"
+jq -c '.status="expired"' "$w4" > "$w4.t" && mv "$w4.t" "$w4"
+q "UPDATE action_requests SET task_id='taskw' WHERE request_id='$wd4';"
+bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
+[ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$wd4';")" = withdrawn/system ] \
+  && ok "terminal task + an already-EXPIRED form: request still withdrawn (not stuck as kept:expired)" \
+  || not_ok "wd4: $(q "SELECT status, authority FROM action_requests WHERE request_id='$wd4';")"
+[ "$(jq -r .status "$w4")" = withdrawn ] \
+  && ok "an expired form record can also be withdrawn (the hub drops it too)" || not_ok "wd4 form: $(jq -c . "$w4")"
+[ "$(wdo "$wd4")" = withdrawn ] && ok "wd4's withdrawal event records outcome=withdrawn, not kept:expired" \
+  || not_ok "wd4 outcome: $(wdo "$wd4")"
 q "UPDATE action_requests SET status='declined' WHERE request_id='${wd[2]}';"
 
 printf '== the omp hook: enforcing only for approval=hook rows ==\n'
