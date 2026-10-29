@@ -1347,8 +1347,30 @@ def result_availability_tick() -> dict | None:
 
     notice = ra.GatedNotice(gate, RESULT_AVAILABILITY_CONDUCTOR, bound, type_notice)
 
+    # SPEED (tmp/in/BRIEF.md #3): herdr-deliver.sh's own subprocess carries a
+    # 120s timeout, and avail.tick() below walks every staged row in ONE
+    # call -- unbudgeted, a tick that found two rows ready at once would
+    # call notify() (type_notice) twice in sequence, up to 240s inside a
+    # single 15s-cadence tick. may_begin caps the irreversible queued->
+    # delivering transition (GatedNotice.prepare's begin_notice) to ONCE per
+    # tick -- not the cheaper, idempotent admit() before it, so a row that is
+    # ALREADY permanently duplicate-blocked (admit() refuses before may_begin
+    # is ever consulted) can never starve a legitimate row of the one slot.
+    # A budget-refused row stays admitted/queued, never 'blocked', and is
+    # retried -- still notify-eligible -- on the next tick.
+    budget = {"left": 1}
+
+    def may_begin():
+        if budget["left"] <= 0:
+            return False
+        budget["left"] -= 1
+        return True
+
+    def prepare_budgeted(rid, text):
+        return notice.prepare(rid, text, may_begin=may_begin)
+
     try:
-        return avail.tick(bound, notice.notify, prepare=notice.prepare)
+        return avail.tick(bound, notice.notify, prepare=prepare_budgeted)
     finally:
         avail.close()
 
