@@ -96,18 +96,68 @@ _esc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # esc_ladder -> the configured tiers, one per line, in escalation order.
 esc_ladder() { printf '%s\n' ${HERDR_ESCALATION_LADDER:-fast standard deep frontier}; }
 
+# esc_spawn_job <run_id> <task_id> -> the job-class embedded in this
+# task's own label (spawn-task.sh: label="${job}:${branch}"), or empty
+# (nonzero exit) if this task has no such label (e.g. a raw-command spawn
+# with no job-class at all).
+esc_spawn_job() {
+  local run_id="$1" task_id="$2" label
+  registry_init || return 1
+  label="$(_sql "SELECT label FROM tasks WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id");" 2>/dev/null)"
+  [ -n "$label" ] && [ "${label#*:}" != "$label" ] || return 1
+  printf '%s\n' "${label%%:*}"
+}
+
+# esc_job_tier <job-class> -> the ladder tier that job-class's recorded
+# MODEL belongs to, using the exact same synonym groups
+# lib/agent-profiles.sh's model_for_agent case statement uses for
+# fast/standard/deep (explore|quick|mechanical / implement|debug|code|docs
+# / plan|architect|design) — deliberately NOT a call to model_for_agent
+# itself, because every agent branch there ends in a catch-all default
+# (`claude:*) sonnet`, `codex:*) $HERDR_CODEX_STD`, ...) that would
+# silently fold an UNRECOGNIZED job-class into "standard"'s model and
+# look like a false match. `review` and `deep-review` are deliberately
+# left unmapped too (they run at a different effort/model than any ladder
+# tier's own exact model) — R4 review: "fail closed if unknown", never
+# guess the weakest tier for a job this ladder doesn't recognize.
+esc_job_tier() {
+  case "$1" in
+    explore|quick|mechanical)   printf 'fast\n' ;;
+    implement|debug|code|docs)  printf 'standard\n' ;;
+    plan|architect|design)      printf 'deep\n' ;;
+    *)                          return 1 ;;
+  esac
+}
+
+# esc_starting_tier <run_id> <task_id> -> the tier this task actually
+# started on, derived from its own spawn record (esc_spawn_job + the
+# model_for_agent groupings esc_job_tier mirrors) — never assumed to be
+# the ladder's weakest tier. Fails (empty, nonzero) when the job-class is
+# missing or unrecognized, so a caller that can't verify where a task
+# started refuses to escalate rather than guessing fast (R4 review D: a
+# worker already on sonnet must never be treated as starting on haiku and
+# "escalated" sideways to the sonnet it is already running).
+esc_starting_tier() {
+  local run_id="$1" task_id="$2" job
+  job="$(esc_spawn_job "$run_id" "$task_id")" || return 1
+  esc_job_tier "$job"
+}
+
 # esc_current_tier <run_id> <task_id> -> the tier this task is on now: the
-# to_tier of its most recent model_escalated event, or the ladder's own
-# first (weakest) tier if it has never escalated.
+# to_tier of its most recent model_escalated event, or — for a task that
+# has never escalated — its ACTUAL starting tier via esc_starting_tier
+# (never the ladder's first word as a blind assumption). Fails (empty,
+# nonzero) when neither is available, so the caller fails closed instead
+# of escalating from an unverifiable position.
 esc_current_tier() {
   local run_id="$1" task_id="$2" payload tier
   payload="$(task_last_event_payload "$run_id" "$task_id" model_escalated)"
   tier="$(printf '%s' "$payload" | jq -r '.to_tier // empty' 2>/dev/null)"
   if [ -n "$tier" ]; then
     printf '%s\n' "$tier"
-  else
-    esc_ladder | head -n1
+    return 0
   fi
+  esc_starting_tier "$run_id" "$task_id"
 }
 
 # esc_next_tier <current_tier> -> the next word after it on the ladder, or
@@ -337,37 +387,94 @@ esc_context_packet() {
   printf '%s\n' "$out"
 }
 
-# ---- serialization lock (R3 #1) ---------------------------------------------
-# A RELEASABLE SQLite lease, acquired BEFORE the first escalation side
-# effect (quiesce) and held for the whole quiesce+spawn attempt — distinct
-# from claim_once's PERMANENT one-shot commit at the end. A failed attempt
-# releases it so the next call (another watchdog cycle) can retry; a
-# process that dies mid-hold leaves a stale row that self-expires after
-# HERDR_ESCALATION_LOCK_STALE_S so the task is never permanently stuck.
+# ---- serialization lock (R3 #1, R4 residual (a)) ----------------------------
+# A RELEASABLE, FENCED, RENEWABLE SQLite lease — acquired BEFORE the first
+# escalation side effect (quiesce) and held for the whole quiesce+spawn
+# attempt — distinct from claim_once's PERMANENT one-shot commit at the
+# end. Every acquire gets a strictly monotonic `fence` (global MAX+1,
+# never reused even across releases/expiries); a background renewer
+# (`_esc_start_lock_renewer`) refreshes `renewed_at` every
+# HERDR_ESCALATION_LOCK_STALE_S/3 seconds for the WHOLE duration of the
+# attempt, including while a single external call (close/spawn) is still
+# blocked — R4 review: "the 300s lock can expire while the hook is still
+# running... that must NOT let a second writer in." A plain TTL with no
+# renewal would let a slow-but-alive holder's lock expire and be stolen
+# mid-attempt; this one only ever goes stale if the holder's renewer
+# itself stops (crash, or the holder already finished). If the renewer
+# ever finds its OWN fence is no longer the live claimed row (stolen —
+# only possible if renewal genuinely lapsed past the TTL), it writes a
+# lost-marker and stops; `_esc_lock_still_held` is checked before EACH
+# subsequent side effect (quiesce, spawn) so a holder that did lose the
+# race aborts before doing anything further, rather than racing a thief.
 # Same `BEGIN IMMEDIATE; ...; COMMIT; SELECT changes();` idiom
 # lib/run-registry.sh's own set_task_state uses for compare-and-swap.
 _esc_lock_schema() {
   _sql "CREATE TABLE IF NOT EXISTS escalation_locks (
-    task_id TEXT NOT NULL, to_tier TEXT NOT NULL, state TEXT NOT NULL,
-    holder TEXT NOT NULL DEFAULT '', locked_at TEXT NOT NULL,
-    PRIMARY KEY (task_id, to_tier));" >/dev/null 2>&1
+    fence INTEGER NOT NULL, task_id TEXT NOT NULL, to_tier TEXT NOT NULL, state TEXT NOT NULL,
+    holder TEXT NOT NULL DEFAULT '', locked_at TEXT NOT NULL, renewed_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, to_tier, fence));" >/dev/null 2>&1
 }
-_esc_acquire_lock() {                   # task_id to_tier -> 0 if acquired
-  local task_id="$1" to_tier="$2" stale="${HERDR_ESCALATION_LOCK_STALE_S:-300}" holder changed
+_esc_acquire_lock() {                   # task_id to_tier -> prints fence, rc 0 if WE acquired it
+  local task_id="$1" to_tier="$2" stale="${HERDR_ESCALATION_LOCK_STALE_S:-300}" holder now out fence got_holder
   registry_init || return 1
   _esc_lock_schema
-  holder="$$_$(_now_iso)"
-  changed="$(_sql "BEGIN IMMEDIATE;
-    DELETE FROM escalation_locks WHERE task_id=$(_sq "$task_id") AND to_tier=$(_sq "$to_tier")
-      AND state='claimed' AND (strftime('%s','now') - strftime('%s',locked_at)) > $stale;
-    INSERT OR IGNORE INTO escalation_locks (task_id, to_tier, state, holder, locked_at)
-      VALUES ($(_sq "$task_id"), $(_sq "$to_tier"), 'claimed', $(_sq "$holder"), $(_sq "$(_now_iso)"));
+  holder="$$_$(_now_iso)_$RANDOM"
+  now="$(_now_iso)"
+  out="$(_sql "BEGIN IMMEDIATE;
+    UPDATE escalation_locks SET state='expired'
+      WHERE task_id=$(_sq "$task_id") AND to_tier=$(_sq "$to_tier") AND state='claimed'
+        AND (strftime('%s','now') - strftime('%s',renewed_at)) > $stale;
+    INSERT INTO escalation_locks (fence, task_id, to_tier, state, holder, locked_at, renewed_at)
+      SELECT COALESCE((SELECT MAX(fence) FROM escalation_locks),0)+1,
+        $(_sq "$task_id"), $(_sq "$to_tier"), 'claimed', $(_sq "$holder"), $(_sq "$now"), $(_sq "$now")
+      WHERE NOT EXISTS (SELECT 1 FROM escalation_locks
+        WHERE task_id=$(_sq "$task_id") AND to_tier=$(_sq "$to_tier") AND state='claimed');
     COMMIT;
-    SELECT changes();" 2>/dev/null)"
-  [ "$changed" = "1" ]
+    SELECT fence, holder FROM escalation_locks
+      WHERE task_id=$(_sq "$task_id") AND to_tier=$(_sq "$to_tier") AND state='claimed'
+      ORDER BY fence DESC LIMIT 1;" 2>/dev/null)"
+  fence="$(printf '%s' "$out" | cut -d'|' -f1)"
+  got_holder="$(printf '%s' "$out" | cut -d'|' -f2)"
+  [ -n "$fence" ] && [ "$got_holder" = "$holder" ] || return 1
+  printf '%s\n' "$fence"
 }
-_esc_release_lock() {                   # task_id to_tier
-  _sql "DELETE FROM escalation_locks WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2");" >/dev/null 2>&1
+_esc_renew_lock() {                     # task_id to_tier fence -> 0 if still the live claimed row
+  local changed
+  changed="$(_sql "UPDATE escalation_locks SET renewed_at=$(_sq "$(_now_iso)")
+    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2") AND fence=$3 AND state='claimed';
+    SELECT changes();" 2>/dev/null)"
+  [ "${changed:-0}" = 1 ]
+}
+_esc_release_lock() {                   # task_id to_tier fence
+  _sql "UPDATE escalation_locks SET state='released'
+    WHERE task_id=$(_sq "$1") AND to_tier=$(_sq "$2") AND fence=$3 AND state='claimed';" >/dev/null 2>&1
+}
+_esc_lock_lost_marker() {               # task_id to_tier fence -> marker path
+  printf '%s/escalation-lock-lost-%s-%s-%s' "${TMPDIR:-/tmp}" "$1" "$2" "$3"
+}
+# _esc_start_lock_renewer <task_id> <to_tier> <fence> -> prints the
+# renewer's pid. Runs as a background subshell (inherits the already-
+# sourced functions) for the lifetime of one escalation attempt; must be
+# paired with `_esc_stop_lock_renewer`.
+_esc_start_lock_renewer() {
+  local task_id="$1" to_tier="$2" fence="$3" stale interval marker
+  stale="${HERDR_ESCALATION_LOCK_STALE_S:-300}"
+  interval=$((stale / 3)); [ "$interval" -ge 1 ] || interval=1
+  marker="$(_esc_lock_lost_marker "$task_id" "$to_tier" "$fence")"
+  rm -f "$marker"
+  ( while sleep "$interval"; do
+      _esc_renew_lock "$task_id" "$to_tier" "$fence" >/dev/null 2>&1 || { : > "$marker"; exit 0; }
+    done ) >/dev/null 2>&1 </dev/null &
+  printf '%s\n' "$!"
+}
+_esc_stop_lock_renewer() {              # renewer_pid
+  [ -n "${1:-}" ] || return 0
+  kill "$1" >/dev/null 2>&1
+  wait "$1" 2>/dev/null
+  return 0
+}
+_esc_lock_still_held() {                # task_id to_tier fence -> 0 unless known lost
+  [ ! -f "$(_esc_lock_lost_marker "$1" "$2" "$3")" ]
 }
 
 # ---- the real quiesce-before-spawn hook -------------------------------------
@@ -482,26 +589,51 @@ _esc_quiesce_old_writer() {
   return 1
 }
 
-# _esc_find_successor <branch> <to_tier> -> task_id of a non-terminal task
-# already registered on this exact branch at this tier's label, or empty.
-# Used ONLY for the first-ever discovery of a successor — see
-# _esc_spawn_next_tier's pinned-first check for every later lookup (R3 #2:
-# "not a branch+label lookup ... alone").
+# _esc_spawn_request <run_id> <task_id> <to_tier> -> prints
+# "request_id\trequested_at", and records an `escalation_spawn_requested`
+# event carrying both, BEFORE the successor is ever spawned. R4 residual
+# (b): first-successor discovery correlates against `requested_at`
+# instead of trusting a bare branch+label match — a PRE-EXISTING task
+# that already happens to sit on this exact branch+label (a decoy, or a
+# leftover from an unrelated earlier run) necessarily has an older
+# created_at and is never adopted as if we had spawned it.
+_esc_spawn_request() {
+  local run_id="$1" task_id="$2" to_tier="$3" request_id at
+  request_id="esc_req_$$_$(_now_iso)_$RANDOM"
+  at="$(_now_iso)"
+  append_event "$run_id" "$task_id" escalation_spawn_requested \
+    "$(jq -nc --arg r "$request_id" --arg t "$to_tier" --arg at "$at" \
+        '{request_id:$r, to_tier:$t, requested_at:$at}')" >/dev/null 2>&1
+  printf '%s\t%s\n' "$request_id" "$at"
+}
+
+# _esc_find_successor <branch> <to_tier> [not_before] -> task_id of a
+# non-terminal task already registered on this exact branch at this
+# tier's label, or empty. `not_before` (an ISO timestamp from
+# `_esc_spawn_request`), when given, excludes any candidate whose
+# created_at predates it — see R4 residual (b) above. Used ONLY for the
+# first-ever discovery of a successor — see _esc_spawn_next_tier's
+# pinned-first check for every later lookup (R3 #2: "not a branch+label
+# lookup ... alone").
 _esc_find_successor() {
-  local branch="$1" to_tier="$2" job label
+  local branch="$1" to_tier="$2" not_before="${3:-}" job label extra
   job="$(esc_tier_job "$to_tier")" || return 1
   label="${job}:${branch}"
+  extra=""
+  [ -n "$not_before" ] && extra="AND created_at >= $(_sq "$not_before")"
   _sql "SELECT task_id FROM tasks WHERE branch=$(_sq "$branch") AND label=$(_sq "$label")
-    AND state NOT IN ('completed','failed','cancelled','lost','gone')
+    AND state NOT IN ('completed','failed','cancelled','lost','gone') $extra
     ORDER BY rowid DESC LIMIT 1;" 2>/dev/null
 }
 
-# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> -> prints the
-# successor's task_id on success, having PINNED it (old+new task_id,
-# old+new pane_id/pane_birth) in a `writer_successor_pinned` event the
-# first time it is identified. Every call after that resolves through the
-# pin, not a fresh branch+label guess — satisfies R3 #2's "pin the old and
-# new task and session incarnation".
+# _esc_spawn_next_tier <run_id> <task_id> <agent> <to_tier> <not_before> ->
+# prints the successor's task_id on success, having PINNED it (old+new
+# task_id, old+new pane_id/pane_birth) in a `writer_successor_pinned`
+# event the first time it is identified. Every call after that resolves
+# through the pin, not a fresh branch+label guess — satisfies R3 #2's
+# "pin the old and new task and session incarnation". `not_before` (from
+# this attempt's `_esc_spawn_request`) is passed through to the
+# first-discovery `_esc_find_successor` call only — R4 residual (b).
 #
 # _esc_task_json <task_id> -> that task's registry row as JSON, resolving
 # its run_id first (task_id alone is globally unique — same pattern
@@ -517,7 +649,7 @@ _esc_task_json() {
 }
 
 _esc_spawn_next_tier() {
-  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" \
+  local run_id="$1" task_id="$2" agent="$3" to_tier="$4" not_before="$5" \
         task_json repo branch job existing old_pane old_pane_birth \
         pinned pinned_tier pinned_task succ_json succ_pane succ_birth
   task_json="$(read_task "$run_id" "$task_id")"
@@ -540,10 +672,10 @@ _esc_spawn_next_tier() {
     # fall through and re-derive rather than silently fabricating one.
   fi
 
-  existing="$(_esc_find_successor "$branch" "$to_tier")"
+  existing="$(_esc_find_successor "$branch" "$to_tier" "$not_before")"
   if [ -z "$existing" ]; then
     _esc_spawn_successor "$repo" "$branch" "$job" "$agent" || return 1
-    existing="$(_esc_find_successor "$branch" "$to_tier")"
+    existing="$(_esc_find_successor "$branch" "$to_tier" "$not_before")"
     [ -n "$existing" ] || { printf 'escalation: spawn command exited 0 but no successor task is registered for %s/%s\n' "$branch" "$to_tier" >&2; return 1; }
   fi
 
@@ -561,9 +693,13 @@ _esc_spawn_next_tier() {
 # esc_escalate <run_id> <task_id> <agent> <reason> <evidence_json> \
 #   <dry_run 0|1> <context_dir> -> escalates to the next ladder tier.
 #
-# Order of operations (R3 #1): acquire the releasable lock FIRST — before
-# the context packet, before quiesce, before anything that touches a live
-# pane or spawns a process. A concurrent second attempt for the same
+# Order of operations (R3 #1): acquire the releasable lock before QUIESCE
+# — the first action that touches a live pane or spawns a process. (The
+# context packet write just above that, and the from_tier/to_tier/model
+# resolution before it, are local reads/a file write, not a live side
+# effect on the task's pane or process, so the lock does not need to cover
+# them — an earlier version of this comment overstated that ordering.) A
+# concurrent second attempt for the same
 # (task_id, to_tier) finds the lock held and returns immediately with NO
 # side effect of its own (see verify case K: a nested attempt fired from
 # inside the fake spawn hook, mid-flight of the first attempt, is refused
@@ -585,7 +721,10 @@ esc_escalate() {
         dry_run="${6:-0}" context_dir="${7:-.}"
   registry_init || return 1
   local from_tier to_tier to_agent
-  from_tier="$(esc_current_tier "$run_id" "$task_id")"
+  from_tier="$(esc_current_tier "$run_id" "$task_id")" || {
+    printf 'escalation: %s has no verifiable starting tier (missing or unrecognized job-class in its spawn record) — refusing to escalate rather than guessing\n' "$task_id" >&2
+    return 1
+  }
   to_tier="$(esc_next_tier "$from_tier")" || { printf 'escalation: %s is already at the ladder ceiling\n' "$task_id" >&2; return 1; }
   esc_already_escalated "$run_id" "$task_id" "$to_tier" && { printf 'escalation: %s already escalated to %s (cap: one per tier)\n' "$task_id" "$to_tier" >&2; return 1; }
 
@@ -611,22 +750,39 @@ esc_escalate() {
     return 0
   fi
 
-  _esc_acquire_lock "$task_id" "$to_tier" || {
+  local fence
+  fence="$(_esc_acquire_lock "$task_id" "$to_tier")" || {
     printf 'escalation: %s/%s is locked by a concurrent attempt\n' "$task_id" "$to_tier" >&2
     return 1
   }
+  local renewer_pid
+  renewer_pid="$(_esc_start_lock_renewer "$task_id" "$to_tier" "$fence")"
+
+  local req_line request_id requested_at
+  req_line="$(_esc_spawn_request "$run_id" "$task_id" "$to_tier")"
+  request_id="${req_line%%	*}"
+  requested_at="${req_line#*	}"
 
   local bound attempt successor_task=""
   bound="${HERDR_ESCALATION_HOOK_RETRIES:-3}"
   for ((attempt = 1; attempt <= bound; attempt++)); do
+    _esc_lock_still_held "$task_id" "$to_tier" "$fence" || {
+      printf 'escalation: %s/%s lock (fence %s) was lost mid-attempt (renewal lapsed past the TTL) — aborting before any further side effect, task preserved\n' "$task_id" "$to_tier" "$fence" >&2
+      break
+    }
     if _esc_quiesce_old_writer "$run_id" "$task_id"; then
-      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier")" && [ -n "$successor_task" ] && break
+      _esc_lock_still_held "$task_id" "$to_tier" "$fence" || {
+        printf 'escalation: %s/%s lock (fence %s) was lost between quiesce and spawn — aborting before spawn, task preserved\n' "$task_id" "$to_tier" "$fence" >&2
+        break
+      }
+      successor_task="$(_esc_spawn_next_tier "$run_id" "$task_id" "$to_agent" "$to_tier" "$requested_at")" && [ -n "$successor_task" ] && break
     fi
     successor_task=""
   done
+  _esc_stop_lock_renewer "$renewer_pid"
 
   if [ -z "$successor_task" ]; then
-    _esc_release_lock "$task_id" "$to_tier"
+    _esc_release_lock "$task_id" "$to_tier" "$fence"
     append_event "$run_id" "$task_id" model_escalation_hook_failed \
       "$(jq -nc --arg t "$to_tier" --argjson attempts "$bound" '{to_tier:$t, attempts:$attempts}')" >/dev/null 2>&1
     printf 'escalation: hook failed for %s -> %s after %s attempt(s)\n' "$task_id" "$to_tier" "$bound" >&2
@@ -654,11 +810,11 @@ esc_escalate() {
   # nothing further.
   claim_once "escalate_${task_id}_${to_tier}" "$run_id" "$task_id" model_escalation_claim \
     "$(jq -nc --arg f "$from_tier" --arg t "$to_tier" '{from_tier:$f, to_tier:$t}')" || {
-    _esc_release_lock "$task_id" "$to_tier"
+    _esc_release_lock "$task_id" "$to_tier" "$fence"
     printf '%s\n' "$(jq -nc --arg t "$to_tier" --arg s "$successor_task" '{to_tier:$t, successor_task_id:$s, already_claimed:true}')"
     return 0
   }
-  _esc_release_lock "$task_id" "$to_tier"
+  _esc_release_lock "$task_id" "$to_tier" "$fence"
 
   local payload
   payload="$(jq -nc --arg from_tier "$from_tier" --arg to_tier "$to_tier" \

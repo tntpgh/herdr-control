@@ -47,6 +47,19 @@
 #      is a verified cross-family jump read live from $HERDR_CODEX_DEEP
 #   R. R3 #5: the real herdr binary is never called, proven by a PATH-wide
 #      shadow that records any call, not just "we didn't observe one"
+#   S. R4 fix D: a never-escalated task spawned already on a STRONGER tier
+#      (e.g. implement/sonnet) is read as starting there, not assumed to
+#      be on the ladder's weakest tier — escalates standard->deep, never
+#      sideways fast->standard into the model it already runs
+#   T. R4 fix D: a task with no recognizable job-class in its own spawn
+#      record has no verifiable starting tier — escalation fails CLOSED
+#      (no event, no bookkeeping, no side effect), never guesses fast
+#   U. R4 residual (a): a slow close/spawn hook that outlasts the raw
+#      lock TTL does NOT let a second writer in — a background renewer
+#      keeps the fence fresh for the whole attempt
+#   V. R4 residual (b): first-successor discovery correlates to this
+#      attempt's own spawn request, not bare branch+label — a
+#      pre-existing decoy on the same branch+label is never adopted
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -66,7 +79,7 @@ export HERDR_ESCALATION_QUIESCE_POLLS=3
 PANES_DIR="$WORK/panes"; mkdir -p "$PANES_DIR"
 rm -f "$PANES_DIR"/*.alive "$PANES_DIR"/*.lag "$PANES_DIR"/*.indeterminate "$PANES_DIR"/*.birth "$PANES_DIR"/*.birth-unreachable 2>/dev/null
 ORDER_LOG="$WORK/order.log"; : >"$ORDER_LOG"
-rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log"
+rm -f "$WORK/spawn-fail-count" "$WORK/nested-probe-branch" "$WORK/nested-probe-pane" "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log" "$WORK/slow-close-pane"
 export PANES_DIR ORDER_LOG HERE_REPO="$here"
 
 # R3 #5 ("offline only: no live close or spawn") belt-and-suspenders: every
@@ -146,6 +159,20 @@ cat >"$WORK/fake-pane-close.sh" <<'SH'
 #!/usr/bin/env bash
 pane="$1"
 printf 'close %s\n' "$pane" >> "$ORDER_LOG"
+# R4 residual (a): simulate "close/spawn slow" — the close call itself
+# blocks past what a naive un-renewed lock's TTL would allow.
+sc="$WORK/slow-close-pane"
+if [ -f "$sc" ] && [ "$(cat "$sc")" = "$pane" ]; then
+  sleep "${SLOW_CLOSE_SECONDS:-0}"
+fi
+# Fire a nested concurrent attempt AFTER the slow close returns — late
+# enough that a naive (non-renewing) lock would already have expired.
+np="$WORK/nested-probe-pane"
+if [ -f "$np" ] && [ "$(cat "$np")" = "$pane" ] && [ ! -f "$WORK/nested-probe-fired" ]; then
+  : > "$WORK/nested-probe-fired"
+  bash "$CLI" tick "$NESTED_RUN" "$NESTED_TASK" --commit-sha unused --artifact-fp "$NESTED_FP" --context-dir "$CTX" \
+    > "$WORK/nested-probe-out.log" 2>&1
+fi
 [ -f "$PANES_DIR/$pane.lag" ] || rm -f "$PANES_DIR/$pane.alive"
 exit 0
 SH
@@ -193,12 +220,12 @@ export HERDR_ESC_PANE_BIRTH_CMD="$WORK/fake-pane-birth.sh"
 export HERDR_ESC_PANE_CLOSE_CMD="$WORK/fake-pane-close.sh"
 export HERDR_ESC_SPAWN_CMD="$WORK/fake-spawn.sh"
 
-seed_task() {   # task_id pane branch [pane_birth]
-  local task_id="$1" pane="$2" branch="$3" birth="${4:-}" now
+seed_task() {   # task_id pane branch [pane_birth] [job]
+  local task_id="$1" pane="$2" branch="$3" birth="${4:-}" job="${5:-explore}" now
   now="$(_now_iso)"
   registry_init
   _sql "INSERT INTO tasks (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth, pane_id, pane_birth, agent_session, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
-    VALUES ($(_sq "$task_id"), $(_sq "$task_id"), '', '', '', '', $(_sq "$pane"), $(_sq "$birth"), '', $(_sq "$REPO"), $(_sq "$REPO"), $(_sq "$branch"), '', '', '', $(_sq "explore:$branch"), 'running', $(_sq "$now"), $(_sq "$now"));"
+    VALUES ($(_sq "$task_id"), $(_sq "$task_id"), '', '', '', '', $(_sq "$pane"), $(_sq "$birth"), '', $(_sq "$REPO"), $(_sq "$REPO"), $(_sq "$branch"), '', '', '', $(_sq "${job}:${branch}"), 'running', $(_sq "$now"), $(_sq "$now"));"
   : > "$PANES_DIR/$pane.alive"
   [ -n "$birth" ] && printf '%s' "$birth" > "$PANES_DIR/$pane.birth"
 }
@@ -601,6 +628,116 @@ frontier_to_model="$(printf '%s' "$from_frontier_payload" | jq -r '.to_model // 
 spawn_codex_count="$(grep -c -- 'spawn deep-review esc-test-q' "$ORDER_LOG" 2>/dev/null)"
 [ "${spawn_codex_count:-0}" = 1 ] && ok "Q: the successor is spawned under the deep-review job-class, not a relabeled plan (no label collision with the deep tier)" \
   || bad "Q: spawn deep-review count (got $spawn_codex_count)"
+
+# =============================================================== case S ===
+# R4 fix D: a task that was NEVER escalated but was spawned already on a
+# STRONGER tier (label="implement:branch" = standard/sonnet, not
+# fast/haiku) must be read as starting on standard, not blindly assumed
+# to be on the ladder's weakest tier — escalating it must move
+# standard->deep (sonnet->opus), never fast->standard (which would look
+# like "escalating" a sonnet worker sideways to the sonnet it already runs).
+RUN=taskS; TASK=taskS; PANE=pane-S; BRANCH=esc-test-s
+seed_task "$TASK" "$PANE" "$BRANCH" "" implement
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpS --context-dir "$CTX" >/dev/null
+done
+payload="$(escalated_payload "$RUN" "$TASK" deep)"
+s_from_tier="$(printf '%s' "$payload" | jq -r '.from_tier // empty')"
+s_from_model="$(printf '%s' "$payload" | jq -r '.from_model // empty')"
+s_to_model="$(printf '%s' "$payload" | jq -r '.to_model // empty')"
+already_standard="$(escalated_payload "$RUN" "$TASK" standard)"
+[ "$s_from_tier" = standard ] && ok "S: a task spawned on implement is read as starting on standard, not fast" \
+  || bad "S: from_tier for a pre-standard task (got [$s_from_tier])"
+[ "$s_from_model" = sonnet ] && [ "$s_to_model" = opus ] \
+  && ok "S: escalates standard->deep (sonnet->opus), not a sideways fast->standard" \
+  || bad "S: from/to model (got from=[$s_from_model] to=[$s_to_model])"
+[ -z "$already_standard" ] && ok "S: no fast->standard event was ever written for this task" \
+  || bad "S: an unwanted standard-tier escalation exists: $already_standard"
+
+# =============================================================== case T ===
+# R4 fix D: a task whose own spawn record has NO recognizable job-class
+# (a raw-command task, or one labeled with something this ladder doesn't
+# map) has no verifiable starting tier — escalation must fail CLOSED
+# (refuse, no event, no lock, no side effect) rather than guess fast.
+RUN=taskT; TASK=taskT; PANE=pane-T; BRANCH=esc-test-t
+seed_task "$TASK" "$PANE" "$BRANCH" "" probe
+: >"$ORDER_LOG"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpT --context-dir "$CTX" >/dev/null
+done
+esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+dry_n="$(event_count "$RUN" "$TASK" model_escalation_dry_run)"
+failed_n="$(event_count "$RUN" "$TASK" model_escalation_hook_failed)"
+[ "${esc_n:-0}" = 0 ] && ok "T: a task with an unrecognized job-class is never escalated" \
+  || bad "T: model_escalated should be 0 for an unrecognized job-class (got $esc_n)"
+[ "${dry_n:-0}" = 0 ] && [ "${failed_n:-0}" = 0 ] \
+  && ok "T: refusal happens before ANY escalation bookkeeping (not even a hook-failed event) — a real fail-closed refusal, not a failed attempt" \
+  || bad "T: unexpected escalation bookkeeping (dry=$dry_n failed=$failed_n)"
+[ ! -s "$ORDER_LOG" ] && ok "T: no close/spawn side effect was ever attempted" \
+  || bad "T: unexpected hook side effect: $(cat "$ORDER_LOG")"
+esc_current_tier "$RUN" "$TASK" >/dev/null 2>&1
+current_tier_rc=$?
+[ "$current_tier_rc" -ne 0 ] && ok "T: esc_current_tier itself fails closed for an unrecognized job-class (not a silent fast default)" \
+  || bad "T: esc_current_tier should fail for an unrecognized job-class (rc=$current_tier_rc)"
+
+# =============================================================== case U ===
+# R4 residual (a): the 300s lock can expire while the hook is still
+# running (close/spawn slow) — that must NOT let a second writer in.
+# Set a tiny TTL, make close block past it, and fire a nested concurrent
+# attempt the instant close returns (already past the raw TTL). The
+# background renewer must have kept the lock fresh throughout, so the
+# nested attempt is STILL refused — proving renewal, not luck.
+RUN=taskU; TASK=taskU; PANE=pane-U; BRANCH=esc-test-u
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+rm -f "$WORK/nested-probe-fired" "$WORK/nested-probe-out.log"
+printf '%s' "$PANE" > "$WORK/nested-probe-pane"
+printf '%s' "$PANE" > "$WORK/slow-close-pane"
+export NESTED_RUN="$RUN" NESTED_TASK="$TASK" NESTED_FP="fpU"
+export SLOW_CLOSE_SECONDS=3 HERDR_ESCALATION_LOCK_STALE_S=2
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpU --context-dir "$CTX" >/dev/null
+done
+unset SLOW_CLOSE_SECONDS HERDR_ESCALATION_LOCK_STALE_S
+rm -f "$WORK/nested-probe-pane" "$WORK/slow-close-pane"
+[ -f "$WORK/nested-probe-fired" ] && ok "U: the nested concurrent attempt actually ran after the raw TTL elapsed (test is exercising the real race)" \
+  || bad "U: nested probe never fired — test setup broken"
+close_count="$(grep -c -- 'close pane-U' "$ORDER_LOG" 2>/dev/null)"
+spawn_count="$(grep -c -- 'spawn implement esc-test-u' "$ORDER_LOG" 2>/dev/null)"
+esc_n="$(event_count "$RUN" "$TASK" model_escalated)"
+[ "${close_count:-0}" = 1 ] && ok "U: exactly one close despite the hook outlasting the raw TTL (renewal kept the lock fresh)" \
+  || bad "U: close count (got $close_count)"
+[ "${spawn_count:-0}" = 1 ] && ok "U: exactly one spawn — no double writer let in by expiry mid-hook" \
+  || bad "U: spawn count (got $spawn_count)"
+[ "${esc_n:-0}" = 1 ] && ok "U: exactly one model_escalated for the real attempt" \
+  || bad "U: model_escalated count (got $esc_n)"
+grep -q 'locked by a concurrent attempt' "$WORK/nested-probe-out.log" 2>/dev/null \
+  && ok "U: the late nested attempt was refused by the still-fresh lock, not a side-effect accident" \
+  || bad "U: nested attempt lock-refusal message missing: $(cat "$WORK/nested-probe-out.log" 2>/dev/null)"
+
+# =============================================================== case V ===
+# R4 residual (b): first-successor discovery must correlate to THIS
+# escalation's own spawn request, not a bare branch+label match — a
+# PRE-EXISTING unrelated task already sitting on the exact branch+label
+# the real successor would get (a decoy) must never be adopted.
+RUN=taskV; TASK=taskV; PANE=pane-V; BRANCH=esc-test-v; DECOY=taskV_decoy
+seed_task "$DECOY" "pane-V-decoy" "$BRANCH" "" implement
+sleep 1   # guarantee the decoy's created_at predates this attempt's spawn request by a full second
+seed_task "$TASK" "$PANE" "$BRANCH"
+: >"$ORDER_LOG"
+for i in 1 2 3; do
+  bash "$CLI" tick "$RUN" "$TASK" --commit-sha unused --artifact-fp fpV --context-dir "$CTX" >/dev/null
+done
+v_payload="$(escalated_payload "$RUN" "$TASK" standard)"
+v_successor="$(printf '%s' "$v_payload" | jq -r '.successor_task_id // empty')"
+v_spawn_count="$(grep -c -- 'spawn implement esc-test-v' "$ORDER_LOG" 2>/dev/null)"
+v_rows="$(_sql "SELECT COUNT(*) FROM tasks WHERE branch=$(_sq "$BRANCH") AND label='implement:$BRANCH';" 2>/dev/null)"
+[ -n "$v_successor" ] && [ "$v_successor" != "$DECOY" ] && ok "V: the pre-existing decoy on the same branch+label is never adopted as the successor" \
+  || bad "V: successor_task_id wrongly resolved to the decoy (got [$v_successor] decoy=[$DECOY])"
+[ "${v_spawn_count:-0}" = 1 ] && ok "V: a genuinely NEW successor was spawned despite the branch+label match existing" \
+  || bad "V: spawn count for the real attempt (got $v_spawn_count, expected 1 — the decoy's presence must not skip spawning)"
+[ "${v_rows:-0}" = 2 ] && ok "V: both the decoy and the real successor now exist as distinct rows" \
+  || bad "V: branch+label row count (got $v_rows, want 2: decoy + real successor)"
 
 # =============================================================== case R ===
 [ ! -f "$WORK/herdr-violation" ] && ok "R: no code path ever called the real herdr binary across the whole suite (PATH-shadow proof)" \
