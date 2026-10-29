@@ -2360,6 +2360,52 @@ class WithdrawnFormsHidden(unittest.TestCase):
         self.assertEqual({f["id"] for f in data["open"]}, {"20261030T000002-3"})
 
 
+class DraftFormIdentity(unittest.TestCase):
+    """Independent audit, 2026-10-29: Path(form_path).stem alone let two
+    forms with the same basename -- different directories, different
+    upstream requests -- share a sessionStorage draft key on the hub's
+    single origin (every served form lives at the same http://127.0.0.1:8600
+    origin). _draft_form_identity() must bind to request_id AND the full
+    form_path, neither alone."""
+
+    def test_stem_alone_would_have_collided(self):
+        # Pins the actual historical bug: these two rows are genuinely
+        # different forms (different directory, different request), but
+        # Path(form_path).stem cannot tell them apart.
+        self.assertEqual(Path("/tmp/dirA/same.html").stem, Path("/tmp/dirB/same.html").stem)
+
+    def test_same_basename_different_request_id_is_a_different_identity(self):
+        row_a = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_aaa"}
+        row_b = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_bbb"}
+        self.assertNotEqual(hub._draft_form_identity("f1", row_a),
+                             hub._draft_form_identity("f2", row_b))
+
+    def test_same_basename_same_request_id_different_directory_is_still_different(self):
+        # request_id alone is not enough either: a reused request_id string
+        # against two genuinely different source files must not collide.
+        row_a = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_shared"}
+        row_b = {"form_path": "/tmp/dirB/same.html", "request_id": "ar_shared"}
+        self.assertNotEqual(hub._draft_form_identity("f1", row_a),
+                             hub._draft_form_identity("f2", row_b))
+
+    def test_a_legacy_row_with_no_request_id_still_disambiguates_by_path(self):
+        # Registered before this fix shipped -- no request_id key at all.
+        row_a = {"form_path": "/tmp/dirA/same.html"}
+        row_b = {"form_path": "/tmp/dirB/same.html"}
+        ident_a = hub._draft_form_identity("f1", row_a)
+        ident_b = hub._draft_form_identity("f2", row_b)
+        self.assertNotEqual(ident_a, ident_b)
+        self.assertTrue(ident_a.startswith(":"), "an empty request_id degrades to an empty prefix, not a crash")
+
+    def test_a_restart_of_the_same_request_is_the_same_identity(self):
+        # The stable case the whole feature exists for: a restart of the
+        # SAME managed form (same source path, same upstream request) must
+        # produce the SAME key, or the draft could never be found again.
+        row = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_aaa"}
+        self.assertEqual(hub._draft_form_identity("f1", row), hub._draft_form_identity("f2", row))
+
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

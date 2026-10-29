@@ -440,7 +440,7 @@ if(fd.get("decision")==="supersede"&&!reason){f.elements.reason.focus();return}
 window.submitAnswers({request_id:"$(_ha_esc "$id")",action_sha256:"$(_ha_esc "$(_ha_field "$row" action_sha256)")",decision:fd.get("decision"),reason:reason})});</script>
 </body></html>
 HTML
-  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
+  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open --request-id "$id" </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
   printf '%s\n' "$f"
 }
 

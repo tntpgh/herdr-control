@@ -149,10 +149,18 @@ SHIM = """
     return h.toString(36);
   }
   function schemaOf(current) {
-    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend"))
+    // h1/h2/legend/label: a rewritten question, section heading, or option
+    // label changes this even when the underlying name/type/value does not
+    // -- "reworded questions can reuse an old draft" (independent audit,
+    // 2026-10-29) was exactly a label changing with everything else held
+    // fixed.
+    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend,label"))
       .map(function (el) { return (el.textContent || "").trim(); });
+    // Both the VALUE and the visible text: an <option value=x>Old</option>
+    // reworded to <option value=x>New</option> has an unchanged value but a
+    // different meaning to a human.
     var options = Array.prototype.slice.call(document.querySelectorAll("option,input[type=radio],input[type=checkbox]"))
-      .map(function (el) { return (el.value || el.textContent || "").trim(); }).sort();
+      .map(function (el) { return (el.value || "") + "|" + (el.textContent || "").trim(); }).sort();
     var fieldSig = current.map(function (el) { return fieldKey(el) + ":" + el.type; }).sort();
     return hashOf(JSON.stringify({ h: headings, o: options, f: fieldSig }));
   }
@@ -378,7 +386,8 @@ def _title_of(html_bytes: bytes, fallback: str) -> str:
 
 
 def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
-                  token: str = "", deliver_to: str = "", schema: dict | None = None) -> Path | None:
+                  token: str = "", deliver_to: str = "", schema: dict | None = None,
+                  request_id: str = "") -> Path | None:
     """Register the form AND hand the hub a copy it can serve itself.
 
     The HTML copy plus the token are what make the decision outlive this
@@ -403,7 +412,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
             "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
             "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
-            "schema": schema or {},
+            "schema": schema or {}, "request_id": request_id,
             "created_at": int(now * 1000),
             "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
         }, indent=1))
@@ -518,6 +527,11 @@ def main() -> int:
                     help="seconds to wait for a submit (default 14400 = 4h; 0 = forever)")
     ap.add_argument("--no-open", action="store_true",
                     help="do not open the Herdr browser pane; just print the URL")
+    ap.add_argument("--request-id", default="",
+                    help="the upstream request this form answers (herdr-action.sh's "
+                         "action_requests.request_id); bound into the draft-preservation "
+                         "key alongside the form's own path so two forms that happen to "
+                         "share a basename never share a draft")
     args = ap.parse_args()
 
     form = Path(args.form).expanduser().resolve()
@@ -548,7 +562,8 @@ def main() -> int:
     # guessed from a previous one.
     token = secrets.token_urlsafe(24)
     shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token) \
-               .replace("{{FORMSERVE_REQUEST_ID}}", html_module.escape(form.stem, quote=True)).encode()
+               .replace("{{FORMSERVE_REQUEST_ID}}",
+                        html_module.escape(f"{args.request_id}:{form}", quote=True)).encode()
 
     raw_html = form.read_bytes()
     # Required-field schema derived from the SOURCE markup, not the page's own
@@ -581,7 +596,8 @@ def main() -> int:
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
     registry = register_form(form, raw_html, url, port, args.timeout,
-                             token=token, deliver_to=args.deliver or "", schema=schema)
+                             token=token, deliver_to=args.deliver or "", schema=schema,
+                             request_id=args.request_id)
     result["registry"] = registry            # the handler claims against it before any 200
     # Held open for this process's entire lifetime, never closed: the kernel
     # releases the lock the instant this process exits or dies, which is what

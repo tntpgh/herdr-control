@@ -58,13 +58,16 @@ function makeEl(tag, opts) {
 
 var sharedSessionStorage; // persists ACROSS "process restarts" within one scenario -- the whole point
 
-function buildPage(heading, fieldSpecs) {
+function buildPage(heading, fieldSpecs, extraSpecs) {
   var elements = [
     makeEl("h1", { tagName: "h1", textContent: heading }),
     makeEl("input", { type: "hidden", id: "__formserve_token", value: "test-token" }),
     makeEl("input", { type: "hidden", id: "__formserve_request_id" }), // value set by caller via document
   ];
   fieldSpecs.forEach((spec) => elements.push(makeEl("input", spec)));
+  // Decorative schema elements: labels and options, which schemaOf() reads
+  // but fields()/isSensitive() never touch (not input/textarea/select).
+  (extraSpecs || []).forEach((spec) => elements.push(makeEl(spec.tagName, spec)));
   var domReadyCbs = [];
   var body = {
     children: [],
@@ -92,7 +95,7 @@ function buildPage(heading, fieldSpecs) {
   return { document: document_, elements, body, domReadyCbs, fire: () => domReadyCbs.forEach((cb) => cb()) };
 }
 
-function runRequest(label, requestId, heading, fieldSpecs) {
+function runRequest(label, requestId, heading, fieldSpecs, extraSpecs) {
   var scripts = buildScripts(requestId)[label];
   var fetchCalls = 0;
   global.window = {};
@@ -106,7 +109,7 @@ function runRequest(label, requestId, heading, fieldSpecs) {
   }
 
   // "Process 1" -- the first run that ever served this request.
-  var page1 = buildPage(heading, fieldSpecs);
+  var page1 = buildPage(heading, fieldSpecs, extraSpecs);
   page1.elements.find((e) => e.id === "__formserve_request_id").value = requestId;
   evalInto(page1);
   var q1a = page1.elements.find((e) => e.name === "q1"), notesA = page1.elements.find((e) => e.name === "notes");
@@ -130,7 +133,7 @@ function runRequest(label, requestId, heading, fieldSpecs) {
   return { page1, key, fetchCalls: () => fetchCalls, evalInto, scripts };
 }
 
-function restartAndCheck(label, requestId, heading, fieldSpecs, expectOffer) {
+function restartAndCheck(label, requestId, heading, fieldSpecs, expectOffer, extraSpecs) {
   // "Process 2" -- an ACTUAL new-id restart: brand new DOM, brand new eval
   // of the extracted scripts, same browser-tab sessionStorage (same origin
   // surviving a restart/navigation -- the only way any of this persists).
@@ -138,7 +141,7 @@ function restartAndCheck(label, requestId, heading, fieldSpecs, expectOffer) {
   global.window = {};
   var fetchCalls = 0;
   global.fetch = () => { fetchCalls++; return Promise.resolve({ ok: true, text: () => Promise.resolve(JSON.stringify({ answers: {} })) }); };
-  var page2 = buildPage(heading, fieldSpecs);
+  var page2 = buildPage(heading, fieldSpecs, extraSpecs);
   page2.elements.find((e) => e.id === "__formserve_request_id").value = requestId;
   global.document = page2.document;
   global.sessionStorage = sharedSessionStorage;
@@ -175,28 +178,52 @@ var QUESTION = { heading: "Approve the deploy?", fields: [
   { type: "password", name: "secret", id: "secret" },
   { type: "text", name: "api_key", id: "api_key" }, // sensitive by NAME, not type
   { type: "hidden", name: "hidden1", id: "hidden1" },
+], extras: [
+  { tagName: "label", textContent: "Pick an outcome" },
+  { tagName: "option", value: "approve", textContent: "Yes, ship it" },
 ] };
 
 function scenario(label) {
-  runRequest(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields);
+  runRequest(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, QUESTION.extras);
 
   // Same request, same question, genuinely new process/page -- must offer, not auto-apply.
-  return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, true)
+  return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, true, QUESTION.extras)
     .then(() => {
       // Draft cleared by the prior submit -- reseed for the negative cases below.
       sharedSessionStorage.data = {};
-      runRequest(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields);
+      runRequest(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, QUESTION.extras);
       // Different request identity (a different source form) -- must fail closed.
-      return restartAndCheck(label, "a-totally-different-form", QUESTION.heading, QUESTION.fields, false);
+      return restartAndCheck(label, "a-totally-different-form", QUESTION.heading, QUESTION.fields, false, QUESTION.extras);
     })
     .then(() => {
       // Same request, but the question text changed -- must fail closed too.
-      return restartAndCheck(label, "ff-pilot-form", "A DIFFERENT question entirely", QUESTION.fields, false);
+      return restartAndCheck(label, "ff-pilot-form", "A DIFFERENT question entirely", QUESTION.fields, false, QUESTION.extras);
     })
     .then(() => {
       // Same request, same heading, but a field was added -- schema changed -- fail closed.
       var changedFields = QUESTION.fields.concat([{ type: "text", name: "q2", id: "q2" }]);
-      return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, changedFields, false);
+      return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, changedFields, false, QUESTION.extras);
+    })
+    .then(() => {
+      // Same request, same heading, same fields -- only a LABEL's wording
+      // changed. name/type/value of every real field is untouched; only the
+      // human-readable question moved. Independent audit, 2026-10-29: this
+      // used to restore anyway.
+      var changedLabel = [
+        { tagName: "label", textContent: "Pick a DIFFERENT outcome entirely" },
+        { tagName: "option", value: "approve", textContent: "Yes, ship it" },
+      ];
+      return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, false, changedLabel);
+    })
+    .then(() => {
+      // Same request, same heading, same fields, same label -- only an
+      // OPTION's visible text changed; its value is still "approve". A
+      // stale draft must not silently answer a reworded choice.
+      var changedOptionLabel = [
+        { tagName: "label", textContent: "Pick an outcome" },
+        { tagName: "option", value: "approve", textContent: "Yes, but only after security review" },
+      ];
+      return restartAndCheck(label, "ff-pilot-form", QUESTION.heading, QUESTION.fields, false, changedOptionLabel);
     });
 }
 

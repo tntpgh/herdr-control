@@ -1403,10 +1403,18 @@ HUB_SUBMIT_SHIM = """
     return h.toString(36);
   }
   function schemaOf(current) {
-    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend"))
+    // h1/h2/legend/label: a rewritten question, section heading, or option
+    // label changes this even when the underlying name/type/value does not
+    // -- "reworded questions can reuse an old draft" (independent audit,
+    // 2026-10-29) was exactly a label changing with everything else held
+    // fixed.
+    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend,label"))
       .map(function (el) { return (el.textContent || "").trim(); });
+    // Both the VALUE and the visible text: an <option value=x>Old</option>
+    // reworded to <option value=x>New</option> has an unchanged value but a
+    // different meaning to a human.
     var options = Array.prototype.slice.call(document.querySelectorAll("option,input[type=radio],input[type=checkbox]"))
-      .map(function (el) { return (el.value || el.textContent || "").trim(); }).sort();
+      .map(function (el) { return (el.value || "") + "|" + (el.textContent || "").trim(); }).sort();
     var fieldSig = current.map(function (el) { return fieldKey(el) + ":" + el.type; }).sort();
     return hashOf(JSON.stringify({ h: headings, o: options, f: fieldSig }));
   }
@@ -1472,9 +1480,19 @@ def _draft_form_identity(form_id: str, row: dict) -> str:
     restart of the same managed form, unlike the registry `id` (a fresh
     timestamp + port every run -- see `_form_server_alive`'s docstring for
     why that value is ephemeral). `form_path` is the SOURCE file formserve
-    was given, which stays the same across restarts of the same form."""
+    was given, which stays the same across restarts of the same form.
+
+    Bound to `request_id` (herdr-action.sh's action_requests.request_id,
+    threaded through formserve.py's --request-id) PLUS the FULL form_path --
+    not `Path(fp).stem` alone (independent audit, 2026-10-29): two forms with
+    the same basename on the hub's single origin shared a sessionStorage key
+    once their basenames collided, regardless of directory or upstream
+    request. A legacy row with no `request_id` (registered before this fix)
+    degrades to an empty prefix, not a crash -- still disambiguated by the
+    full path.
+    """
     fp = row.get("form_path")
-    return Path(fp).stem if fp else form_id
+    return f"{row.get('request_id', '')}:{fp}" if fp else form_id
 
 
 def _form_row(form_id: str) -> tuple[Path, dict] | tuple[None, None]:
