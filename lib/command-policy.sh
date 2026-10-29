@@ -6878,6 +6878,84 @@ _cp_write_menu_verdict() {
   return 0
 }
 
+# _cp_write_content_verdict <path> <content> <worktree> [manifest] -> UNWIRED
+# PROTOTYPE for herdr-control#267 (docs/design/write-panel-ceiling-267.md).
+# Zero callers. Judges a write/edit panel's STRUCTURED fields instead of a
+# size-capped screen scrape: the 4096-byte ceiling in
+# `_cp_input_ceiling_hit` never applies here, but every existing semantic
+# check still runs on the FULL content, not a truncated prefix.
+#
+# Returns on stdout: "allow", "deny:<reason>", or "escalate:<reason>".
+# "allow" here means "path containment and content checks found nothing to
+# refuse" -- it is NOT a bypass of herdr-control#277 (write/edit stays
+# categorically human-only for every non-human authority; the caller that
+# eventually wires this in must keep applying that rule exactly as today).
+#
+# Activation is a separate, explicit, human-reviewed change (see the design
+# doc's checklist) -- this function existing does not change behavior.
+_cp_write_content_verdict() {
+  local path="$1" content="$2" wt="$3" manifest="${4:-}"
+  case "$path" in
+    ''|*[[:space:]]*) printf 'deny:empty or whitespace-containing path'; return 0 ;;
+  esac
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read)
+      : ;; # allowlisted targets below still get the content scan
+    xd://*)
+      printf 'deny:unrecognized xd:// write target'; return 0 ;;
+    *[!A-Za-z0-9._/-]*)
+      printf 'deny:path contains characters no real filesystem write target can'; return 0 ;;
+  esac
+  # Reject content that is not valid UTF-8 or ends mid multi-byte sequence --
+  # a structured-input path has no terminal scrape to be torn, so a bad
+  # encoding here means the recorded payload itself is suspect, not a
+  # rendering artifact; never silently judge a truncated/invalid prefix.
+  if ! printf '%s' "$content" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null; then
+    printf 'deny:content is not valid UTF-8 — cannot be reviewed as text'
+    return 0
+  fi
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read) ;;
+    *)
+      if [ -z "$wt" ]; then
+        printf 'escalate:worker worktree unknown — cannot judge write path containment'
+        return 0
+      fi
+      if ! _cp_path_within_worktree "$path" "$wt"; then
+        printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
+        return 0
+      fi
+      ;;
+  esac
+  # Reuse the SAME reserved-pattern / secret-path scanner a shell command
+  # gets, against the full content, never a clipped prefix -- but
+  # `conductor_reserved_reason` has its OWN unconditional 4096-byte ceiling
+  # (`lib/command-policy.sh` ~line 8205) that this prototype must not
+  # silently inherit (that would just reproduce #267 one level down, as
+  # verified while drafting this). Reuse the function completely
+  # UNMODIFIED -- never touch its pattern list -- by scanning it in
+  # <=4000-byte windows with a 512-byte overlap (comfortably longer than
+  # any reserved pattern below) so a match sitting across a window
+  # boundary is still caught by the window that contains it whole. This is
+  # the scan write/edit content has never gotten at any size until wired
+  # in; splitting is scan-granularity only, never a new allow rule.
+  local reserved clen off win step=3488 wsize=4000
+  clen=${#content}
+  off=0
+  while :; do
+    win="${content:$off:$wsize}"
+    reserved="$(conductor_reserved_reason "$win")"
+    if [ -n "$reserved" ]; then
+      printf 'deny:%s' "$reserved"
+      return 0
+    fi
+    off=$((off + step))
+    [ "$off" -lt "$clen" ] || break
+  done
+  printf 'allow'
+  return 0
+}
+
 # A script runner's quoted arguments are data to its script, not command
 # position. Do not let a prose/data argument such as
 # `bash probe.sh 'git push origin feat/x'` reserve the outer approval. Inline
