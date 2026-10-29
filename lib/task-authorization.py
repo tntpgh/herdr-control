@@ -300,6 +300,207 @@ def accept_local(db, command_id, actor_pane, actor_birth, repo, raw_manifest):
     return _insert(db, claims, canonical(claims), expected)
 
 
+# ---- resident escalation launch grant (docs/design/resident-launch-grant.md) --
+# INERT until a human runs the mint command from a real, live, conductor-
+# eligible pane -- that is the ONLY place live ancestry is ever proven for
+# this feature, moved to mint time instead of spawn time. A grant is a
+# STANDING, read-only policy check, never bound to a task_id and never
+# consumed -- the existing `task_id UNIQUE` / claim_task_worktree_mutation
+# machinery is architected for a single-use receipt (one row, one eventual
+# task), which cannot represent "stay authorized across many no-progress
+# escalations for up to 24h". A grant therefore never flows into
+# register_task's own authorization_command_id directly. Each actual spawn
+# instead self-mints its OWN one-time, task-bindable record
+# (accept_resident_spawn, source=resident_escalation_spawn) that links back
+# to the standing grant for audit purposes -- the same shape accept_local
+# already uses for a live-ancestry spawn, just gated by a grant lookup
+# instead of caller_pane_from_ancestry.
+RESIDENT_JOB_CLASSES = {"explore", "implement", "plan", "deep-review"}
+RESIDENT_TIERS = ("fast", "standard", "deep", "frontier")
+RESIDENT_TTL_MS_MAX = 24 * 60 * 60 * 1000  # hard cap: 24h, never longer; re-mint required after
+
+
+def expected_resident_manifest(scope):
+    if not isinstance(scope, dict) or set(scope) != {"job_classes", "max_tier", "secrets"}:
+        raise Refused("invalid resident effective scope fields")
+    if scope["max_tier"] not in RESIDENT_TIERS:
+        raise Refused("unsupported resident max_tier")
+    if scope["secrets"] != "default":
+        raise Refused("a resident grant may never carry a credential grant")
+    if (not isinstance(scope["job_classes"], list) or not scope["job_classes"]
+            or not all(v in RESIDENT_JOB_CLASSES for v in scope["job_classes"])):
+        raise Refused("invalid resident job_classes")
+    return canonical({"job_classes": sorted(set(scope["job_classes"])),
+                       "max_tier": scope["max_tier"], "secrets": "default"})
+
+
+def accept_resident(db, command_id, minting_pane, minting_pane_birth, repo, job_classes_csv, max_tier, ttl_ms):
+    for key, value in (("command id", command_id), ("minting pane", minting_pane),
+                        ("minting pane birth", minting_pane_birth)):
+        identifier(value, key)
+    if not os.path.isabs(repo) or os.path.normpath(repo) != repo:
+        raise Refused("resident grant repository must be an absolute normalized path")
+    job_classes = [j for j in job_classes_csv.split(",") if j]
+    expected = expected_resident_manifest({"job_classes": job_classes, "max_tier": max_tier, "secrets": "default"})
+    try:
+        ttl = int(ttl_ms)
+    except (TypeError, ValueError):
+        raise Refused("invalid resident grant ttl") from None
+    if ttl <= 0 or ttl > RESIDENT_TTL_MS_MAX:
+        raise Refused("resident grant ttl exceeds the hard cap")
+    payload = {"minting_pane": minting_pane, "minting_pane_birth": minting_pane_birth,
+               "repo": repo, "effective_scope": parse(expected)}
+    payload_hash = digest(canonical(payload))
+    # A retry keeps the original validity window; it must never extend a grant.
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, command_id)
+    if previous:
+        if previous["source"] != "resident_escalation_grant" or previous["payload_sha256"] != payload_hash:
+            raise Refused("resident grant command id already has a different source")
+        _check_source(previous)
+        db.commit()
+        return public(previous)
+    issued = now_ms()
+    claims = {"version": 1, "source": "resident_escalation_grant", "command_id": command_id,
+              "op": "resident_grant", "remote_task_id": "", "requester_actor": minting_pane,
+              "actor_pane_birth": minting_pane_birth, "requester_client": "local_process_ancestry",
+              "scope": "resident_escalation_grant", "repo": repo, "mode": "",
+              "effective_scope": parse(expected), "payload_sha256": payload_hash,
+              "issued_at": issued, "expires_at": issued + ttl}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def read_resident_for_repo(db, repo):
+    """The standing-grant lookup escalation's pre-flight check uses: most
+    recent accepted, unexpired resident_escalation_grant row for <repo>.
+    READ-ONLY -- never calls verify_receipt/_binding (those assume the
+    single-task-bound model this grant deliberately does not use), never
+    mutates. An expired or absent grant returns {} exactly alike -- the
+    caller falls through to today's live-ancestry check either way."""
+    row = db.execute(
+        """SELECT * FROM task_authorizations
+           WHERE source='resident_escalation_grant' AND source_repo=? AND status='accepted' AND expires_at>?
+           ORDER BY issued_at DESC LIMIT 1""",
+        (repo, now_ms())).fetchone()
+    if row is None:
+        return {}
+    _check_source(row)  # integrity only
+    return public(row)
+
+
+def accept_resident_spawn(db, command_id, grant_command_id, repo, raw_manifest):
+    """The one-time, task-bindable record a resident-grant-admitted spawn
+    self-mints for ITSELF, mirroring accept_local's shape exactly so
+    register_task/mark_authorization_launch need no changes at all -- the
+    only difference is what gated minting it (a standing grant lookup
+    instead of live caller_pane_from_ancestry) and that its claims carry
+    grant_command_id, the durable audit link back to the standing grant
+    that authorized it. The standing grant row itself is never touched."""
+    for key, value in (("command id", command_id), ("grant command id", grant_command_id)):
+        identifier(value, key)
+    if not os.path.isabs(repo) or os.path.normpath(repo) != repo:
+        raise Refused("resident spawn repository must be an absolute normalized path")
+    expected = manifest(raw_manifest)
+    payload = {"grant_command_id": grant_command_id, "repo": repo, "manifest": parse(expected)}
+    payload_hash = digest(canonical(payload))
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, command_id)
+    if previous:
+        if previous["source"] != "resident_escalation_spawn" or previous["payload_sha256"] != payload_hash:
+            raise Refused("resident spawn command id already has a different source")
+        verify_receipt(db, previous)
+        valid_window(_check_source(previous))
+        db.commit()
+        return public(previous)
+    issued = now_ms()
+    claims = {"version": 1, "source": "resident_escalation_spawn", "command_id": command_id,
+              "op": "resident_spawn", "remote_task_id": "", "requester_actor": "resident:" + grant_command_id,
+              "actor_pane_birth": "resident-grant", "requester_client": "resident_escalation_grant",
+              "scope": "resident_escalation_spawn", "repo": repo, "mode": "",
+              "grant_command_id": grant_command_id, "effective_scope": parse(expected),
+              "payload_sha256": payload_hash, "issued_at": issued, "expires_at": issued + TTL_MS}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+# ---- resident escalation redemption token (REVIEW-GRANT-9ac2fc4 HIGH fix) --
+# The standing grant (resident_escalation_grant, above) is deliberately
+# multi-use across many no-progress escalations for up to 24h -- but that
+# multi-use nature is exactly what made its OWN command_id a reusable
+# bearer credential once discovered via a spawned task's ordinary,
+# unauthenticated audit trail (claims.grant_command_id on any
+# resident_escalation_spawn row). This closes that gap WITHOUT making the
+# standing grant itself single-use: _esc_check_launch_authority mints a
+# FRESH, short-TTL, single-use REDEMPTION TOKEN for each individual
+# escalation attempt it admits, and ONLY that token (never the grant's own
+# command_id) is what spawn-task.sh's new admission branch accepts. A
+# token is structurally mintable only by _esc_check_launch_authority
+# itself (no other caller in this codebase calls accept_resident_
+# redemption), is consumed atomically on first use, and is never written
+# into any spawned task's own audit fields -- so recovering a past
+# grant_command_id from the audit trail no longer yields anything
+# redeemable.
+RESIDENT_REDEMPTION_TTL_MS = 5 * 60 * 1000  # 5 min: only the quiesce-then-spawn window, not the grant's own 24h
+
+
+def accept_resident_redemption(db, token_command_id, grant_command_id, repo, job_class):
+    for key, value in (("token command id", token_command_id), ("grant command id", grant_command_id)):
+        identifier(value, key)
+    if not os.path.isabs(repo) or os.path.normpath(repo) != repo:
+        raise Refused("resident redemption repository must be an absolute normalized path")
+    identifier(job_class, "resident redemption job class")
+    scope = {"grant_command_id": grant_command_id, "repo": repo, "job_class": job_class}
+    expected = canonical(scope)
+    payload_hash = digest(expected)
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, token_command_id)
+    if previous:
+        db.rollback()
+        raise Refused("resident redemption token command id collision")
+    issued = now_ms()
+    claims = {"version": 1, "source": "resident_escalation_redemption", "command_id": token_command_id,
+              "op": "resident_redemption", "remote_task_id": "", "requester_actor": "resident:" + grant_command_id,
+              "actor_pane_birth": "resident-redemption", "requester_client": "resident_escalation_grant",
+              "scope": "resident_escalation_redemption", "repo": repo, "mode": "",
+              "grant_command_id": grant_command_id, "job_class": job_class,
+              "effective_scope": parse(expected), "payload_sha256": payload_hash,
+              "issued_at": issued, "expires_at": issued + RESIDENT_REDEMPTION_TTL_MS}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def claim_resident_redemption(db, token_command_id, repo, job_class):
+    """The single-use choke point REVIEW-GRANT-9ac2fc4's HIGH finding
+    required: atomically consumes a redemption token minted ONLY by
+    _esc_check_launch_authority. A bare command_id that isn't a genuine
+    token row of THIS source (e.g. the standing grant's own id, or
+    anything else) is refused the same way an unknown token is -- it is
+    structurally never mintable by any other caller. status flips
+    accepted->bound in the SAME transaction as the check (an UPDATE with
+    `WHERE status='accepted'`, rowcount checked), so a concurrent or
+    replayed claim of the SAME token sees 0 rows affected and is refused.
+    The grant itself stays standing/multi-use; only each REDEMPTION is
+    single-use. Returns the verified grant_command_id on success."""
+    db.execute("BEGIN IMMEDIATE")
+    row = read(db, token_command_id)
+    if row is None or row["source"] != "resident_escalation_redemption":
+        db.rollback()
+        raise Refused("no such resident redemption token")
+    claims = _check_source(row)
+    if claims.get("repo") != repo or claims.get("job_class") != job_class:
+        db.rollback()
+        raise Refused("resident redemption token does not match this repo/job-class")
+    if row["status"] != "accepted" or row["expires_at"] <= now_ms():
+        db.rollback()
+        raise Refused("resident redemption token already consumed or expired")
+    cur = db.execute("UPDATE task_authorizations SET status='bound' WHERE command_id=? AND status='accepted'",
+                      (token_command_id,))
+    if cur.rowcount != 1:
+        db.rollback()
+        raise Refused("resident redemption token lost the single-use claim race")
+    grant_command_id = claims["grant_command_id"]
+    db.commit()
+    return grant_command_id
+
+
 def event(db, run_id, task_id, kind, payload):
     db.execute("INSERT INTO events(event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
                ("ev_" + uuid.uuid4().hex, run_id, task_id, kind, now_iso(), canonical(payload)))
@@ -321,6 +522,17 @@ def _check_source(row):
         expected = canonical(claims["effective_scope"])
         identifier(claims.get("requester_actor"), "local actor")
         identifier(claims.get("actor_pane_birth"), "local actor birth")
+    elif row["source"] == "resident_escalation_grant":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("requester_actor"), "resident minting pane")
+        identifier(claims.get("actor_pane_birth"), "resident minting pane birth")
+    elif row["source"] == "resident_escalation_spawn":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("grant_command_id"), "resident spawn grant command id")
+    elif row["source"] == "resident_escalation_redemption":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("grant_command_id"), "resident redemption grant command id")
+        identifier(claims.get("job_class"), "resident redemption job class")
     else:
         raise Refused("unknown authorization source")
     if expected != row["expected_manifest"]:
@@ -683,13 +895,23 @@ def action_decide(db, request_id, status, authority, decided_by, category, reaso
 
 def main():
     path, op, *args = sys.argv[1:]
-    with connect(path, readonly=op in ("read", "check", "pending-acks")) as db:
+    with connect(path, readonly=op in ("read", "check", "pending-acks", "read-resident")) as db:
         if op == "schema":
             schema(db)
         elif op == "accept":
             print(canonical(accept(db, *args)))
         elif op == "accept-local":
             print(canonical(accept_local(db, *args)))
+        elif op == "accept-resident":
+            print(canonical(accept_resident(db, *args)))
+        elif op == "read-resident":
+            print(canonical(read_resident_for_repo(db, *args)))
+        elif op == "accept-resident-spawn":
+            print(canonical(accept_resident_spawn(db, *args)))
+        elif op == "accept-resident-redemption":
+            print(canonical(accept_resident_redemption(db, *args)))
+        elif op == "claim-resident-redemption":
+            print(claim_resident_redemption(db, *args))
         elif op == "read":
             db.execute("BEGIN")
             row = read(db, *args)

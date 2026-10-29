@@ -78,6 +78,184 @@ watchdog chain, which never has to prove its own ancestry because it is
 presenting a receipt instead — exactly how the OAuth remote path already
 works for a publisher that is never a herdr pane either.
 
+## Pilot scope: two options
+
+Terrence named a specific ladder he wants (Sonnet, then Opus, then the top
+Codex tier, triggered after 2-3 no-progress loops) — materially wider than
+this document's original default-recommended pilot (`standard` only). Both
+are laid out here so the choice is explicit, not defaulted past him.
+
+| | **A — restricted pilot** | **B — T's requested ladder** |
+|---|---|---|
+| Max tier | `standard` only (haiku→sonnet) | `frontier` (sonnet→opus→codex top tier) |
+| Tiers admitted | `fast`,`standard` | `fast`,`standard`,`deep`,`frontier` (full ladder — see below) |
+| Blast radius | One model step up, Claude family only | Three model steps, crosses into a second model family (codex) at the top |
+| Unattended spend/runtime | Lowest — one extra sonnet session per loop | Highest — can reach codex's most expensive configured tier unattended |
+| Operating experience needed first | None required | None required, but more to watch — recommend running A first even if B is the target end state |
+
+**Option A** is this document's original proposal, unchanged: `max_tier =
+standard`. A no-progress loop can escalate from `fast` to `standard` under
+the grant; reaching `deep` or `frontier` still requires a live human/
+conductor pane (today's behavior, unchanged — refused, task `blocked`,
+reason `no_launch_authority`).
+
+**Option B** is what Terrence described: `max_tier = frontier`, admitting
+escalation all the way up the real ladder — `esc_tier_job`
+(`lib/escalation.sh:189-196`) maps `fast→explore`, `standard→implement`,
+`deep→plan`, `frontier→deep-review`; `esc_tier_agent`
+(`lib/escalation.sh:206-212`) keeps the task's own model family for every
+tier except `frontier`, which always resolves to `codex` (opus is Claude's
+ceiling, so the one real step beyond it is the strongest model this config
+names for any family). `esc_tier_model` (`lib/escalation.sh:218-222`) reads
+the actual model id from the same table `spawn-task.sh` itself uses
+(`lib/agent-profiles.sh`'s `model_for_agent`):
+
+- `standard` → `claude:implement` → harness alias **`sonnet`**
+  (`lib/agent-profiles.sh:188`) — **UNVERIFIED which provider model id this
+  resolves to.** `sonnet`/`opus`/`haiku` are harness-level aliases passed
+  to the `claude`/`omp` CLI, not provider model ids; which exact id an
+  alias resolves to is decided inside the harness at launch time, not
+  stored in any local config this repo can read. Checked and confirmed by
+  the conductor (read-only, `~/.omp/agent/models.db`, 2026 — out of scope
+  for a spawned worker to read directly): the `model_cache` table there
+  holds a broad provider CATALOG (many `claude-opus-*`/`claude-sonnet-*`
+  candidate rows), with **no alias-to-id mapping** — naming one specific id
+  here would be a guess, not a citation, so this document does not name one.
+- `deep` → `claude:plan` → harness alias **`opus`** (`lib/agent-profiles.sh:
+  186`) — same UNVERIFIED caveat as `sonnet` above, same evidence.
+- `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**
+  (`lib/agent-profiles.sh:201`) — this one IS a real provider model id, not
+  a harness alias, and IS verifiable from local config, with one added
+  wrinkle: it differs by which commit is live.
+  - On this feature's own branch (`config.sh:104`, current HEAD): defaults
+    to **`gpt-5.6-sol:high`**.
+  - On `integrate/release-bundle-437eebe` (`1df9d93:config.sh:104` — the
+    release bundle this work ships through, which already includes #378):
+    defaults to **`gpt-6-sol:high`** instead. "The top Codex tier ('Sol
+    high')" tracks whichever of these is actually live wherever a grant is
+    minted — **the `gpt-6-sol:high` figure holds only once #378 ships**;
+    until then the deployed value is `gpt-5.6-sol:high`. Neither figure is
+    a concept this proposal introduces — both are `config.sh:104` read
+    verbatim, no code change here, same as every other tier already does.
+
+**Design option this raises, not proposed here**: because `sonnet`/`opus`
+cannot be pinned to an exact provider id from local config the way the
+Codex tiers can, `lib/agent-profiles.sh` could be changed to pin exact
+provider model ids for the escalation tiers specifically (instead of the
+bare harness aliases `model_for_agent` emits today), giving Option B's
+`standard`/`deep` steps the same verifiability its `frontier` step already
+has. That would be its own change to `lib/agent-profiles.sh`, with its own
+review — not something this document implements or recommends picking an
+id for.
+
+The loop threshold — "after 2-3 no-progress loops" — is
+`HERDR_NO_PROGRESS_CYCLES` (`lib/escalation.sh:272`, `${HERDR_NO_PROGRESS_
+CYCLES:-3}`), already defaulted to **3** identical ticks before
+`no_progress_detect` reports a loop at all (`lib/escalation.sh:82-85`) —
+this grant proposal does not change that threshold or the one-tier-per-
+escalation pacing; "2-3 loops" is already what today's detector requires
+per step, and each of the three steps in B still only fires on its OWN
+fresh 3-cycle (or configured) no-progress window for the NEW tier, not a
+single trigger that cascades through all three at once.
+
+A grant's `max_tier` admits every tier at or below it in `esc_ladder`'s
+order (`lib/escalation.sh:98`, default `fast standard deep frontier`), not
+a hand-picked subset — so Option B's `frontier` ceiling also admits `fast`
+and `standard` escalations for the same task, even though Terrence's own
+description starts at Sonnet (`standard`). That's consistent with how
+escalation already works (`esc_next_tier`, `lib/escalation.sh:166-...`,
+moves exactly one tier at a time from wherever the task currently sits) —
+nothing here lets a task skip from `fast` straight to `frontier` in one
+jump regardless of which option is chosen; each tier still needs its own
+fresh no-progress window.
+
+**Per-step scope, both options:**
+
+- **Repo**: one repo per grant, exactly as specified throughout this
+  document — unchanged by which ladder is granted.
+- **Task lineage**: a grant is never task-bound (no no-progress task exists
+  at mint time); scope is enforced structurally by `esc_escalate` only ever
+  running after `no_progress_detect` already reported a loop for a
+  SPECIFIC task (`stall-watchdog.sh:280-282`), and by `_esc_spawn_next_
+  tier`'s existing journal/pinning logic refusing a second spawn for a task
+  that already has one in flight or bound (`lib/escalation.sh:830-...`).
+  Each step up the ladder (standard→deep, deep→frontier) is a NEW spawn for
+  the SAME task lineage (the successor becomes the new task the next
+  no-progress window watches) — the grant authorizes the repo and tier
+  ceiling, not a specific task_id, by construction, in both options.
+- **Write scope**: unchanged by this proposal in either option — every
+  managed spawn (live-ancestry or grant-admitted) gets its own dedicated git
+  worktree keyed to one branch (`spawn-task.sh`'s worktree creation), and
+  `lib/command-policy.sh`'s grant-tokenizer already scopes action grants to
+  that task's own `branch`/`worktree` fields, failing closed on an empty
+  branch (`lib/run-registry.sh:242-247`'s comment on the `branch` column).
+  This proposal adds no new write-scope mechanism and narrows nothing
+  further than what every other managed spawn already gets.
+- **Spend or time caps**: **none exist today**, in either option. Grepping
+  `lib/escalation.sh`, `stall-watchdog.sh`, `no-progress-escalate.sh`,
+  `spawn-task.sh`, `config.sh` for any budget/spend/cost-cap mechanism
+  found none — `HERDR_ESCALATION_HOOK_RETRIES` (`config.sh:140`) bounds one
+  watchdog cycle's spawn *retry* attempts, not total spend, and nothing
+  bounds how long a spawned successor itself may run once launched (true
+  for every spawn today, not something this proposal changes). Option B's
+  wider ceiling reaches a more expensive model with the exact same absence
+  of a spend guard — if a time/spend cap is wanted, it is a separate,
+  unrelated piece of infrastructure this document does not propose and
+  should not be assumed to exist.
+- **Caller binding**: identical in both options — §3 below, live ancestry
+  proven once at mint time, never inferred from the unattended caller.
+- **Action-time revocation**: identical in both options — §5 below, the
+  sentinel file, checked before the grant lookup on every tick, so a mid-
+  run revoke stops the NEXT spawn attempt at whichever tier it was about to
+  reach, including a frontier/codex spawn already queued for this watchdog
+  tick. It does not stop or kill a successor already launched in an earlier
+  tick — revocation is "mint no more," not "recall what's running," in
+  both options (consistent with §6 rollback: this was never a live-agent
+  kill switch).
+- **Expiry**: identical in both options — §4 below, the same hard 24h cap.
+  B does not get a longer window for reaching further; the ceiling is tier,
+  not time.
+
+**Which steps need a step-up human approval, and why:**
+
+Neither option auto-approves anything beyond what minting the grant already
+decided. The three-step distinction is about WHEN Terrence's judgment is
+asked for, not whether it ever is:
+
+- **Minting the grant at all** — human-only in both options (§3, §8): this
+  is the one unavoidable step-up, because it is the only place live pane
+  ancestry is ever proven for this feature.
+- **Reaching `deep`/`frontier` specifically** needs its own, separate
+  step-up beyond "mint a grant for this repo" IF Option A ships first and
+  Option B is wanted later — raising `max_tier` above `standard` is already
+  listed as human-only (§8, "Raising `max_tier` above `standard`... requires
+  a code change to the mint command's own hard caps"). If B ships as the
+  initial design instead, this is folded into the single mint-time decision
+  — Terrence chooses `frontier` once, at mint time, and nothing asks again
+  per tier-step after that, which is the material difference from A: A asks
+  "is sonnet enough" once per repo at mint time and never risks more; B asks
+  "is the full ladder, unattended, acceptable for this repo" once at mint
+  time and then genuinely does not ask again before an unattended codex
+  spawn.
+- **Crossing model families (claude→codex) specifically** is not a separate
+  approval gate in either option as designed — `frontier` always resolves
+  to codex (`lib/escalation.sh:209`) as part of the existing, already-
+  shipped tier ladder, not something this grant introduces. If a distinct
+  approval step for the family crossing (not just the tier ceiling) is
+  wanted, that is a NEW control this document does not currently propose
+  and would need its own design, since today nothing — not escalation, not
+  this grant — treats a family crossing as materially different from a
+  same-family tier step.
+
+**Recommendation stands as originally written: default to Option A for the
+first repo, even if Option B is the eventual goal** — not because B is
+unsafe by design, but because neither option has any operating history yet,
+and A's smaller blast radius makes the first real-world failure mode (if
+any) cheaper to observe and fix. This is a recommendation, not a
+restriction the code enforces — the mint command's own hard cap (§8) is
+Terrence's to set per repo at mint time regardless of which option this
+pilot starts with.
+
 ## 1. Exact action
 
 - **Caller**: `_esc_check_launch_authority` (`lib/escalation.sh:544-556`),
@@ -92,7 +270,9 @@ works for a publisher that is never a herdr pane either.
   `bash "$_esc_dir/../spawn-task.sh" --no-focus "$repo" "$branch" "$job"
   "$agent"` (`lib/escalation.sh:591`, inside `_esc_spawn_successor`), with one
   new argument added when a grant is admissible:
-  `--authorization-command-id <grant_command_id>`.
+  `--resident-redemption-id <token_command_id>` — **not** the grant's own
+  `command_id` (REVIEW-GRANT-9ac2fc4, HIGH: see §3 point 3 below for why a
+  bare grant id is never passed around after the fix).
 - **Job classes**: exactly the four `esc_tier_job` values
   (`lib/escalation.sh:189-196`) — `explore` (fast), `implement` (standard),
   `plan` (deep), `deep-review` (frontier). No other job class is ever passed
@@ -121,17 +301,28 @@ works for a publisher that is never a herdr pane either.
   that already has one in flight or bound. The grant only ever reaches
   `spawn-task.sh` from inside that already-gated call path — it is not a
   general-purpose spawn credential and must never be accepted outside
-  `_esc_spawn_successor`'s own invocation.
+  `_esc_spawn_successor`'s own invocation. **REVIEW-GRANT-9ac2fc4 (HIGH)**
+  found the first implementation only *intended* this and did not enforce
+  it: the grant's own `command_id`, once recovered from any spawned task's
+  ordinary audit record (`claims.grant_command_id`), was independently
+  presentable straight to `spawn-task.sh` with zero ancestry and zero
+  `esc_escalate` involvement, admitting a second, unrelated spawn. Fixed
+  structurally (§3 point 3): `_esc_check_launch_authority` now mints a
+  fresh, single-use redemption token per admitted escalation attempt, and
+  only that token — never the grant's own id — is what `spawn-task.sh`
+  will accept.
 - **Max tier**: the grant's `effective_scope` carries a `max_tier` field (one
   of `fast|standard|deep|frontier`). `_esc_check_launch_authority` refuses
   if `to_tier` (the tier `esc_escalate` is currently trying to reach) ranks
   above the grant's `max_tier` in the existing ladder order — the old writer
   stays active and the task is marked `blocked`, same shape as a missing
-  grant. **Default proposal: `standard` only** (haiku→sonnet). Reaching
-  `deep`/`frontier` unattended is a materially bigger blast radius (opus/
-  codex spend, longer unattended runtime) and should require either a
-  separate, explicitly wider grant or stay human-only until there is
-  operating experience with `standard`.
+  grant. **Default recommendation: `standard` only** (Option A, haiku→
+  sonnet) — see "Pilot scope: two options" above for the full comparison
+  against Terrence's requested wider ladder (Option B, `max_tier =
+  frontier`). Reaching `deep`/`frontier` unattended is a materially bigger
+  blast radius (opus/codex spend, longer unattended runtime); the mint
+  command's own hard cap is Terrence's to set per repo regardless of which
+  option a given grant uses.
 
 ## 3. Identity and binding — no spoofed ancestry, no env bypass
 
@@ -163,11 +354,37 @@ they are, reused read-only by the **mint** step instead:
    recent `status='accepted'` row with `source='resident_escalation_grant'`
    and `source_repo = <repo>` (a read, same transaction shape `read()`
    already provides, `lib/task-authorization.py:156-157`). If one exists,
-   unexpired, and its `max_tier` admits `to_tier`, pass its `command_id`
-   through to `_esc_spawn_successor` as `--authorization-command-id`.
-   `spawn-task.sh`'s own validation at line 420 gains the matching new
-   admissible `.source` branch with its own predicate (job_class, repo,
-   max_tier — never widened to the OAuth predicate's shape).
+   unexpired, and its `max_tier` admits `to_tier`, it does **not** pass that
+   row's own `command_id` onward — **REVIEW-GRANT-9ac2fc4 (HIGH)** proved
+   that id leaks via every spawn's own ordinary audit record
+   (`claims.grant_command_id` on the `resident_escalation_spawn` row below),
+   making it a reusable bearer credential for the grant's whole TTL once any
+   one spawn under it had happened. Instead it mints a brand-new,
+   short-TTL (5 min — just the quiesce-then-spawn window, not the grant's
+   own up-to-24h one), single-use row of a **third** source,
+   `resident_escalation_redemption` (`accept_resident_redemption`,
+   `lib/task-authorization.py`), scoped to `(grant_command_id, repo,
+   job_class)`, and passes *that* row's `command_id` through to
+   `_esc_spawn_successor` as `--resident-redemption-id`. This mint is the
+   **only** place in the codebase that ever produces a redemption token —
+   nothing else, including `grant-resident-escalation.sh` or any CLI,
+   mints this source, so a token cannot be pre-forged or requested on
+   demand by an unattended caller; it only ever exists as the byproduct of
+   a real admission decision. `spawn-task.sh`'s own validation gains a
+   matching new branch that calls `claim_resident_redemption(token, repo,
+   job_class)` — an ATOMIC, single-use consumption (`status`
+   `accepted`→`bound` inside one transaction, race-safe via the UPDATE's
+   own affected-row count) that returns the underlying `grant_command_id`
+   on success and refuses outright for anything that is not a genuine,
+   unconsumed, unexpired, matching-scope token of this exact source — a
+   bare grant `command_id` presented here fails the source check the same
+   way an unknown id does, closing the leak. `spawn-task.sh` then
+   independently re-verifies the recovered grant is *still* admissible
+   (`resident_grant_admits`, unchanged defense-in-depth from before this
+   fix) before self-minting its own per-spawn `resident_escalation_spawn`
+   record (unchanged) — a revocation or expiry in the gap between token
+   mint and claim still refuses here even though the token itself was
+   genuine.
 4. No environment variable ever carries a grant, a repo name, or a bypass
    flag. `HERDR_ESC_AUTHORITY_CMD` (the existing test seam) stays test-only
    and is never read in production; the grant lookup is a database read, not
@@ -289,10 +506,14 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
 4. A grant exists but its `max_tier` is below the tier `esc_escalate` is
    currently trying to reach → refused (tier-cap enforcement), including the
    boundary case (`to_tier == max_tier` must pass; one above must refuse).
-5. A grant is valid, unexpired, correctly scoped — but the authority check is
-   invoked directly, bypassing `esc_escalate`'s own no-progress gate — must
-   still refuse or be structurally unreachable, proving the grant is not a
-   general-purpose spawn bypass usable outside escalation's own call path.
+5. A grant is valid, unexpired, correctly scoped — but its own `command_id`
+   (not a genuine redemption token) is presented directly to the claim
+   step, bypassing `_esc_check_launch_authority`'s own token mint entirely
+   — must refuse (wrong `source`), proving the grant is not a general-
+   purpose spawn bypass usable outside escalation's own call path.
+   **REVIEW-GRANT-9ac2fc4 (HIGH)**: this exact test was missing from the
+   first implementation, and the gap it would have caught was real — now
+   covered (`verify-resident-launch-grant.sh` case 7).
 6. The revocation sentinel is present → refused even against an otherwise
    fully valid grant, and the sentinel is checked *before* the grant lookup
    (ordering test: a valid grant plus the sentinel must never spawn).
@@ -300,11 +521,16 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
    under a valid grant) and takes effect on the *next* tick without a
    process restart — directly proves "effective at the next tick," not
    "effective after redeploy."
-8. A grant that does authorize a spawn is consumed through the existing
-   once-only `claim_task_worktree_mutation` claim (`spawn-task.sh:435`) —
-   verify a grant cannot authorize two concurrent spawns (reuses the
-   existing once-only semantics; this proposal adds no new consumption
-   logic to re-prove, only a new way to reach the existing gate).
+8. **REVIEW-GRANT-9ac2fc4 (HIGH) superseded this item's original text**
+   ("reuses the existing once-only semantics, no new consumption logic to
+   re-prove") — the redemption-token fix adds genuinely new single-use
+   consumption logic (`claim_resident_redemption`'s atomic `accepted`→
+   `bound` transition) that sits IN FRONT OF the pre-existing
+   `claim_task_worktree_mutation` gate, not instead of it, and must be
+   proved on its own terms: a token claimed once succeeds and recovers the
+   correct grant id; a second claim of the SAME token is refused — a grant
+   cannot authorize two concurrent spawns off a single redemption
+   (`verify-resident-launch-grant.sh` case 8).
 9. The full existing `verify-no-progress-escalation.sh` suite (120
    assertions as of R9) stays green with the new lookup branch present but
    no grant ever minted in any fixture — the new code path must be
@@ -317,7 +543,9 @@ escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
 A positive "grant actually authorizes a successful spawn end-to-end"
 fixture test is also required once the mint/consume code exists, but it is
 not a *negative* test and does not gate activation by itself — items 1-10
-above do.
+above do. (Now present: `verify-resident-launch-grant.sh` case 8's first
+two assertions — grant admits, token mints, token claims and recovers the
+correct grant id — are what item 10's mutation probe targets.)
 
 ## Review boundary
 

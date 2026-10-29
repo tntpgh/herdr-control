@@ -95,10 +95,12 @@ secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
 approval_req=menu
 authorization_command_id=""
+resident_redemption_id=""
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; tools_req=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --authorization-command-id) authorization_command_id="${2:?spawn-task: authorization command id required}"; shift 2 ;;
+    --resident-redemption-id) resident_redemption_id="${2:?spawn-task: resident redemption id required}"; shift 2 ;;
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
@@ -921,6 +923,38 @@ esac
 # second argument).
 _spawn_task_root_real="$(cd "$root" 2>/dev/null && pwd -P)"
 [ -n "$_spawn_task_root_real" ] || _spawn_task_root_real="$root"
+# docs/design/resident-launch-grant.md, REVIEW-GRANT-9ac2fc4 (HIGH fix): an
+# UNATTENDED caller with no live herdr-pane ancestry (lib/escalation.sh's
+# own no-progress escalation path) can still admit here, but ONLY by
+# presenting a single-use redemption token that ONLY
+# _esc_check_launch_authority can mint -- never by presenting the standing
+# grant's own command_id (which is discoverable later via any spawned
+# task's own audit trail, and is deliberately NOT accepted here at all).
+# claim_resident_redemption atomically consumes the token (structural
+# single-use: a second presentation of the SAME token, from anywhere,
+# fails here the same way an unknown one does) and returns the grant's
+# own command_id on success -- THEN this independently re-derives
+# admission AGAIN from the grant itself (never trusting the token's mere
+# existence as proof the grant is STILL good; a revocation or expiry in
+# the gap since the token was minted still refuses here). This never
+# trusts lib/escalation.sh's own prior decision; it is a completely
+# separate process, a completely separate query, same defense-in-depth
+# posture as every other check in this gate. A self-minted
+# resident_escalation_spawn record (accept_resident_escalation_spawn) is
+# what actually flows into authorization_command_id below -- the standing
+# grant row itself is never bound to a task_id and never touched by this.
+if [ -n "$resident_redemption_id" ] && [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
+  _resident_claimed_grant_id="$(claim_resident_redemption "$resident_redemption_id" "$_spawn_task_root_real" "$job" 2>/dev/null)"
+  [ -n "$_resident_claimed_grant_id" ] || {
+    echo "spawn-task: authorization hold: resident redemption token invalid, already consumed, expired, or does not match this repo/job-class" >&2; exit 1;
+  }
+  _resident_reverify_id="$(resident_grant_admits "$_spawn_task_root_real" "$job" 2>/dev/null)"
+  [ -n "$_resident_reverify_id" ] && [ "$_resident_reverify_id" = "$_resident_claimed_grant_id" ] || {
+    echo "spawn-task: authorization hold: resident grant no longer admits this repo/job-class (revoked or expired after the token was minted)" >&2; exit 1;
+  }
+  authorization_command_id="$(gen_id resident_spawn)"
+  accept_resident_escalation_spawn "$authorization_command_id" "$_resident_claimed_grant_id" "$root" "$manifest_json" >/dev/null || exit 1
+fi
 if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
   source_pane="$(caller_pane_from_ancestry)" || {
     echo "spawn-task: authorization hold: local caller ancestry unavailable or outside Herdr" >&2; exit 1;
@@ -1183,6 +1217,12 @@ if [ -n "$authorization_command_id" ]; then
     if [ "$launch_source" != "$source_pane" ] || [ "$launch_source_birth" != "$source_birth" ] || \
        ! pane_is_conductor_eligible "$source_pane" "$_spawn_task_root_real"; then
       echo "spawn-task: authorization hold: local source identity changed before launch" >&2; exit 1
+    fi
+  fi
+  if [ -n "${_resident_claimed_grant_id:-}" ]; then
+    _resident_launch_reverify="$(resident_grant_admits "$_spawn_task_root_real" "$job" 2>/dev/null)"
+    if [ "$_resident_launch_reverify" != "$_resident_claimed_grant_id" ]; then
+      echo "spawn-task: authorization hold: resident grant no longer admits this repo/job-class (revoked or expired before launch)" >&2; exit 1
     fi
   fi
   mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launch_claimed || {

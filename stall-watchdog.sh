@@ -82,6 +82,93 @@ _sw_digest() {                          # <text> -> short stable digest
   fi
 }
 
+# ---- completion harvest / successor queue (docs/design/completion- -------
+# harvest-dispatch.md) ---------------------------------------------------
+# `signal` in {artifact, handoff} is the one shape that actually means "a
+# worker finished something" (denied/unprocessed/conductor_prompt are not).
+# For those two signals only:
+#   1. `_sw_record_receipt`, called ONCE early in cmd_wake, unconditional
+#      (independent of whether an owner is even reachable to wake) —
+#      records a durable completion receipt, deduped by task + the
+#      artifact's own content sha (lib/run-registry.sh's
+#      record_completion_receipt).
+#   2. `_sw_successor_note`, called at EACH actual send site (both already
+#      gated on a live, identity-matched conductor pane — never computed,
+#      let alone claimed, for an unreachable/dead owner, so a successor is
+#      never silently burned on a wake nobody received) — if the task's
+#      lane has a pre-planned successor and is not held, checks WHO (if
+#      anyone) already holds the dispatch claim for that exact lane +
+#      successor-content pair (dispatch_successor_owner): empty -> tries
+#      to WIN it (dispatch_successor_once, "one writer per scope", the
+#      scope being the lane); already ours (e.g. an earlier attempt for
+#      this SAME wake failed to deliver and this is the M3 retry) ->
+#      re-asserts it, no new write; someone else's -> silent. Either way
+#      the note is folded in iff we own the claim — review REVIEW-HARVEST-
+#      6a20224 HIGH: the claim is WHO gets to announce the successor,
+#      decided once, but whether THIS delivery attempt's message includes
+#      the note is re-derived from that fact every call, so a failed send
+#      (nothing delivered, nothing typed) never silently drops the note on
+#      its own retry — it just keeps riding along with the base wake's
+#      message, same as everything else in it, until delivery confirms or
+#      the base wake's own N4 typed-gate stops retrying. A duplicate
+#      harvest of the same completion by a DIFFERENT task racing the same
+#      lane still gets exactly one winner and omits the note on the loser
+#      — exactly one dispatch per successor, never a repeated hand-off
+#      across two different owners. Never a new send, never a spawn,
+#      never new authority: the successor is a string folded into the
+#      EXISTING wake to the EXISTING owner, nothing more. A task with no
+#      assigned lane, no queued successor, or a successor someone else
+#      already owns the dispatch for degrades to exactly today's bare
+#      wake text.
+_sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
+  local path="$1/$2"
+  [ -f "$path" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" 2>/dev/null | awk '{print $1}'
+  fi
+}
+_sw_record_receipt() {                  # task_id signal artifact worktree
+  local task_id="$1" signal="$2" artifact="$3" worktree="$4" sha
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
+  if [ -n "$artifact" ] && [ -n "$worktree" ]; then
+    sha="$(_sw_artifact_sha "$worktree" "$artifact")"
+    [ -n "$sha" ] && record_completion_receipt "$task_id" "$artifact" "$sha" >/dev/null 2>&1
+  fi
+}
+# Review REVIEW-HARVEST-6a20224 HIGH: the dispatch claim is the RIGHT to
+# announce a successor, decided once -- but whether THIS attempt's
+# message includes the note is re-derived from that permanent fact on
+# EVERY call, so a failed send's retry (same task, same key, called
+# again by cmd_wake's own M3 retry loop) still carries the note instead
+# of silently losing it. Owner-empty: try to win the claim. Owner==us
+# (we already won it, possibly on an earlier failed attempt for this
+# same wake): re-assert, no new write. Owner==someone else: silent, no
+# write attempted -- this is what keeps two tasks racing the same lane's
+# successor to exactly one dispatch and prevents a retry from ever
+# claiming twice (successor_dispatch_count stays at 1 regardless of how
+# many times this function is called for the winning task).
+_sw_successor_note() {                  # task_id signal conductor -> prints "Pre-planned next: ..." or nothing
+  local task_id="$1" signal="$2" conductor="$3" lane succ owner
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
+  lane="$(read_lane_for_task "$task_id" 2>/dev/null)" || return 0
+  succ="$(lane_successor_admits "$lane" 2>/dev/null)" || return 0
+  [ -n "$succ" ] || return 0
+  owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  if [ -z "$owner" ]; then
+    dispatch_successor_once "$lane" "$succ" "$task_id" "$conductor" >/dev/null 2>&1
+    owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  fi
+  [ "$owner" = "$task_id" ] && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
+}
+
 _sw_escalate_window_s() {
   local raw="${HERDR_STALL_WATCHDOG_ESCALATE_S:-}" thresh="${HERDR_STALL_WATCHDOG_THRESHOLD_S:-600}"
   case "$thresh" in ''|*[!0-9]*) thresh=600 ;; esac
@@ -298,13 +385,15 @@ cmd_wake() {
   task_json="$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$task_id");" 2>/dev/null)"
   [ -n "$task_json" ] || return 0   # task vanished between detection and delivery — nothing to wake
 
-  local run_id pane conductor conductor_birth label
+  local run_id pane conductor conductor_birth label worktree
   run_id="$(printf '%s' "$task_json" | jq -r '.run_id // empty')"
   pane="$(printf '%s' "$task_json" | jq -r '.pane_id // empty')"
   conductor="$(printf '%s' "$task_json" | jq -r '.conductor_pane_id // empty')"
   conductor_birth="$(printf '%s' "$task_json" | jq -r '.conductor_pane_birth // empty')"
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
+  worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty')"
   [ -n "$label" ] || label="$task_id"
+  _sw_record_receipt "$task_id" "$signal" "$artifact" "$worktree"
 
   # feat/no-progress-model-escalation R2: every real cycle hub hands this
   # task to us, regardless of whether the stall-WAKE itself is deduped
@@ -348,9 +437,10 @@ cmd_wake() {
       # window's own Slack fallback instead of compounding it.
       if ! _sw_wake_confirmed "$task_id" "$key" && ! _sw_wake_typed "$task_id" "$key"; then
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
-          local art_note=""
+          local art_note="" harvest_note
           [ -n "$artifact" ] && art_note=" ($artifact)"
-          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+          harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
+          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
           _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
       fi
@@ -384,9 +474,10 @@ cmd_wake() {
   fi
 
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
-    local art_note=""
+    local art_note="" harvest_note
     [ -n "$artifact" ] && art_note=" ($artifact)"
-    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+    harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
+    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
     _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
 }
