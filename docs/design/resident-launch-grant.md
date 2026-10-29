@@ -110,13 +110,43 @@ names for any family). `esc_tier_model` (`lib/escalation.sh:218-222`) reads
 the actual model id from the same table `spawn-task.sh` itself uses
 (`lib/agent-profiles.sh`'s `model_for_agent`):
 
-- `standard` → `claude:implement` → **sonnet** (`lib/agent-profiles.sh:188`)
-- `deep` → `claude:plan` → **opus** (`lib/agent-profiles.sh:186`)
-- `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**, defaulted to
-  **`gpt-5.6-sol:high`** (`config.sh:104`, `lib/agent-profiles.sh:201`) — "the
-  top Codex tier ('Sol high')" is this exact config value, not a separate
-  concept; it tracks whatever `config.sh:104` resolves to with no code
-  change here, same as every other tier already does.
+- `standard` → `claude:implement` → harness alias **`sonnet`**
+  (`lib/agent-profiles.sh:188`) — **UNVERIFIED which provider model id this
+  resolves to.** `sonnet`/`opus`/`haiku` are harness-level aliases passed
+  to the `claude`/`omp` CLI, not provider model ids; which exact id an
+  alias resolves to is decided inside the harness at launch time, not
+  stored in any local config this repo can read. Checked and confirmed by
+  the conductor (read-only, `~/.omp/agent/models.db`, 2026 — out of scope
+  for a spawned worker to read directly): the `model_cache` table there
+  holds a broad provider CATALOG (many `claude-opus-*`/`claude-sonnet-*`
+  candidate rows), with **no alias-to-id mapping** — naming one specific id
+  here would be a guess, not a citation, so this document does not name one.
+- `deep` → `claude:plan` → harness alias **`opus`** (`lib/agent-profiles.sh:
+  186`) — same UNVERIFIED caveat as `sonnet` above, same evidence.
+- `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**
+  (`lib/agent-profiles.sh:201`) — this one IS a real provider model id, not
+  a harness alias, and IS verifiable from local config, with one added
+  wrinkle: it differs by which commit is live.
+  - On this feature's own branch (`config.sh:104`, current HEAD): defaults
+    to **`gpt-5.6-sol:high`**.
+  - On `integrate/release-bundle-437eebe` (`1df9d93:config.sh:104` — the
+    release bundle this work ships through, which already includes #378):
+    defaults to **`gpt-6-sol:high`** instead. "The top Codex tier ('Sol
+    high')" tracks whichever of these is actually live wherever a grant is
+    minted — **the `gpt-6-sol:high` figure holds only once #378 ships**;
+    until then the deployed value is `gpt-5.6-sol:high`. Neither figure is
+    a concept this proposal introduces — both are `config.sh:104` read
+    verbatim, no code change here, same as every other tier already does.
+
+**Design option this raises, not proposed here**: because `sonnet`/`opus`
+cannot be pinned to an exact provider id from local config the way the
+Codex tiers can, `lib/agent-profiles.sh` could be changed to pin exact
+provider model ids for the escalation tiers specifically (instead of the
+bare harness aliases `model_for_agent` emits today), giving Option B's
+`standard`/`deep` steps the same verifiability its `frontier` step already
+has. That would be its own change to `lib/agent-profiles.sh`, with its own
+review — not something this document implements or recommends picking an
+id for.
 
 The loop threshold — "after 2-3 no-progress loops" — is
 `HERDR_NO_PROGRESS_CYCLES` (`lib/escalation.sh:272`, `${HERDR_NO_PROGRESS_
