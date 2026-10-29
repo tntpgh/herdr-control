@@ -62,15 +62,20 @@ run() {  # run <run_id> <task_id> [args...]
     HERDR_RUN_STATE_DIR="$HERDR_RUN_STATE_DIR" \
     PATH="$PATH" bash "$here/mark-launch-failed.sh" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"
 }
-reg() {  # reg <task_id> <pane_id> <pane_birth> <worktree> <branch> [created_at_offset_seconds]
-  local task_id="$1" pane_id="$2" pane_birth="$3" wt="$4" branch="$5" off="${6:-0}"
-  register_task r1 "$task_id" w1 c1 "" "" "$pane_id" "$pane_birth" repo "$wt" "label:$task_id" "$branch" trunk >/dev/null
+reg() {  # reg <task_id> <pane_id> <pane_birth> <worktree> <branch> [created_at_offset_seconds] [run_id]
+  local task_id="$1" pane_id="$2" pane_birth="$3" wt="$4" branch="$5" off="${6:-0}" rid="${7:-r1}"
+  register_task "$rid" "$task_id" w1 c1 "" "" "$pane_id" "$pane_birth" repo "$wt" "label:$task_id" "$branch" trunk >/dev/null
   if [ "$off" != 0 ]; then
     _q "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '$off seconds') WHERE task_id='$task_id';" >/dev/null
   fi
 }
 state_of() { _q "SELECT state FROM tasks WHERE task_id='$1';"; }
-last_event() { _q "SELECT payload FROM events WHERE task_id='$1' AND type='launch_failed_marked' ORDER BY sequence DESC LIMIT 1;"; }
+# L4 (round 2): the disposition/reason/dead_evidence/superseded_by payload
+# moved from a separate best-effort `launch_failed_marked` event into the
+# `detail` of the SAME `state_changed` event set_task_state writes
+# atomically — json_extract pulls that object back out so every assertion
+# below reads exactly as it did against the old separate event.
+last_event() { _q "SELECT json_extract(payload,'\$.detail') FROM events WHERE task_id='$1' AND type='state_changed' AND json_extract(payload,'\$.state')='launch_failed' ORDER BY sequence DESC LIMIT 1;"; }
 
 printf '== no such task: refused, exit 1 ==\n'
 PANES="" AGENT_PANE=""
@@ -167,6 +172,19 @@ printf '%s' "$(last_event t-old-1)" | jq -e '.disposition == "superseded"' >/dev
   && ok "event disposition=superseded" || bad "event: $(last_event t-old-1)"
 printf '%s' "$(last_event t-old-1)" | jq -e '.superseded_by == "t-new-1"' >/dev/null 2>&1 \
   && ok "event names the superseding task" || bad "event: $(last_event t-old-1)"
+
+printf '== --superseded-by a REAL newer same-worktree/branch task registered under a DIFFERENT run_id (round 2, L5 — the ordinary respawn shape: spawn-task.sh mints a fresh run_id per spawn): marked launch_failed, disposition=superseded ==\n'
+reg t-old-1b pOld1b birthOld1b /wt/super-xrun br-super-xrun 0 r1
+set_task_state r1 t-old-1b running >/dev/null
+reg t-new-1b pNew1b birthNew1b /wt/super-xrun br-super-xrun 5 r2
+PANES="" AGENT_PANE=""
+run r1 t-old-1b --superseded-by t-new-1b; rc=$?
+[ "$rc" = 0 ] && ok "exit 0 (cross-run_id match succeeds)" || bad "exit $rc: $(cat "$WORK/out.txt") $(cat "$WORK/err.txt")"
+[ "$(state_of t-old-1b)" = "launch_failed" ] && ok "state=launch_failed" || bad "state=$(state_of t-old-1b)"
+printf '%s' "$(last_event t-old-1b)" | jq -e '.disposition == "superseded"' >/dev/null 2>&1 \
+  && ok "event disposition=superseded" || bad "event: $(last_event t-old-1b)"
+printf '%s' "$(last_event t-old-1b)" | jq -e '.superseded_by == "t-new-1b"' >/dev/null 2>&1 \
+  && ok "event names the superseding task" || bad "event: $(last_event t-old-1b)"
 
 printf '== --superseded-by a task in a DIFFERENT worktree: refused, not marked ==\n'
 reg t-old-2 pOld2 birthOld2 /wt/super2 br-super2

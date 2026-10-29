@@ -13,15 +13,24 @@
 # registry.sh's `_legal_transition`) — the SAME distinct state spawn-task.sh
 # itself now uses for this failure class, never the generic `failed` a
 # worker that ran and then errored gets. Records WHICH of two dispositions
-# applied in the audit event (`launch_failed_marked`), not as a second state:
+# applied, as a JSON `detail` object INSIDE the same `state_changed` event
+# set_task_state already writes (round 2, L4: a separate best-effort
+# `append_event` call after the state write was non-atomic — a crash or a
+# lost write between the two left a `launch_failed` row with no audit
+# payload explaining which disposition or why):
 #   launch_failed  (default) — nothing ever replaced this launch; `--reason`
 #                   is free text explaining why (default: "operator-marked
 #                   dead task").
 #   superseded     (--superseded-by TASK_ID) — a newer task already took over
 #                   this one's worktree/branch. TASK_ID must be a REAL
-#                   registered task in the same run, for the same
-#                   worktree+branch, created AFTER this one — re-checked
-#                   here, never taken on the caller's word.
+#                   registered task, in ANY run (round 2, L5: spawn-task.sh
+#                   mints a fresh run_id per spawn unless HERDR_RUN_ID is
+#                   exported, so an ordinary respawn is almost never the
+#                   same run_id as the task it replaces — matched by
+#                   worktree+branch via `read_task_by_id`, never scoped to
+#                   this task's own run_id), for the same worktree+branch,
+#                   created AFTER this one — re-checked here, never taken
+#                   on the caller's word.
 #
 # DEADNESS IS RE-VERIFIED, NEVER TAKEN ON THE CALLER'S SAY-SO (same
 # fail-closed shape as every other registry writer in this repo): the task's
@@ -116,8 +125,8 @@ fi
 
 disposition="launch_failed"
 if [ -n "$superseded_by" ]; then
-  newer="$(read_task "$run_id" "$superseded_by")"
-  [ -n "$newer" ] || { echo "mark-launch-failed: --superseded-by $superseded_by does not match any registered task in run $run_id" >&2; exit 1; }
+  newer="$(read_task_by_id "$superseded_by")"
+  [ -n "$newer" ] || { echo "mark-launch-failed: --superseded-by $superseded_by does not match any registered task" >&2; exit 1; }
   this_wt="$(printf '%s' "$task" | jq -r '.worktree // ""')"
   this_branch="$(printf '%s' "$task" | jq -r '.branch // ""')"
   this_created="$(printf '%s' "$task" | jq -r '.created_at // ""')"
@@ -138,12 +147,10 @@ else
   [ -n "$reason" ] || reason="operator-marked dead task"
 fi
 
-set_task_state "$run_id" "$task_id" launch_failed || { echo "mark-launch-failed: set_task_state refused — see its own stderr" >&2; exit 1; }
-append_event "$run_id" "$task_id" "launch_failed_marked" \
-  "$(jq -nc --arg disposition "$disposition" --arg reason "$reason" \
-      --arg dead_evidence "$dead_evidence" --arg superseded_by "$superseded_by" \
-      '{disposition:$disposition, reason:$reason, dead_evidence:$dead_evidence, superseded_by:$superseded_by}')" \
-  >/dev/null 2>&1 || true
+detail="$(jq -nc --arg disposition "$disposition" --arg reason "$reason" \
+    --arg dead_evidence "$dead_evidence" --arg superseded_by "$superseded_by" \
+    '{disposition:$disposition, reason:$reason, dead_evidence:$dead_evidence, superseded_by:$superseded_by}')"
+set_task_state "$run_id" "$task_id" launch_failed "" "" "$detail" || { echo "mark-launch-failed: set_task_state refused — see its own stderr" >&2; exit 1; }
 
 printf 'mark-launch-failed: %s/%s -> launch_failed (disposition=%s): %s\n' "$run_id" "$task_id" "$disposition" "$dead_evidence"
 read_task "$run_id" "$task_id"

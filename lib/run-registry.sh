@@ -1147,16 +1147,35 @@ file_approval_state() {                 # <task_id> <abs-path> <sha256>
 # approvals table below records decisions against a task whose state is
 # supposed to be settled. So the table is enforced, and an illegal transition
 # is refused with a diagnostic rather than written.
-#
 # `blocked` is deliberately NOT terminal even though it is reported like one:
 # a worker waiting on a prompt resolves back to `running` all the time.
+#
+# `uncertain` (root-audit, fix/launch-receipt-r2 round 2, conductor
+# 2026-10-29): a registered-but-AMBIGUOUS startup outcome — herdr itself
+# unreachable mid-liveness-check, or a kickoff `send-to-agent.sh` exit
+# that is neither a confirmed submit nor a confirmed refusal (exit 4
+# UNSUBMITTED: "the caller MUST NOT assume the peer received it", by
+# send-to-agent.sh's own doc) — where the agent may genuinely be alive
+# and fine. Distinct from `launch_failed` (a CONFIRMED "never started")
+# specifically so neither a human skimming the registry nor an automated
+# caller (lib/escalation.sh's `_esc_spawn_successor`/journal, completion-
+# harvest successor dispatch) reads this as either a clean success (no
+# `HERDR_SPAWN_RECEIPT` is ever printed on this path) or a confirmed
+# no-effect failure safe to retry (spawn-task.sh's own exit trap stays
+# silent too, since this always happens after `register_task` already
+# committed) — both would risk a second, duplicate writer on the same
+# worktree/branch. Like `blocked`, NOT terminal: a human or
+# `mark-launch-failed.sh` (the one supported lifecycle command that
+# re-verifies and resolves it, same as it does for a `running` row)
+# moves it onward once the real outcome is known.
 _legal_transition() {                   # from to -> 0 if allowed
   local from="$1" to="$2"
   [ "$from" = "$to" ] && return 0       # idempotent re-assert, always fine
   case "$from" in
     ''|starting) case "$to" in running|blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
-    running)     case "$to" in blocked|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
-    blocked)     case "$to" in running|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    running)     case "$to" in blocked|uncertain|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
+    blocked)     case "$to" in running|uncertain|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
+    uncertain)   case "$to" in running|completed|failed|launch_failed|cancelled|lost) return 0 ;; esac ;;
     # Terminal. Nothing leaves these; `lost` in particular must not be
     # resurrected by a stale hook firing after the sweep already buried it.
     # `launch_failed` (fix/launch-receipt-r2): a DISTINCT terminal outcome
@@ -1164,8 +1183,8 @@ _legal_transition() {                   # from to -> 0 if allowed
     # readiness/liveness check failed, or a conductor's mark-launch-
     # failed.sh confirmed the registered pane is dead) — so a consumer can
     # tell "never ran" apart from "ran and then errored" without parsing
-    # event payloads. Reachable only from `starting`/`running`, same shape
-    # as `failed`, never resurrected.
+    # event payloads. Reachable only from `starting`/`running`/`blocked`/
+    # `uncertain`, same shape as `failed`, never resurrected.
     completed|failed|launch_failed|cancelled|lost) return 1 ;;
   esac
   return 1
@@ -1833,6 +1852,22 @@ set_task_verified() {
 read_task_by_remote_id() {
   registry_init || return 1
   _sql "$(_task_json_select) WHERE remote_task_id=$(_sq "$1") LIMIT 1;" 2>/dev/null
+}
+
+# read_task_by_id <task_id> -> json (empty if absent)
+#
+# task_id alone is globally unique (gen_id's scope, same assumption
+# lib/escalation.sh's `_esc_task_json` and stall-watchdog.sh's cmd_ack
+# already make) — a caller that knows a task_id but not its run_id, e.g.
+# mark-launch-failed.sh's `--superseded-by TASK_ID` (fix/launch-receipt-r2
+# round 2, L5: the superseding task is almost always a DIFFERENT run_id,
+# since spawn-task.sh mints a fresh one per spawn unless HERDR_RUN_ID is
+# exported — `read_task "$run_id" "$superseded_by"` with THIS task's own
+# run_id could never find it), looks it up directly instead of requiring
+# the caller to already know which run owns it.
+read_task_by_id() {
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE task_id=$(_sq "$1") LIMIT 1;" 2>/dev/null
 }
 
 # R4-1 (round-4 security review): tasks.py's post-spawn-failure cleanup must
