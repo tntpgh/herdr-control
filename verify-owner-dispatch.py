@@ -1387,38 +1387,43 @@ def operator_cases(base: Path) -> None:
 
 
 def publisher_tick_cases(base: Path) -> None:
-    """(7) remote-mcp/publisher.py result_availability_tick: default off; a
-    conductor without a registry-bound lease -> held:not_dispatched, nothing
-    typed; with one -> exactly one notice typed to the conductor pane."""
+    """remote-mcp/publisher.py result_availability_tick: STAGE ONLY since
+    tmp/in/BRIEF-optC.md's Option C split -- default off; never calls the
+    owner-lease gate's admit() or herdr-deliver.sh, even with a live
+    conductor lease and a fully staged request. SPEED: stays fast with
+    DELIVER configured to hang for 120s -- the actual send moved to
+    remote-mcp/ra-sender.py (see remote-mcp/verify-ra-sender.py for the
+    notify/budget/crash/alert proofs that used to live here)."""
     import importlib.util
     import time as _t
     root, J = base / "kb_root", base / "journal"
     root.mkdir(); J.mkdir()
     lease_db = str(base / "lease.db")
     lc = ol.connect(lease_db); ol.migrate(lc)
-    ol.register_owner(lc, KB, "tntpgh/knowledge-base", max_open=10, now=_t.time())  # headroom: 6 rids dispatched across this fixture (DEFAULT_MAX_OPEN=5 would QueueFull)
-    ol.register_owner(lc, "conductor", "tntpgh/thurber-os", max_open=10, now=_t.time())  # headroom: owner_lease.OPEN includes blocked/delivering, never released here (no on_reply/resolve in the RA path) -- 6 RA attempts across this fixture would hit DEFAULT_MAX_OPEN=5
-    typed = base / "typed.log"
-    fake = base / "fake-deliver.sh"
-    fake.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$1" "$2" >> {typed}\n')
-    fake.chmod(0o700)
+    ol.register_owner(lc, KB, "tntpgh/knowledge-base", now=_t.time())
+    ol.register_owner(lc, "conductor", "tntpgh/thurber-os", now=_t.time())
+    hang, sentinel = base / "hang-deliver.sh", base / "hang-ran.marker"
+    hang.write_text(f"#!/bin/sh\ntouch {sentinel}\nsleep 120\nexit 0\n")  # SPEED: must never actually run
+    hang.chmod(0o700)
     env = {"HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": lease_db,
            "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
            "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={root}", "HERDR_RESULT_AVAILABILITY_JOURNAL": str(J)}
     saved = {k: os.environ.get(k) for k in [*env, "HERDR_RESULT_AVAILABILITY", "HERDR_DELIVER"]}
-    os.environ.update(env); os.environ["HERDR_DELIVER"] = str(fake)
+    os.environ.update(env); os.environ["HERDR_DELIVER"] = str(hang)
     try:
         sys.path.insert(0, str(HERE / "remote-mcp"))
         spec = importlib.util.spec_from_file_location("publisher_under_test", HERE / "remote-mcp" / "publisher.py")
         pub = importlib.util.module_from_spec(spec); spec.loader.exec_module(pub)
-        pub.DELIVER = str(fake)
+        pub.DELIVER = str(hang)
         rows = {KB: {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "agent_session": "kb-sess"},
                 "conductor": {"pane_id": "w72:p1", "pane_birth": "term_cond", "agent_session": "cond-sess"}}
         pub.registry_owners = lambda: {k: dict(v, workspace="", registered_at="", updated_at="") for k, v in rows.items()}
         kb_digest = pub.owner_session_digest(KB, rows[KB])
         ol.acquire(lc, KB, *PANE[KB], TTL, _t.time(), session_digest=kb_digest)
+        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
+                   session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
         os.environ.pop("HERDR_RESULT_AVAILABILITY", None)
-        case("TICK default off: no flag -> None, nothing typed", pub.result_availability_tick() is None and not typed.exists())
+        case("TICK default off: no flag -> None", pub.result_availability_tick() is None)
         os.environ["HERDR_RESULT_AVAILABILITY"] = "1"
         av = ra.Availability(env["HERDR_RESULT_AVAILABILITY_DB"], {KB: str(root)}, str(J))
         d = od.Dispatcher(old.DeliveryGate(lease_db), av, lambda l, h, t: True, pub.registry_resolver,
@@ -1426,107 +1431,22 @@ def publisher_tick_cases(base: Path) -> None:
         case("TICK fixture: dispatched through the publisher's own registry resolver",
              d.dispatch(KB, "r_tick", b"REQ tick\n", ["result.md"]) == "dispatched")
         (root / "r_tick" / "result.md").write_text("ACK r_tick")
-        pub.result_availability_tick(); pub.result_availability_tick()
+        pub.result_availability_tick()
+        case("TICK observe: pending -> observing after the first tick", av.state("r_tick")[0] == "observing")
+        pub.result_availability_tick()
+        case("TICK observe: observing -> staged after the second tick, content unchanged", av.state("r_tick")[0] == "staged")
+        # SPEED (tmp/in/BRIEF-optC.md #1,#9): a THIRD tick is exactly where the
+        # pre-split code reached prepare()/notify() for a staged row -- with a
+        # live conductor lease AND a DELIVER configured to sleep 120s, this
+        # must still return instantly and the hang script must never run.
+        t0 = _t.monotonic()
         out = pub.result_availability_tick()
-        case("TICK no conductor lease: typed pre-send held, row stays staged, nothing typed, no gate row",
-             out == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and av.state("r_tick")[0] == "staged"
-             and not typed.exists() and lc.execute("SELECT count(*) FROM owner_requests WHERE label='conductor'").fetchone()[0] == 0)
-        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(), session_digest=hashlib.sha256(b"wrong").hexdigest())
-        case("TICK conductor lease not matching the registry session: still held, nothing typed",
-             pub.result_availability_tick() == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and not typed.exists())
-        lc.execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00.000000Z' WHERE label='conductor'")
-        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
-                   session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
-        gate = old.DeliveryGate(lease_db)
-        xid = ra.GatedNotice.exchange_id
-
-        def stage(rid):
-            assert d.dispatch(KB, rid, f"REQ {rid}\n".encode(), ["result.md"]) == "dispatched"
-            (root / rid / "result.md").write_text(f"ACK {rid}")
-            pub.result_availability_tick(); pub.result_availability_tick()
-            row = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid=?", (rid,)).fetchone()
-            return ra.notice_text(rid, row[0], row[1])
-
-        # RACE: ready/prepare saw the conductor, identity gone at the typing boundary.
-        real_resolver, calls = pub.registry_resolver, {"n": 0}
-
-        def flaky(label):
-            if label == "conductor":
-                calls["n"] += 1
-                if calls["n"] > 1:
-                    return None
-            return real_resolver(label)
-        pub.registry_resolver = flaky
-        text = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid='r_tick'").fetchone()
-        text = ra.notice_text("r_tick", *text)
-        out = pub.result_availability_tick()
-        pub.registry_resolver = real_resolver
-        case("RACE identity gone at the boundary: typed pre-send held, row staged (never notifying/ambiguous), nothing typed",
-             out == {"r_tick": "held:not_dispatched:identity_changed_pre_send"} and av.state("r_tick")[0] == "staged"
-             and not typed.exists() and gate.record(xid(text))[2:] == ("blocked", "identity_changed_pre_send"))
-        case("RACE: the blocked notice is never re-admitted (no resend grant)",
-             pub.result_availability_tick()["r_tick"] == "held:not_dispatched:owner_lease_duplicate:blocked" and not typed.exists())
-        t2 = stage("r_tick2")
-        out = pub.result_availability_tick()
-        lines = typed.read_text().splitlines() if typed.exists() else []
-        case("TICK registry-bound conductor: notified through the gate, exactly one notice, body-bound exchange id delivering",
-             out["r_tick2"] == "notified" and len(lines) == 1 and lines[0] == f"w72:p1|{t2}"
-             and gate.record(xid(t2))[:3] == ("conductor", gate.record(xid(t2))[1], "delivering")
-             and "r_tick2" not in pub.result_availability_tick())
-        t3 = stage("r_tick3")
-        bad = base / "fail-deliver.sh"
-        bad.write_text("#!/bin/sh\nexit 1\n"); bad.chmod(0o700)
-        pub.DELIVER = str(bad)
-        out = pub.result_availability_tick()
-        pub.DELIVER = str(fake)
-        case("POST-SEND failure: ambiguous, gate blocked send_not_confirmed (not retryable)",
-             out["r_tick3"] == "ambiguous" and gate.record(xid(t3))[2:] == ("blocked", "send_not_confirmed"))
-        t4 = stage("r_tick4")
-
-        class Crash(BaseException):
-            pass
-        real_prepare = ra.GatedNotice.prepare
-
-        def crash_after_prepare(self, rid, text, **kw):
-            r = real_prepare(self, rid, text, **kw)
-            if rid != "r_tick4":
-                return r
-            raise Crash()  # killed after begin_notice, before the notifying CAS
-        ra.GatedNotice.prepare = crash_after_prepare
-        try:
-            pub.result_availability_tick()
-        except Crash:
-            pass
-        finally:
-            ra.GatedNotice.prepare = real_prepare
-        out = pub.result_availability_tick()
-        case("CRASH after begin_notice, before CAS: row staged, gate delivering, next tick held duplicate, never typed",
-             out["r_tick4"] == "held:not_dispatched:owner_lease_duplicate:delivering" and av.state("r_tick4")[0] == "staged"
-             and gate.record(xid(t4))[2] == "delivering" and len(typed.read_text().splitlines()) == 1)
-        # SPEED (tmp/in/BRIEF.md #3): two requests BOTH ready to notify in the
-        # SAME tick must still produce exactly one herdr-deliver.sh call --
-        # the other stays admitted/staged and is delivered on the very next
-        # tick, never starved, never double-sent. r_tick and r_tick4 (above)
-        # both stay perpetually staged, permanently duplicate-blocked/
-        # duplicate-delivering in the gate -- proves neither stuck row ever
-        # eats the one slot (admit() refuses both before the budget check).
-        assert d.dispatch(KB, "r_budget_a", b"REQ budget a\n", ["result.md"]) == "dispatched"
-        assert d.dispatch(KB, "r_budget_b", b"REQ budget b\n", ["result.md"]) == "dispatched"
-        (root / "r_budget_a" / "result.md").write_text("ACK budget a")
-        (root / "r_budget_b" / "result.md").write_text("ACK budget b")
-        pub.result_availability_tick(); pub.result_availability_tick()
-        case("BUDGET: both requests reach staged before the shared tick",
-             av.state("r_budget_a")[0] == "staged" and av.state("r_budget_b")[0] == "staged")
-        before_lines = len(typed.read_text().splitlines()) if typed.exists() else 0
-        out = pub.result_availability_tick()
-        case("BUDGET: one tick with two ready rows notifies exactly ONE (lowest rid first), exactly one new typed line",
-             out["r_budget_a"] == "notified" and out["r_budget_b"] == "held:not_dispatched:rate_limited_one_notice_per_tick"
-             and len(typed.read_text().splitlines()) == before_lines + 1 and av.state("r_budget_b")[0] == "staged")
-        out2 = pub.result_availability_tick()
-        case("BUDGET: the deferred row is notified on the very next tick, nothing lost",
-             out2["r_budget_b"] == "notified" and len(typed.read_text().splitlines()) == before_lines + 2)
-
-        gate.close()
+        elapsed = _t.monotonic() - t0
+        case("SPEED: staged + live conductor lease + a 120s-hanging DELIVER -> tick stays under 1s, hang script never ran",
+             elapsed < 1.0 and out == {"r_tick": "held:not_dispatched:staged_for_ra-sender"}
+             and av.state("r_tick")[0] == "staged" and not sentinel.exists())
+        case("TICK observe-only never touches the owner-lease gate: zero owner_requests rows for conductor",
+             lc.execute("SELECT count(*) FROM owner_requests WHERE label='conductor'").fetchone()[0] == 0)
         av.close()
     finally:
         for k, v in saved.items():
