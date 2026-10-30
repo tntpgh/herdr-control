@@ -33,14 +33,37 @@
 # resolves inside the sandbox ($S). $S itself is never deleted (no cleanup
 # trap) so the sandboxed registry/forms a human would want to inspect after
 # a run survive it; its path is printed at the end.
+#
+# REVIEW-FORMFIX-R3-a336a25.md: (1) the real-$HOME capture had no validation
+# -- an empty/relative/missing $HOME silently produced a bogus live root.
+# (6) a bare `bash …; rc=$?` under `set -e` meant any suite failure (rc!=0)
+# aborted this script immediately, so the retained-$S path from r3 never
+# printed on the one case (a failure) where a human would most want it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$here/verify-formserve-action-forms-guard.sh" ] || { echo "isolated-run: missing verify-formserve-action-forms-guard.sh next to this script" >&2; exit 1; }
 
-HERDR_GUARD_LIVE_ROOT="$HOME/.local/state/herdr"
+if [ -z "${HOME:-}" ]; then
+  echo "isolated-run: \$HOME is empty -- refusing to run" >&2
+  exit 1
+fi
+case "$HOME" in
+  /*) ;;
+  *) echo "isolated-run: \$HOME ($HOME) is not an absolute path -- refusing to run" >&2; exit 1 ;;
+esac
+[ -d "$HOME" ] || { echo "isolated-run: \$HOME ($HOME) does not exist or is not a directory -- refusing to run" >&2; exit 1; }
+
+HERDR_GUARD_LIVE_ROOT="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$HOME/.local/state/herdr")" \
+  || { echo "isolated-run: could not resolve the real path of \$HOME/.local/state/herdr" >&2; exit 1; }
+case "$HERDR_GUARD_LIVE_ROOT" in
+  /*) ;;
+  *) echo "isolated-run: resolved live root ($HERDR_GUARD_LIVE_ROOT) is not absolute -- refusing to run" >&2; exit 1 ;;
+esac
 
 S="$(mktemp -d)" || { echo "isolated-run: mktemp -d failed" >&2; exit 1; }
+S="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$S")" \
+  || { echo "isolated-run: could not resolve the real path of the sandbox dir" >&2; exit 1; }
 
 mkdir -p "$S/home" "$S/state" "$S/runs" "$S/tmp" "$S/bin" || { echo "isolated-run: mkdir -p scratch dirs failed" >&2; exit 1; }
 
@@ -55,14 +78,14 @@ EOF
 chmod +x "$S/bin/notify-stub.sh" "$S/bin/send-stub.sh" || { echo "isolated-run: could not write/chmod stub scripts" >&2; exit 1; }
 
 export HOME="$S/home" HERDR_STATE_ROOT="$S/state" HERDR_RUN_STATE_DIR="$S/runs" TMPDIR="$S/tmp"
-export HERDR_GUARD_LIVE_ROOT="$HERDR_GUARD_LIVE_ROOT"
+export HERDR_GUARD_LIVE_ROOT="$HERDR_GUARD_LIVE_ROOT" HERDR_GUARD_SANDBOX_ROOT="$S"
 export HERDR_ACTION_NOTIFY="$S/bin/notify-stub.sh" HERDR_ACTION_SEND="$S/bin/send-stub.sh"
 export HERDR_TEST_NOTIFIED="$S/notified.log" HERDR_TEST_SENT="$S/sent.log"
 : > "$HERDR_TEST_NOTIFIED"
 : > "$HERDR_TEST_SENT"
 
-bash "$here/verify-formserve-action-forms-guard.sh"
-rc=$?
+rc=0
+bash "$here/verify-formserve-action-forms-guard.sh" || rc=$?
 
 echo
 echo "== isolated-run: stubbed side channels (informational -- a notify call"

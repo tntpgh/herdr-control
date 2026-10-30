@@ -32,25 +32,36 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # R2-510269d.md (G2/L1) caught this suite computing it from "${HOME}" at a
 # point where the launcher had ALREADY exported a sandboxed HOME, so it
 # snapshotted the sandbox instead of the real tree. Fail closed rather than
-# fall back to deriving it ourselves again: unset, or anything that
-# resolves inside the current (possibly sandboxed) HOME or TMPDIR, refuses.
+# fall back to deriving it ourselves again: unset, or anything whose REAL
+# path (symlinks and relative components resolved) is the sandbox root or
+# any descendant of it, refuses.
+#
+# REVIEW-FORMFIX-R3-a336a25.md (5): a prior version of this check compared
+# the raw string against only $HOME and $TMPDIR -- 2 of the sandbox's 5
+# subdirectories (home/, state/, runs/, tmp/, bin/), unresolved. The
+# launcher now exports HERDR_GUARD_SANDBOX_ROOT (its own realpath'd $S) and
+# this suite does its own realpath-based PREFIX comparison against it,
+# covering every descendant in one check, independent of what the launcher
+# already validated.
 if [ -z "${HERDR_GUARD_LIVE_ROOT:-}" ]; then
   echo "FAIL setup: HERDR_GUARD_LIVE_ROOT is not set -- run via run-formserve-action-forms-guard-isolated.sh, which captures the real ~/.local/state/herdr before sandboxing HOME" >&2
   exit 1
 fi
-case "$HERDR_GUARD_LIVE_ROOT" in
-  "$HOME"/.local/state/herdr)
-    echo "FAIL setup: HERDR_GUARD_LIVE_ROOT ($HERDR_GUARD_LIVE_ROOT) equals \$HOME/.local/state/herdr under the CURRENT \$HOME ($HOME) -- it was not captured before HOME was sandboxed" >&2
+if [ -z "${HERDR_GUARD_SANDBOX_ROOT:-}" ]; then
+  echo "FAIL setup: HERDR_GUARD_SANDBOX_ROOT is not set -- run via run-formserve-action-forms-guard-isolated.sh" >&2
+  exit 1
+fi
+_guard_realpath() { python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1"; }
+live_real="$(_guard_realpath "$HERDR_GUARD_LIVE_ROOT")" \
+  || { echo "FAIL setup: could not resolve realpath of HERDR_GUARD_LIVE_ROOT ($HERDR_GUARD_LIVE_ROOT)" >&2; exit 1; }
+sandbox_real="$(_guard_realpath "$HERDR_GUARD_SANDBOX_ROOT")" \
+  || { echo "FAIL setup: could not resolve realpath of HERDR_GUARD_SANDBOX_ROOT ($HERDR_GUARD_SANDBOX_ROOT)" >&2; exit 1; }
+case "$live_real" in
+  "$sandbox_real"|"$sandbox_real"/*)
+    echo "FAIL setup: HERDR_GUARD_LIVE_ROOT realpath ($live_real) is the sandbox root or a descendant of it ($sandbox_real) -- refusing to run" >&2
     exit 1 ;;
 esac
-if [ -n "${TMPDIR:-}" ]; then
-  case "$HERDR_GUARD_LIVE_ROOT" in
-    "$TMPDIR"/*|"$TMPDIR")
-      echo "FAIL setup: HERDR_GUARD_LIVE_ROOT ($HERDR_GUARD_LIVE_ROOT) is inside \$TMPDIR ($TMPDIR) -- that is the sandbox, not the live tree" >&2
-      exit 1 ;;
-  esac
-fi
-LIVE_HERDR_DIR="$HERDR_GUARD_LIVE_ROOT"
+LIVE_HERDR_DIR="$live_real"
 live_snapshot() {
   python3 -c "
 import os, sys
@@ -71,7 +82,6 @@ print(sorted(out))
 }
 live_before="$(live_snapshot)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/formserve-action-guard.XXXXXX")" || exit 1
-trap 'rm -rf "$work"' EXIT
 export HERDR_RUN_STATE_DIR="$work/runs" HERDR_STATE_ROOT="$work/state"
 wt="$work/worktree"; mkdir -p "$wt"
 fails=0
@@ -146,6 +156,7 @@ if [ "$live_before" = "$live_after" ]; then
 else
   not_ok "live $LIVE_HERDR_DIR CHANGED: before=$live_before after=$live_after"
 fi
+echo "work dir retained (no cleanup trap), for inspection: $work"
 
 if [ "$fails" -eq 0 ]; then
   echo "# all checks passed"
