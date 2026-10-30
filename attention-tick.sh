@@ -317,7 +317,7 @@ HTML
         "attnformref_$(basename "$f")" >/dev/null 2>&1 || true
     fi
     rm -f "$log" 2>/dev/null
-  ) 2>/dev/null & disown
+  ) >/dev/null 2>&1 & disown
 }
 
 _attn_maybe_form() {                    # run_id task_id pane key reason label command_text

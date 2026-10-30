@@ -457,7 +457,7 @@ HTML
         "actformref_${id}_${n}" >/dev/null 2>&1 || true
     fi
     rm -f "$log" 2>/dev/null
-  ) 2>/dev/null & disown
+  ) >/dev/null 2>&1 & disown
   printf '%s\n' "$f"
 }
 
@@ -487,6 +487,22 @@ _ha_form_status() {                     # form-path -> "<status> <form_id>" (emp
   printf '%s %s\n' "$(jq -r '.status // empty' "$rec" 2>/dev/null)" "$(basename "$rec" .json)"
 }
 
+# One Slack post per request (not per re-served form), and only once the
+# form is CONFIRMED open -- a refused serve never reaches status=open, so
+# this never fires for it (review REVIEW-FORMSERVE-3e67f75.md, S1: "herdr-
+# action still sends its Slack alert pointing at /decisions where no form
+# exists"). The alert says where to decide; the form is what stays open.
+_ha_notify_human_once() {               # id row task-json
+  local id="$1" row="$2" tj="$3"
+  claim_once "actslack_${id}" "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_slack_claimed \
+       "$(jq -nc --arg id "$id" '{request_id:$id}')" || return 0
+  # The command itself stays on this machine (the hub form shows it): a
+  # command line can carry a secret no redactor recognises (webhook paths).
+  bash "$HA_NOTIFY" --class human-action --pane "$(_ha_field "$tj" pane_id)" \
+    "$(_ha_field "$tj" label): needs YOUR OK for one $(_ha_field "$row" tool) action (request $id, $(_ha_field "$row" verdict)) — see it and decide at http://127.0.0.1:8600/decisions" \
+    >/dev/null 2>&1 || true
+}
+
 _ha_human_route() {                     # id row task-json
   local id="$1" row="$2" tj="$3" fp st fid ans n disp
   fp="$(_ha_field "$row" form_path)"
@@ -500,6 +516,7 @@ $(_ha_form_status "$fp")
 EOF
       [ "${st:-}" = open ] || return 0
       _sql "UPDATE action_requests SET form_record=$(_sq "$fid") WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
+      _ha_notify_human_once "$id" "$row" "$tj"
       return 0
     fi
     st="$(jq -r '.status // empty' "$HA_FORMS_DIR/$fid.json" 2>/dev/null)"
@@ -522,18 +539,14 @@ EOF
   fi
   fp="$(_ha_serve_form "$row" "$tj")" || return 0
   _sql "UPDATE action_requests SET form_path=$(_sq "$fp"), form_record='' WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
-  _ha_pin_form "$id" "$fp" || true
   append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_form_served \
     "$(jq -nc --arg id "$id" --arg f "$fp" '{request_id:$id, form_path:$f}')" >/dev/null 2>&1 || true
-  # One Slack post per request (not per re-served form): the alert says where
-  # to decide; the form is what stays open.
-  if claim_once "actslack_${id}" "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_slack_claimed \
-       "$(jq -nc --arg id "$id" '{request_id:$id}')"; then
-    # The command itself stays on this machine (the hub form shows it): a
-    # command line can carry a secret no redactor recognises (webhook paths).
-    bash "$HA_NOTIFY" --class human-action --pane "$(_ha_field "$tj" pane_id)" \
-      "$(_ha_field "$tj" label): needs YOUR OK for one $(_ha_field "$row" tool) action (request $id, $(_ha_field "$row" verdict)) — see it and decide at http://127.0.0.1:8600/decisions" \
-      >/dev/null 2>&1 || true
+  # _ha_pin_form only returns 0 once it has observed the form open; if it
+  # is merely slow to start, the next tick takes the branch above (:493-504)
+  # and notifies there instead -- if formserve refused the serve, status
+  # never becomes open and neither branch ever notifies.
+  if _ha_pin_form "$id" "$fp"; then
+    _ha_notify_human_once "$id" "$row" "$tj"
   fi
 }
 

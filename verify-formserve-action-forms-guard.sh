@@ -26,6 +26,31 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The real tree herdr-action.sh/formserve.py fall back to whenever
+# HERDR_RUN_STATE_DIR/HERDR_STATE_ROOT are unset -- captured BEFORE the
+# export below, with size+mtime per file (not names only, independent
+# review REVIEW-FORMSERVE-3e67f75.md: L1 noted a names-only snapshot misses
+# a modified existing file). Never touched by this suite.
+LIVE_HERDR_DIR="${HOME:-$HOME}/.local/state/herdr"
+live_snapshot() {
+  python3 -c "
+import os, sys
+d = sys.argv[1]
+out = []
+if os.path.isdir(d):
+    for root, dirs, files in os.walk(d):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            try:
+                st = os.stat(p)
+                out.append((os.path.relpath(p, d), st.st_size, int(st.st_mtime)))
+            except OSError:
+                pass
+print(sorted(out))
+" "$LIVE_HERDR_DIR"
+}
+live_before="$(live_snapshot)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/formserve-action-guard.XXXXXX")" || exit 1
 trap 'rm -rf "$work"' EXIT
 export HERDR_RUN_STATE_DIR="$work/runs" HERDR_STATE_ROOT="$work/state"
@@ -94,6 +119,13 @@ if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "herdr-action serves this for
   ok "a hand copy of the same bytes, same dir, no bound request-id, is still refused"
 else
   not_ok "hand copy was not refused: rc=$rc out=$(printf '%s' "$out" | head -2)"
+fi
+
+live_after="$(live_snapshot)"
+if [ "$live_before" = "$live_after" ]; then
+  ok "live $LIVE_HERDR_DIR unchanged"
+else
+  not_ok "live $LIVE_HERDR_DIR CHANGED: before=$live_before after=$live_after"
 fi
 
 if [ "$fails" -eq 0 ]; then

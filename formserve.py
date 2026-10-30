@@ -409,6 +409,21 @@ def is_herdr_actions_own_serve(form: Path, request_id: str) -> bool:
     uses (lib/run-registry.sh's action_requests table) -- not merely a
     plausible-looking filename, which a hand copy can trivially reproduce.
     Read-only connection; formserve never writes to the control-plane registry.
+
+    Residual limitation (REVIEW-FORMSERVE-3e67f75.md, C1), accepted rather
+    than closed: this binds to an ARGUMENT (--request-id) and a DATABASE
+    ROW, not to the calling process. A same-UID hand copy of the html named
+    exactly `<id>-N.html`, served with `--request-id <id>` while that id is
+    still a live pending row, passes this check -- nothing here proves the
+    caller is actually herdr-action.sh's own backgrounded formserve
+    invocation. This guard stops the incident shape (a copy with a WRONG,
+    unrelated heading/title mislabeling the hub, or a copy recorded under
+    the wrong id) and accidental duplication; it is not a security boundary
+    against a same-UID process that deliberately reproduces both the
+    filename and the flag. Closing that would need a per-serve nonce minted
+    by herdr-action.sh and written into the row alongside request_id, passed
+    back on the formserve command line and checked here instead of/beside
+    request_id -- out of scope for this round.
     """
     if not request_id or request_id != action_form_request_id(form):
         return False
