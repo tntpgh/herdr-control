@@ -378,14 +378,39 @@ def deliver(target: str, url: str, answers: dict) -> None:
 FORMS_DIR = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr")) / "forms"
 
 
-def _title_of(html_bytes: bytes, fallback: str) -> str:
-    m = re.search(rb"<h1[^>]*>(.*?)</h1>", html_bytes, re.I | re.S) or re.search(rb"<title>(.*?)</title>", html_bytes, re.I | re.S)
-    if not m:
-        return fallback
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1).decode("utf-8", "replace"))).strip() or fallback
+_HEADING_RE = re.compile(rb"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
+_TITLE_TAG_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
-def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
+def _clean_text(raw: bytes) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", raw.decode("utf-8", "replace"))).strip()
+
+
+def resolve_title(html_bytes: bytes, fallback: str, explicit: str | None) -> tuple[str, str | None]:
+    """Decide the title recorded for this form. Returns (title, refusal_reason).
+
+    refusal_reason is None unless the page must not be served: incident
+    2026-10-30, two hook-mode forms were built by copying another form's
+    <head>, so the hub listed a live approval form under a stranger's title
+    while the page itself showed the right heading. The heading is what the
+    human actually reads, so it wins and is what gets recorded — but a
+    disagreeing <title> is evidence of exactly that copy-paste mistake, so
+    refuse rather than silently mislabel the hub's list. --title overrides.
+    """
+    if explicit is not None:
+        return explicit, None
+    heading_match = _HEADING_RE.search(html_bytes)
+    heading = _clean_text(heading_match.group(1)) if heading_match else ""
+    title_match = _TITLE_TAG_RE.search(html_bytes)
+    title_tag = _clean_text(title_match.group(1)) if title_match else ""
+    if heading and title_tag and heading != title_tag:
+        return "", (f"<title> says {title_tag!r} but the first heading (<h1>/<h2>) says "
+                     f"{heading!r} — looks like the <head> was copied from another form. "
+                     f"Fix the mismatch, or pass --title to record one explicitly.")
+    return heading or title_tag or fallback, None
+
+
+def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float, title: str,
                   token: str = "", deliver_to: str = "", schema: dict | None = None,
                   request_id: str = "") -> Path | None:
     """Register the form AND hand the hub a copy it can serve itself.
@@ -409,7 +434,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
                   file=sys.stderr)
             hub_url = ""
         path.write_text(json.dumps({
-            "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
+            "id": path.stem, "title": title, "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
             "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
             "schema": schema or {}, "request_id": request_id,
@@ -532,18 +557,23 @@ def main() -> int:
                          "action_requests.request_id); bound into the draft-preservation "
                          "key alongside the form's own path so two forms that happen to "
                          "share a basename never share a draft")
+    ap.add_argument("--title",
+                    help="record this title verbatim instead of deriving one from the page; "
+                         "required to serve a page whose <title> disagrees with its first "
+                         "<h1>/<h2>")
     args = ap.parse_args()
 
     form = Path(args.form).expanduser().resolve()
     if not form.is_file():
         print(f"formserve: no such file: {form}", file=sys.stderr)
         return 2
+    raw_html = form.read_bytes()
 
     # Refuse to serve a form nobody can answer. A configuration error, so it
     # exits 2 like the missing-file case above rather than serving a dead page:
     # the failure this replaces was invisible — the decision appeared in the
     # inbox, rendered correctly, and silently swallowed every click.
-    dead = unanswerable_reasons(form.read_text(errors="replace"))
+    dead = unanswerable_reasons(raw_html.decode("utf-8", errors="replace"))
     if dead:
         print(f"formserve: {form} cannot record an answer:", file=sys.stderr)
         for reason in dead:
@@ -557,6 +587,15 @@ def main() -> int:
               "  see examples/form-template.html", file=sys.stderr)
         return 2
 
+    # The hub list shows this title; a disagreeing <title> means the <head>
+    # was copied from another form's page (incident 2026-10-30) and the hub
+    # would mislabel a live decision. Refuse rather than guess which one is
+    # right; --title records one explicitly and skips the check.
+    title, title_error = resolve_title(raw_html, form.stem, args.title)
+    if title_error:
+        print(f"formserve: {form}: {title_error}", file=sys.stderr)
+        return 2
+
     # Unguessable per-run secret (see the /submit handler for why this exists)
     # — generated fresh every invocation so it cannot be reused across runs or
     # guessed from a previous one.
@@ -565,7 +604,6 @@ def main() -> int:
                .replace("{{FORMSERVE_REQUEST_ID}}",
                         html_module.escape(f"{args.request_id}:{form}", quote=True)).encode()
 
-    raw_html = form.read_bytes()
     # Required-field schema derived from the SOURCE markup, not the page's own
     # script — the thing that lied in the 2026-10-18 incident. Computed once,
     # used by this process's own /submit AND stored on the registry row so
@@ -595,7 +633,7 @@ def main() -> int:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
-    registry = register_form(form, raw_html, url, port, args.timeout,
+    registry = register_form(form, raw_html, url, port, args.timeout, title,
                              token=token, deliver_to=args.deliver or "", schema=schema,
                              request_id=args.request_id)
     result["registry"] = registry            # the handler claims against it before any 200
