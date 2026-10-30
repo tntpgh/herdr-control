@@ -27,11 +27,30 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The real tree herdr-action.sh/formserve.py fall back to whenever
-# HERDR_RUN_STATE_DIR/HERDR_STATE_ROOT are unset -- captured BEFORE the
-# export below, with size+mtime per file (not names only, independent
-# review REVIEW-FORMSERVE-3e67f75.md: L1 noted a names-only snapshot misses
-# a modified existing file). Never touched by this suite.
-LIVE_HERDR_DIR="${HOME:-$HOME}/.local/state/herdr"
+# HERDR_RUN_STATE_DIR/HERDR_STATE_ROOT are unset. MUST come from the
+# caller, captured before anything sandboxes HOME: review REVIEW-FORMFIX-
+# R2-510269d.md (G2/L1) caught this suite computing it from "${HOME}" at a
+# point where the launcher had ALREADY exported a sandboxed HOME, so it
+# snapshotted the sandbox instead of the real tree. Fail closed rather than
+# fall back to deriving it ourselves again: unset, or anything that
+# resolves inside the current (possibly sandboxed) HOME or TMPDIR, refuses.
+if [ -z "${HERDR_GUARD_LIVE_ROOT:-}" ]; then
+  echo "FAIL setup: HERDR_GUARD_LIVE_ROOT is not set -- run via run-formserve-action-forms-guard-isolated.sh, which captures the real ~/.local/state/herdr before sandboxing HOME" >&2
+  exit 1
+fi
+case "$HERDR_GUARD_LIVE_ROOT" in
+  "$HOME"/.local/state/herdr)
+    echo "FAIL setup: HERDR_GUARD_LIVE_ROOT ($HERDR_GUARD_LIVE_ROOT) equals \$HOME/.local/state/herdr under the CURRENT \$HOME ($HOME) -- it was not captured before HOME was sandboxed" >&2
+    exit 1 ;;
+esac
+if [ -n "${TMPDIR:-}" ]; then
+  case "$HERDR_GUARD_LIVE_ROOT" in
+    "$TMPDIR"/*|"$TMPDIR")
+      echo "FAIL setup: HERDR_GUARD_LIVE_ROOT ($HERDR_GUARD_LIVE_ROOT) is inside \$TMPDIR ($TMPDIR) -- that is the sandbox, not the live tree" >&2
+      exit 1 ;;
+  esac
+fi
+LIVE_HERDR_DIR="$HERDR_GUARD_LIVE_ROOT"
 live_snapshot() {
   python3 -c "
 import os, sys

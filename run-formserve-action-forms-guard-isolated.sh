@@ -24,14 +24,23 @@
 # scripts, because the suite's route=human action request makes it past
 # claim_once's slack-notify gate on its very first herdr-action.sh tick —
 # without a stub, that is a REAL Slack post (herdr-action.sh:534-536).
+#
+# REVIEW-FORMFIX-R2-510269d.md: the suite's own live-dir check must snapshot
+# the REAL root, not whatever HOME happens to be once this launcher has
+# already exported its sandboxed one. HERDR_GUARD_LIVE_ROOT is therefore
+# captured from the REAL $HOME below, BEFORE the `export HOME=...` line, and
+# handed to the suite explicitly; the suite fails closed if it is unset or
+# resolves inside the sandbox ($S). $S itself is never deleted (no cleanup
+# trap) so the sandboxed registry/forms a human would want to inspect after
+# a run survive it; its path is printed at the end.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$here/verify-formserve-action-forms-guard.sh" ] || { echo "isolated-run: missing verify-formserve-action-forms-guard.sh next to this script" >&2; exit 1; }
 
+HERDR_GUARD_LIVE_ROOT="$HOME/.local/state/herdr"
+
 S="$(mktemp -d)" || { echo "isolated-run: mktemp -d failed" >&2; exit 1; }
-cleanup() { rm -rf "$S"; }
-trap cleanup EXIT
 
 mkdir -p "$S/home" "$S/state" "$S/runs" "$S/tmp" "$S/bin" || { echo "isolated-run: mkdir -p scratch dirs failed" >&2; exit 1; }
 
@@ -46,6 +55,7 @@ EOF
 chmod +x "$S/bin/notify-stub.sh" "$S/bin/send-stub.sh" || { echo "isolated-run: could not write/chmod stub scripts" >&2; exit 1; }
 
 export HOME="$S/home" HERDR_STATE_ROOT="$S/state" HERDR_RUN_STATE_DIR="$S/runs" TMPDIR="$S/tmp"
+export HERDR_GUARD_LIVE_ROOT="$HERDR_GUARD_LIVE_ROOT"
 export HERDR_ACTION_NOTIFY="$S/bin/notify-stub.sh" HERDR_ACTION_SEND="$S/bin/send-stub.sh"
 export HERDR_TEST_NOTIFIED="$S/notified.log" HERDR_TEST_SENT="$S/sent.log"
 : > "$HERDR_TEST_NOTIFIED"
@@ -62,5 +72,9 @@ echo "notify-stub.sh calls:"
 cat "$HERDR_TEST_NOTIFIED"
 echo "send-stub.sh calls:"
 cat "$HERDR_TEST_SENT"
+
+echo
+echo "== isolated-run: sandbox retained (no cleanup trap), for inspection =="
+echo "$S"
 
 exit "$rc"
