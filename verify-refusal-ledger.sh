@@ -163,5 +163,55 @@ name_count=$(printf '%s\n' "$_RL_PROTECTED_NAMES" | wc -l | tr -d ' ')
 pipe_count=$(printf '%s' "$_CP_POLICY_FILE_RE" | grep -o '|' | wc -l | tr -d ' ')
 [ "$pipe_count" -eq 15 ] && ok "_CP_POLICY_FILE_RE's pipe count is still 15 (no un-mirrored addition/removal)" || bad "_CP_POLICY_FILE_RE has $pipe_count pipes, expected 15 — update _RL_PROTECTED_NAMES to match"
 
+printf '== R1 (review, HIGH, a0e13dc): a retry naming TWO protected files was never caught ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" "cat lib/alert-gate.sh lib/run-registry.sh")"; rc=$?
+[ "$rc" -eq 1 ] && ok "two-target retry (one of them refused) is caught" || bad "rc=$rc, expected 1"
+
+printf '== R1 (review): directory glob naming every protected file was never caught ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" "cat lib/*")"; rc=$?
+[ "$rc" -eq 1 ] && ok "lib/* glob (extracts all 14 names, including the refused one) is caught" || bad "rc=$rc, expected 1"
+
+printf '== R1 (review): find -exec was never caught ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" "find lib -name '*.sh' -exec cat {} +")"; rc=$?
+[ "$rc" -eq 1 ] && ok "find -exec (extracts the .sh names, including the refused one) is caught" || bad "rc=$rc, expected 1"
+
+printf '== R2 (review): brace expansion is pure syntax, resolved without executing anything ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" "cat lib/run-regis{t,}ry.sh")"; rc=$?
+[ "$rc" -eq 1 ] && ok "run-regis{t,}ry.sh brace-expands to include the refused file" || bad "rc=$rc, expected 1"
+out="$(refusal_ledger_check "$RUN" "$TASK" "cat lib/{run-registry,x}.sh")"; rc=$?
+[ "$rc" -eq 1 ] && ok "{run-registry,x}.sh brace-expands to include the refused file" || bad "rc=$rc, expected 1"
+
+printf '== R2 (review): ANSI-C \\xHH hex escape is pure syntax, resolved without executing anything ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" 'cat $'"'"'lib/\x72un-registry.sh'"'"'')"; rc=$?
+[ "$rc" -eq 1 ] && ok "ANSI-C hex-escaped filename hex-decodes to the refused filename" || bad "rc=$rc, expected 1"
+
+printf '== R2 (review): documented NOT-covered — command substitution ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" 'cat $(printf run-reg)istry.sh')"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "a value built by a command substitution is NOT resolved — documented gap; executing it to find out would mean executing untrusted text" || bad "rc=$rc out=[$out] — if this now fires, the header's accepted-gap list is stale"
+
+printf '== R2 (review): documented NOT-covered — read builtin assigns the variable, not a NAME=value literal ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" 'read f <<< run-registry; cat lib/$f.sh')"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "a read-assigned variable is NOT resolved — only a literal NAME=value in the same text is" || bad "rc=$rc out=[$out] — if this now fires, the header's accepted-gap list is stale"
+
+printf '== R3 (review): documented NOT-covered — symlink created in one call, dereferenced in a later, separate call ==\n'
+RUN5=run_test5; TASK5=task_test5
+seed_refusal "$RUN5" "$TASK5" "$REASON" "ln -s lib/run-registry.sh tmp/x"
+out="$(refusal_ledger_check "$RUN5" "$TASK5" "cat tmp/x")"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "a later cat of the symlink path is NOT resolved — this module never stats the filesystem" || bad "rc=$rc out=[$out] — if this now fires, the header's accepted-gap list is stale"
+
+printf '== R4 (review): ditto / rsync -a / tar -c of a directory are bulk shapes too ==\n'
+out="$(refusal_ledger_check "$RUN" "$TASK" "ditto tmp/extracted /tmp/outA")"; rc=$?
+[ "$rc" -eq 1 ] && ok "ditto of a directory is flagged" || bad "rc=$rc, expected 1"
+out="$(refusal_ledger_check "$RUN" "$TASK" "rsync -a tmp/extracted/ /tmp/outB")"; rc=$?
+[ "$rc" -eq 1 ] && ok "rsync -a is flagged" || bad "rc=$rc, expected 1"
+out="$(refusal_ledger_check "$RUN" "$TASK" "tar -cf /tmp/outC.tar tmp/extracted")"; rc=$?
+[ "$rc" -eq 1 ] && ok "tar -cf of a directory is flagged" || bad "rc=$rc, expected 1"
+out="$(refusal_ledger_check "$RUN" "$TASK" "tar cf - tmp/extracted | gzip > /tmp/outD.tgz")"; rc=$?
+[ "$rc" -eq 1 ] && ok "dashless BSD-style 'tar cf' is flagged" || bad "rc=$rc, expected 1"
+out="$(refusal_ledger_check "$RUN" "$TASK" "tar -xf /tmp/outC.tar")"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "tar -xf (extract, not create) stays quiet" || bad "rc=$rc out=[$out]"
+out="$(refusal_ledger_check "$RUN" "$TASK" "rsync notes.txt /tmp/outE")"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "rsync of a single file without -a/-r stays quiet" || bad "rc=$rc out=[$out]"
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
