@@ -8,6 +8,25 @@ is built, the same posture `docs/design/resident-launch-grant.md` and
 `docs/design/conductor-hold-precedence.md` already use for a change to who
 may act unattended.
 
+**Revision 2** (this version): responds to independent review
+`REVIEW-WEEKLY-AUTH-962585c.md` (p35, 2026-10-30 12:24Z), which REJECTED
+the first commit (`962585c`) on five material divergences from T's stated
+intent plus one concrete mechanical gap. Fixed here, each inline at its
+own section: (1)/(C) every lease a grant-authorized call creates AND the
+redemption token it mints are now clamped to the grant's own `expires_at`
+(§(f) item 5); (A) expiry is reframed from "falls back to the daily form"
+to a visible PAUSE resolved only by one explicit weekly mint, with the
+daily-form framing removed from this design's intended path (§(a), §(e),
+§(f)); (B) Main's cross-task delegation privilege is now bounded by the
+SAME scope and expiry as everything else the grant authorizes, with an
+explicit numeric cap, not left permanently unbounded (§(c)); (E) pane
+closure in §(i) is no longer unconditional — evidence is resolved before
+either the state transition or the pane close, both held together; (F)
+§(h)'s mint command now must print its own explicit start/end and flag a
+weekend-spanning window on every successful mint, not only the no-op
+refresh case. §(b)'s identity reasoning and §(a)'s 120h-vs-work-week
+duration tradeoff were both reviewed and found sound — unchanged here.
+
 ## Problem this closes
 
 T, 2026-10-30 12:03Z, DESIGN-only request, verbatim: *"we shouldn't have to
@@ -97,22 +116,32 @@ do it.
   --apply` for the specific, closed label set the grant names at mint time
   (the label(s) the conductor/Main identity's own standing registration
   depends on — never a wildcard, never "every label"), each individual call
-  still subject to `recover_lifecycle()`'s own unchanged 24h-per-call bound,
-  self-extension ban, and CAS — this grant only ever substitutes for the
-  **human confirmation** leg of that function's authorization, never the
-  CAS, never the bound, never the self-extension check (§(f) below spells
-  out exactly how); (ii) `conductor-handover.sh` calls made by the then-live
-  Main, same as today, with no change to that script at all — the grant
-  adds an audit/expiry wrapper around an already-unconditional power, it
-  does not gate a previously-blocked one.
+  still subject to `recover_lifecycle()`'s own unchanged self-extension
+  ban and TOCTOU-safe CAS, PLUS a new clamp this grant itself requires:
+  the lease bound it sets and the single-use redemption token it mints are
+  BOTH capped at `min(now + ol.MAX_TTL_S, grant.expires_at)` — never
+  outliving the grant that authorized them (§(f) item 5, fixing
+  independent review finding 1/C); this grant only ever substitutes for
+  the **human confirmation** leg of that function's authorization, never
+  the CAS, never the 24h ceiling itself, never the self-extension check;
+  (ii) Main's CROSS-TASK use of `conductor-handover.sh` — the part of
+  that script beyond a conductor giving away its own task — while a valid
+  weekly grant is active: scoped to the SAME closed label/repo set as
+  (i), capped at a hard, non-adjustable rate constant, and refused
+  outright the instant the grant expires, is revoked, or never existed
+  (§(c) spells out the exact cap, fixing independent review finding B/3 —
+  an earlier draft of this document left this power permanently
+  unbounded).
 - **Never authorizes**: minting itself (human-only, every time, §(h));
-  raising `recover_lifecycle`'s 24h cap or `owner_lease.MAX_TTL_S`; adding a
-  label to the grant's scope after mint (widening scope = a new mint, a new
-  human consent, never an edit of a live grant — tested explicitly, §(g)
-  item 4); spawning a *new* task/worker (that is `spawn-task.sh`'s own,
-  separately-gated authority, untouched); crossing to a different Main pane
-  without that pane independently clearing `designate-main.sh`'s own,
-  unmodified succession rules.
+  raising `recover_lifecycle`'s 24h cap, the grant's own clamp, or
+  `owner_lease.MAX_TTL_S`; adding a label to the grant's scope after mint
+  (widening scope = a new mint, a new human consent, never an edit of a
+  live grant — tested explicitly, §(g) item 4); a cross-task handover
+  beyond the grant's own closed scope or its numeric rate cap, even while
+  the grant is otherwise valid (§(c)); spawning a *new* task/worker (that
+  is `spawn-task.sh`'s own, separately-gated authority, untouched);
+  crossing to a different Main pane without that pane independently
+  clearing `designate-main.sh`'s own, unmodified succession rules.
 
 ## (a) Two distinct durations — never merged into one
 
@@ -122,7 +151,7 @@ do it.
 | Storage | `owner_leases` (unchanged) | `task_authorizations`, new `source` |
 | Typical TTL | ~1h, renewed every ~15min (`owner_lease_renew.RENEW_TTL_S`/`RENEW_MARGIN_S`) | ≤5 work days, one mint, no auto-renew |
 | Who/what renews it | the tick itself, unattended, continuously (`renew_due`) | **only T, outside herdr, every time** (§(h)) |
-| What its expiry means | the lease is simply gone — the NORMAL, frequent, harmless case `renew_due`/`acquire` already handle every day | the grant is gone — daily automated `owner-lease-recover.py --apply` calls stop; everything falls back to TODAY's shape (a human answers a fresh form), never a security failure, just a return to the status quo |
+| What its expiry means | the lease is simply gone — the NORMAL, frequent, harmless case `renew_due`/`acquire` already handle every day | the grant is gone — the daily automated `owner-lease-recover.py --apply` call AND Main's cross-task delegation under the grant both STOP immediately; the label PAUSES (the same stuck state an unanswered recovery already has today) until T runs the ONE weekly mint command again (§(h)). This design never surfaces, relies on, or frames a human answering a fresh `--confirm-form` as the intended path back to authorization for the conductor-identity label — pausing is the correct, expected steady state, not an emergency fallback (fixes independent review finding A) |
 
 These must stay two separate objects, never one merged "renew the lease for
 a week" change, for the reason resident-launch-grant.md already established
@@ -205,38 +234,51 @@ mint step reuses, §(h)), and cannot forge it by presenting a stale
 `indeterminate`, so a herdr read failure during the restart window refuses
 rather than guesses).
 
-## (c) Managing and delegating existing workers — same scope, same expiry, never wider
+## (c) Managing and delegating existing workers — bounded by this grant's scope and expiry (fixes independent review finding B/3)
 
-`conductor-handover.sh` already enforces the only scope limit that matters
-here, unmodified: a non-Main caller may only give away its OWN tasks; Main
-may give away any task, but only an EXISTING, already-registered task row
-(`set_task_conductor`'s CAS is keyed on a task that already exists — there
-is no "create a task and immediately own it" path through this script).
-The weekly authorization adds nothing here beyond an audit/expiry wrapper:
+`conductor-handover.sh` has two distinct powers today, and only one of
+them is what this grant exists to time-box:
 
-- **Same scope**: exactly `conductor-handover.sh`'s existing power
-  (reassign `conductor_pane_id`/`conductor_pane_birth`/`conductor_id` on an
-  existing, non-terminal task row). No new verb. Delegating a task to an
-  `orchestrator@*` role still independently requires that target to hold a
-  live `proj:` claim for the task's repo (`lib/run-registry.sh:1092-1101`,
-  P2 project-scoped handover) — unchanged, the grant does not loosen it.
-- **Same expiry**: once the weekly grant expires or is revoked, Main does
-  NOT lose the ability to run `conductor-handover.sh` — that script has no
-  TTL concept today and this document does not add one to it (out of
-  scope: changing `conductor-handover.sh` itself is a separate, future
-  change if ever wanted). What expires is specifically the **unattended
-  daily recovery call** in §(f) — the one thing this document actually
-  automates. `conductor-handover.sh` remains, as today, a live-pane,
-  live-ancestry action available to whoever `designate-main.sh` currently
-  says is Main, grant or no grant; it was never gated by owner-lease
-  confirmation forms in the first place; it needs no grant to keep
-  working, and the grant does not add one.
+- **Self-handover (unaffected, out of scope)**: any conductor may give
+  away its OWN task (`conductor-handover.sh:28-38`). Pre-existing,
+  unconditional, unrelated to Main-ness — this grant neither widens nor
+  narrows it; it needs no authorization today and gets none from this
+  document.
+- **Cross-task handover (bounded by this grant)**: ONLY Main may give away
+  a task it does not itself hold (`set_task_conductor`'s CAS is keyed on
+  an existing, non-terminal task row — there is no "create a task and
+  immediately own it" path through this script). This is the genuinely
+  novel power item (c) names, and an earlier draft of this document left
+  it permanently unbounded ("Main does NOT lose the ability to run
+  conductor-handover.sh" after expiry) — independent review
+  (`REVIEW-WEEKLY-AUTH-962585c.md` finding B/3) confirmed this diverges
+  from T's literal ask ("manage others... for 1 work week"). Fixed here:
+  while a valid weekly grant is active, Main's cross-task use of
+  `conductor-handover.sh` is
+  - **scoped**: to the SAME closed label/repo set the grant names at mint
+    (§"Exact scope") — never "any task" unconditionally; delegating a
+    task outside that set still independently requires that target to
+    hold a live `proj:` claim for the task's repo
+    (`lib/run-registry.sh:1092-1101`, P2 project-scoped handover) AND is
+    refused by the new scope check regardless;
+  - **capped**: at a hard, non-caller-adjustable rate constant proposed as
+    `CONDUCTOR_HANDOVER_CAP = 10` handovers per grant period — the same
+    fixed-constant-never-env-overridable posture `ORCH_CHILD_CAP` already
+    uses (`lib/task-authorization.py:33`: "deliberately not env-
+    overridable... changing it is a reviewed code change"); a call past
+    the cap is refused, named, exactly like every other check in this
+    document;
+  - **expired exactly with the grant**: the instant the grant expires, is
+    revoked, or never existed, a CROSS-TASK handover attempt is REFUSED
+    outright — not merely "the daily recovery call stops" as the rejected
+    first draft stated. Without a valid grant, Main retains only the
+    baseline self-handover power every conductor already has; it cannot
+    reach a different task's row until a fresh weekly mint (§(h)) exists.
 
-The only thing a future "gate conductor-handover.sh on the weekly grant
-too" change could add is a NARROWING (requiring the grant to even attempt
-a handover) — that is explicitly out of scope here since it was not asked
-for and would be new, additional risk this document should not smuggle in
-un-requested.
+This makes "manage and delegate existing workers" bounded by the exact
+same scope and expiry as everything else this grant authorizes — not a
+separately-unbounded, pre-existing power the grant merely wraps in an
+audit log, which is what the rejected first draft actually described.
 
 ## (d) Revocation and audit trail
 
@@ -247,7 +289,7 @@ can never be confused or cross-revoked by accident:
 - `touch ~/.local/state/herdr/conductor-weekly-authorization.revoked` — one
   file, no code required to take effect, checked fresh (no caching) before
   every grant lookup in both consuming call sites (§(f)'s daily recovery
-  tick and, if ever added, a gated `conductor-handover.sh`).
+  tick and §(c)'s now-bounded cross-task `conductor-handover.sh` check).
 - **Mint audit**: an `events` row in the same transaction as the
   `task_authorizations` INSERT (mirrors `accept_resident`'s own
   `_insert`/`event()` pattern) — `minting_pane`, `minting_pane_birth`
@@ -255,6 +297,10 @@ can never be confused or cross-revoked by accident:
   `reason` (required, non-empty, same requirement
   `conductor-handover.sh:107` already enforces for its own `--reason`),
   `expires_at`, `command_id`.
+- **Cross-task delegation audit**: every grant-scoped cross-task
+  `conductor-handover.sh` call records its own position against
+  `CONDUCTOR_HANDOVER_CAP` in its existing `conductor_handover` event
+  detail (§(c)) — auditable per-grant usage, not merely per-call.
 - **Redemption audit**: every automated daily recovery call under the
   grant writes the SAME `owner_events('lifecycle_recovered', ...)` row
   `recover_lifecycle()` already writes for a human-confirmed recovery
@@ -275,18 +321,26 @@ can never be confused or cross-revoked by accident:
   currently active" (mirroring `xd://decisions_open`'s existing style) is
   optional, not required for v1.
 
-## (e) Hard stop — no exceptions
+## (e) Hard stop — PAUSE, never a silent reversion to the daily form
 
-- **No grant → no daily automated recovery call is ever attempted.** The
-  consuming code's lookup (`read_conductor_week()`, modeled on
-  `read_resident_for_repo`, `lib/task-authorization.py:373-388`) returns
-  `{}` for "no row," "expired," AND "revoked" alike — all three collapse to
-  the exact same fallthrough, which is TODAY's unmodified behavior: the
-  recovery waits for a human `--confirm-form` decision. There is no
-  degraded middle state and no silent retry-forever; the daily tick simply
-  stops producing a confirmed recovery and the next time the `conductor`-
-  identity label's `lifecycle_end_at` is checked it reports `not_expired`
-  false / stuck exactly as it would with no grant mechanism built at all.
+- **No grant → the automated path PAUSES; it never silently reverts to a
+  daily human form.** The consuming code's lookup (`read_conductor_week()`,
+  modeled on `read_resident_for_repo`, `lib/task-authorization.py:
+  373-388`) returns `{}` for "no row," "expired," AND "revoked" alike —
+  all three collapse to the identical fallthrough: the daily automated
+  `owner-lease-recover.py --apply` call AND Main's cross-task delegation
+  under the grant (§(c)) both simply STOP. This design does not surface,
+  rely on, or describe a human answering a fresh `--confirm-form` as the
+  intended next step for the conductor-identity label (fixes independent
+  review finding A — the rejected first draft framed that reversion as
+  "never a security failure, just a return to the status quo," which
+  read as an intended, desirable fallback rather than a pause). There is
+  no degraded middle state and no silent retry-forever: the label goes
+  stuck/blocked, the identical honest resting state an unanswered
+  recovery already has today with no grant mechanism built at all. The
+  ONLY way forward is exactly ONE explicit weekly mint (§(h)) — this
+  design removes the daily-renewal BURDEN; it does not reintroduce daily
+  renewal as a fallback path.
 - **No grant admits an unproven caller.** The lookup is read-only and
   content-based (does a valid row exist), never "trust whoever is asking" —
   the SAME `roles.main` liveness check from §(b) runs on every single
@@ -302,7 +356,7 @@ can never be confused or cross-revoked by accident:
   command, run by T, every time, produces a new row. Expiry is therefore a
   true hard stop: the system cannot talk itself back into authorization.
 
-## (f) How this supersedes `owner-lease-recover.py`'s daily forms
+## (f) How this supersedes `owner-lease-recover.py`'s daily forms — for the conductor-identity label only
 
 `owner-lease-recover.py` (`owner-lease-recover.py`, this session) today
 requires `--confirm-form <formserve id>` in BOTH dry-run and `--apply`,
@@ -310,16 +364,19 @@ bound to an exact `(label, new_lifecycle_end_at, caller_pane_id,
 caller_pane_birth)` tuple (`owner-lease-recover.py:read_confirmation`) —
 that id must be freshly answered by a human, once per call, because the
 24h cap means a new call is needed roughly once a day for any label stuck
-past its bound. This document proposes a SECOND, alternate confirmation
-path for the CLI — `--conductor-grant <redemption-token-id>` beside the
-existing `--confirm-form <form-id>` — reached only by a new, unattended
-daily tick (not interactively by T), that:
+past its bound. For every OTHER owner-lease label, that path is untouched
+and remains the CLI's only mechanism. For the conductor-identity label
+specifically, this document proposes a SECOND, alternate confirmation
+path — `--conductor-grant <redemption-token-id>` beside the existing
+`--confirm-form <form-id>` — reached only by a new, unattended daily tick
+(not interactively by T), that:
 
 1. Checks the revocation sentinel first (§(d)), then looks up the current
    `conductor_weekly_authorization` row (§(e) — absent/expired/revoked all
    fall through identically to "no grant," at which point the tick simply
-   does not run `--apply` today and the label waits for a human form, same
-   as if this whole feature did not exist).
+   does not run `--apply` today and the label PAUSES — it does not wait
+   for or request a human form; resuming requires a fresh weekly mint,
+   §(h)).
 2. Re-verifies the live-Main identity check (§(b)) — refuses if no live,
    registry-proven Main currently exists, even with a technically-valid
    grant row.
@@ -343,21 +400,39 @@ daily tick (not interactively by T), that:
    check for this path must validate the token's `source` is exactly
    `conductor_weekly_redemption` and reject a bare
    `conductor_weekly_authorization` id outright, the same way `--confirm-
-   form`'s check rejects a form that is not `status=="answered"`.
-5. `recover_lifecycle()` itself (`lib/owner_lease_recover.py`) **does not
-   change** — it still enforces its own unchanged self-extension ban,
-   24h-per-call bound, and TOCTOU-safe CAS regardless of which
-   confirmation path supplied `confirmation_ref`. The grant only ever
-   substitutes for the human clicking "approve" on a form; every other
-   check this session already built and verified (45/45,
-   `verify-owner-lease-recover.py`) still runs, unchanged, every day.
+   form`'s check rejects a form that is not `status=="answered"`. **This
+   redemption token — the "child grant" of the standing weekly
+   authorization — is itself clamped**: its own `expires_at` is
+   `min(issued_at + <short redemption TTL>, grant.expires_at)`, so a
+   token minted near the end of the week cannot outlive the grant that
+   authorized it, even before step 5's own clamp is reached.
+5. `recover_lifecycle()` itself (`lib/owner_lease_recover.py`) is called
+   with ONE bound change specific to this path:
+   **`new_lifecycle_end_at = min(now + ol.MAX_TTL_S, grant.expires_at)`**
+   — a lease this path creates or extends can never reach past the
+   grant's own `expires_at`. This closes the exact gap independent review
+   (`REVIEW-WEEKLY-AUTH-962585c.md`, finding 1/C) found: an unclamped call
+   near hour 100 of a 120h grant would otherwise set a 24h-out bound
+   reaching ~hour 124 — up to ~24h past the grant's own end, letting the
+   label's standing registration outlive the authorization that produced
+   it. Every OTHER check `recover_lifecycle()` already enforces — self-
+   extension ban, the 24h ceiling as the other half of the `min()`,
+   TOCTOU-safe CAS — stays unchanged regardless of which confirmation path
+   supplied `confirmation_ref`; the grant only ever substitutes for the
+   human clicking "approve" on a form, and now additionally supplies this
+   one clamp. Every other check this session already built and verified
+   (45/45, `verify-owner-lease-recover.py`) still runs, unchanged, every
+   day.
 
-**Net effect for T**: with no grant, nothing changes (today's daily-form
-behavior, unmodified, still available as a manual fallback at any time).
-With a valid weekly grant, the daily `--confirm-form` decision disappears
-for the grant's named label(s) for up to 120h, replaced by the ONE
-up-front decision in §(h) — and reappears automatically, with no action
-required to make it reappear, the moment the grant expires or is revoked.
+**Net effect for T**: for every OTHER owner-lease label, nothing changes —
+the daily `--confirm-form` path remains the CLI's only mechanism,
+untouched. For the conductor-identity label specifically, once a valid
+weekly grant exists, the daily `--confirm-form` decision disappears for up
+to 120h, with the resulting lease and its redemption token both clamped
+exactly to the grant's own window (item 5) — and on expiry or revocation,
+the label PAUSES rather than silently reverting to a daily form: the only
+way forward is the ONE weekly mint in §(h), never an assumption that a
+human will resume answering individual daily prompts.
 
 ## (g) Exact test list (negatives required before any code lands)
 
@@ -422,6 +497,30 @@ before implementation, not a retrofit:
     activation but, like resident-launch-grant.md's own closing note, does
     not by itself satisfy items 1–11; all of the negatives above gate
     activation independently.
+13. **Lease clamp at grant near-expiry (fixes finding 1/C)**: a grant-
+    authorized recovery call at hour 100 of a 120h grant sets
+    `lifecycle_end_at` to exactly the grant's `expires_at` (hour 120), NOT
+    hour 124 — proving the `min(now+24h, grant.expires_at)` clamp from
+    §(f) item 5. A call well before the window's end (hour 10) is
+    unaffected — it still gets the full 24h, proving the clamp only bites
+    near expiry, never shortens an ordinary call.
+14. **Redemption token (child grant) clamp**: a redemption token minted at
+    hour 119 of a 120h grant has its own `expires_at` capped at hour 120,
+    never its normal short redemption TTL past that point (§(f) item 4).
+15. **Delegation cap and expiry (fixes finding B/3)**: a cross-task
+    `conductor-handover.sh` call beyond `CONDUCTOR_HANDOVER_CAP` within
+    one grant period is refused even though the grant itself is otherwise
+    valid; a cross-task call naming a label/repo OUTSIDE the grant's own
+    scope is refused; a cross-task call attempted after the grant has
+    expired is refused outright — not merely "the daily recovery call
+    stops" (§(c)); a SELF-handover (any conductor giving away its own
+    task) succeeds identically with no grant at all, proving that power
+    stayed untouched.
+16. **Mint prints its own start and end (fixes finding F)**: a fresh mint's
+    terminal output states both `issued_at` and `expires_at` as absolute
+    timestamps; a mint whose `[issued_at, expires_at)` window includes a
+    Saturday or Sunday prints an explicit weekend-spanning flag; a mint
+    whose window does not must NOT print that flag (no false positive).
 
 ## (h) The one action-time activation consent T would sign
 
@@ -456,11 +555,24 @@ grant-conductor-week.sh --reason "<text>"
   editing and re-reviewing that script, never by an argument at mint time.
   This is what makes "scope widening" (§(g) item 4) a code change and
   review, not a runtime choice available to whoever runs the mint command.
+- **Every mint prints its own start and end, explicitly — not only the
+  no-op-refresh case (fixes independent review finding F).** On a FRESH
+  mint, the command's own terminal output states both `issued_at` and
+  `expires_at` as absolute timestamps, never just "120h" — and prints a
+  visible flag line whenever `[issued_at, expires_at)` includes a Saturday
+  or Sunday (e.g. `NOTE: this window includes a weekend — effective
+  working days may be fewer than 5`), so the window is never silently
+  read as "until Friday" or silently assumed to be exactly five business
+  days. §(a)'s Duration table is honest about weekend-spanning in the
+  document's own prose; this makes the RUNTIME TOOL say the same thing to
+  T at the exact moment he turns the key, not only in a design doc he
+  read once.
 
 Running it when a grant is already active and unexpired is a no-op refresh
-(prints the existing row's `expires_at`, writes nothing new) — not a
-silent extension of the existing window; "turning the key" always produces
-a grant whose `expires_at` is 120h from the moment the command actually
+— it ALSO prints both `issued_at` and `expires_at` (same requirement,
+same format, no special case), writes nothing new — not a silent
+extension of the existing window; "turning the key" always produces a
+grant whose `expires_at` is 120h from the moment the command actually
 ran, same "retry keeps the original validity window, never extends it"
 rule `accept_resident`/`accept_local` already enforce
 (`lib/task-authorization.py:281,354`) — reread as: a SECOND run before the
@@ -507,41 +619,55 @@ action.** Today, "close the pane" and "mark the task completed" happen in
 the same `apply=1` branch, back to back (`close-done-workers.sh:764-782`).
 They become two independently-true records:
 
-1. **Closing a session/pane must never imply completion.** Before the
-   `completed` transition, the gate gains a fifth and sixth check, same
-   shape as the existing four (report-and-hold, never silently skip): no
-   `approvals` row for this `task_id` has `decided_at IS NOT NULL AND
-   outcome IS NULL` (an approved action never consumed), and no
-   `prompt-occurrence` row for this task has `unresolved_reason IS NOT
-   NULL AND resolution_reason IS NULL` (a prompt only ever seen). Either
-   one HOLDS the `completed` transition specifically, named with the exact
-   `approval_id`/occurrence key, exactly how the existing four checks
-   already name their own hold reason — never a silent skip.
+1. **Closing a session/pane must never imply completion.** Before EITHER
+   the `completed` transition or the pane close itself, the gate gains a
+   fifth and sixth check, same shape as the existing four (report-and-
+   hold, never silently skip, and now symmetric with them in what they
+   gate — see item 3): no `approvals` row for this `task_id` has
+   `decided_at IS NOT NULL AND outcome IS NULL` (an approved action never
+   consumed), and no `prompt-occurrence` row for this task has
+   `unresolved_reason IS NOT NULL AND resolution_reason IS NULL` (a prompt
+   only ever seen). Either one HOLDS BOTH the `completed` transition AND
+   the pane close (item 3), named with the exact `approval_id`/occurrence
+   key, exactly how the existing four checks already name their own hold
+   reason — never a silent skip.
 2. **The real hold/approval-consumption/uncertain-outcome state survives.**
-   A task held by check 5 or 6 does not become `completed` **and does not
-   stay silently `running` against a pane that is about to disappear
-   either** — the SAME honest failure mode the file's own `refused`
-   branch (`close-done-workers.sh:770-780`) already treats as unacceptable
-   ("leave its state... untouched... instead of a lie") applies here in
-   reverse: it moves to the registry's existing `blocked` state (already a
-   valid, non-terminal value — no new enum needed) with a reason naming
-   which evidence is outstanding (`approval_unconsumed:<approval_id>` /
-   `prompt_unresolved:<occurrence_key>`), so the task registry itself keeps
-   reporting the true, open state instead of either extreme.
-3. **A truthful terminal-session record, separate from work completion.**
-   The PANE still closes — reversible, and nothing about checks 5/6 should
-   trap a dead pane open just because its task's own state is unresolved
-   (that would recreate the exact "phantom `running` row" failure mode
-   `close-done-workers.sh:766-769` already exists to prevent). Pane closure
-   now unconditionally appends one new `events` row,
+   A task held by check 5 or 6 does not become `completed` **and its pane
+   does not close either** — the SAME honest failure mode the file's own
+   `refused` branch (`close-done-workers.sh:770-780`) already treats as
+   unacceptable ("leave its state... untouched... instead of a lie")
+   applies here too: it moves to the registry's existing `blocked` state
+   (already a valid, non-terminal value — no new enum needed) with a
+   reason naming which evidence is outstanding
+   (`approval_unconsumed:<approval_id>` /
+   `prompt_unresolved:<occurrence_key>`), and the pane stays open — exactly
+   like a row held by any of checks 1–4 today — so a human can still
+   re-query it. There is no third, in-between state where the pane is
+   gone but the evidence question is still open.
+3. **Evidence is captured and resolved BEFORE the pane is ever allowed to
+   close — closure is never unconditional (fixes independent review
+   finding 6/E).** Checks 5 and 6 are fully symmetric with the file's
+   existing four (`close-done-workers.sh:30-48`): failing EITHER holds
+   BOTH the state transition AND the pane close together, exactly like
+   checks 1-4 already do — there is no "close the pane anyway, just
+   don't say completed" path. An earlier draft of this document made pane
+   closure unconditional even while gating only the `completed` label,
+   which meant the pane — and with it, any further ability to re-query
+   live state — could still disappear out from under an unresolved
+   approval or prompt; that is the exact defect independent review
+   (`REVIEW-WEEKLY-AUTH-962585c.md`, finding 6/E) found. Only once checks
+   1–6 ALL pass does `close-done-workers.sh` append a NEW `events` row,
    `type='session_closed'` (`task_id`, `run_id`, `pane_id`, `pane_birth`,
-   `closed_by`, `closed_at`, `reason` = the batch's `closure_reason`),
-   regardless of whether the task's own state transition was `completed`
-   or `blocked`. An auditor (or `xd://handoff_debt`-style tool) can then
-   always answer two SEPARATE questions — "when did this session end" and
-   "was the work actually verified done" — without inferring the second
-   from the first, which is precisely the inference that produced the
-   15/10/12-task incident.
+   `closed_by`, `closed_at`, `reason` = the batch's `closure_reason`), in
+   the SAME transaction as the `completed` state write, and only then
+   does the pane actually close. The record stays conceptually SEPARATE
+   from work completion — it answers "when did this session end," the
+   state write answers "was the work verified done" — but both facts are
+   now produced together, atomically, only once evidence is clean, which
+   closes the gap independent review found without reopening the
+   "phantom `running` row against a gone pane" failure mode this
+   document's checks 1-4 already exist to prevent (a HELD row's pane
+   stays open and reachable, never orphaned, per item 2).
 4. **No grant inheritance, no automatic successor, on a fabricated
    completion.** Stated as a hard invariant for every consumer, present
    and future: `state='completed'` is the ONLY admissible completion
@@ -549,46 +675,54 @@ They become two independently-true records:
    already never reads task state at all — confirmed here as deliberate,
    not incidental), (B) any no-progress-escalation successor-spawn logic,
    and (C) any future "hand the next task to whoever finished the last
-   one" convention. A bare `session_closed` event — by construction, now
-   that it is written on EVERY pane closure including held ones — must
-   never be read as evidence of completion by anything; it proves only
-   that a pane stopped existing.
+   one" convention. A `session_closed` event — now written only once a
+   closure actually completes (checks 1-6 all passed, item 3) — must
+   still never be read as evidence of completion by anything; it proves
+   only that a pane stopped existing, not that the work behind it was
+   verified done.
 
 ### Negative tests required before any of this lands (design-only gate)
 
 1. **A closed stalled task** — pane idle, worktree clean, no unpushed
-   commits (passes all 4 existing checks), but the task made no real
-   progress (no completion evidence at all, just silence) — must NOT
-   reach `completed`; the session-closed event is appended, the task
-   state is NOT silently left `running` either (same reasoning as item 2
-   above — it needs its own honest resting state, not a third unexamined
-   possibility).
+   commits, and no outstanding `approvals`/prompt-occurrence evidence
+   (passes all 6 checks) — closes and reaches `completed` exactly as
+   today's batch-reason semantics intend (e.g. `--reason=no-follow-on`
+   requires no per-task proof); this test exists to prove checks 5/6 add
+   a gate without regressing the existing, accepted "nothing more to do"
+   closure path.
 2. **An approved-but-unconsumed request** — an `approvals` row with
    `decided_at` set and `outcome IS NULL` for the task under test — the
-   close attempt HOLDS specifically on check 5, names the exact
-   `approval_id` in its printed reason, and does not append a
-   `session_closed` event until the pane is ACTUALLY closed (dry-run must
-   change nothing, same as every other check in this file).
+   close attempt HOLDS on check 5: the task state stays `blocked` (named
+   with the exact `approval_id`), the pane stays OPEN (not closed), and no
+   `session_closed` event is appended at all — none of the three happens
+   independently of the others (dry-run must change nothing, same as
+   every other check in this file).
 3. **Pane-only evidence loss** — the pane itself is gone (no live occupant
    to re-query) and the ONLY remaining evidence is the registry's own
    `approvals`/`prompt-occurrence` rows; if those rows themselves cannot be
    read (query failure, corrupt row, anything short of a clean "no
-   outstanding evidence" answer), the gate HOLDS — never defaults to
-   "could not check, assume fine, mark completed." Mirrors the existing
-   `panes_ok` fail-closed pattern at `close-done-workers.sh:181-189` (F2,
-   security review round 2) applied to the new evidence sources instead of
-   pane-list shape.
+   outstanding evidence" answer), the gate HOLDS the state transition —
+   never defaults to "could not check, assume fine, mark completed."
+   Mirrors the existing `panes_ok` fail-closed pattern at `close-done-
+   workers.sh:181-189` (F2, security review round 2) applied to the new
+   evidence sources instead of pane-list shape. Since the pane itself is
+   already gone in this scenario, the test asserts the TASK STATE is never
+   silently marked `completed` on unreadable evidence — the "hold the
+   pane too" half of item 3 only applies when there is still a pane left
+   to hold.
 
 ## Review boundary
 
 This document, the new `grant-conductor-week.sh` command, the new
 `accept_conductor_week`/`read_conductor_week`/`claim_conductor_redemption`
 adapters in `lib/task-authorization.py`, `owner-lease-recover.py`'s new
-`--conductor-grant` branch, and §(i)'s two new `close-done-workers.sh`
-evidence checks plus the `session_closed` event are a security-relevant
-change to who may act as Main without a fresh human decision, and to what
-a closed task registry row is allowed to claim happened — security-
-reviewer, zero unresolved high/critical findings, before any of it lands,
+`--conductor-grant` branch (including its lease/redemption-token clamp,
+§(f) items 4-5), `conductor-handover.sh`'s new cross-task grant/scope/cap
+check (§(c)), and §(i)'s two new `close-done-workers.sh` evidence checks
+plus the gated `session_closed` event are a security-relevant change to
+who may act as Main without a fresh human decision, and to what a closed
+task registry row is allowed to claim happened — security-reviewer, zero
+unresolved high/critical findings, before any of it lands,
 not activation: no grant exists until `grant-conductor-week.sh` is run,
 and the first grant requires T first-hand, outside herdr, every single
 time — not a conductor acting on a prior general approval, not inferred
