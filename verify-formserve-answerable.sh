@@ -22,9 +22,21 @@
 set -uo pipefail
 
 FORMSERVE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/formserve.py"
+# The live path formserve.py falls back to when HERDR_STATE_ROOT is unset —
+# captured BEFORE the export below, so it is the real default regardless of
+# the sandbox this script sets up for its own subprocesses. This suite's
+# only serving fixture (the one case that reaches register_form) must never
+# write a row into the live hub registry.
+LIVE_FORMS_DIR="${HERDR_STATE_ROOT:-$HOME/.local/state/herdr}/forms"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/formserve-answerable.XXXXXX")" || exit 1
 trap 'rm -rf "$WORK"' EXIT
+export HERDR_STATE_ROOT="$WORK/state"
 fails=0
+
+live_snapshot() {
+  python3 -c "import os,sys; d=sys.argv[1]; print(sorted(os.listdir(d)) if os.path.isdir(d) else [])" "$LIVE_FORMS_DIR"
+}
+live_before="$(live_snapshot)"
 
 cat > "$WORK/good.html" <<'HTML'
 <html><body><form id="f">
@@ -92,6 +104,14 @@ check no_handler     refuse
 check orphan_button  refuse
 check cancels_itself refuse
 
+live_after="$(live_snapshot)"
+if [ "$live_after" = "$live_before" ]; then
+  printf '  ok   %-16s live forms dir unchanged (%s)\n' "live_state" "$LIVE_FORMS_DIR"
+else
+  printf '  FAIL %-16s live forms dir changed: before=%s after=%s\n' \
+    "live_state" "$live_before" "$live_after"
+  fails=$((fails + 1))
+fi
 if [ "$fails" -eq 0 ]; then
   echo "# all formserve answerability checks passed"
   exit 0

@@ -221,9 +221,10 @@ def render_form(rec: dict) -> bytes:
     else:
         intro = "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
     label_t, proj_t = esc(rec["owner_label"]), esc(rec["project"])
-    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Approve ONE owner-dispatch request for '
-            f'{label_t} ({proj_t})</title></head><body>'
-            f'<h1>Approve ONE owner-dispatch request for {label_t} ({proj_t})?</h1>'
+    heading = f"Approve ONE owner-dispatch request for {label_t} ({proj_t})?"
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{heading}'
+            f'</title></head><body>'
+            f'<h1>{heading}</h1>'
             f"{intro}"
             f"<table>{table}</table>"
             f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
@@ -307,11 +308,12 @@ def render_standing_form(rec: dict) -> bytes:
         f"<td><code>{esc(it.get('cost_cents') if isinstance(it, dict) and it.get('cost_cents') is not None else '-')}</code></td>"
         f"<td><code>{esc(it.get('action') if isinstance(it, dict) else '')}</code></td></tr>"
         for it in qi)
-    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Approve standing grant: '
-            f'{esc(rec.get("owner_label"))} / {esc(rec.get("project"))}</title></head><body>'
-            f'<h1>Approve a standing grant for {esc(rec.get("owner_label"))} ({esc(rec.get("project"))})? '
-            f'Up to {esc(rec.get("item_cap"))} dispatches, spend capped at {esc(rec.get("spend_cap_cents"))}c, '
-            f'valid {esc(rec.get("standing_window_s"))} s after you answer.</h1>'
+    heading = (f'Approve a standing grant for {esc(rec.get("owner_label"))} ({esc(rec.get("project"))})? '
+              f'Up to {esc(rec.get("item_cap"))} dispatches, spend capped at {esc(rec.get("spend_cap_cents"))}c, '
+              f'valid {esc(rec.get("standing_window_s"))} s after you answer.')
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{heading}'
+            f'</title></head><body>'
+            f'<h1>{heading}</h1>'
             f"<p>Approving authorizes up to {esc(rec.get('item_cap'))} future dispatches (spend capped at "
             f"{esc(rec.get('spend_cap_cents'))}c) against the EXACT queue below, for the currently-live holder "
             "shown. Nothing claims a new lease.</p>"

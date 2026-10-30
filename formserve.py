@@ -44,6 +44,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -376,16 +377,105 @@ def deliver(target: str, url: str, answers: dict) -> None:
 # hub treats "open but the port no longer answers" as gone. Registry failures
 # never affect the form itself — the human's page comes first.
 FORMS_DIR = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr")) / "forms"
+# herdr-action.sh writes and answers its own action-request forms here
+# (run_state_root()/action-forms, lib/run-registry.sh): run_state_root() is
+# `${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}` (lib/run-registry.sh
+# :50-52) -- a DIFFERENT variable from HERDR_STATE_ROOT above, and several
+# suites set them to different scratch dirs. Deriving this from the wrong one
+# would miss a hand copy under the real action-forms dir whenever an operator
+# overrides HERDR_RUN_STATE_DIR.
+ACTION_FORMS_DIR = Path(os.environ.get("HERDR_RUN_STATE_DIR",
+                                       Path.home() / ".local/state/herdr/runs")) / "action-forms"
+# Same file lib/run-registry.sh's registry_db() resolves to.
+ACTION_REGISTRY_DB = ACTION_FORMS_DIR.parent / "registry.sqlite3"
 
 
-def _title_of(html_bytes: bytes, fallback: str) -> str:
-    m = re.search(rb"<h1[^>]*>(.*?)</h1>", html_bytes, re.I | re.S) or re.search(rb"<title>(.*?)</title>", html_bytes, re.I | re.S)
-    if not m:
-        return fallback
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1).decode("utf-8", "replace"))).strip() or fallback
+_ACTION_FORM_ID_RE = re.compile(r"^(?P<id>.+)-\d+$")
 
 
-def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
+def action_form_request_id(form: Path) -> str:
+    """The <request_id> herdr-action.sh encoded into `<request_id>-N.html`
+    (herdr-action.sh:405). Falls back to the whole stem for a name that
+    doesn't fit the pattern, which then simply never matches a real request.
+    """
+    m = _ACTION_FORM_ID_RE.match(form.stem)
+    return m.group("id") if m else form.stem
+
+
+def is_herdr_actions_own_serve(form: Path, request_id: str) -> bool:
+    """True only for herdr-action.sh's OWN, current call on its OWN file:
+    the caller's --request-id must name the id encoded in the filename, AND
+    that id must still be a real row in the SAME registry herdr-action.sh
+    uses (lib/run-registry.sh's action_requests table) -- not merely a
+    plausible-looking filename, which a hand copy can trivially reproduce.
+    Read-only connection; formserve never writes to the control-plane registry.
+
+    Residual limitation (REVIEW-FORMSERVE-3e67f75.md, C1), accepted rather
+    than closed: this binds to an ARGUMENT (--request-id) and a DATABASE
+    ROW, not to the calling process. A same-UID hand copy of the html named
+    exactly `<id>-N.html`, served with `--request-id <id>` while that id is
+    still a live pending row, passes this check -- nothing here proves the
+    caller is actually herdr-action.sh's own backgrounded formserve
+    invocation. This guard stops the incident shape (a copy with a WRONG,
+    unrelated heading/title mislabeling the hub, or a copy recorded under
+    the wrong id) and accidental duplication; it is not a security boundary
+    against a same-UID process that deliberately reproduces both the
+    filename and the flag. Closing that would need a per-serve nonce minted
+    by herdr-action.sh and written into the row alongside request_id, passed
+    back on the formserve command line and checked here instead of/beside
+    request_id -- out of scope for this round.
+    """
+    if not request_id or request_id != action_form_request_id(form):
+        return False
+    if not ACTION_REGISTRY_DB.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{ACTION_REGISTRY_DB}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return False
+    try:
+        row = con.execute("SELECT 1 FROM action_requests WHERE request_id = ? LIMIT 1",
+                          (request_id,)).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+
+
+_HEADING_RE = re.compile(rb"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
+_TITLE_TAG_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def _clean_text(raw: bytes) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", raw.decode("utf-8", "replace"))).strip()
+
+
+def resolve_title(html_bytes: bytes, fallback: str, explicit: str | None) -> tuple[str, str | None]:
+    """Decide the title recorded for this form. Returns (title, refusal_reason).
+
+    refusal_reason is None unless the page must not be served: incident
+    2026-10-30, two hook-mode forms were built by copying another form's
+    <head>, so the hub listed a live approval form under a stranger's title
+    while the page itself showed the right heading. The heading is what the
+    human actually reads, so it wins and is what gets recorded — but a
+    disagreeing <title> is evidence of exactly that copy-paste mistake, so
+    refuse rather than silently mislabel the hub's list. --title overrides.
+    """
+    if explicit is not None:
+        return explicit, None
+    heading_match = _HEADING_RE.search(html_bytes)
+    heading = _clean_text(heading_match.group(1)) if heading_match else ""
+    title_match = _TITLE_TAG_RE.search(html_bytes)
+    title_tag = _clean_text(title_match.group(1)) if title_match else ""
+    if heading and title_tag and heading != title_tag:
+        return "", (f"<title> says {title_tag!r} but the first heading (<h1>/<h2>) says "
+                     f"{heading!r} — looks like the <head> was copied from another form. "
+                     f"Fix the mismatch, or pass --title to record one explicitly.")
+    return heading or title_tag or fallback, None
+
+
+def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float, title: str,
                   token: str = "", deliver_to: str = "", schema: dict | None = None,
                   request_id: str = "") -> Path | None:
     """Register the form AND hand the hub a copy it can serve itself.
@@ -409,7 +499,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
                   file=sys.stderr)
             hub_url = ""
         path.write_text(json.dumps({
-            "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
+            "id": path.stem, "title": title, "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
             "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
             "schema": schema or {}, "request_id": request_id,
@@ -532,6 +622,10 @@ def main() -> int:
                          "action_requests.request_id); bound into the draft-preservation "
                          "key alongside the form's own path so two forms that happen to "
                          "share a basename never share a draft")
+    ap.add_argument("--title",
+                    help="record this title verbatim instead of deriving one from the page; "
+                         "required to serve a page whose <title> disagrees with its first "
+                         "<h1>/<h2>")
     args = ap.parse_args()
 
     form = Path(args.form).expanduser().resolve()
@@ -539,11 +633,26 @@ def main() -> int:
         print(f"formserve: no such file: {form}", file=sys.stderr)
         return 2
 
+    # herdr-action.sh writes and answers these itself, bound to the request id
+    # via claim-once (lib/run-registry.sh). A hand-served copy can collect a
+    # human answer that herdr-action then correctly refuses as unbound to any
+    # request -- but herdr-action.sh's OWN call on its OWN file, naming the
+    # SAME request id that is still a real row in its registry, must go
+    # through: that is this guard's only legitimate caller.
+    if form.is_relative_to(ACTION_FORMS_DIR.resolve()) \
+            and not is_herdr_actions_own_serve(form, args.request_id):
+        ar_id = action_form_request_id(form)
+        print(f"formserve: {form}: herdr-action serves this form itself; "
+              f"use herdr-action.sh show {ar_id} for its id", file=sys.stderr)
+        return 2
+
+    raw_html = form.read_bytes()
+
     # Refuse to serve a form nobody can answer. A configuration error, so it
     # exits 2 like the missing-file case above rather than serving a dead page:
     # the failure this replaces was invisible — the decision appeared in the
     # inbox, rendered correctly, and silently swallowed every click.
-    dead = unanswerable_reasons(form.read_text(errors="replace"))
+    dead = unanswerable_reasons(raw_html.decode("utf-8", errors="replace"))
     if dead:
         print(f"formserve: {form} cannot record an answer:", file=sys.stderr)
         for reason in dead:
@@ -557,6 +666,15 @@ def main() -> int:
               "  see examples/form-template.html", file=sys.stderr)
         return 2
 
+    # The hub list shows this title; a disagreeing <title> means the <head>
+    # was copied from another form's page (incident 2026-10-30) and the hub
+    # would mislabel a live decision. Refuse rather than guess which one is
+    # right; --title records one explicitly and skips the check.
+    title, title_error = resolve_title(raw_html, form.stem, args.title)
+    if title_error:
+        print(f"formserve: {form}: {title_error}", file=sys.stderr)
+        return 2
+
     # Unguessable per-run secret (see the /submit handler for why this exists)
     # — generated fresh every invocation so it cannot be reused across runs or
     # guessed from a previous one.
@@ -565,7 +683,6 @@ def main() -> int:
                .replace("{{FORMSERVE_REQUEST_ID}}",
                         html_module.escape(f"{args.request_id}:{form}", quote=True)).encode()
 
-    raw_html = form.read_bytes()
     # Required-field schema derived from the SOURCE markup, not the page's own
     # script — the thing that lied in the 2026-10-18 incident. Computed once,
     # used by this process's own /submit AND stored on the registry row so
@@ -595,7 +712,7 @@ def main() -> int:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
-    registry = register_form(form, raw_html, url, port, args.timeout,
+    registry = register_form(form, raw_html, url, port, args.timeout, title,
                              token=token, deliver_to=args.deliver or "", schema=schema,
                              request_id=args.request_id)
     result["registry"] = registry            # the handler claims against it before any 200
