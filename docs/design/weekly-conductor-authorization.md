@@ -27,6 +27,31 @@ weekend-spanning window on every successful mint, not only the no-op
 refresh case. §(b)'s identity reasoning and §(a)'s 120h-vs-work-week
 duration tradeoff were both reviewed and found sound — unchanged here.
 
+**Revision 3** (this version): responds to a delta review of `706821f`
+(same `REVIEW-WEEKLY-AUTH-962585c.md`, PROOF 12:40Z) — two adversarial
+gaps found in revision 2's OWN new text plus a conductor-escalated
+tightening of §(i)'s completion bar. Fixed here: (1) §(h)'s mint command
+is now a strict two-step preview-then-confirm flow — the computed start,
+end, scope, and caps are displayed and digested BEFORE any row exists,
+and the eventual insert is compare-and-swapped against that exact,
+human-approved digest, reusing `owner-dispatch-issue.py`'s own already-
+reviewed "approval binds the record that was on screen" pattern rather
+than inventing a new one; (2) §(c)'s self-handover carve-out is now
+checked at the RECIPIENT: any handover — regardless of which side
+initiates it — that would make the live Main a task's conductor runs
+through the SAME scope/cap/expiry check as a Main-initiated cross-task
+pull, closing the bypass where a non-Main conductor could simply hand
+Main its own task for free; (3) §(i)'s `completed` transition now
+requires POSITIVE completion proof under the closure reasons that
+already carry one (`shipped`+`--proof`, `superseded`, the detached-PR
+path's own GitHub-verified state) — a batch closure with no per-task
+proof (e.g. `no-follow-on`) no longer writes `completed`; it writes a
+new, honest `closed_unverified` state ("session-closed / not-completed")
+instead, and no successor or grant may ever read that state as
+completion. All five of revision 2's already-fixed items (1/C clamp, A
+pause-not-fallback, B delegation cap, E closure-holds-together, F
+start/end print) are unchanged and kept.
+
 ## Problem this closes
 
 T, 2026-10-30 12:03Z, DESIGN-only request, verbatim: *"we shouldn't have to
@@ -124,21 +149,26 @@ do it.
   independent review finding 1/C); this grant only ever substitutes for
   the **human confirmation** leg of that function's authorization, never
   the CAS, never the 24h ceiling itself, never the self-extension check;
-  (ii) Main's CROSS-TASK use of `conductor-handover.sh` — the part of
-  that script beyond a conductor giving away its own task — while a valid
-  weekly grant is active: scoped to the SAME closed label/repo set as
-  (i), capped at a hard, non-adjustable rate constant, and refused
-  outright the instant the grant expires, is revoked, or never existed
-  (§(c) spells out the exact cap, fixing independent review finding B/3 —
-  an earlier draft of this document left this power permanently
-  unbounded).
+  (ii) any `conductor-handover.sh` transfer that results in Main holding
+  a task it did not already hold — whether Main itself initiates a
+  CROSS-TASK pull, or another conductor voluntarily self-hands its own
+  task TO Main (§(c)'s recipient-side check, fixing independent review
+  addendum (b)) — while a valid weekly grant is active: scoped to the
+  SAME closed label/repo set as (i), capped at a hard, non-adjustable
+  rate constant, and refused outright the instant the grant expires, is
+  revoked, or never existed (§(c) spells out the exact cap, fixing
+  independent review finding B/3 — an earlier draft of this document
+  left this power permanently unbounded and, even after that fix,
+  checked only the caller-initiated half).
 - **Never authorizes**: minting itself (human-only, every time, §(h));
   raising `recover_lifecycle`'s 24h cap, the grant's own clamp, or
   `owner_lease.MAX_TTL_S`; adding a label to the grant's scope after mint
   (widening scope = a new mint, a new human consent, never an edit of a
-  live grant — tested explicitly, §(g) item 4); a cross-task handover
-  beyond the grant's own closed scope or its numeric rate cap, even while
-  the grant is otherwise valid (§(c)); spawning a *new* task/worker (that
+  live grant — tested explicitly, §(g) item 4); a transfer that makes
+  Main the conductor of a task it did not hold — from either side,
+  Main-initiated or self-handed TO Main — beyond the grant's closed
+  scope or its numeric rate cap, even while the grant is otherwise valid
+  (§(c)); spawning a *new* task/worker (that
   is `spawn-task.sh`'s own, separately-gated authority, untouched);
   crossing to a different Main pane without that pane independently
   clearing `designate-main.sh`'s own, unmodified succession rules.
@@ -239,11 +269,30 @@ rather than guesses).
 `conductor-handover.sh` has two distinct powers today, and only one of
 them is what this grant exists to time-box:
 
-- **Self-handover (unaffected, out of scope)**: any conductor may give
-  away its OWN task (`conductor-handover.sh:28-38`). Pre-existing,
-  unconditional, unrelated to Main-ness — this grant neither widens nor
-  narrows it; it needs no authorization today and gets none from this
-  document.
+- **Self-handover — bounded ONLY when the recipient is Main (fixes
+  independent review addendum (b))**: any conductor may give away its OWN
+  task (`conductor-handover.sh:28-38`) — for a recipient OTHER than the
+  live, registry-proven Main, this stays exactly as pre-existing and
+  unconditional as it is today; this grant neither widens nor narrows
+  that case, and it needs no authorization. But revision 2's own closing
+  claim in this section — "Main retains only the baseline self-handover
+  power... it cannot reach a different task's row until a fresh weekly
+  mint" — was never actually demonstrated: it only constrained the
+  CALLER-initiated path (Main asking for a task), and said nothing about
+  a task's own current conductor voluntarily handing it TO Main. A
+  non-Main conductor self-handing its task to Main reaches the IDENTICAL
+  end state (Main now manages a task it did not originally hold) the
+  cross-task bound below exists to govern, with no grant, no scope check,
+  and no cap — making that bound "largely decorative" if left open
+  (independent review addendum (b), `REVIEW-WEEKLY-AUTH-962585c.md`
+  lines 320-351). **Fixed**: `set_task_conductor`'s CAS gains one
+  additional check, run regardless of which side initiated the call —
+  whenever the NEW `conductor_pane_id`/`conductor_pane_birth` resolves to
+  the registry's live `roles.main` row, the SAME weekly-grant scope/cap/
+  expiry check below applies, exactly as it would for a Main-initiated
+  cross-task pull. A transfer to any pane that is NOT the live Main
+  remains fully unconditional, unrelated to Main-ness, and untouched.
+
 - **Cross-task handover (bounded by this grant)**: ONLY Main may give away
   a task it does not itself hold (`set_task_conductor`'s CAS is keyed on
   an existing, non-terminal task row — there is no "create a task and
@@ -268,17 +317,22 @@ them is what this grant exists to time-box:
     overridable... changing it is a reviewed code change"); a call past
     the cap is refused, named, exactly like every other check in this
     document;
-  - **expired exactly with the grant**: the instant the grant expires, is
-    revoked, or never existed, a CROSS-TASK handover attempt is REFUSED
-    outright — not merely "the daily recovery call stops" as the rejected
-    first draft stated. Without a valid grant, Main retains only the
-    baseline self-handover power every conductor already has; it cannot
-    reach a different task's row until a fresh weekly mint (§(h)) exists.
+  - **expired exactly with the grant, on EITHER side of the transfer**:
+    the instant the grant expires, is revoked, or never existed, BOTH a
+    CROSS-TASK pull initiated by Main AND a self-handover voluntarily
+    offered TO Main by another conductor are REFUSED outright — not
+    merely "the daily recovery call stops" as the rejected first draft
+    stated, and not merely the caller-initiated half as revision 2 left
+    it. Without a valid grant, Main retains only tasks it already holds;
+    it cannot come to hold a NEW task's row — by asking OR by being
+    handed one — until a fresh weekly mint (§(h)) exists.
 
 This makes "manage and delegate existing workers" bounded by the exact
-same scope and expiry as everything else this grant authorizes — not a
-separately-unbounded, pre-existing power the grant merely wraps in an
-audit log, which is what the rejected first draft actually described.
+same scope and expiry as everything else this grant authorizes, on
+whichever side of the transfer initiates it — not a separately-unbounded,
+pre-existing power the grant merely wraps in an audit log (revision 2's
+gap), and not a bound a non-Main conductor could simply route around by
+handing Main the task directly (revision 2's unfixed addendum (b) gap).
 
 ## (d) Revocation and audit trail
 
@@ -289,7 +343,8 @@ can never be confused or cross-revoked by accident:
 - `touch ~/.local/state/herdr/conductor-weekly-authorization.revoked` — one
   file, no code required to take effect, checked fresh (no caching) before
   every grant lookup in both consuming call sites (§(f)'s daily recovery
-  tick and §(c)'s now-bounded cross-task `conductor-handover.sh` check).
+  tick and §(c)'s now-bounded `conductor-handover.sh` check, on either
+  side of the transfer).
 - **Mint audit**: an `events` row in the same transaction as the
   `task_authorizations` INSERT (mirrors `accept_resident`'s own
   `_insert`/`event()` pattern) — `minting_pane`, `minting_pane_birth`
@@ -513,71 +568,158 @@ before implementation, not a retrofit:
     valid; a cross-task call naming a label/repo OUTSIDE the grant's own
     scope is refused; a cross-task call attempted after the grant has
     expired is refused outright — not merely "the daily recovery call
-    stops" (§(c)); a SELF-handover (any conductor giving away its own
-    task) succeeds identically with no grant at all, proving that power
-    stayed untouched.
-16. **Mint prints its own start and end (fixes finding F)**: a fresh mint's
-    terminal output states both `issued_at` and `expires_at` as absolute
-    timestamps; a mint whose `[issued_at, expires_at)` window includes a
-    Saturday or Sunday prints an explicit weekend-spanning flag; a mint
-    whose window does not must NOT print that flag (no false positive).
+    stops" (§(c)); a self-handover to a NON-Main recipient succeeds
+    identically with no grant at all, proving that power stayed
+    untouched (a self-handover TO Main specifically is covered
+    separately by test 17, §(c)'s recipient-side check).
+16. **Mint prints its own start and end — now at PREVIEW, not just after
+    (fixes finding F, superseded in shape by the two-step flow in §(h)
+    below but the underlying claim is unchanged)**: `build`'s terminal
+    output states both `issued_at` and `expires_at` as absolute
+    timestamps and the exact scope/cap list; a window including a
+    Saturday or Sunday prints an explicit weekend-spanning flag; a window
+    that does not must NOT print that flag (no false positive).
+17. **Recipient-side self-handover bound (fixes independent review
+    addendum (b))**: a non-Main conductor hands its OWN task directly to
+    the current live Main, with no weekly grant active — REFUSED, exactly
+    as a Main-initiated cross-task pull would be with no grant (§(c)'s
+    new recipient check); the identical handover with a valid, in-scope
+    grant active — ADMITTED, counted against `CONDUCTOR_HANDOVER_CAP`
+    exactly like a Main-initiated pull; the identical handover naming a
+    task OUTSIDE the grant's scope — REFUSED even with an otherwise valid
+    grant. A self-handover between two NON-Main conductors, or TO Main
+    while Main is not the live, registry-proven Main (a stale/incorrect
+    claim), is unaffected and stays exactly as unconditional as today.
+18. **Build writes nothing authoritative (fixes independent review
+    addendum (a))**: after `grant-conductor-week.sh build`, the
+    `task_authorizations` table has no new row of any kind — only a
+    formserve form exists; a process crash or interruption immediately
+    after `build` leaves zero partial grant state to clean up or revoke.
+19. **Issue refuses without a matching, fresh, answered form**: `issue`
+    run with no form id, an unanswered form, an expired form, or a form
+    whose embedded record's digest no longer matches a fresh hash of its
+    own fields (simulated tamper) — all refused, none insert a row;
+    `issue` run against the SAME answered form twice succeeds once and
+    refuses the second time (single-use, mirrors §(f) item 4's
+    redemption-token discipline).
+20. **Issue never substitutes a later "now" for the previewed window**: a
+    form built and answered at real-time T, then `issue` run at T+30
+    minutes (within the confirm window) — the resulting grant's
+    `issued_at`/`expires_at` equal exactly what `build` printed and T
+    approved, NOT `issue`'s own invocation time.
+21. **Stale confirm window refused**: an answered form older than
+    `CONFIRM_WINDOW_S` (proposed 3600s) at the moment `issue` runs is
+    refused — forcing a fresh `build`+approval rather than redeeming an
+    old consent long after the fact.
 
-## (h) The one action-time activation consent T would sign
+## (h) The one action-time activation consent T would sign — preview, then a digest-bound confirm (fixes independent review addendum (a))
 
-Exactly one new command, run by T, every time, from OUTSIDE herdr entirely
-— the identical proof `designate-main.sh --force` already requires
-(`caller_pane_from_ancestry` returns rc=2: the ancestry walk completed and
-found NO herdr pane anywhere in this process's chain, `designate-main.sh:
-77-90`) — never from inside a Main pane, never relayed by an agent on his
-behalf, never inferred from a prior week's grant or from this document
-existing:
+Revision 2 required the mint command to PRINT its computed window —
+correct, but, as the independent review's addendum confirmed, only
+AFTER the `task_authorizations` row already existed: "the command mints,
+THEN reports what it just did... T gives that consent blind to the exact
+numbers and only learns them in retrospect," and scope was never shown
+at all, before or after. Fixed here by splitting one command into two,
+reusing a pattern this codebase has already built and reviewed —
+`owner-dispatch-issue.py`'s "the approval binds the record that was on
+screen" model (`owner-dispatch-issue.py:9-38`): a BUILD step computes and
+displays the exact candidate record with nothing written to the
+authoritative store yet; a human approves that exact, byte-identical
+record; an ISSUE step reads back only the approved record and inserts —
+never the reverse order. No new primitive — the same `formserve`
+build/answer/issue machinery `owner-dispatch-issue.py` already uses.
+
+**Step 1 — build (preview, zero authoritative writes)**, run by T, every
+time, from OUTSIDE herdr entirely — the identical proof `designate-
+main.sh --force` already requires (`caller_pane_from_ancestry` returns
+rc=2: the ancestry walk completed and found NO herdr pane anywhere in
+this process's chain, `designate-main.sh:77-90`) — never from inside a
+Main pane, never relayed by an agent on his behalf:
 
 ```
-grant-conductor-week.sh --reason "<text>"
+grant-conductor-week.sh build --reason "<text>"
 ```
 
-- **No `--pane` argument** — the grant binds to whichever pane
-  `roles.main` names live AT THE MOMENT of each redemption (§(b)), never a
-  pane T names by hand at mint time; naming one would reintroduce exactly
-  the frozen-snapshot restart problem (b) exists to avoid.
-- **No `--days`/`--ttl` argument** — fixed at 120h (§(a)'s recommended
-  option), a hard constant in the command itself, not a caller-supplied
-  value, same posture `grant-resident-escalation.sh`'s own hard tier/TTL
-  caps take (`docs/design/resident-launch-grant.md:407-409`: "No grant may
-  ever request a longer window; the mint command itself refuses a `ttl`
-  argument above the cap").
-- **`--reason` is the one required field** — non-empty, audited verbatim
-  (§(d)), the same bar `conductor-handover.sh --reason` already sets.
-- **The label scope is the one other thing fixed in the command itself**
-  (not caller-supplied either) — a closed, reviewed list of the exact
-  label(s) the conductor/Main identity's own standing registration
-  depends on, hard-coded in `grant-conductor-week.sh`, changeable only by
-  editing and re-reviewing that script, never by an argument at mint time.
-  This is what makes "scope widening" (§(g) item 4) a code change and
-  review, not a runtime choice available to whoever runs the mint command.
-- **Every mint prints its own start and end, explicitly — not only the
-  no-op-refresh case (fixes independent review finding F).** On a FRESH
-  mint, the command's own terminal output states both `issued_at` and
-  `expires_at` as absolute timestamps, never just "120h" — and prints a
-  visible flag line whenever `[issued_at, expires_at)` includes a Saturday
-  or Sunday (e.g. `NOTE: this window includes a weekend — effective
-  working days may be fewer than 5`), so the window is never silently
-  read as "until Friday" or silently assumed to be exactly five business
-  days. §(a)'s Duration table is honest about weekend-spanning in the
-  document's own prose; this makes the RUNTIME TOOL say the same thing to
-  T at the exact moment he turns the key, not only in a design doc he
-  read once.
+Computes, and prints to the terminal, EVERY field the eventual grant
+would carry — nothing is hidden or deferred to after the fact:
+- `issued_at` / `expires_at` as absolute timestamps (120h apart, §(a)'s
+  recommended fixed duration — no `--days`/`--ttl` argument exists; the
+  duration is a hard constant in the script, same posture `grant-
+  resident-escalation.sh`'s own hard TTL cap already takes,
+  `docs/design/resident-launch-grant.md:407-409`);
+- an explicit weekend-spanning flag line whenever `[issued_at,
+  expires_at)` includes a Saturday or Sunday;
+- the exact **scope**: the closed label/repo list this grant would cover
+  (§"Exact scope") — printed, not merely asserted to exist "hard-coded
+  somewhere" as revision 2 left it;
+- the exact **caps**: `CONDUCTOR_HANDOVER_CAP` and the lease/redemption-
+  token clamp rule (§(f) item 5, §(c));
+- `reason` (the `--reason` argument, required, non-empty, same bar
+  `conductor-handover.sh --reason` already sets) and the builder's own
+  `minting_pane`/`minting_pane_birth` (T's ancestry-resolved identity at
+  build time).
 
-Running it when a grant is already active and unexpired is a no-op refresh
-— it ALSO prints both `issued_at` and `expires_at` (same requirement,
-same format, no special case), writes nothing new — not a silent
-extension of the existing window; "turning the key" always produces a
-grant whose `expires_at` is 120h from the moment the command actually
-ran, same "retry keeps the original validity window, never extends it"
-rule `accept_resident`/`accept_local` already enforce
-(`lib/task-authorization.py:281,354`) — reread as: a SECOND run before the
-first expires replaces nothing silently; its own new `command_id` mints a
-genuinely separate row rather than lying about `issued_at`.
+This exact tuple is canonicalized and hashed; the build step prints the
+resulting **digest** as the last line of its output. It writes ONE
+formserve form (`build-form`'s own pattern: `<id>.html` rendering those
+same fields for a human to read, `<id>.json` with `status="open"`) and
+**nothing else** — no `task_authorizations` row exists after this step,
+by construction; there is nothing yet to revoke or that any consumer
+could read as a grant.
+
+**Step 2 — human approval**: T answers the form (the SAME trusted
+hub/dashboard path every other formserve-gated decision in this codebase
+already uses, e.g. `owner-dispatch-issue.py`'s own approval flow) —
+`status="answered"`, `answered_at` set, the exact approved record
+embedded back into the answered page, unchanged from what step 1 showed
+(formserve's own "claim-once" + byte-identical-page guarantee, already
+reviewed, not re-litigated here).
+
+**Step 3 — issue (the only step that writes the grant)**:
+
+```
+grant-conductor-week.sh issue --confirm-form <form-id>
+```
+
+May run unattended (a tick, or Main) — authority already flows entirely
+from T's own form answer in step 2, the identical trust boundary
+`owner-dispatch-issue.py`'s own `issue` step already relies on. This step:
+1. Reads the answered form, verifies it parses, is `status=="answered"`,
+   and its embedded record's sha256 still matches a fresh hash of its own
+   fields (`owner-dispatch-issue.py`'s own `window()`/`expected_rows()`
+   pattern) — a tampered or malformed record refuses outright.
+2. Checks the approval is fresh: `answered_at` within a short, hard-
+   capped confirm window (proposed `CONFIRM_WINDOW_S = 3600`, the same
+   `MAX_WINDOW_S`-style cap `owner-dispatch-issue.py` already enforces
+   elsewhere) — a form approved but left unconfirmed for longer than that
+   is refused, forcing a fresh build+approve rather than redeeming a
+   stale consent.
+3. **Compare-and-swap, bound to the exact digest T approved**: recomputes
+   the SAME canonical tuple from the form's own embedded fields (never
+   from a freshly-recomputed "now," which would silently substitute a
+   DIFFERENT window than the one T actually saw and approved) and
+   verifies its digest equals the one the form embeds. Only on an exact
+   match does it INSERT the real `task_authorizations` row
+   (`source='conductor_weekly_authorization'`) using those exact,
+   previewed `issued_at`/`expires_at`/scope/caps — the mint never
+   silently substitutes a later "now" for the window T actually consented
+   to, and the insert is CAS-keyed on that digest never having been
+   consumed before (single-use, same discipline every other redemption
+   token in this document already uses, §(f) item 4).
+
+**The INSERT can never happen before the display, by construction**: step
+1 performs zero writes to `task_authorizations`; step 3 refuses unless a
+matching, fresh, answered form already exists. There is no code path that
+reaches an INSERT without first having printed and formed every field T
+is consenting to.
+
+Re-running `build` while an unexpired grant already exists is a no-op
+preview (prints the EXISTING row's `issued_at`/`expires_at`/scope, builds
+no new form) — not a silent extension; "turning the key" for a genuinely
+new week always requires its own fresh build→approve→issue cycle, each
+step's own identifiers kept distinct, mirroring "retry keeps the original
+validity window, never extends it" (`accept_resident`/`accept_local`,
+`lib/task-authorization.py:281,354`).
 
 ## (i) A closed session must never fabricate a completed task
 
@@ -668,36 +810,77 @@ They become two independently-true records:
    "phantom `running` row against a gone pane" failure mode this
    document's checks 1-4 already exist to prevent (a HELD row's pane
    stays open and reachable, never orphaned, per item 2).
-4. **No grant inheritance, no automatic successor, on a fabricated
+4. **Zero outstanding holds is NOT verified completion (fixes a
+   conductor-escalated tightening of the review's own self-correction
+   note).** Passing checks 1-6 proves only the ABSENCE of a specific list
+   of negative signals (dirty tree, unpushed commits, unconsumed
+   approval, unresolved prompt) — it is not POSITIVE proof the work was
+   actually done, and the review that accepted revision 2 explicitly
+   flagged this as "a legitimate internal-consistency fix... not a quiet
+   narrowing of what finding 6/E required," which is a correct but
+   permissive reading this document now tightens past. `completed` is
+   reached ONLY when the closure reason itself already carries a
+   per-task verification `close-done-workers.sh` has long required:
+   `--reason=shipped` with its mandatory `--proof` (`close-done-
+   workers.sh:12`: "one proof cannot honestly cover every closable task
+   in a batch, so shipped scopes to exactly the one it is evidence for"),
+   `--reason=superseded`'s own GitHub-verified rule set
+   (`_superseded_check`, five numbered rules against the live PR), or the
+   detached-HEAD reviewer path's own GitHub-verified merged/closed state
+   (`_detached_pr_check`). These three are "the existing task contract" —
+   `close-done-workers.sh` already demands concrete, checked evidence for
+   exactly them. Any OTHER closure that passes checks 1-6 but carries no
+   such per-task proof — most commonly the batch-wide `--reason=no-
+   follow-on`, which by design asks for none — writes a NEW terminal
+   state, `closed_unverified` ("session-closed / not-completed"), never
+   `completed`. The pane still closes (nothing about checks 1-6 held it —
+   this item changes only WHICH LABEL is written, not whether closure
+   happens); only the state differs: `completed` means verified by one of
+   the three existing proof paths, `closed_unverified` means the session
+   ended with no outstanding EVIDENCE problems but no one checked, and
+   nobody may, that the actual work behind it was finished.
+5. **No grant inheritance, no automatic successor, on a fabricated
    completion.** Stated as a hard invariant for every consumer, present
    and future: `state='completed'` is the ONLY admissible completion
    signal for (A) this document's own §(f) daily redemption tick (it
    already never reads task state at all — confirmed here as deliberate,
    not incidental), (B) any no-progress-escalation successor-spawn logic,
    and (C) any future "hand the next task to whoever finished the last
-   one" convention. A `session_closed` event — now written only once a
-   closure actually completes (checks 1-6 all passed, item 3) — must
-   still never be read as evidence of completion by anything; it proves
-   only that a pane stopped existing, not that the work behind it was
-   verified done.
+   one" convention. Neither a `session_closed` event (written only once a
+   closure actually completes, checks 1-6 all passed, item 3) NOR a
+   `closed_unverified` state (item 4) may ever be read as evidence of
+   completion by anything — the first proves only that a pane stopped
+   existing, the second proves only that it stopped existing cleanly,
+   neither proves the work behind it was verified done.
 
 ### Negative tests required before any of this lands (design-only gate)
 
-1. **A closed stalled task** — pane idle, worktree clean, no unpushed
-   commits, and no outstanding `approvals`/prompt-occurrence evidence
-   (passes all 6 checks) — closes and reaches `completed` exactly as
-   today's batch-reason semantics intend (e.g. `--reason=no-follow-on`
-   requires no per-task proof); this test exists to prove checks 5/6 add
-   a gate without regressing the existing, accepted "nothing more to do"
-   closure path.
-2. **An approved-but-unconsumed request** — an `approvals` row with
+1. **A closed stalled task reaches `closed_unverified`, never a fabricated
+   `completed`**: pane idle, worktree clean, no unpushed commits, no
+   outstanding `approvals`/prompt-occurrence evidence (passes all 6
+   checks), closed under `--reason=no-follow-on` (no per-task proof
+   required or supplied) — the row's new state is `closed_unverified`,
+   NOT `completed`; the pane still closes and `session_closed` is still
+   appended (item 3) — only the state label differs from revision 2's own
+   (incorrect, now-superseded) expectation that this case should reach
+   `completed`.
+2. **`--reason=shipped` with a valid `--proof` still reaches `completed`**:
+   the one existing path that already carries positive, per-task
+   evidence is unaffected by item 4 — proving the new state is additive,
+   not a blanket downgrade of every closure.
+3. **`--reason=superseded` and the detached-PR `abandoned` path are
+   unaffected**: both already run their own GitHub-verified rule sets
+   (`_superseded_check`/`_detached_pr_check`) independent of checks 1-6;
+   both still reach `completed` through their own existing, unmodified
+   proof, never downgraded to `closed_unverified`.
+4. **An approved-but-unconsumed request** — an `approvals` row with
    `decided_at` set and `outcome IS NULL` for the task under test — the
    close attempt HOLDS on check 5: the task state stays `blocked` (named
    with the exact `approval_id`), the pane stays OPEN (not closed), and no
    `session_closed` event is appended at all — none of the three happens
    independently of the others (dry-run must change nothing, same as
    every other check in this file).
-3. **Pane-only evidence loss** — the pane itself is gone (no live occupant
+5. **Pane-only evidence loss** — the pane itself is gone (no live occupant
    to re-query) and the ONLY remaining evidence is the registry's own
    `approvals`/`prompt-occurrence` rows; if those rows themselves cannot be
    read (query failure, corrupt row, anything short of a clean "no
@@ -707,19 +890,22 @@ They become two independently-true records:
    workers.sh:181-189` (F2, security review round 2) applied to the new
    evidence sources instead of pane-list shape. Since the pane itself is
    already gone in this scenario, the test asserts the TASK STATE is never
-   silently marked `completed` on unreadable evidence — the "hold the
+   silently marked `completed` (or silently marked `closed_unverified`,
+   which would equally be a guess) on unreadable evidence — the "hold the
    pane too" half of item 3 only applies when there is still a pane left
    to hold.
 
 ## Review boundary
 
-This document, the new `grant-conductor-week.sh` command, the new
+This document, the new `grant-conductor-week.sh build`/`issue` two-step
+command and the formserve form it builds (§(h)), the new
 `accept_conductor_week`/`read_conductor_week`/`claim_conductor_redemption`
 adapters in `lib/task-authorization.py`, `owner-lease-recover.py`'s new
 `--conductor-grant` branch (including its lease/redemption-token clamp,
-§(f) items 4-5), `conductor-handover.sh`'s new cross-task grant/scope/cap
-check (§(c)), and §(i)'s two new `close-done-workers.sh` evidence checks
-plus the gated `session_closed` event are a security-relevant change to
+§(f) items 4-5), `conductor-handover.sh`'s new recipient-checked grant/
+scope/cap gate (§(c), both the cross-task and self-handover-to-Main
+paths), and §(i)'s evidence checks plus the gated `session_closed` event
+and the new `closed_unverified` state are a security-relevant change to
 who may act as Main without a fresh human decision, and to what a closed
 task registry row is allowed to claim happened — security-reviewer, zero
 unresolved high/critical findings, before any of it lands,
