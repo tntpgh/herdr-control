@@ -1,0 +1,563 @@
+# Resident escalation launch grant
+
+Status: design candidate only. Offline planning. This document proposes no
+code change, activates nothing, and grants no authority. It exists so the
+decision to build it (and the decision to turn it on) can be made with the
+full shape in front of Terrence at once, instead of inferred piecemeal.
+
+## Problem this closes
+
+R8 (`8376ffb`) added `_esc_check_launch_authority` (`lib/escalation.sh:537-
+556`), called once by `esc_escalate` immediately after lock acquisition and
+strictly before `_esc_quiesce_old_writer` (`lib/escalation.sh:1056-1059`). It
+reuses `spawn-task.sh`'s own real gate — `caller_pane_from_ancestry` +
+`pane_is_conductor_eligible` (`lib/pane-guard.sh:297-324`,
+`lib/pane-guard.sh:161-173`) — read-only,
+never reimplemented. In production this check fails every time, by
+construction: the real caller chain is `hub.py`'s `stall-watchdog` daemon
+thread (`daemon=True`, started unconditionally at hub startup, `hub.py:5824`)
+running `_stall_watchdog_loop` (`hub.py:4712-4719`) which calls
+`_stall_watchdog_tick()` (`hub.py:4676-4709`), which forks `bash
+stall-watchdog.sh wake ...` as a **plain subprocess** (`hub.py:4700-4702`) —
+not a process running inside any herdr pane. `stall-watchdog.sh`'s
+`_sw_escalation_tick` then calls `esc_escalate` directly
+(`stall-watchdog.sh:268-287`, the call at `285-286`). A background daemon's
+subprocess chain cannot acquire herdr-pane ancestry by waiting or retrying;
+this is a structural certainty, independently confirmed by both R7's review
+(`REVIEW-ESC-R7.md:198-348`, "Confirmed the real production caller has no
+pane ancestry") and this round's own reading of the same files.
+
+R8's behavior on refusal is correct and is **not changed by this proposal**:
+the old writer stays untouched, the task is marked `blocked` (reason
+`no_launch_authority`, discoverable via the existing `journal_table`/
+`journal_key` event fields), never quiesced, never retried. Today, that is
+the *permanent* outcome for the resident caller — there is no path to
+production success at all. This document proposes the "if production success
+is required" half the R7 review named as out of scope and explicitly deferred
+("a new persistent-access decision, not something I can clear myself"):
+
+> it needs its own legitimate, persisted authorization — the same shape
+> `spawn-task.sh` already has for a remote-MCP publisher
+> (`authorization_command_id` + `read_task_authorization`,
+> `spawn-task.sh:415-419`), established and reviewed as its own
+> security-relevant change, never inferred or self-asserted by the watchdog.
+
+## Existing mechanism this reuses, not reinvents
+
+`spawn-task.sh` already has exactly two ways a spawn's authority can be
+proven, both backed by the single `task_authorizations` table
+(`lib/task-authorization.py:103-154`, columns include `command_id` PK,
+`source`, `claims`, `effective_scope`, `source_repo`, `issued_at`,
+`expires_at` INTEGER, `deadline_at` TEXT default `''`, `status` CHECK IN
+`('accepted','bound','launch_claimed','launched')`):
+
+1. **Live ancestry** (`spawn-task.sh:924-935`): when no
+   `--authorization-command-id` is given and the job is `managed` (default,
+   `spawn-task.sh:189`), the caller's *own, current* process ancestry must
+   resolve via `caller_pane_from_ancestry` + implicit eligibility, and
+   `spawn-task.sh` self-mints a `local_conductor`-sourced bookkeeping row
+   after the fact (`lib/task-authorization.py:273-300`, `accept_local`). This
+   is the path the resident caller can never pass — there is no live pane.
+2. **Pre-minted bearer receipt** (`spawn-task.sh:411-445`): when
+   `--authorization-command-id <id>` is given, `spawn-task.sh` calls
+   `read_task_authorization` (`lib/run-registry.sh:949-951`) and validates the
+   row *in place of* live ancestry — `.status == "accepted"`, `.source ==
+   "oauth_task_delegation"`, `.repo == $repo`, `.effective_scope.job_class ==
+   $job` (`spawn-task.sh:417-421`), plus a credential-posture check
+   (`spawn-task.sh:423-432`) and a once-only worktree-mutation claim
+   (`spawn-task.sh:435`). This is the shape the review named: a receipt
+   **minted earlier, by a separately-verified actor, presented later by an
+   unrelated process**.
+
+This proposal is path 2, with a **new, narrower `source` value** —
+`resident_escalation_grant` — not a third storage mechanism. No new table.
+The grant is minted by a real, live, conductor-eligible pane (so minting
+itself goes through the *existing* `caller_pane_from_ancestry` +
+`pane_is_conductor_eligible` gate, unmodified) and consumed later by the
+watchdog chain, which never has to prove its own ancestry because it is
+presenting a receipt instead — exactly how the OAuth remote path already
+works for a publisher that is never a herdr pane either.
+
+## Pilot scope: two options
+
+Terrence named a specific ladder he wants (Sonnet, then Opus, then the top
+Codex tier, triggered after 2-3 no-progress loops) — materially wider than
+this document's original default-recommended pilot (`standard` only). Both
+are laid out here so the choice is explicit, not defaulted past him.
+
+| | **A — restricted pilot** | **B — T's requested ladder** |
+|---|---|---|
+| Max tier | `standard` only (haiku→sonnet) | `frontier` (sonnet→opus→codex top tier) |
+| Tiers admitted | `fast`,`standard` | `fast`,`standard`,`deep`,`frontier` (full ladder — see below) |
+| Blast radius | One model step up, Claude family only | Three model steps, crosses into a second model family (codex) at the top |
+| Unattended spend/runtime | Lowest — one extra sonnet session per loop | Highest — can reach codex's most expensive configured tier unattended |
+| Operating experience needed first | None required | None required, but more to watch — recommend running A first even if B is the target end state |
+
+**Option A** is this document's original proposal, unchanged: `max_tier =
+standard`. A no-progress loop can escalate from `fast` to `standard` under
+the grant; reaching `deep` or `frontier` still requires a live human/
+conductor pane (today's behavior, unchanged — refused, task `blocked`,
+reason `no_launch_authority`).
+
+**Option B** is what Terrence described: `max_tier = frontier`, admitting
+escalation all the way up the real ladder — `esc_tier_job`
+(`lib/escalation.sh:189-196`) maps `fast→explore`, `standard→implement`,
+`deep→plan`, `frontier→deep-review`; `esc_tier_agent`
+(`lib/escalation.sh:206-212`) keeps the task's own model family for every
+tier except `frontier`, which always resolves to `codex` (opus is Claude's
+ceiling, so the one real step beyond it is the strongest model this config
+names for any family). `esc_tier_model` (`lib/escalation.sh:218-222`) reads
+the actual model id from the same table `spawn-task.sh` itself uses
+(`lib/agent-profiles.sh`'s `model_for_agent`):
+
+- `standard` → `claude:implement` → harness alias **`sonnet`**
+  (`lib/agent-profiles.sh:188`) — **UNVERIFIED which provider model id this
+  resolves to.** `sonnet`/`opus`/`haiku` are harness-level aliases passed
+  to the `claude`/`omp` CLI, not provider model ids; which exact id an
+  alias resolves to is decided inside the harness at launch time, not
+  stored in any local config this repo can read. Checked and confirmed by
+  the conductor (read-only, `~/.omp/agent/models.db`, 2026 — out of scope
+  for a spawned worker to read directly): the `model_cache` table there
+  holds a broad provider CATALOG (many `claude-opus-*`/`claude-sonnet-*`
+  candidate rows), with **no alias-to-id mapping** — naming one specific id
+  here would be a guess, not a citation, so this document does not name one.
+- `deep` → `claude:plan` → harness alias **`opus`** (`lib/agent-profiles.sh:
+  186`) — same UNVERIFIED caveat as `sonnet` above, same evidence.
+- `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**
+  (`lib/agent-profiles.sh:201`) — this one IS a real provider model id, not
+  a harness alias, and IS verifiable from local config, with one added
+  wrinkle: it differs by which commit is live.
+  - On this feature's own branch (`config.sh:104`, current HEAD): defaults
+    to **`gpt-5.6-sol:high`**.
+  - On `integrate/release-bundle-437eebe` (`1df9d93:config.sh:104` — the
+    release bundle this work ships through, which already includes #378):
+    defaults to **`gpt-6-sol:high`** instead. "The top Codex tier ('Sol
+    high')" tracks whichever of these is actually live wherever a grant is
+    minted — **the `gpt-6-sol:high` figure holds only once #378 ships**;
+    until then the deployed value is `gpt-5.6-sol:high`. Neither figure is
+    a concept this proposal introduces — both are `config.sh:104` read
+    verbatim, no code change here, same as every other tier already does.
+
+**Design option this raises, not proposed here**: because `sonnet`/`opus`
+cannot be pinned to an exact provider id from local config the way the
+Codex tiers can, `lib/agent-profiles.sh` could be changed to pin exact
+provider model ids for the escalation tiers specifically (instead of the
+bare harness aliases `model_for_agent` emits today), giving Option B's
+`standard`/`deep` steps the same verifiability its `frontier` step already
+has. That would be its own change to `lib/agent-profiles.sh`, with its own
+review — not something this document implements or recommends picking an
+id for.
+
+The loop threshold — "after 2-3 no-progress loops" — is
+`HERDR_NO_PROGRESS_CYCLES` (`lib/escalation.sh:272`, `${HERDR_NO_PROGRESS_
+CYCLES:-3}`), already defaulted to **3** identical ticks before
+`no_progress_detect` reports a loop at all (`lib/escalation.sh:82-85`) —
+this grant proposal does not change that threshold or the one-tier-per-
+escalation pacing; "2-3 loops" is already what today's detector requires
+per step, and each of the three steps in B still only fires on its OWN
+fresh 3-cycle (or configured) no-progress window for the NEW tier, not a
+single trigger that cascades through all three at once.
+
+A grant's `max_tier` admits every tier at or below it in `esc_ladder`'s
+order (`lib/escalation.sh:98`, default `fast standard deep frontier`), not
+a hand-picked subset — so Option B's `frontier` ceiling also admits `fast`
+and `standard` escalations for the same task, even though Terrence's own
+description starts at Sonnet (`standard`). That's consistent with how
+escalation already works (`esc_next_tier`, `lib/escalation.sh:166-...`,
+moves exactly one tier at a time from wherever the task currently sits) —
+nothing here lets a task skip from `fast` straight to `frontier` in one
+jump regardless of which option is chosen; each tier still needs its own
+fresh no-progress window.
+
+**Per-step scope, both options:**
+
+- **Repo**: one repo per grant, exactly as specified throughout this
+  document — unchanged by which ladder is granted.
+- **Task lineage**: a grant is never task-bound (no no-progress task exists
+  at mint time); scope is enforced structurally by `esc_escalate` only ever
+  running after `no_progress_detect` already reported a loop for a
+  SPECIFIC task (`stall-watchdog.sh:280-282`), and by `_esc_spawn_next_
+  tier`'s existing journal/pinning logic refusing a second spawn for a task
+  that already has one in flight or bound (`lib/escalation.sh:830-...`).
+  Each step up the ladder (standard→deep, deep→frontier) is a NEW spawn for
+  the SAME task lineage (the successor becomes the new task the next
+  no-progress window watches) — the grant authorizes the repo and tier
+  ceiling, not a specific task_id, by construction, in both options.
+- **Write scope**: unchanged by this proposal in either option — every
+  managed spawn (live-ancestry or grant-admitted) gets its own dedicated git
+  worktree keyed to one branch (`spawn-task.sh`'s worktree creation), and
+  `lib/command-policy.sh`'s grant-tokenizer already scopes action grants to
+  that task's own `branch`/`worktree` fields, failing closed on an empty
+  branch (`lib/run-registry.sh:242-247`'s comment on the `branch` column).
+  This proposal adds no new write-scope mechanism and narrows nothing
+  further than what every other managed spawn already gets.
+- **Spend or time caps**: **none exist today**, in either option. Grepping
+  `lib/escalation.sh`, `stall-watchdog.sh`, `no-progress-escalate.sh`,
+  `spawn-task.sh`, `config.sh` for any budget/spend/cost-cap mechanism
+  found none — `HERDR_ESCALATION_HOOK_RETRIES` (`config.sh:140`) bounds one
+  watchdog cycle's spawn *retry* attempts, not total spend, and nothing
+  bounds how long a spawned successor itself may run once launched (true
+  for every spawn today, not something this proposal changes). Option B's
+  wider ceiling reaches a more expensive model with the exact same absence
+  of a spend guard — if a time/spend cap is wanted, it is a separate,
+  unrelated piece of infrastructure this document does not propose and
+  should not be assumed to exist.
+- **Caller binding**: identical in both options — §3 below, live ancestry
+  proven once at mint time, never inferred from the unattended caller.
+- **Action-time revocation**: identical in both options — §5 below, the
+  sentinel file, checked before the grant lookup on every tick, so a mid-
+  run revoke stops the NEXT spawn attempt at whichever tier it was about to
+  reach, including a frontier/codex spawn already queued for this watchdog
+  tick. It does not stop or kill a successor already launched in an earlier
+  tick — revocation is "mint no more," not "recall what's running," in
+  both options (consistent with §6 rollback: this was never a live-agent
+  kill switch).
+- **Expiry**: identical in both options — §4 below, the same hard 24h cap.
+  B does not get a longer window for reaching further; the ceiling is tier,
+  not time.
+
+**Which steps need a step-up human approval, and why:**
+
+Neither option auto-approves anything beyond what minting the grant already
+decided. The three-step distinction is about WHEN Terrence's judgment is
+asked for, not whether it ever is:
+
+- **Minting the grant at all** — human-only in both options (§3, §8): this
+  is the one unavoidable step-up, because it is the only place live pane
+  ancestry is ever proven for this feature.
+- **Reaching `deep`/`frontier` specifically** needs its own, separate
+  step-up beyond "mint a grant for this repo" IF Option A ships first and
+  Option B is wanted later — raising `max_tier` above `standard` is already
+  listed as human-only (§8, "Raising `max_tier` above `standard`... requires
+  a code change to the mint command's own hard caps"). If B ships as the
+  initial design instead, this is folded into the single mint-time decision
+  — Terrence chooses `frontier` once, at mint time, and nothing asks again
+  per tier-step after that, which is the material difference from A: A asks
+  "is sonnet enough" once per repo at mint time and never risks more; B asks
+  "is the full ladder, unattended, acceptable for this repo" once at mint
+  time and then genuinely does not ask again before an unattended codex
+  spawn.
+- **Crossing model families (claude→codex) specifically** is not a separate
+  approval gate in either option as designed — `frontier` always resolves
+  to codex (`lib/escalation.sh:209`) as part of the existing, already-
+  shipped tier ladder, not something this grant introduces. If a distinct
+  approval step for the family crossing (not just the tier ceiling) is
+  wanted, that is a NEW control this document does not currently propose
+  and would need its own design, since today nothing — not escalation, not
+  this grant — treats a family crossing as materially different from a
+  same-family tier step.
+
+**Recommendation stands as originally written: default to Option A for the
+first repo, even if Option B is the eventual goal** — not because B is
+unsafe by design, but because neither option has any operating history yet,
+and A's smaller blast radius makes the first real-world failure mode (if
+any) cheaper to observe and fix. This is a recommendation, not a
+restriction the code enforces — the mint command's own hard cap (§8) is
+Terrence's to set per repo at mint time regardless of which option this
+pilot starts with.
+
+## 1. Exact action
+
+- **Caller**: `_esc_check_launch_authority` (`lib/escalation.sh:544-556`),
+  called from `esc_escalate` (`lib/escalation.sh:1056`), reached only through
+  `stall-watchdog.sh`'s `_sw_escalation_tick` (`stall-watchdog.sh:268-287`),
+  reached only from `hub.py`'s `_stall_watchdog_loop` thread (`hub.py:4712`,
+  started at `hub.py:5824`). No other caller of `esc_escalate` exists in this
+  repo today (`no-progress-escalate.sh`'s own `cmd_tick` is the offline test
+  CLI, invoked by a human/test harness, which already has real ancestry when
+  run from a pane and is unaffected).
+- **spawn-task.sh invocation**: unchanged —
+  `bash "$_esc_dir/../spawn-task.sh" --no-focus "$repo" "$branch" "$job"
+  "$agent"` (`lib/escalation.sh:591`, inside `_esc_spawn_successor`), with one
+  new argument added when a grant is admissible:
+  `--resident-redemption-id <token_command_id>` — **not** the grant's own
+  `command_id` (REVIEW-GRANT-9ac2fc4, HIGH: see §3 point 3 below for why a
+  bare grant id is never passed around after the fix).
+- **Job classes**: exactly the four `esc_tier_job` values
+  (`lib/escalation.sh:189-196`) — `explore` (fast), `implement` (standard),
+  `plan` (deep), `deep-review` (frontier). No other job class is ever passed
+  by this caller; the grant's `effective_scope.job_class` is validated
+  against this closed set, not a wildcard.
+- **Models**: unchanged — whatever `esc_tier_model`/`esc_tier_agent`
+  (`lib/escalation.sh:206-213`, `esc_tier_model` immediately below it) already
+  resolve for the granted tier (fast =
+  haiku, standard = sonnet, deep = opus, frontier = codex's
+  `$HERDR_CODEX_DEEP`). The grant authorizes a **tier ceiling**, not a model
+  string, so it tracks config changes the same way escalation already does.
+
+## 2. Scope
+
+- **Repo**: the grant's `source_repo` column names exactly one repo
+  (absolute, normalized path — the same shape `accept_local` already
+  enforces, `lib/task-authorization.py:276-277`). One grant per repo; no
+  wildcard, no "all repos" grant ever.
+- **Task**: a grant does **not** name a task_id — it cannot, since the task
+  that will eventually need it does not exist yet at mint time (no-progress
+  loops are detected after the fact). Scope is instead enforced structurally:
+  `esc_escalate` only ever runs after `no_progress_detect` has already
+  returned `loop: true` for a *specific* task (`stall-watchdog.sh:280-282`),
+  and `_esc_spawn_next_tier`'s own journal/pinning logic
+  (`lib/escalation.sh:830-...`) already refuses a second spawn for a task
+  that already has one in flight or bound. The grant only ever reaches
+  `spawn-task.sh` from inside that already-gated call path — it is not a
+  general-purpose spawn credential and must never be accepted outside
+  `_esc_spawn_successor`'s own invocation. **REVIEW-GRANT-9ac2fc4 (HIGH)**
+  found the first implementation only *intended* this and did not enforce
+  it: the grant's own `command_id`, once recovered from any spawned task's
+  ordinary audit record (`claims.grant_command_id`), was independently
+  presentable straight to `spawn-task.sh` with zero ancestry and zero
+  `esc_escalate` involvement, admitting a second, unrelated spawn. Fixed
+  structurally (§3 point 3): `_esc_check_launch_authority` now mints a
+  fresh, single-use redemption token per admitted escalation attempt, and
+  only that token — never the grant's own id — is what `spawn-task.sh`
+  will accept.
+- **Max tier**: the grant's `effective_scope` carries a `max_tier` field (one
+  of `fast|standard|deep|frontier`). `_esc_check_launch_authority` refuses
+  if `to_tier` (the tier `esc_escalate` is currently trying to reach) ranks
+  above the grant's `max_tier` in the existing ladder order — the old writer
+  stays active and the task is marked `blocked`, same shape as a missing
+  grant. **Default recommendation: `standard` only** (Option A, haiku→
+  sonnet) — see "Pilot scope: two options" above for the full comparison
+  against Terrence's requested wider ladder (Option B, `max_tier =
+  frontier`). Reaching `deep`/`frontier` unattended is a materially bigger
+  blast radius (opus/codex spend, longer unattended runtime); the mint
+  command's own hard cap is Terrence's to set per repo regardless of which
+  option a given grant uses.
+
+## 3. Identity and binding — no spoofed ancestry, no env bypass
+
+The resident caller's own process ancestry is never checked, inferred, or
+trusted — it has none, and nothing here teaches `caller_pane_from_ancestry`
+or `pane_is_conductor_eligible` to accept one. Both functions stay exactly as
+they are, reused read-only by the **mint** step instead:
+
+1. Terrence (or a conductor acting on his explicit instruction) runs a new,
+   narrow, human-invoked command — e.g.
+   `grant-resident-escalation.sh <repo> <max_tier> <ttl>` — **from a real
+   herdr pane**. The command's first action is calling
+   `caller_pane_from_ancestry` + `pane_is_conductor_eligible` against *itself,
+   right now* (identical call shape to `_esc_check_launch_authority`'s
+   existing fallback, `lib/escalation.sh:554-555`) — if that fails, nothing
+   is minted. This is the **only** place in the whole proposal where live
+   ancestry is proven, and it happens once, interactively, at mint time —
+   never deferred to the unattended caller.
+2. On success it calls a new `accept_resident(db, command_id, minting_pane,
+   minting_pane_birth, repo, max_tier, expires_at)` adapter (same file,
+   `lib/task-authorization.py`, modeled on `accept_local` at lines 273-300
+   but with `source="resident_escalation_grant"` and its own narrower
+   manifest validator — `job_class` closed to the four escalation values,
+   `secrets` hard-coded to `"default"`, never `"grant"`) and writes one row
+   to the existing `task_authorizations` table. No new table, no new
+   storage adapter class.
+3. At spawn time, `_esc_check_launch_authority` gains one new branch, tried
+   **before** falling through to today's ancestry check: look up the most
+   recent `status='accepted'` row with `source='resident_escalation_grant'`
+   and `source_repo = <repo>` (a read, same transaction shape `read()`
+   already provides, `lib/task-authorization.py:156-157`). If one exists,
+   unexpired, and its `max_tier` admits `to_tier`, it does **not** pass that
+   row's own `command_id` onward — **REVIEW-GRANT-9ac2fc4 (HIGH)** proved
+   that id leaks via every spawn's own ordinary audit record
+   (`claims.grant_command_id` on the `resident_escalation_spawn` row below),
+   making it a reusable bearer credential for the grant's whole TTL once any
+   one spawn under it had happened. Instead it mints a brand-new,
+   short-TTL (5 min — just the quiesce-then-spawn window, not the grant's
+   own up-to-24h one), single-use row of a **third** source,
+   `resident_escalation_redemption` (`accept_resident_redemption`,
+   `lib/task-authorization.py`), scoped to `(grant_command_id, repo,
+   job_class)`, and passes *that* row's `command_id` through to
+   `_esc_spawn_successor` as `--resident-redemption-id`. This mint is the
+   **only** place in the codebase that ever produces a redemption token —
+   nothing else, including `grant-resident-escalation.sh` or any CLI,
+   mints this source, so a token cannot be pre-forged or requested on
+   demand by an unattended caller; it only ever exists as the byproduct of
+   a real admission decision. `spawn-task.sh`'s own validation gains a
+   matching new branch that calls `claim_resident_redemption(token, repo,
+   job_class)` — an ATOMIC, single-use consumption (`status`
+   `accepted`→`bound` inside one transaction, race-safe via the UPDATE's
+   own affected-row count) that returns the underlying `grant_command_id`
+   on success and refuses outright for anything that is not a genuine,
+   unconsumed, unexpired, matching-scope token of this exact source — a
+   bare grant `command_id` presented here fails the source check the same
+   way an unknown id does, closing the leak. `spawn-task.sh` then
+   independently re-verifies the recovered grant is *still* admissible
+   (`resident_grant_admits`, unchanged defense-in-depth from before this
+   fix) before self-minting its own per-spawn `resident_escalation_spawn`
+   record (unchanged) — a revocation or expiry in the gap between token
+   mint and claim still refuses here even though the token itself was
+   genuine.
+4. No environment variable ever carries a grant, a repo name, or a bypass
+   flag. `HERDR_ESC_AUTHORITY_CMD` (the existing test seam) stays test-only
+   and is never read in production; the grant lookup is a database read, not
+   an env check, so there is nothing to export into a shared process
+   environment that a different, unauthorized caller could inherit.
+
+## 4. Expiry — a hard time window
+
+Every grant row carries `expires_at` (the existing INTEGER epoch-ms column).
+`_esc_check_launch_authority`'s lookup filters on `expires_at > now()` the
+same way `launch()` already enforces `deadline_at` for the OAuth path
+(`lib/task-authorization.py:522-524`, "task deadline expired before
+launch") — an expired grant is invisible to the lookup, not specially
+handled; the pre-flight check falls straight through to today's ancestry
+check (which still fails for this caller) and the task is marked `blocked`
+exactly as it is today. The existing local/OAuth grants use a 15-minute TTL
+(`TTL_MS`, `lib/task-authorization.py:21`) because they authorize one
+spawn, now. A resident grant has to survive across many unattended ticks
+over hours, so it needs a longer but still *hard-capped* window — proposed
+**24 hours**, re-mint required after. No grant may ever request a longer
+window; the mint command itself refuses a `ttl` argument above the cap
+(enforced in the command, not trusted from the caller).
+
+## 5. Revocation — one file, effective at the next tick
+
+This repo already has exactly this pattern for an equally blunt instrument:
+`~/.local/state/herdr/merge-delegation.revoked` instantly revokes routine-
+merge delegation for every session the moment any session touches it (per
+`AGENTS.md`'s "Stop merging" rule). Reuse the same shape rather than invent
+a second one:
+
+- `touch ~/.local/state/herdr/resident-escalation.revoked` — one file, one
+  command, requires no code to run to take effect (`touch` itself is the
+  entire revocation).
+- `_esc_check_launch_authority`'s new branch checks for this sentinel
+  **before** it ever queries the grant row — present means refuse
+  unconditionally, regardless of any otherwise-valid, unexpired,
+  correctly-scoped grant. Checked fresh on every call (no caching), so it is
+  live on the very next tick, not the next process restart — `esc_escalate`
+  runs inside a short-lived `bash` subprocess per tick already
+  (`stall-watchdog.sh:285-286`), so there is no long-lived state to flush.
+- **Proof it fired**: on seeing the sentinel, the pre-flight check marks the
+  task `blocked` via the existing `_esc_mark_blocked_uncertain`
+  (`lib/escalation.sh:1058-1059`'s own call shape) with its own distinct
+  reason, e.g. `resident_grant_revoked`, carrying the same
+  `journal_table`/`journal_key` discoverability fields every other blocked
+  reason already carries. A negative test (§9) touches the sentinel, runs a
+  tick against an otherwise-valid grant, and asserts exactly that reason —
+  the same observable proof pattern as every `_esc_mark_blocked_uncertain`
+  path already in the suite, not a new kind of evidence.
+- Per-repo, finer-grained revocation does not need a new mechanism at all:
+  update that repo's row to `status != 'accepted'` or let it expire — the
+  lookup predicate (`status='accepted' AND expires_at > now()`) already
+  excludes it.
+
+## 6. Rollback
+
+The new branch in `_esc_check_launch_authority` is strictly additive and
+tried *before* a fallthrough, never a replacement: no grant, an expired
+grant, a wrong-repo grant, a tier-exceeding grant, or the revocation sentinel
+all fall through to exactly the ancestry check R8 already ships — which
+still fails for the resident caller and produces exactly today's shipped
+behavior (old writer untouched, task `blocked` with reason
+`no_launch_authority`). Full rollback of the feature is therefore: `touch`
+the revocation sentinel (instant, no deploy) and/or stop running the mint
+command (no new grants are ever created automatically — nothing mints
+itself). There is no code path that needs reverting under load; the R8
+behavior this builds on is never removed, only extended.
+
+## 7. Audit fields
+
+- **Mint**: an `events` row via the existing `event()` helper
+  (`lib/task-authorization.py:303-305`, the same mechanism `register()`
+  already uses for `manifest_recorded`) — `minting_pane`, `minting_pane_birth`,
+  `repo`, `max_tier`, `expires_at`, `command_id`. Written by the mint command
+  itself, inside the same transaction as the `task_authorizations` insert, so
+  a grant can never exist without its own audit event.
+- **Consumption**: no new field needed — `register_task` already stores
+  `authorization_command_id` on the task row
+  (`lib/run-registry.sh:889`, surfaced in every task's JSON), so every
+  successor spawned under a resident grant is already traceable to the exact
+  grant that authorized it, by the existing mechanism, for free.
+- **Revocation**: the bare `touch` has no actor field by itself — the mint
+  command's companion revoke command (not just raw `touch` by hand) should
+  also write one `events` row (or a line to a small revocation log) naming
+  who revoked and when, so "it fired" and "who fired it" are both
+  answerable without trusting file mtimes alone.
+- **Expiry**: no action needed at expiry time — the row simply stops
+  matching the lookup predicate. A periodic sweep (future, optional, not
+  required for v1) could surface "a resident grant expired N days ago and
+  was never re-minted" on the hub dashboard, the same way
+  `xd://decisions_open` already surfaces other waiting state.
+
+## 8. What stays human-only
+
+- Minting a new grant (requires live, real pane ancestry at mint time — this
+  cannot be automated without recreating exactly the gap this document
+  exists to close).
+- Revoking a grant.
+- Re-minting after expiry.
+- Choosing which repo(s) are eligible at all — this proposal activates for
+  **zero repos** by default; enabling the first one is a deliberate,
+  separate decision, not a side effect of landing the code.
+- Raising `max_tier` above `standard`, or raising the TTL cap above 24h —
+  both require a code change to the mint command's own hard caps, reviewed
+  like any other security-relevant change, never a runtime argument.
+
+## 9. Negative tests required before activation
+
+All offline, same fake-command-seam style as `verify-no-progress-
+escalation.sh` (`HERDR_ESC_AUTHORITY_CMD` override, no real `herdr`/
+`spawn-task.sh` invocation), run as part of that suite:
+
+1. No grant exists for the repo → today's exact refuse-and-block behavior,
+   byte-for-byte unchanged (regression, not new — proves default-off).
+2. A grant exists but `expires_at` is in the past → refused, `blocked`,
+   discoverable reason; never silently treated as valid.
+3. A grant exists for a *different* repo → refused (scope mismatch).
+4. A grant exists but its `max_tier` is below the tier `esc_escalate` is
+   currently trying to reach → refused (tier-cap enforcement), including the
+   boundary case (`to_tier == max_tier` must pass; one above must refuse).
+5. A grant is valid, unexpired, correctly scoped — but its own `command_id`
+   (not a genuine redemption token) is presented directly to the claim
+   step, bypassing `_esc_check_launch_authority`'s own token mint entirely
+   — must refuse (wrong `source`), proving the grant is not a general-
+   purpose spawn bypass usable outside escalation's own call path.
+   **REVIEW-GRANT-9ac2fc4 (HIGH)**: this exact test was missing from the
+   first implementation, and the gap it would have caught was real — now
+   covered (`verify-resident-launch-grant.sh` case 7).
+6. The revocation sentinel is present → refused even against an otherwise
+   fully valid grant, and the sentinel is checked *before* the grant lookup
+   (ordering test: a valid grant plus the sentinel must never spawn).
+7. The sentinel is created mid-run (after a tick that already succeeded
+   under a valid grant) and takes effect on the *next* tick without a
+   process restart — directly proves "effective at the next tick," not
+   "effective after redeploy."
+8. **REVIEW-GRANT-9ac2fc4 (HIGH) superseded this item's original text**
+   ("reuses the existing once-only semantics, no new consumption logic to
+   re-prove") — the redemption-token fix adds genuinely new single-use
+   consumption logic (`claim_resident_redemption`'s atomic `accepted`→
+   `bound` transition) that sits IN FRONT OF the pre-existing
+   `claim_task_worktree_mutation` gate, not instead of it, and must be
+   proved on its own terms: a token claimed once succeeds and recovers the
+   correct grant id; a second claim of the SAME token is refused — a grant
+   cannot authorize two concurrent spawns off a single redemption
+   (`verify-resident-launch-grant.sh` case 8).
+9. The full existing `verify-no-progress-escalation.sh` suite (120
+   assertions as of R9) stays green with the new lookup branch present but
+   no grant ever minted in any fixture — the new code path must be
+   provably inert until a human has explicitly run the mint command.
+10. A mutation probe (same isolated `git archive` + rewritten-test pattern
+    as every round of this feature) proving the new branch is load-bearing:
+    reverting it to "always fall through to ancestry" must make the
+    valid-grant positive-path test fail.
+
+A positive "grant actually authorizes a successful spawn end-to-end"
+fixture test is also required once the mint/consume code exists, but it is
+not a *negative* test and does not gate activation by itself — items 1-10
+above do. (Now present: `verify-resident-launch-grant.sh` case 8's first
+two assertions — grant admits, token mints, token claims and recovers the
+correct grant id — are what item 10's mutation probe targets.)
+
+## Review boundary
+
+This document, the mint command, the new `accept_resident` adapter, the new
+`_esc_check_launch_authority` branch, and `spawn-task.sh`'s new admissible
+`.source` branch are a security-relevant change to who may launch an agent
+unattended in production and must go through `security-reviewer` with zero
+unresolved high/critical findings before any code lands, exactly like the
+`authorization_command_id` + `read_task_authorization` mechanism it reuses
+did. Landing the code is still not activation: no grant exists until the
+mint command is run, and **the first grant for the first repo requires
+Terrence first-hand** — not a conductor acting on a prior general approval,
+not inferred from this document existing, not inferred from the code having
+merged. This document does not request that approval; it exists so that when
+it is requested, the exact shape being approved is already written down.

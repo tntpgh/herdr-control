@@ -601,7 +601,20 @@ class GatedNotice:
     def exchange_id(text: str) -> str:
         return "ra-notice-" + hashlib.sha256(text.encode()).hexdigest()
 
-    def prepare(self, rid: str, text: str):
+    def prepare(self, rid: str, text: str, may_begin: Callable[[], bool] | None = None):
+        """may_begin(), if given, is consulted AFTER admit() (cheap, idempotent
+        for an already-queued exchange_id -- safe to call every tick) but
+        BEFORE begin_notice() (the irreversible queued->delivering transition
+        that commits this exact caller to typing). A False here returns Held
+        WITHOUT calling begin_notice, so the request stays admitted/queued,
+        never 'blocked', and is retried -- still notify-eligible -- next
+        call. Lets a caller cap concurrent real sends (remote-mcp/publisher.py
+        SPEED, tmp/in/BRIEF.md #3: herdr-deliver.sh's own 120s timeout means
+        an unbudgeted tick that found N ready rows could block N*120s)
+        without ever leaving an exchange half-admitted or a legitimate row
+        starved by one unrelated, permanently duplicate-blocked rid sorting
+        first -- admit()'s own duplicate refusal already returns Held before
+        may_begin is ever consulted, so a stuck row never spends the budget."""
         cur = self.bound(self.label)
         if cur is None:
             return Held("conductor_identity_gone")
@@ -613,6 +626,8 @@ class GatedNotice:
         if adm.generation != gen:
             self.gate.settle(self.label, pane, birth, adm.generation, xid, "blocked", "admit_generation_changed", now)
             return Held("admit_generation_changed")
+        if may_begin is not None and not may_begin():
+            return Held("rate_limited_one_notice_per_tick")
         began = self.gate.begin_notice(self.label, pane, birth, gen, xid, self.clock())
         if began != "delivering":
             if began != "lease_too_short":  # too short stays queued: re-admitted after renewal

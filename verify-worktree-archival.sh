@@ -42,6 +42,30 @@ export HERDR_ARCHIVE_MIN_FREE_KB=0
 WTROOT="$HERDR_CODE_ROOT/.worktrees"
 mkdir -p "$WTROOT"
 
+# Shared across Sections A and U below (the venv-provenance dirty-check
+# rows): same stubbing technique as verify-spawn-spec-proof.sh's bashlex-
+# preflight cases, a fake python3 answering exactly the two invocations
+# provision_worktree_bashlex_venv makes. Each fixture below gets its own
+# fake venv at ITS OWN root's .venv-bashlex (the first candidate) rather
+# than at $HERDR_APP_DIR (the second candidate, shared with Section S's
+# real spawn-task.sh runs) -- writing a real venv into $HERDR_APP_DIR would
+# change what THOSE unrelated probes observe.
+. "$here/lib/bashlex-preflight.sh"
+make_fake_bashlex_venv() {  # <dir> <bashlex-version>
+  local dir="$1" ver="$2"
+  mkdir -p "$dir/bin"
+  cat > "$dir/bin/python3" <<PYSTUB
+#!/usr/bin/env bash
+case "\$*" in
+  *importlib.metadata*) echo "$ver" ;;
+  *"import bashlex"*)   exit 0 ;;
+  *)                    exit 1 ;;
+esac
+PYSTUB
+  chmod +x "$dir/bin/python3"
+}
+VENV_PINNED_VER="$(sed -n 's/^bashlex==\([0-9.][0-9.]*\).*/\1/p' "$here/lib/bashlex-requirements.txt" | head -1)"
+
 CALLS=$(mktemp)
 export CALLS
 export PANES_JSON='{"result":{"panes":[{"pane_id":"pD","agent_status":"idle","terminal_id":"birthD-live","cwd":"/"}]}}'
@@ -165,6 +189,7 @@ git -C "$A_WORK" add .gitignore
 G -C "$A_WORK" commit -q -m gitignore
 git -C "$A_WORK" remote add origin "$A_ORIGIN"
 git -C "$A_WORK" push -q origin main
+make_fake_bashlex_venv "$A_WORK/.venv-bashlex" "$VENV_PINNED_VER"
 
 for n in 42 43 44; do
   git -C "$A_WORK" switch -q -c "pr-$n" main
@@ -302,6 +327,24 @@ if [ -n "$manifest_path" ] && [ -f "$manifest_path" ]; then
 else
   bad "positive: no archive manifest path found in output: $out"
 fi
+
+# positive V: _detached_pr_check's MERGED path (same helper the main loop
+# and _superseded_check use) treats a spawn-provisioned .venv-bashlex link
+# as not-dirty too — case 1 of the venv-provenance design, merged path row.
+wtG="$A_WT/wtG"; git -C "$A_WORK" worktree add -q --detach "$wtG" "$A_SHA42"
+provision_worktree_bashlex_venv "$wtG" "$A_WORK" >/dev/null 2>&1
+[ -L "$wtG/.venv-bashlex" ] || bad "positive V setup: provision did not create a link"
+register_task runA7 taskA7 w c cp cb pD birthD-live "$A_WORK" "$wtG" "detached-A7" || bad "register taskA7"
+set_task_state runA7 taskA7 running || bad "taskA7 -> running"
+set_task_review_pr runA7 taskA7 org/repo 42 || bad "set_task_review_pr A7"
+: > "$CALLS"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=shipped --task=taskA7 \
+  --proof="https://github.com/org/repo/pull/42 a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "positive V: apply closes despite the provisioned .venv-bashlex link" \
+  || bad "positive V exit $rc: $out"
+check "positive V: task completed" "$(read_task runA7 taskA7 | jq -r .state)" "completed"
+
 
 #######################################################################
 # Section B: archive-worktrees.sh
@@ -1216,6 +1259,7 @@ git -C "$U_WORK" add .gitignore
 G -C "$U_WORK" commit -q -m gitignore
 git -C "$U_WORK" remote add origin "$U_ORIGIN"
 git -C "$U_WORK" push -q origin main
+make_fake_bashlex_venv "$U_WORK/.venv-bashlex" "$VENV_PINNED_VER"
 U_WT_ROOT="$U_TMP/worktrees"; mkdir -p "$U_WT_ROOT"
 
 # _u_case <old-label> <new-label> -> fresh org/repo#<N> PR (own GH_PRS line,
@@ -1807,11 +1851,24 @@ check "U T3 (mutant V15): task untouched" "$(read_task "$U_M4_RUN" "$U_M4_TASK" 
   && ok "U T3 (mutant V15): no orphan archive dir was created" \
   || bad "U T3 (mutant V15): an archive dir was created despite the refusal"
 
+printf -- '-- V-U1: provisioned .venv-bashlex link -> closes as superseded (same helper _superseded_check uses) --\n'
 
+_u_case "review:old-vu1" "review:new-vu1"
+provision_worktree_bashlex_venv "$U_WT" "$U_WORK" >/dev/null 2>&1
+[ -L "$U_WT/.venv-bashlex" ] || bad "V-U1 setup: provision did not create a link"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "V-U1: --apply closes despite the provisioned .venv-bashlex link" || bad "V-U1 exit $rc: $out"
+check "V-U1: task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
 
+printf -- '-- V-U2: a regular file at .venv-bashlex -> HOLD (file), via the same provenance-aware check --\n'
 
-
-
+_u_case "review:old-vu2" "review:new-vu2"
+printf 'not a venv\n' > "$U_WT/.venv-bashlex"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not the spawn-provisioned link (file)' \
+  && ok "V-U2: a regular file at .venv-bashlex HOLDs via the provenance-aware check" || bad "V-U2 output: $out"
+check "V-U2: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

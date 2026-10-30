@@ -71,6 +71,43 @@
 		<string>__REMOTE_MCP_CONDUCTOR_PANE__</string>
 		<key>HERDR_MCP_CONDUCTOR_BIRTH</key>
 		<string>__REMOTE_MCP_CONDUCTOR_BIRTH__</string>
+		<!-- tmp/in/BRIEF.md: turn on result-availability delivery. Off until
+		     now, publisher.py's result_availability_tick() (~1298) returned
+		     None every tick -- finished owner results were never observed or
+		     noticed; a canary needed a manual tick. The same owner-lease gate
+		     also drives owner_lease_renew_tick() (~1259), which is generic
+		     over EVERY registered owner_projects label already (lib/
+		     owner_lease_renew.py renew_all_due(), one SELECT ORDER BY label,
+		     no code change needed) -- turning the gate on here is what makes
+		     the registered `conductor` label (owner_projects conductor ->
+		     tntpgh/herdr-control, lifecycle_end +24h) actually get renewed
+		     within its bound instead of just sitting on its gen1 3600s lease.
+		     Paths are the fixed single-machine herdr-control state root
+		     (~/.local/state/herdr/owner-dispatch/), the SAME store and the
+		     SAME literal values the hub's rendered LaunchAgent env already
+		     uses -- not install.sh-rendered, matching how OP_BIOMETRIC_UNLOCK_
+		     ENABLED/HERDR_EDGE_PEER_ANSWER above are fixed infra constants in
+		     that template, not per-invocation flags like the Mac-switch keys
+		     above. Deliberately WITHOUT HERDR_OWNER_DISPATCH / HERDR_OWNER_
+		     DISPATCH_AUTH_DB: those gate the separate owner-dispatch.py CLI
+		     and queue-supervisor.py entry points, neither of which this tick
+		     (grep-checked) ever imports or reads an env var from -- adding
+		     them here would be dead weight on a key this publisher never
+		     consults. -->
+		<key>HERDR_RESULT_AVAILABILITY</key>
+		<string>1</string>
+		<key>HERDR_RESULT_AVAILABILITY_DB</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/result-availability.sqlite3</string>
+		<key>HERDR_RESULT_AVAILABILITY_JOURNAL</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/journal</string>
+		<key>HERDR_RESULT_AVAILABILITY_ROOTS</key>
+		<string>thurber-os=/Users/thurbs/.local/state/herdr/owner-dispatch/handoffs/thurber-os</string>
+		<key>HERDR_OWNER_LEASE_DELIVERY</key>
+		<string>1</string>
+		<key>HERDR_OWNER_LEASE_DB</key>
+		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/owner-lease.sqlite3</string>
+		<key>HERDR_OWNER_LEASE_RENEW</key>
+		<string>1</string>
 	</dict>
 	<!-- 15 s: the Worker reports `disconnected` after 90 s without a sync,
 	     so six missed ticks in a row are what it takes to go dark. -->

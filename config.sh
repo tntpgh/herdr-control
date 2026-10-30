@@ -10,8 +10,8 @@
 # claude/codex process, matching spawn-task.sh's cli_for_agent routing and
 # smart-name.sh's SMART_NAME_BACKEND default.
 : "${HERDR_DEFAULT_AGENT:=omp}"
-HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-23-queuesup-v26e/omp"
-HERDR_OMP_LAUNCHER_SHA256="11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403a09be4bc700"
+HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-29-s4-v27a/omp"
+HERDR_OMP_LAUNCHER_SHA256="45a8484b0a4146d3373404a7babb1a2446d147545a53e18b52425f4b9f7cdf1c"
 
 # Extra dirs prepended to PATH so git/gh/jq/python3 (and your agent) resolve even
 # when herdr runs a script with a minimal environment (e.g. from a keybinding).
@@ -101,9 +101,64 @@ HERDR_OMP_LAUNCHER_SHA256="11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
 # Format: "<model>:<reasoning-effort>".
-: "${HERDR_CODEX_DEEP:=gpt-5.6-sol:high}"     # plan / architect / design / deep-review
+: "${HERDR_CODEX_DEEP:=gpt-6-sol:high}"      # plan / architect / design / deep-review
 : "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code / review / docs
 : "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical
+
+# ---- no-progress -> stronger-model escalation (lib/escalation.sh) ----------
+# Fixed, reviewed order of model tiers a stalled task may be handed up
+# through: fast(haiku) -> standard(sonnet) -> deep(opus) -> frontier. The
+# first three stay within the task's own agent family via model_for_agent's
+# existing fast/standard/deep vocabulary (not a second table). `frontier`
+# is a deliberate cross-family jump: opus is claude's ceiling, so the one
+# real step beyond it is codex's own deep tier — whatever $HERDR_CODEX_DEEP
+# above resolves to right now (today gpt-5.6-sol:high; becomes
+# gpt-6-sol:high automatically the moment PR #378 merges, with no edit
+# needed here, since lib/escalation.sh's esc_tier_model reads that SAME
+# variable through model_for_agent rather than naming a version itself). A
+# task already on the last word has nowhere to escalate to and stays put.
+: "${HERDR_ESCALATION_LADDER:=fast standard deep frontier}"
+# Consecutive no-progress ticks (lib/escalation.sh no_progress_tick, one per
+# stall-watchdog cycle) with identical evidence required before a loop
+# counts as "no progress" and may trigger an escalation. 2-3 per BRIEF.
+: "${HERDR_NO_PROGRESS_CYCLES:=3}"
+# 1 = record the escalation decision and context packet but never actually
+# quiesce the old pane or spawn a successor. --dry-run on the CLI overrides
+# this per call in either direction. A dry run never claims a tier.
+: "${HERDR_ESCALATION_DRY_RUN:=0}"
+# Claude/omp/codex/omc family the fast/standard/deep tiers spawn the
+# successor under — the registry does not track which family a task's own
+# pane is running, so this is the one place that choice is made for an
+# automated escalation. The ladder's `frontier` tier ignores this and
+# always resolves to codex (lib/escalation.sh's esc_tier_agent), since
+# that is the one step beyond this family's own ceiling.
+: "${HERDR_ESCALATION_AGENT:=claude}"
+# How many times esc_escalate retries its quiesce+spawn hook in one call
+# before giving up for this tick (the NEXT tick's call retries again from
+# scratch — nothing is committed on failure, so this bound only limits how
+# long one watchdog cycle spends retrying, not how many cycles may retry).
+: "${HERDR_ESCALATION_HOOK_RETRIES:=3}"
+# How many times esc_escalate polls pane liveness after asking herdr to
+# close the old pane before concluding the close did not take and failing
+# this attempt.
+: "${HERDR_ESCALATION_QUIESCE_POLLS:=5}"
+# Seconds before a held escalation lock (lib/escalation.sh's
+# escalation_locks table, acquired before the first side effect of an
+# attempt) is treated as abandoned and auto-released for the next
+# watchdog cycle to retry — guards against a process that dies mid-hold,
+# not normal contention (a normal attempt finishes in well under this).
+: "${HERDR_ESCALATION_LOCK_STALE_S:=300}"
+# Test/operator overrides for the actions the hook performs — empty (the
+# default) means the real `herdr pane`/spawn-task.sh commands. See
+# lib/escalation.sh's header for the exact 3-way contract of each.
+: "${HERDR_ESC_PANE_ALIVE_CMD:=}"
+: "${HERDR_ESC_PANE_BIRTH_CMD:=}"
+: "${HERDR_ESC_PANE_CLOSE_CMD:=}"
+: "${HERDR_ESC_SPAWN_CMD:=}"
+# 1 = stall-watchdog.sh's cmd_wake feeds every wake into the escalation
+# detector (lib/escalation.sh). 0 = detection-only code stays loaded but
+# inert — set when rolling this out gradually.
+: "${HERDR_ESCALATION_ENABLED:=1}"
 
 # ---- shared state (smart-name.sh ownership/debounce, attention.sh stalls) ---
 # Where the tools remember what they've done. Removable at any time; the tools

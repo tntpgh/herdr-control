@@ -1,0 +1,27 @@
+{
+  "synthetic": true,
+  "note": "Bounty cards describe work and the evidence that closes it. No money, rewards, points or revenue — and nothing is earned by approving anything.",
+  "statuses": ["open", "in_progress", "awaiting_evidence", "verified"],
+  "bounties": [
+    {
+      "id": "b1",
+      "kind": "build",
+      "objective": "Remove the duplicate alert path so each synthetic checkout error raises exactly one alert.",
+      "owner": "orchestrator@orchard-api (synthetic pane) — project lead",
+      "function": "debug",
+      "status": "open",
+      "evidence_needed": "Verify-script output over 24 hours showing one alert per error event, plus the merged PR and its merge sha.",
+      "verified_completion": { "verified": false, "by": null, "proof": null, "note": "Not started." }
+    },
+    {
+      "id": "b2",
+      "kind": "archive",
+      "objective": "Archive lighthouse-docs worktrees older than 30 days that hold no unpushed work (synthetic).",
+      "owner": "orchestrator@lighthouse-docs (synthetic pane) — project lead",
+      "function": "mechanical",
+      "status": "awaiting_evidence",
+      "evidence_needed": "Before/after worktree listing and the archive manifest showing every archived branch exists on the remote.",
+      "verified_completion": { "verified": false, "by": null, "proof": null, "note": "Evidence submitted; nobody has checked it yet." }
+    }
+  ]
+}

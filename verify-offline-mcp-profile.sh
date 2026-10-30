@@ -152,10 +152,11 @@ printf 'hook=%s\nlib_tree=%s\nspawn=%s\noverlay=%s\nselector=%s\n' \
 EOF
 chmod +x "$ctl_fx"
 ctl_fx_sha="$(shasum -a 256 "$ctl_fx" | cut -d' ' -f1)"
-ctl_old_bin='HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-23-queuesup-v26e/omp"'
-ctl_old_sha='HERDR_OMP_LAUNCHER_SHA256="11a476cfa8328fb43cf8a33a675f1e3c575a879312882c197c403a09be4bc700"'
+ctl_old_bin="$(grep -m1 '^HERDR_OMP_BIN=' "$ctl/config.sh" || true)"
+ctl_old_sha="$(grep -m1 '^HERDR_OMP_LAUNCHER_SHA256=' "$ctl/config.sh" || true)"
+[ -n "$ctl_old_bin" ] || { echo "FATAL: HERDR_OMP_BIN pin not found in $ctl/config.sh" >&2; exit 1; }
+[ -n "$ctl_old_sha" ] || { echo "FATAL: HERDR_OMP_LAUNCHER_SHA256 pin not found in $ctl/config.sh" >&2; exit 1; }
 ctl_cfg="$(cat "$ctl/config.sh")"
-case "$ctl_cfg" in *"$ctl_old_bin"*) ;; *) echo "FATAL: HERDR_OMP_BIN pin not found in $ctl/config.sh" >&2; exit 1 ;; esac
 ctl_cfg="${ctl_cfg//$ctl_old_bin/HERDR_OMP_BIN=\"$ctl_fx\"}"
 ctl_cfg="${ctl_cfg//$ctl_old_sha/HERDR_OMP_LAUNCHER_SHA256=\"$ctl_fx_sha\"}"
 printf '%s\n' "$ctl_cfg" > "$ctl/config.sh"
@@ -336,7 +337,7 @@ load_fixture_guard "$guard_neg/absent.sh" "$guard_fixture_sha" >/dev/null && bad
 load_fixture_guard "$guard_neg/empty.sh" "$guard_fixture_sha" >/dev/null && bad "empty fixture loaded" || ok "empty fixture fails closed"
 printf '%s\n' "$fixture_src" | awk '{ sub(/only the bound/, "only THE bound"); print }' > "$guard_neg/tampered.sh"
 load_fixture_guard "$guard_neg/tampered.sh" "$guard_fixture_sha" >/dev/null && bad "tampered fixture loaded" || ok "tampered fixture: digest mismatch fails closed"
-load_fixture_guard "$guard_fixture" 0000000000000000000000000000000000000000000000000000000000000000 >/dev/null && bad "wrong pin accepted" || ok "wrong pinned digest fails closed"
+load_fixture_guard "$guard_fixture" 0cdeaaaef8bc8f494747f3145677f6a9cd69b9edf7266e4a20c2e5d56840c622 >/dev/null && bad "wrong pin accepted" || ok "wrong pinned digest fails closed"
 printf 'args=("$@")\nfor x in; do :\ndone\n' > "$guard_neg/shape.sh"
 load_fixture_guard "$guard_neg/shape.sh" "$(guard_digest "$(guard_block_of "$guard_neg/shape.sh")")" >/dev/null && bad "wrong-shape guard loaded" || ok "wrong-shape guard fails closed even with a matching digest"
 wt_overlay="$here/agent-hooks/omp-worker-overlay.yml"

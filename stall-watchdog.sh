@@ -64,6 +64,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib/run-registry.sh"
 . "$here/lib/pane-guard.sh"
 . "$here/lib/alert-gate.sh"       # alert_claim — the escalation post-dedupe
+. "$here/lib/escalation.sh"       # feat/no-progress-model-escalation R2:
+                                   # same resident watchdog feeds the
+                                   # stronger-model detector every real
+                                   # cycle — no second daemon.
 
 SW_SEND="${HERDR_STALL_WATCHDOG_SEND:-$here/send-to-agent.sh}"
 SW_NOTIFY="${HERDR_STALL_WATCHDOG_NOTIFY:-$here/slack-bridge/herdr-notify.sh}"
@@ -76,6 +80,93 @@ _sw_digest() {                          # <text> -> short stable digest
   else
     printf '%s' "$1" | cksum | tr -d ' \t'
   fi
+}
+
+# ---- completion harvest / successor queue (docs/design/completion- -------
+# harvest-dispatch.md) ---------------------------------------------------
+# `signal` in {artifact, handoff} is the one shape that actually means "a
+# worker finished something" (denied/unprocessed/conductor_prompt are not).
+# For those two signals only:
+#   1. `_sw_record_receipt`, called ONCE early in cmd_wake, unconditional
+#      (independent of whether an owner is even reachable to wake) —
+#      records a durable completion receipt, deduped by task + the
+#      artifact's own content sha (lib/run-registry.sh's
+#      record_completion_receipt).
+#   2. `_sw_successor_note`, called at EACH actual send site (both already
+#      gated on a live, identity-matched conductor pane — never computed,
+#      let alone claimed, for an unreachable/dead owner, so a successor is
+#      never silently burned on a wake nobody received) — if the task's
+#      lane has a pre-planned successor and is not held, checks WHO (if
+#      anyone) already holds the dispatch claim for that exact lane +
+#      successor-content pair (dispatch_successor_owner): empty -> tries
+#      to WIN it (dispatch_successor_once, "one writer per scope", the
+#      scope being the lane); already ours (e.g. an earlier attempt for
+#      this SAME wake failed to deliver and this is the M3 retry) ->
+#      re-asserts it, no new write; someone else's -> silent. Either way
+#      the note is folded in iff we own the claim — review REVIEW-HARVEST-
+#      6a20224 HIGH: the claim is WHO gets to announce the successor,
+#      decided once, but whether THIS delivery attempt's message includes
+#      the note is re-derived from that fact every call, so a failed send
+#      (nothing delivered, nothing typed) never silently drops the note on
+#      its own retry — it just keeps riding along with the base wake's
+#      message, same as everything else in it, until delivery confirms or
+#      the base wake's own N4 typed-gate stops retrying. A duplicate
+#      harvest of the same completion by a DIFFERENT task racing the same
+#      lane still gets exactly one winner and omits the note on the loser
+#      — exactly one dispatch per successor, never a repeated hand-off
+#      across two different owners. Never a new send, never a spawn,
+#      never new authority: the successor is a string folded into the
+#      EXISTING wake to the EXISTING owner, nothing more. A task with no
+#      assigned lane, no queued successor, or a successor someone else
+#      already owns the dispatch for degrades to exactly today's bare
+#      wake text.
+_sw_artifact_sha() {                    # worktree relpath -> sha256 or empty
+  local path="$1/$2"
+  [ -f "$path" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" 2>/dev/null | awk '{print $1}'
+  fi
+}
+_sw_record_receipt() {                  # task_id signal artifact worktree
+  local task_id="$1" signal="$2" artifact="$3" worktree="$4" sha
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
+  if [ -n "$artifact" ] && [ -n "$worktree" ]; then
+    sha="$(_sw_artifact_sha "$worktree" "$artifact")"
+    [ -n "$sha" ] && record_completion_receipt "$task_id" "$artifact" "$sha" >/dev/null 2>&1
+  fi
+}
+# Review REVIEW-HARVEST-6a20224 HIGH: the dispatch claim is the RIGHT to
+# announce a successor, decided once -- but whether THIS attempt's
+# message includes the note is re-derived from that permanent fact on
+# EVERY call, so a failed send's retry (same task, same key, called
+# again by cmd_wake's own M3 retry loop) still carries the note instead
+# of silently losing it. Owner-empty: try to win the claim. Owner==us
+# (we already won it, possibly on an earlier failed attempt for this
+# same wake): re-assert, no new write. Owner==someone else: silent, no
+# write attempted -- this is what keeps two tasks racing the same lane's
+# successor to exactly one dispatch and prevents a retry from ever
+# claiming twice (successor_dispatch_count stays at 1 regardless of how
+# many times this function is called for the winning task).
+_sw_successor_note() {                  # task_id signal conductor -> prints "Pre-planned next: ..." or nothing
+  local task_id="$1" signal="$2" conductor="$3" lane succ owner
+  case "$signal" in
+    artifact|handoff) ;;
+    *) return 0 ;;
+  esac
+  lane="$(read_lane_for_task "$task_id" 2>/dev/null)" || return 0
+  succ="$(lane_successor_admits "$lane" 2>/dev/null)" || return 0
+  [ -n "$succ" ] || return 0
+  owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  if [ -z "$owner" ]; then
+    dispatch_successor_once "$lane" "$succ" "$task_id" "$conductor" >/dev/null 2>&1
+    owner="$(dispatch_successor_owner "$lane" "$succ" 2>/dev/null)"
+  fi
+  [ "$owner" = "$task_id" ] && printf 'Pre-planned next (lane %s): %s' "$lane" "$succ"
 }
 
 _sw_escalate_window_s() {
@@ -232,6 +323,56 @@ _sw_escalate() {                        # task_id run_id signal label pane condu
        '{signal:$s, reason:$r, notify_exit:$rc}')" >/dev/null 2>&1 || true
 }
 
+# _sw_escalation_tick <run_id> <task_id> <signal> <fingerprint> <detail> —
+# feed one real watchdog cycle into lib/escalation.sh's detector. Called
+# unconditionally from cmd_wake's first sighting of EVERY candidate hub.py
+# hands it (hub dispatches a wake every tick the task is still an
+# unresolved candidate — see hub.py's _stall_watchdog_tick — so a task that
+# stays stalled produces one tick per real cycle here, not a synthetic
+# poll). `commit_sha` is the task worktree's actual HEAD; `artifact_fp` is
+# a digest of hub's own progress fingerprint for this signal (already
+# computed upstream, reused rather than re-derived).
+#
+# R3 (root audit of 7bb9fba): a `denied` signal is a tool/approval-policy
+# denial, not a tool EXECUTION failure — it is fed as `denial_sig`, kept
+# OUT of `tool_fail_sig`, so a repeated denial can never by itself drive a
+# loop verdict (escalating on a denial alone would look like routing
+# around it with a stronger model; lib/escalation.sh's
+# esc_carry_forward_denials is the explicit "stays held" path instead).
+# `tool_fail_sig` is reserved for a genuine repeated tool EXECUTION
+# failure signature, which this resident wiring does not currently have a
+# source for (no stall-watchdog signal reports one) — left empty here on
+# purpose rather than fed from signal=denied.
+#
+# waiting_on_human is set here for the one signal stall-watchdog itself
+# names for it (`conductor_prompt`); no_progress_tick ALSO ORs in
+# esc_task_awaiting_human's registry-grounded check unconditionally, so a
+# task blocked on an `input_required` prompt is excluded regardless of
+# which signal happened to trigger this particular wake (R3: the
+# conductor_prompt-only exclusion alone was too narrow).
+#
+# Never lets a detector failure break the real stall-wake path below it.
+_sw_escalation_tick() {
+  [ "${HERDR_ESCALATION_ENABLED:-1}" = 1 ] || return 0
+  local run_id="$1" task_id="$2" signal="$3" fingerprint="$4" detail="$5"
+  local task_json worktree commit_sha="" artifact_fp tool_fail_sig="" denial_sig="" waiting_on_human=0
+  task_json="$(read_task "$run_id" "$task_id" 2>/dev/null)" || return 0
+  worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty' 2>/dev/null)"
+  [ -n "$worktree" ] && [ -d "$worktree/.git" ] && commit_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null)"
+  artifact_fp="$(_sw_digest "$fingerprint")"
+  [ "$signal" = denied ] && denial_sig="$(_sw_digest "$detail")"
+  [ "$signal" = conductor_prompt ] && waiting_on_human=1
+  no_progress_tick "$run_id" "$task_id" "$commit_sha" "$artifact_fp" "$tool_fail_sig" "$waiting_on_human" "$denial_sig" >/dev/null 2>&1 || return 0
+  local verdict loop reason evidence
+  verdict="$(no_progress_detect "$run_id" "$task_id" 2>/dev/null)" || return 0
+  loop="$(printf '%s' "$verdict" | jq -r '.loop' 2>/dev/null)"
+  [ "$loop" = true ] || return 0
+  reason="$(printf '%s' "$verdict" | jq -r '.reason' 2>/dev/null)"
+  evidence="$(printf '%s' "$verdict" | jq -c '{cycles:.cycles, window:.window}' 2>/dev/null)"
+  esc_escalate "$run_id" "$task_id" "${HERDR_ESCALATION_AGENT:-claude}" "$reason" "${evidence:-{\}}" \
+    "${HERDR_ESCALATION_DRY_RUN:-0}" "$here/.handoffs/escalations" >/dev/null 2>&1
+}
+
 cmd_wake() {
   local task_id="${1:?usage: stall-watchdog.sh wake <task_id> <signal> <fingerprint> <detail> [artifact]}"
   local signal="${2:?signal required}"
@@ -244,14 +385,21 @@ cmd_wake() {
   task_json="$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$task_id");" 2>/dev/null)"
   [ -n "$task_json" ] || return 0   # task vanished between detection and delivery — nothing to wake
 
-  local run_id pane conductor conductor_birth label
+  local run_id pane conductor conductor_birth label worktree
   run_id="$(printf '%s' "$task_json" | jq -r '.run_id // empty')"
   pane="$(printf '%s' "$task_json" | jq -r '.pane_id // empty')"
   conductor="$(printf '%s' "$task_json" | jq -r '.conductor_pane_id // empty')"
   conductor_birth="$(printf '%s' "$task_json" | jq -r '.conductor_pane_birth // empty')"
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
+  worktree="$(printf '%s' "$task_json" | jq -r '.worktree // empty')"
   [ -n "$label" ] || label="$task_id"
+  _sw_record_receipt "$task_id" "$signal" "$artifact" "$worktree"
 
+  # feat/no-progress-model-escalation R2: every real cycle hub hands this
+  # task to us, regardless of whether the stall-WAKE itself is deduped
+  # below — the escalation window needs one tick per cycle, not one per
+  # distinct fingerprint.
+  _sw_escalation_tick "$run_id" "$task_id" "$signal" "$fingerprint" "$detail"
   local digest key payload
   digest="$(_sw_digest "$fingerprint")"
   key="stall_${task_id}_${signal}_${digest}"
@@ -289,9 +437,10 @@ cmd_wake() {
       # window's own Slack fallback instead of compounding it.
       if ! _sw_wake_confirmed "$task_id" "$key" && ! _sw_wake_typed "$task_id" "$key"; then
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
-          local art_note=""
+          local art_note="" harvest_note
           [ -n "$artifact" ] && art_note=" ($artifact)"
-          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+          harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
+          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
           _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
       fi
@@ -325,9 +474,10 @@ cmd_wake() {
   fi
 
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
-    local art_note=""
+    local art_note="" harvest_note
     [ -n "$artifact" ] && art_note=" ($artifact)"
-    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+    harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
+    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
     _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
 }

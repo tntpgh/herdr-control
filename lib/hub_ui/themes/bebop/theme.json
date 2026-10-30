@@ -1,0 +1,73 @@
+{
+  "name": "Bebop",
+  "presentation_only": "Palette, place names, crew drawings and captions only. Station membership, state names and every status word are canonical (lib/hub_ui/__init__.py) and cannot be changed by a theme.",
+  "tagline": "Work makes a good crew.",
+  "palette": {
+    "--bg": "#0f1626",
+    "--surface": "#18223a",
+    "--surface-2": "#212d48",
+    "--fg": "#e9e4d8",
+    "--muted": "#b3ab98",
+    "--accent": "#d9a441",
+    "--brass": "#c29d66",
+    "--border": "#3a4866",
+    "--ok": "#86c79a",
+    "--warn": "#e2b84f",
+    "--bad": "#f08a7c",
+    "--info": "#94b6ec"
+  },
+  "sprite_style": {
+    "note": "Look is NOT final. Swap these knobs or the per-character sprite params to restyle without touching ui.js.",
+    "outline": "#0b1222",
+    "outline_width": 1.5,
+    "head_radius": 9,
+    "corner_radius": 4,
+    "frame": "#a8875a",
+    "frame_fill": "#212d48"
+  },
+  "characters": {
+    "jet":     { "name": "Jet", "role": "Captain",
+                 "look": "Jet Black: bald, black beard, cybernetic left arm, dark jacket",
+                 "sprite": { "body": "human", "build": "broad", "hair": "bald", "hair_color": "#1c1714", "skin": "#c08a5c", "coat": "#2b3445", "shirt": "#e9dcc0", "accent": "#9aa3ad", "extras": ["beard", "metal_arm"] },
+                 "flavour": ["Ship's steady. Mostly.", "Somebody check the release before I check the bonsai."] },
+    "spike":   { "name": "Spike", "role": "Project lead",
+                 "look": "Spike Spiegel: fluffy dark-green hair, blue suit, yellow shirt, thin black tie",
+                 "sprite": { "body": "human", "build": "tall", "hair": "fluffy", "hair_color": "#1e4a3c", "skin": "#efcfae", "coat": "#2c4f9e", "shirt": "#e8c547", "accent": "#111111", "extras": ["tie"] },
+                 "flavour": ["Stretching before the next bug.", "Lazy until the stack trace gets interesting."] },
+    "faye":    { "name": "Faye", "role": "Research",
+                 "look": "Faye Valentine: purple-black bob, yellow headband, yellow top, red accents",
+                 "sprite": { "body": "human", "build": "slim", "hair": "bob", "hair_color": "#3d2a5c", "skin": "#f2d4b6", "coat": "#f2c230", "shirt": "#f2c230", "accent": "#f2c230", "extras": ["headband", "red_trim"] },
+                 "flavour": ["Three sources, two stale, one keeper.", "I read the fine print so you don't have to."] },
+    "ed":      { "name": "Ed", "role": "Design and build",
+                 "look": "Radical Edward: spiky red-orange hair, goggles on forehead, white shirt, dark skin",
+                 "sprite": { "body": "human", "build": "thin", "hair": "spiky", "hair_color": "#c8501e", "skin": "#8a5a3a", "coat": "#f5f2ea", "shirt": "#f5f2ea", "accent": "#7d8a99", "extras": ["goggles"] },
+                 "flavour": ["Ed made a branch! Ed made... two branches.", "Compiling at the speed of cartwheels."] },
+    "ein":     { "name": "Ein", "role": "Quick checks",
+                 "look": "Ein: Pembroke Welsh corgi, tan back, white chest, big upright ears",
+                 "sprite": { "body": "dog", "hair_color": "#c98a3e", "coat": "#f7f0e2", "accent": "#c0392b" },
+                 "flavour": ["Sniffed every log line. One smelled off.", "Good boy. Green tests."] },
+    "vicious": { "name": "Vicious", "role": "Independent review",
+                 "look": "Vicious: long silver hair, long black coat, crow on his shoulder, katana",
+                 "sprite": { "body": "human", "build": "tall", "hair": "long", "hair_color": "#d5d9de", "skin": "#efe2d4", "coat": "#16161c", "shirt": "#16161c", "accent": "#c9ccd1", "extras": ["crow", "katana"] },
+                 "flavour": ["Every line is guilty until reviewed.", "The crow has notes."] },
+    "bigshot": { "name": "Big Shot", "role": "Guest: reads out suggestions",
+                 "look": "Punch from the Big Shot show: cowboy hat, big mustache, western shirt",
+                 "sprite": { "body": "human", "build": "broad", "hair": "cowboy_hat", "hair_color": "#8a5a2b", "facial": "#2a1d14", "skin": "#d9a877", "coat": "#5a3b25", "shirt": "#e9dcc0", "accent": "#b08d57", "extras": ["mustache"] },
+                 "flavour": ["New card on the board. Proposal only."] },
+    "old-guys": { "name": "The three old guys", "role": "Guest: unclassified work",
+                 "look": "Antonio, Carlos and Jobim: three old men in hats, side by side",
+                 "sprite": { "body": "trio", "hair_color": "#5a5248", "skin": "#c9a27e", "coat": "#6b6255", "accent": "#e8e4dc" },
+                 "flavour": ["Back in our day jobs had names."] }
+  },
+  "stations": {
+    "bridge":      { "place": "Bridge",      "who": "jet" },
+    "projectdeck": { "place": "Project Deck", "who": "spike" },
+    "buildbay":    { "place": "Build Bay",   "who": "ed" },
+    "scout":       { "place": "Scout Desk",  "who": "faye" },
+    "qualitygate": { "place": "Quality Gate \u2014 Ein & Vicious", "who": "ein" }
+  },
+  "panels": {
+    "overview": "jet", "projects": "spike", "decisions": "jet", "loops": "jet",
+    "timeline": "ed", "herdr": "ed", "kb": "ed", "owners": "spike", "links": "ein", "search": "faye"
+  }
+}

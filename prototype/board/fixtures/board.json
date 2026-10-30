@@ -1,0 +1,123 @@
+{
+  "synthetic": true,
+  "generated_at": "2026-10-26T20:00:00Z",
+  "note": "Synthetic snapshot. Every project, lane, worker and number here is made up. Ages are measured from generated_at, not the wall clock.",
+  "projects": [
+    {
+      "id": "orchard-api",
+      "name": "orchard-api (synthetic)",
+      "summary": "Checkout refactor under way; one release waiting on a live check.",
+      "lead": "orchestrator@orchard-api (synthetic pane)",
+      "lanes": [
+        {
+          "id": "checkout-refactor",
+          "name": "Checkout refactor",
+          "kind": "build",
+          "cost_today_usd": 4.31,
+          "cards": [
+            { "id": "c1", "label": "implement:checkout/split-cart", "job_class": "implement",
+              "engine": { "kind": "task", "state": "running", "source": "live", "updated_at": "2026-10-26T19:58:00Z" },
+              "cost_today_usd": 1.84 },
+            { "id": "c2", "label": "code:checkout/tax-rounding", "job_class": "code",
+              "engine": { "kind": "owner_request", "state": "queued", "updated_at": "2026-10-26T19:51:00Z" },
+              "queue_position": 2 },
+            { "id": "c3", "label": "debug:checkout/flaky-total", "job_class": "debug",
+              "function_badges": ["debugger"],
+              "engine": { "kind": "task", "state": "running", "source": "stored", "updated_at": "2026-10-26T19:38:00Z" },
+              "cost_today_usd": 0.92 },
+            { "id": "c4", "label": "review:checkout/split-cart", "job_class": "review",
+              "engine": { "kind": "task", "state": "ready_review", "source": "live", "updated_at": "2026-10-26T19:55:00Z" },
+              "review_of": "synthetic PR #12 (open)", "cost_today_usd": 1.55 }
+          ]
+        },
+        {
+          "id": "release-watch",
+          "name": "Release watch",
+          "kind": "release",
+          "function_badges": ["release_watch"],
+          "cost_today_usd": 0.47,
+          "cards": [
+            { "id": "c5", "label": "plan:release/v2.3-synthetic", "job_class": "plan",
+              "function_badges": ["release_watch"],
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T19:20:00Z",
+                          "closure_reason": "shipped", "closure_proof": ".handoffs/PROOF.md#release-v2-3" },
+              "deploy": { "required": true, "verified": false, "note": "Deployed to the synthetic staging host; no live check has run." } },
+            { "id": "c6", "label": "quick:release/smoke-v2.2", "job_class": "quick",
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T17:05:00Z",
+                          "closure_reason": "shipped", "closure_proof": ".handoffs/PROOF.md#smoke-v2-2" },
+              "deploy": { "required": true, "verified": true, "note": "Live check passed: health endpoint returned 200 (synthetic)." } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lighthouse-docs",
+      "name": "lighthouse-docs (synthetic)",
+      "summary": "One decision waiting on you; archive sweep timed out and one check failed.",
+      "lead": "orchestrator@lighthouse-docs (synthetic pane)",
+      "lanes": [
+        {
+          "id": "docs-refresh",
+          "name": "Docs refresh",
+          "kind": "build",
+          "cost_today_usd": 2.06,
+          "cards": [
+            { "id": "c7", "label": "docs:guide/onboarding-synthetic", "job_class": "docs",
+              "engine": { "kind": "task", "state": "blocked", "source": "live", "updated_at": "2026-10-26T19:57:00Z" },
+              "decision_id": "d1", "cost_today_usd": 0.71 },
+            { "id": "c8", "label": "research:guide/source-survey", "job_class": "research",
+              "engine": { "kind": "owner_request", "state": "held", "updated_at": "2026-10-26T18:40:00Z" },
+              "hold": { "by": "the project conductor (synthetic)", "reason": "Waiting for the docs outline to be frozen first." } },
+            { "id": "c9", "label": "explore:guide/link-audit", "job_class": "explore",
+              "engine": { "kind": "task", "state": "stalled", "source": "live", "updated_at": "2026-10-26T19:30:00Z" },
+              "owes": "Wrote ANSWER.md 30 minutes ago; the conductor has not acknowledged it.", "cost_today_usd": 0.18 }
+          ]
+        },
+        {
+          "id": "archive-sweep",
+          "name": "Archive sweep",
+          "kind": "maintenance",
+          "cost_today_usd": 0.33,
+          "cards": [
+            { "id": "c10", "label": "mechanical:archive/old-worktrees", "job_class": "mechanical",
+              "engine": { "kind": "owner_request", "state": "timeout", "updated_at": "2026-10-26T18:00:00Z" },
+              "decision_id": "d2" },
+            { "id": "c11", "label": "triage:archive/broken-links", "job_class": "triage",
+              "engine": { "kind": "task", "state": "failed", "source": "stored", "updated_at": "2026-10-26T18:45:00Z" },
+              "failure": "Verify script exited 1: 2 of 14 checks failed (synthetic).", "cost_today_usd": 0.33 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbor-ledger",
+      "name": "harbor-ledger (synthetic)",
+      "summary": "Auth hardening: one request denied, design work running.",
+      "lead": "orchestrator@harbor-ledger (synthetic pane)",
+      "lanes": [
+        {
+          "id": "auth-hardening",
+          "name": "Auth hardening",
+          "kind": "build",
+          "cost_today_usd": 6.12,
+          "cards": [
+            { "id": "c12", "label": "deep-review:auth/session-rotation", "job_class": "deep-review",
+              "engine": { "kind": "dispatch_auth", "state": "denied", "updated_at": "2026-10-26T19:40:00Z" },
+              "decision_id": "d3", "cost_today_usd": 2.40 },
+            { "id": "c13", "label": "architect:auth/token-store", "job_class": "architect",
+              "engine": { "kind": "task", "state": "completed", "source": "stored", "updated_at": "2026-10-26T16:10:00Z",
+                          "closure_reason": "handed_off_to:implement", "closure_proof": null },
+              "decision_id": "d4", "cost_today_usd": 1.95 },
+            { "id": "c14", "label": "design:auth/login-screen", "job_class": "design",
+              "engine": { "kind": "task", "state": "running", "source": "live", "updated_at": "2026-10-26T19:59:00Z" },
+              "cost_today_usd": 1.12 },
+            { "id": "c15", "label": "implement:auth/legacy-cookie", "job_class": "implement",
+              "engine": { "kind": "task", "state": "cancelled", "source": "stored", "updated_at": "2026-10-26T15:00:00Z",
+                          "closure_reason": "canceled" },
+              "cost_today_usd": 0.65 }
+          ]
+        }
+      ]
+    }
+  ]
+}

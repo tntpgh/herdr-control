@@ -1,0 +1,38 @@
+{
+  "synthetic": true,
+  "note": "Google Business Profile post drafts. Synthetic text, no real listing, client, street or photo. Nothing here can publish.",
+  "review_statuses": ["draft", "needs_review", "approved_for_publish", "published_unverified"],
+  "drafts": [
+    {
+      "id": "g1",
+      "lane": "listing_story",
+      "title": "A light-filled three-bedroom in Maple Terrace (synthetic)",
+      "copy": "Morning sun in the kitchen, a fenced yard, and a five-minute walk to the park. Open house this Saturday, 1-3 pm. (Synthetic draft: no real listing.)",
+      "image": { "suggestion": "Wide shot of the kitchen at morning light", "rights_status": "owned", "rights_note": "Shot by the team photographer under a work-for-hire agreement (synthetic)." },
+      "source": { "name": "Synthetic listing fixture LS-0001", "freshness": { "result": "pass", "detail": "Listing still marked active in the fixture.", "checked_on": "2026-10-26" } },
+      "proposed_publish_date": "2026-10-28",
+      "review_status": "needs_review"
+    },
+    {
+      "id": "g2",
+      "lane": "team_update",
+      "title": "Welcome to our new transaction coordinator (synthetic)",
+      "copy": "Our team grew this month. A new coordinator now keeps every closing date on track so clients get one clear point of contact. (Synthetic draft: no real person.)",
+      "image": { "suggestion": "Group photo at the office front desk", "rights_status": "needs_release", "rights_note": "People are identifiable; a signed photo release is not on file." },
+      "source": { "name": "Synthetic team roster fixture", "freshness": { "result": "pass", "detail": "Roster entry dated this month.", "checked_on": "2026-10-25" } },
+      "proposed_publish_date": "2026-10-30",
+      "review_status": "approved_for_publish"
+    },
+    {
+      "id": "g3",
+      "lane": "guide",
+      "title": "Five things to check before a home inspection (synthetic)",
+      "copy": "Clear access to the furnace and electrical panel, test every smoke detector, and keep a list of past repairs handy. Full checklist in the guide. (Synthetic draft.)",
+      "image": { "suggestion": "Close-up of a checklist on a clipboard", "rights_status": "unconfirmed", "rights_note": "Stock image; licence not confirmed for business-profile use." },
+      "source": { "name": "Synthetic guide page G-07", "freshness": { "result": "stale", "detail": "Guide last edited 14 months ago; one item references a retired form.", "checked_on": "2026-10-24" } },
+      "proposed_publish_date": "2026-10-22",
+      "review_status": "published_unverified",
+      "published_note": "Marked published on 2026-10-22; nobody has confirmed the post is live on the profile."
+    }
+  ]
+}

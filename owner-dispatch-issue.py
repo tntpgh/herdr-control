@@ -64,7 +64,6 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
-import private_sqlite  # noqa: E402
 import queue_supervisor as qs  # noqa: E402
 
 PROTOCOL = "owner-dispatch-approval/2"
@@ -81,6 +80,16 @@ KEYS = {"protocol", "owner_label", "project", "max_open", "expected_holder", "ex
 # classic gen1 record (set(rec) == KEYS, no successor keys at all) is
 # byte-identical, schema and HTML, to the pre-successor frozen baseline.
 SUCCESSOR_KEYS = KEYS | {"expected_prev_generation", "expected_prev_holder"}
+# R12 (ANSWER-r12.md): a THIRD, DISJOINT record kind -- same registered
+# holder, an ALREADY-LIVE lease generation, a fresh single-use grant for
+# ONE request body. Claims/releases nothing (no claim_initial/
+# claim_successor call at issue time at all): the lease must already be
+# live, at exactly this generation, held by exactly this identity, both
+# at build time (read-only pre-check) and again at issue time
+# (revalidation, same shape as same_identity's two calls). Mutually
+# exclusive with SUCCESSOR_KEYS by construction (disjoint key sets; a
+# record can never satisfy both schemas at once).
+BIND_LIVE_KEYS = KEYS | {"bind_live_generation"}
 HOLDER_KEYS = {"pane_id", "pane_birth", "session_digest"}
 
 # A SEPARATE record kind for standing grants (owner-dispatch-approval-standing/1,
@@ -165,15 +174,23 @@ def render_form(rec: dict) -> bytes:
     """Deterministic decision page for one approval record. read_decision()
     accepts ONLY a stored page byte-identical to this rendering, so what was on
     screen is exactly the record (including holder, request sha and window).
-    A classic gen1 record (no expected_prev_generation key) renders
-    BYTE-IDENTICAL to the original claim_initial-only form (frozen at
-    1a0b873); a successor record (expected_prev_generation present)
-    additionally names the released predecessor and the generation being
-    claimed (claim_successor path)."""
+    A classic gen1 record (no expected_prev_generation/bind_live_generation
+    key), a successor record (expected_prev_generation present -- additionally
+    names the released predecessor and the generation being claimed), and a
+    bind-live record (bind_live_generation present, R12 -- names the
+    ALREADY-LIVE generation it binds to and states plainly that nothing is
+    claimed or released) all share the same title/H1 shape, derived from
+    rec["owner_label"]/rec["project"] (R12d fix: the title/H1 used to be a
+    FIXED "KB owner-dispatch pilot" string regardless of the real label --
+    deployed form 20261028T204112-8740 showed that wording for a thurber-os
+    grant. Never hardcode a label here; title/H1 schema content changed
+    (no longer byte-identical to the pre-R12d baseline), everything else
+    -- table rows, intro paragraph wording per mode -- is unchanged)."""
     emb = approval_bytes(rec)
     sha = hashlib.sha256(emb).hexdigest()
     h = rec["expected_holder"]
     is_successor = "expected_prev_generation" in rec
+    is_bind_live = "bind_live_generation" in rec
     rows = [("Owner", rec["owner_label"]), ("Project", rec["project"]), ("Holder pane", h["pane_id"]),
             ("Holder birth", h["pane_birth"]), ("Holder session sha256", h["session_digest"]),
             ("Request", f'{rec["request_id"]} / {rec["request_name"]}'), ("Request sha256", rec["request_sha256"]),
@@ -185,17 +202,28 @@ def render_form(rec: dict) -> bytes:
         ph = raw_ph if isinstance(raw_ph, dict) else {}
         rows.append(("Predecessor",
                      f'releases expired generation {prev_gen}, held by {ph.get("pane_id", "?")}@{ph.get("pane_birth", "?")}'))
+    elif is_bind_live:
+        rows.append(("Binds to", f'the ALREADY-LIVE generation {rec["bind_live_generation"]}, '
+                                  f'held by {h["pane_id"]}@{h["pane_birth"]} -- claims/releases nothing'))
     rows += [("Lease", f'generation {rec["expected_generation"]}, ttl {rec["lease_ttl_s"]} s, max_open {rec["max_open"]}'),
              ("Approval valid for", f'{rec["grant_window_s"]} s after you answer'), ("Approval record sha256", sha)]
     esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     table = "".join(f"<tr><th>{esc(k)}</th><td><code>{esc(v)}</code></td></tr>" for k, v in rows)
-    intro = ("<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
-             if not is_successor else
-             f'<p>Approving releases the expired predecessor lease (generation {rec["expected_prev_generation"]}, held by '
-             f'{ph.get("pane_id", "?")}@{ph.get("pane_birth", "?")}) and issues exactly one '
-             f'generation-{rec["expected_generation"]} lease claim and one grant for the request below. Nothing retries.</p>')
-    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Approve ONE KB owner-dispatch pilot request</title></head><body>"
-            "<h1>Approve ONE read-only KB pilot request?</h1>"
+    if is_bind_live:
+        intro = (f'<p>Approving issues exactly one grant for the request below, bound to the generation-'
+                  f'{rec["bind_live_generation"]} lease already live and held by {h["pane_id"]}@{h["pane_birth"]}. '
+                  f'Nothing is claimed, released or renewed; the grant\'s own expiry is capped at the live lease\'s '
+                  f'expiry. Nothing retries.</p>')
+    elif is_successor:
+        intro = (f'<p>Approving releases the expired predecessor lease (generation {rec["expected_prev_generation"]}, held by '
+                  f'{ph.get("pane_id", "?")}@{ph.get("pane_birth", "?")}) and issues exactly one '
+                  f'generation-{rec["expected_generation"]} lease claim and one grant for the request below. Nothing retries.</p>')
+    else:
+        intro = "<p>Approving issues exactly one generation-1 lease claim and one grant for the request below. Nothing retries.</p>"
+    label_t, proj_t = esc(rec["owner_label"]), esc(rec["project"])
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Approve ONE owner-dispatch request for '
+            f'{label_t} ({proj_t})</title></head><body>'
+            f'<h1>Approve ONE owner-dispatch request for {label_t} ({proj_t})?</h1>'
             f"{intro}"
             f"<table>{table}</table>"
             f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
@@ -205,9 +233,10 @@ def render_form(rec: dict) -> bytes:
 
 
 def validate_approval(rec) -> dict:
-    if not isinstance(rec, dict) or set(rec) not in (KEYS, SUCCESSOR_KEYS):
+    if not isinstance(rec, dict) or set(rec) not in (KEYS, SUCCESSOR_KEYS, BIND_LIVE_KEYS):
         raise Refused("approval_schema")
     is_successor = "expected_prev_generation" in rec
+    is_bind_live = "bind_live_generation" in rec
     if not _valid_holder(rec["expected_holder"]):
         raise Refused("approval_holder_schema")
     if rec["protocol"] != PROTOCOL:
@@ -222,7 +251,13 @@ def validate_approval(rec) -> dict:
     m = rec["manifest"]
     if not isinstance(m, list) or not m or not all(isinstance(x, str) and SAFE_ID.match(x) for x in m) or len(set(m)) != len(m):
         raise Refused("approval_field_manifest")
-    if is_successor:
+    if is_bind_live:
+        bg = rec["bind_live_generation"]
+        if type(bg) is not int or bg < 1:
+            raise Refused("approval_field_bind_live_generation")
+        if type(rec["expected_generation"]) is not int or rec["expected_generation"] != bg:
+            raise Refused("approval_generation_mismatch")
+    elif is_successor:
         pg = rec["expected_prev_generation"]
         if type(pg) is not int or pg < 1:
             raise Refused("approval_field_expected_prev_generation")
@@ -532,24 +567,82 @@ def standing_grant_state(auth_db: str, dec, exp: float) -> str:
     return "unknown"
 
 
-def build_main(argv, resolve=None) -> int:
+def build_main(argv, resolve=None, now=None) -> int:
     """OFFLINE: write the deterministic decision page for ONE request, binding the
     holder identity resolved fresh from the registry NOW and the request bytes'
     sha256. --expected-prev-generation 0 (default) is the initial gen-1 claim;
     >=1 additionally resolves the EXPIRED predecessor's (pane_id, pane_birth,
     session_digest) from --lease-db (read-only) for display in the form text.
+    --bind-live-generation N (R12, mutually exclusive with
+    --expected-prev-generation) is a THIRD mode: binds a fresh single-use
+    grant to a lease that is ALREADY live at generation N, held by exactly
+    the registry's current identity -- read-only confirmed from --lease-db
+    at build time (refused:live_generation_unresolved otherwise), and
+    re-confirmed again at issue time (ANSWER-r12.md) since build and issue
+    are separated by a human answering the form. Claims nothing either way.
+    Exactly one of --request-id (free-form) or --queue-item-id ID (R12e,
+    tmp/in/r12/QUEUE-RID.md) is required: --queue-item-id derives
+    request_id = queue_supervisor.rid_for(label, ID) BEFORE the approval
+    bytes are hashed, so the signed form shows the canonical queue rid --
+    a grant meant for queue-supervisor.py's tick_lane() can then never be
+    built with a request_id that diverges from what the queue will later
+    present to oda.consume(), the gap tmp/out/r12/REPORT-r12d-queue-rid.md
+    reported. oda.consume()/consume_standing()'s own equality checks are
+    untouched by this: request_id is still an opaque string to them.
+    --queue-item-id and its derived rid are validated BEFORE any approval
+    bytes are built or hashed (R12f, tmp/in/r12/QUEUE-RID-VALIDATE.md):
+    the id must fully match queue_supervisor._ID_RE, and rid_for(label,
+    ID) must match queue_supervisor._RID_RE -- the SAME alphabets/limits
+    tick_lane() itself enforces before ever consuming a grant, reused
+    directly here (never duplicated) so a bad id/rid is refused before a
+    human ever approves it, not only at dispatch time.
     Serves nothing and records nothing."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-form")
-    for a in ("--label", "--project", "--request-dir", "--request-name", "--request-id", "--auth-id", "--out"):
+    for a in ("--label", "--project", "--request-dir", "--request-name", "--auth-id", "--out"):
         ap.add_argument(a, required=True)
+    ap.add_argument("--request-id")
+    ap.add_argument("--queue-item-id")
     ap.add_argument("--manifest", action="append", required=True)
     ap.add_argument("--lease-ttl-s", type=int, default=1800)
     ap.add_argument("--grant-window-s", type=int, default=1800)
     ap.add_argument("--expected-prev-generation", type=int, default=0)
+    ap.add_argument("--bind-live-generation", type=int, default=0)
     ap.add_argument("--lease-db")
     a = ap.parse_args(argv)
+    if a.request_id is not None and a.queue_item_id is not None:
+        print("refused:request_id_and_queue_item_id_mutually_exclusive")
+        return 2
+    if a.request_id is None and a.queue_item_id is None:
+        print("refused:request_id_or_queue_item_id_required")
+        return 2
+    if a.queue_item_id is not None:
+        # lib/queue_supervisor.py:71 (_ID_RE) and :123 (_RID_RE) -- the
+        # queue's OWN accepted alphabets/limits, reused directly (never
+        # duplicated here): a queue item id tick_lane() will ever read
+        # from a queue.json file must already satisfy _ID_RE, and the rid
+        # it derives (rid_for(label, id)) must already satisfy _RID_RE
+        # (checked again at tick_lane():255 before any grant consumption
+        # or send) -- refusing anything that would fail those checks
+        # BEFORE a human ever approves it, rather than only at dispatch
+        # time deep in the queue pipeline.
+        if not qs._ID_RE.match(a.queue_item_id):
+            print("refused:queue_item_id_invalid")
+            return 2
+        request_id = qs.rid_for(a.label, a.queue_item_id)
+        if not qs._RID_RE.match(request_id):
+            print("refused:queue_item_id_rid_invalid")
+            return 2
+    else:
+        request_id = a.request_id
+    clock = (lambda: now) if now is not None else time.time
     if a.expected_prev_generation < 0:
         print("refused:expected_prev_generation_negative")
+        return 2
+    if a.bind_live_generation < 0:
+        print("refused:bind_live_generation_negative")
+        return 2
+    if a.bind_live_generation and a.expected_prev_generation:
+        print("refused:bind_live_and_successor_mutually_exclusive")
         return 2
     if resolve is None:
         import publisher  # noqa: E402
@@ -564,9 +657,12 @@ def build_main(argv, resolve=None) -> int:
             print("refused:lease_db_required_for_successor")
             return 2
         try:
-            plconn = private_sqlite.open_private(a.lease_db, ol.connect, require_table="owner_leases")
+            plconn = ol.open_rw_checked(a.lease_db, require_table="owner_leases")
         except ValueError as exc:
             print(f"refused:lease_{exc}")
+            return 4
+        except ol.SchemaMigrationRequired as exc:
+            print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {a.lease_db} --apply")
             return 4
         try:
             prow = plconn.execute(
@@ -578,6 +674,25 @@ def build_main(argv, resolve=None) -> int:
             print("refused:predecessor_unresolved")
             return 2
         prev_holder = {"pane_id": prow[0], "pane_birth": prow[1], "session_digest": prow[2]}
+    if a.bind_live_generation >= 1:
+        if not a.lease_db:
+            print("refused:lease_db_required_for_bind_live")
+            return 2
+        try:
+            blconn = ol.open_rw_checked(a.lease_db, require_table="owner_leases")
+        except ValueError as exc:
+            print(f"refused:lease_{exc}")
+            return 4
+        except ol.SchemaMigrationRequired as exc:
+            print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {a.lease_db} --apply")
+            return 4
+        try:
+            live = ol.holder_tuple(blconn, a.label, clock())
+        finally:
+            blconn.close()
+        if live != (ident[0], ident[1], ident[2], a.bind_live_generation):
+            print("refused:live_generation_unresolved")
+            return 2
     try:
         data = oda.read_request_once(a.request_dir, a.request_name)
     except (ValueError, OSError):
@@ -585,12 +700,15 @@ def build_main(argv, resolve=None) -> int:
         return 2
     rec = {"protocol": PROTOCOL, "owner_label": a.label, "project": a.project, "max_open": 1,
            "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
-           "expected_generation": a.expected_prev_generation + 1, "lease_ttl_s": a.lease_ttl_s, "request_id": a.request_id,
+           "expected_generation": a.bind_live_generation if a.bind_live_generation else a.expected_prev_generation + 1,
+           "lease_ttl_s": a.lease_ttl_s, "request_id": request_id,
            "request_name": a.request_name, "request_sha256": oda.body_sha256(data), "manifest": a.manifest,
            "auth_id": a.auth_id, "grant_window_s": a.grant_window_s}
     if a.expected_prev_generation >= 1:
         rec["expected_prev_generation"] = a.expected_prev_generation
         rec["expected_prev_holder"] = prev_holder
+    elif a.bind_live_generation >= 1:
+        rec["bind_live_generation"] = a.bind_live_generation
     try:
         validate_approval(rec)
     except Refused as exc:
@@ -656,9 +774,12 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
         return 4
     try:
         store = oda.open_store(auth_db)
@@ -745,9 +866,12 @@ def main(argv=None, resolve=None, now=None) -> int:
         return 2
     lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     try:
-        lconn = private_sqlite.open_private(lease_db, ol.connect, require_table="owner_leases")
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
     except ValueError as exc:
         print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
         return 4
     try:
         store = oda.open_store(auth_db)
@@ -770,8 +894,22 @@ def main(argv=None, resolve=None, now=None) -> int:
                              (rec["auth_id"], dec["form_id"])).fetchone():
                 raise Refused("approval_already_used")
             prev_gen = rec.get("expected_prev_generation", 0)
+            bind_live_gen = rec.get("bind_live_generation")
             try:
-                if prev_gen == 0:
+                if bind_live_gen is not None:
+                    # No claim at all: this mode never mutates the lease.
+                    # Verify, read-only, that the CURRENT live lease is
+                    # exactly this generation held by exactly this holder
+                    # -- the same comparison "revalidation 2" below repeats
+                    # right before insert_grant, so an expiry/takeover in
+                    # the gap between this check and that one is still
+                    # caught there (ANSWER-r12.md: "lease expired between
+                    # form and issue: refuse, never renew/rebind").
+                    if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"],
+                                                                               h["session_digest"], bind_live_gen):
+                        raise Refused("live_generation_mismatch")
+                    gen = bind_live_gen
+                elif prev_gen == 0:
                     gen = ol.claim_initial(lconn, rec["owner_label"], h["pane_id"], h["pane_birth"], rec["lease_ttl_s"],
                                            h["session_digest"], now=clock())
                 else:
@@ -800,6 +938,15 @@ def main(argv=None, resolve=None, now=None) -> int:
             if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"], h["session_digest"],
                                                                        rec["expected_generation"]):
                 raise Refused("lease_holder_mismatch")
+            if bind_live_gen is not None:
+                # ANSWER-r12.md binding: a bind-live grant's own expiry
+                # must never outlive the lease it is bound to -- checked
+                # against the REAL, current lease expiry at issue time,
+                # not a stale build-time snapshot (same revalidation
+                # philosophy as same_identity's two calls).
+                lease_exp = ol.live_expiry(lconn, rec["owner_label"], clock())
+                if lease_exp is None or exp > lease_exp:
+                    raise Refused("grant_exceeds_lease_expiry")
             insert_grant(store, dec, exp)
         except BaseException as exc:  # noqa: BLE001  after the claim: classify by what the store says
             reason = str(exc) if isinstance(exc, Refused) else f"error_{type(exc).__name__}"

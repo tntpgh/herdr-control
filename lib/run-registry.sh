@@ -949,6 +949,64 @@ accept_local_task_authorization() {
 read_task_authorization() {
   _task_authorization_adapter read "$1"
 }
+# ---- resident escalation launch grant (docs/design/resident-launch-grant.md) --
+# INERT: these wrappers exist so the storage layer is reachable, but nothing
+# in this repo calls accept_resident_escalation_grant yet -- only a future,
+# not-yet-written, human-run mint script would. read_resident_escalation_grant
+# and resident_grant_admits ARE reachable from lib/escalation.sh's pre-flight
+# check, but return {} / fail closed on every real repo until a grant is
+# minted, which nothing here does automatically.
+accept_resident_escalation_grant() {   # command_id pane birth repo job_classes_csv max_tier ttl_ms
+  registry_init || return 1
+  _task_authorization_adapter accept-resident "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+read_resident_escalation_grant() {     # repo -> grant JSON, or {} if none/expired/revoked-by-status
+  _task_authorization_adapter read-resident "$1"
+}
+accept_resident_escalation_spawn() {   # command_id grant_command_id repo manifest_json
+  registry_init || return 1
+  _task_authorization_adapter accept-resident-spawn "$1" "$2" "$3" "${4:-}"
+}
+# REVIEW-GRANT-9ac2fc4 HIGH fix: the single-use redemption token.
+# mint_resident_redemption is called ONLY from lib/escalation.sh's
+# _esc_check_launch_authority -- never exposed as something spawn-task.sh
+# itself (or anything else) can mint, which is the structural half of the
+# fix (the atomic-consume half is claim_resident_redemption).
+mint_resident_redemption() {   # token_command_id grant_command_id repo job_class
+  registry_init || return 1
+  _task_authorization_adapter accept-resident-redemption "$1" "$2" "$3" "$4"
+}
+claim_resident_redemption() {   # token_command_id repo job_class -> prints grant_command_id on success
+  registry_init || return 1
+  _task_authorization_adapter claim-resident-redemption "$1" "$2" "$3"
+}
+# resident_grant_revoked -> 0 iff the global revocation sentinel is present.
+# Same "touch one file, instant effect on the next check" shape as the
+# house merge-delegation.revoked pattern (AGENTS.md). Checked fresh every
+# call, never cached in this process or any other.
+resident_grant_revoked() {
+  local f="${HERDR_RESIDENT_GRANT_REVOKED_FILE:-$HOME/.local/state/herdr/resident-escalation.revoked}"
+  [ -f "$f" ]
+}
+# resident_grant_admits <repo> <job_class> -> prints the admitting grant's
+# command_id and returns 0 iff an unrevoked, unexpired, accepted
+# resident_escalation_grant row exists for <repo> whose job_classes list
+# contains <job_class>. Read-only; never binds, never consumes the grant
+# row. <repo> must already be the caller's absolute, normalized real path.
+# Two independent callers (lib/escalation.sh's pre-flight AND
+# spawn-task.sh's own admission check) each call this fresh themselves --
+# defense in depth, not a decision passed from one process to the other.
+resident_grant_admits() {
+  local repo="$1" job="$2" row jc
+  resident_grant_revoked && return 1
+  [ -n "$repo" ] && [ -n "$job" ] || return 1
+  row="$(read_resident_escalation_grant "$repo" 2>/dev/null)"
+  [ -n "$row" ] && [ "$row" != '{}' ] || return 1
+  jc="$(printf '%s' "$row" | jq -r --arg j "$job" '.effective_scope.job_classes // [] | index($j) // empty' 2>/dev/null)"
+  [ -n "$jc" ] || return 1
+  printf '%s\n' "$(printf '%s' "$row" | jq -r '.command_id // empty' 2>/dev/null)"
+}
+
 # Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
 # enumeration/confirmation are read of the SAME protected registry row the
 # accept/register/launch adapters above already write -- no new storage,
@@ -1922,6 +1980,185 @@ claim_once() {                          # event_id [run_id] [task_id] [type] [pa
       VALUES ($(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), $(_sq "$type"),
         $(_sq "$(_now_iso)"), $(_sq "$payload")); SELECT changes();" 2>/dev/null)"
   [ "$changed" = "1" ]
+}
+
+# ---- completion harvest / successor queue (docs/design/completion- -------
+# harvest-dispatch.md): the conductor-notified half of "a worker finished,
+# what happens next" — never auto-dispatches anything, only makes an
+# already-existing wake (stall-watchdog.sh cmd_wake) carry a durable
+# receipt and a human-pre-planned next step. Plain `events` rows
+# throughout, same idiom `claim_once`/`append_event` already provide; no
+# new table, no migration.
+
+# record_completion_receipt <task_id> <artifact_path> <sha256> -> 0 the
+# FIRST time this exact (task_id, sha256) pair is seen (claim_once
+# semantics: a rewritten artifact with the SAME bytes after a restart
+# never double-fires; different bytes is a different event_id and
+# receipts again, same "a changed fingerprint re-arms" shape cmd_wake's
+# own wake dedup already uses).
+record_completion_receipt() {
+  local task_id="$1" artifact_path="$2" sha="$3"
+  [ -n "$task_id" ] && [ -n "$sha" ] || return 1
+  claim_once "completion_receipt_${task_id}_${sha}" "" "$task_id" completion_receipt \
+    "$(jq -nc --arg a "$artifact_path" --arg s "$sha" '{artifact:$a, sha:$s}')"
+}
+
+# assign_lane <task_id> <lane> -> 0 the first time this task is assigned a
+# lane (claim_once: immutable once set — a task does not change lanes
+# mid-flight).
+assign_lane() {
+  local task_id="$1" lane="$2"
+  [ -n "$task_id" ] && [ -n "$lane" ] || return 1
+  claim_once "lane_assignment_${task_id}" "" "$task_id" lane_assignment \
+    "$(jq -nc --arg l "$lane" '{lane:$l}')"
+}
+
+# read_lane_for_task <task_id> -> the assigned lane, or empty + rc1 if none.
+read_lane_for_task() {
+  local task_id="$1" lane
+  registry_init || return 1
+  lane="$(_sql "SELECT json_extract(payload,'\$.lane') FROM events
+        WHERE task_id=$(_sq "$task_id") AND type='lane_assignment' LIMIT 1;" 2>/dev/null)"
+  [ -n "$lane" ] || return 1
+  printf '%s\n' "$lane"
+}
+
+# queue_successor <lane> <next> <queued_by> -> records the pre-planned next
+# step for a lane. A FRESH row every call (not claim_once) -- the
+# conductor can replan; the latest row for this lane always wins on read.
+queue_successor() {
+  local lane="$1" next="$2" queued_by="${3:-}"
+  [ -n "$lane" ] && [ -n "$next" ] || return 1
+  append_event "" "" successor_queued \
+    "$(jq -nc --arg l "$lane" --arg n "$next" --arg q "$queued_by" '{lane:$l, next:$n, queued_by:$q}')"
+}
+
+# read_successor_for_lane <lane> -> the most recently queued `next` string
+# for this lane, or empty if none was ever queued.
+read_successor_for_lane() {
+  local lane="$1"
+  registry_init || return 1
+  _sql "SELECT json_extract(payload,'\$.next') FROM events
+        WHERE type='successor_queued' AND json_extract(payload,'\$.lane')=$(_sq "$lane")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
+# hold_lane <lane> <reason> [held_by] / release_lane <lane> [released_by] ->
+# a FRESH row every call; `lane_held` below reads whichever is most recent
+# for this lane. Scoped entirely by the `lane` key inside the payload, so
+# holding lane A never touches any row belonging to lane B.
+hold_lane() {
+  local lane="$1" reason="${2:-}" held_by="${3:-}"
+  [ -n "$lane" ] || return 1
+  append_event "" "" lane_hold \
+    "$(jq -nc --arg l "$lane" --arg r "$reason" --arg b "$held_by" '{lane:$l, state:"held", reason:$r, held_by:$b}')"
+}
+release_lane() {
+  local lane="$1" released_by="${2:-}"
+  [ -n "$lane" ] || return 1
+  append_event "" "" lane_hold \
+    "$(jq -nc --arg l "$lane" --arg b "$released_by" '{lane:$l, state:"released", released_by:$b}')"
+}
+
+# lane_held <lane> -> 0 iff the most recent lane_hold row for this lane has
+# state="held" (no row at all -> not held, rc1).
+lane_held() {
+  local lane="$1" state
+  registry_init || return 1
+  state="$(_sql "SELECT json_extract(payload,'\$.state') FROM events
+        WHERE type='lane_hold' AND json_extract(payload,'\$.lane')=$(_sq "$lane")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+  [ "$state" = held ]
+}
+
+# lane_successor_admits <lane> -> prints the queued successor for <lane>
+# and returns 0, UNLESS the lane is currently held (empty + rc1) or
+# nothing was ever queued for it (empty + rc1). The single read cmd_wake
+# uses: never surfaces a plan for a held lane, never invents one for a
+# lane with no plan.
+lane_successor_admits() {
+  local lane="$1" next
+  [ -n "$lane" ] || return 1
+  lane_held "$lane" && return 1
+  next="$(read_successor_for_lane "$lane")"
+  [ -n "$next" ] || return 1
+  printf '%s\n' "$next"
+}
+
+# dispatch_successor_once <lane> <next> <task_id> <dispatched_to> -> 0 the
+# FIRST time THIS EXACT successor content is dispatched for <lane>
+# (claim_once on event_id=dispatch_successor_<lane>_<sha256 of next>,
+# scoped entirely by the lane key the same way hold/release are -- "one
+# writer per scope": claim_once's underlying UNIQUE(event_id) constraint
+# is what makes two concurrent/duplicate harvest passes for the SAME
+# completion agree on exactly one winner, same guarantee the resident-
+# redemption token's atomic consume relies on). Review REVIEW-HARVEST-
+# 6a20224 HIGH: this claim is the RIGHT to announce the successor, never
+# a delivery receipt -- the caller (stall-watchdog.sh's _sw_successor_note)
+# calls this only when nobody owns it yet, then re-asserts ownership via
+# dispatch_successor_owner on every retry of the SAME task's wake, so a
+# failed send never silently drops the note: the claim who-won is
+# permanent, but INCLUDING the note in a message is re-decided every
+# attempt from that permanent fact, exactly like the base wake's own
+# retry-until-_sw_wake_confirmed already works. <task_id> is stored as
+# the claim row's real `task_id` column (not just payload) specifically
+# so dispatch_successor_owner can read it back. If the lane is later
+# replanned (a genuinely different `next`), that is a different event_id
+# and dispatches again, same "a changed fingerprint re-arms" shape this
+# whole feature already uses twice over (completion receipts,
+# stall-watchdog's own wake dedup).
+dispatch_successor_once() {
+  local lane="$1" next="$2" task_id="$3" dispatched_to="${4:-}" sha
+  [ -n "$lane" ] && [ -n "$next" ] && [ -n "$task_id" ] || return 1
+  sha="$(_sw_sha "$next")"
+  claim_once "dispatch_successor_${lane}_${sha}" "" "$task_id" successor_dispatched \
+    "$(jq -nc --arg l "$lane" --arg n "$next" --arg t "$task_id" --arg d "$dispatched_to" \
+       '{lane:$l, next:$n, task_id:$t, dispatched_to:$d}')"
+}
+
+# dispatch_successor_owner <lane> <next> -> the task_id that holds the
+# dispatch claim for this exact (lane, successor-content) pair, or empty
+# if nobody has claimed it yet. Read-only, never writes -- the retry-safe
+# complement to dispatch_successor_once: a task re-checks this on every
+# wake attempt rather than re-calling the one-shot claim, so its OWN
+# retries keep including the note (claim already won) while a DIFFERENT
+# task racing the same lane correctly sees someone else's task_id and
+# stays silent, with zero new writes either way.
+dispatch_successor_owner() {
+  local lane="$1" next="$2" sha
+  [ -n "$lane" ] && [ -n "$next" ] || return 1
+  sha="$(_sw_sha "$next")"
+  _sql "SELECT task_id FROM events WHERE event_id=$(_sq "dispatch_successor_${lane}_${sha}") LIMIT 1;" 2>/dev/null
+}
+
+# successor_dispatch_count <lane> -> integer count of distinct successor_
+# dispatched claims ever recorded for this lane (test/audit helper: "one
+# writer per scope" proved by this never exceeding 1 across a duplicate
+# harvest for the same completion).
+successor_dispatch_count() {
+  local lane="$1" n
+  registry_init || { printf '0\n'; return 1; }
+  n="$(_sql "SELECT COUNT(*) FROM events WHERE type='successor_dispatched'
+        AND json_extract(payload,'\$.lane')=$(_sq "$lane");" 2>/dev/null)"
+  printf '%s\n' "${n:-0}"
+}
+
+# _sw_sha <text> -> short stable digest (text-content, not a file -- used
+# to key a dispatch claim on the successor STRING itself, since there is
+# no artifact file backing a queued plan the way a completion receipt has
+# one). Deliberately the same shasum/md5 fallback shape _sw_digest in
+# stall-watchdog.sh already uses for fingerprints, duplicated here (not
+# sourced from stall-watchdog.sh) because lib/run-registry.sh is sourced
+# by far more callers than just that one script and must not take on a
+# dependency the other direction.
+_sw_sha() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-16
+  elif command -v md5 >/dev/null 2>&1; then
+    printf '%s' "$1" | md5 | cut -c1-16
+  else
+    printf '%s' "$1" | cksum | tr -d ' \t'
+  fi
 }
 
 # task_input_required_command <run_id> <task_id> <prompt_id> -> the

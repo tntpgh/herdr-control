@@ -26,6 +26,68 @@
 # installed version against the SAME pin (`lib/bashlex-requirements.txt`)
 # before linking, so a stale or mismatched source venv is refused, not reused.
 
+# bashlex_venv_candidates <shared_checkout_root>
+#
+# Prints, one per line, the two paths provision_worktree_bashlex_venv tries
+# in order: the shared checkout's own venv, then the deployed app's. Shared
+# with worktree_bashlex_venv_state below so the producer (this function) and
+# the checker (close-done-workers.sh's dirty-check predicate) can never
+# drift apart about what "the provisioned link" means.
+bashlex_venv_candidates() {
+  local root="$1"
+  printf '%s\n' "$root/.venv-bashlex" "${HERDR_APP_DIR:-$HOME/.local/share/herdr-control/app}/.venv-bashlex"
+}
+
+# worktree_bashlex_venv_state <worktree_dir> <shared_checkout_root>
+#
+# Prints exactly one of:
+#   absent          — neither -e nor -L is true at <worktree_dir>/.venv-bashlex
+#   provisioned     — a symlink whose literal readlink target equals, byte
+#                      for byte, the `source:` line of this worktree's
+#                      .handoffs/bashlex-provenance.txt, AND that target is
+#                      one of bashlex_venv_candidates' two paths
+#   foreign:symlink — a symlink that fails either comparison above (wrong
+#                      target, provenance missing/mismatched, or a dangling
+#                      link to a non-candidate path)
+#   foreign:dir     — a real directory
+#   foreign:file    — a regular file
+#   foreign:other   — anything else (socket, fifo, device, …)
+#
+# Checking -L before -e means a dangling link is classified by link-ness,
+# never misread as absent. Comparisons are literal strings, with no
+# realpath/readlink -f, so a link chain cannot launder a foreign target into
+# looking like a match. Always exits 0 — this is a classifier, not a gate;
+# the caller decides what each state means.
+worktree_bashlex_venv_state() {
+  local wt="$1" root="$2" link="$wt/.venv-bashlex" prov="$wt/.handoffs/bashlex-provenance.txt"
+  if [ -L "$link" ]; then
+    local target source_line candidate match=0
+    target="$(readlink "$link" 2>/dev/null)"
+    source_line=""
+    [ -f "$prov" ] && source_line="$(sed -n 's/^source: //p' "$prov" | head -1)"
+    if [ -n "$source_line" ] && [ "$target" = "$source_line" ]; then
+      while IFS= read -r candidate; do
+        [ "$target" = "$candidate" ] && { match=1; break; }
+      done < <(bashlex_venv_candidates "$root")
+    fi
+    if [ "$match" = 1 ]; then
+      echo "provisioned"
+    else
+      echo "foreign:symlink"
+    fi
+    return 0
+  fi
+  if [ -d "$link" ]; then
+    echo "foreign:dir"
+  elif [ -f "$link" ]; then
+    echo "foreign:file"
+  elif [ -e "$link" ]; then
+    echo "foreign:other"
+  else
+    echo "absent"
+  fi
+}
+
 # provision_worktree_bashlex_venv <worktree_dir> <shared_checkout_root>
 #
 # Links `<worktree_dir>/.venv-bashlex` to the first candidate source venv
@@ -58,7 +120,8 @@ provision_worktree_bashlex_venv() {
     return 1
   fi
 
-  local candidates=("$root/.venv-bashlex" "${HERDR_APP_DIR:-$HOME/.local/share/herdr-control/app}/.venv-bashlex")
+  local candidates=()
+  while IFS= read -r src; do candidates+=("$src"); done < <(bashlex_venv_candidates "$root")
   local src src_ver notes="" chosen="" chosen_ver=""
   for src in "${candidates[@]}"; do
     [ -x "$src/bin/python3" ] || { notes="${notes}no interpreter at $src/bin/python3; "; continue; }

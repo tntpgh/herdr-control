@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -20,6 +21,7 @@ import owner_dispatch as od  # noqa: E402
 import owner_lease_delivery as old  # noqa: E402
 import json  # noqa: E402
 import owner_lease as ol  # noqa: E402
+import owner_lease_renew as olr  # noqa: E402
 import result_availability as ra  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import sqlite3  # noqa: E402
@@ -386,10 +388,16 @@ def main() -> int:
 
     auth_contract_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     lease_writer_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    register_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    register_pretracking_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    unregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    reregister_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     cli_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     publisher_tick_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     operator_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    bind_live_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    title_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
@@ -592,7 +600,7 @@ def lease_writer_cases(base: Path) -> None:
     lc, av, roots, lease_db = env(base)
     reg = {KB: (*PANE[KB], SESS[KB])}
 
-    def run(label, flags=True, resolve=reg.get):
+    def run(label, flags=True, resolve=reg.get, ttl=TTL):
         saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY", "HERDR_OWNER_LEASE_DB")}
         if flags:
             os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DELIVERY="1", HERDR_OWNER_LEASE_DB=lease_db)
@@ -602,7 +610,7 @@ def lease_writer_cases(base: Path) -> None:
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                rc = olc.main(["--label", label, "--ttl", str(TTL)], resolve=resolve)
+                rc = olc.main(["--label", label, "--ttl", str(ttl)], resolve=resolve)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
@@ -613,10 +621,42 @@ def lease_writer_cases(base: Path) -> None:
     events = lambda: lc.execute("SELECT count(*) FROM owner_events").fetchone()[0]
     case("WRITER: flags off -> refused, no lease", run(KB, flags=False) == (4, "refused:flags_off") and leases(KB) == [])
     case("WRITER: label not in the registry -> refused", run(DOTS) == (2, "refused:not_registered_or_no_session") and leases(DOTS) == [])
-    rc, out = run(KB)
+    # (REVIEW.md round-2 Medium): a claim-time TTL check against bare
+    # MIN_LEASE_REMAINING_S (180s) gives a lease claimed at exactly that
+    # floor ZERO slack -- begin_notice()'s own remaining-time fence is
+    # evaluated at whatever LATER wall-clock moment a separate
+    # owner-dispatch.py/queue-supervisor.py process reaches it, so ANY
+    # claim-to-delivery delay reproduces the exact "parked at queued
+    # forever" failure (REVIEW.md Low-1) the floor exists to close -- it
+    # only moved the threshold, it never added margin. The floor is now
+    # CLAIM_TTL_FLOOR_S = MIN_LEASE_REMAINING_S + CLAIM_TO_DELIVERY_SLACK_S.
+    case("WRITER: TTL below the delivery floor -> refused, no lease",
+         run(KB, ttl=old.CLAIM_TTL_FLOOR_S - 1) == (2, f"refused:ttl_below_delivery_floor:{old.CLAIM_TTL_FLOOR_S}")
+         and leases(KB) == [])
+    # Exactly-at-floor TTL folded into the real gen1 claim below (a second
+    # successful claim here would consume the only initial-claim slot KB
+    # has, breaking every case that follows). owner-lease-claim.py never
+    # accepts an injected `now`, so the real wall clock is the claim
+    # moment: captured as t_claim for the margin check right after.
+    t_claim = time.time()
+    rc, out = run(KB, ttl=old.CLAIM_TTL_FLOOR_S)
     ht = ol.holder_tuple(lc, KB)
     case("WRITER: initial claim = generation 1 with EXACTLY the registry (pane, birth, session digest)",
          rc == 0 and out == "acquired:knowledge-base:gen1" and ht is not None and ht[:3] == reg[KB] and ht[3] == 1)
+    # The margin itself (REVIEW.md round-2 Medium, not reverted -- reasoned
+    # against the pre-fix floor): run begin_notice() against the SAME
+    # just-claimed KB lease with an INJECTED `now` -- no real sleep -- set
+    # past the OLD 180s margin. Under the pre-fix floor (TTL == 180 exactly)
+    # this delay alone would already put remaining time below
+    # MIN_LEASE_REMAINING_S, returning 'lease_too_short'; the new floor's
+    # extra CLAIM_TO_DELIVERY_SLACK_S must still clear it.
+    margin_gate = old.DeliveryGate(lease_db)
+    adm = margin_gate.admit(KB, *PANE[KB], "r_margin", now=time.time())
+    case("DELIVERY: margin fixture admitted at gen1", adm.ok and adm.generation == 1)
+    delayed_now = t_claim + old.MIN_LEASE_REMAINING_S + 1  # 1s past the OLD 180s slack
+    case("DELIVERY: a claim at the NEW floor still clears begin_notice() after a delay past the old 180s margin",
+         margin_gate.begin_notice(KB, *PANE[KB], 1, "r_margin", now=delayed_now) == "delivering")
+    margin_gate.close()
     before, ev = leases(KB), events()
     case("WRITER: a second run (same holder, live lease) -> not_initial; nothing renewed or written",
          run(KB) == (2, "refused:not_initial") and leases(KB) == before and events() == ev)
@@ -643,6 +683,555 @@ def lease_writer_cases(base: Path) -> None:
     case("WRITER: group/other-readable lease DB -> refused before any claim", run(KB)[1] == "refused:lease_db_not_private_regular")
     os.chmod(lease_db, 0o600)
     av.close(); lc.close()
+
+
+def register_cases(base: Path) -> None:
+    """owner-register.py: REVIEW.md Medium-1 -- the first and only
+    production/CLI caller of owner_lease.register_owner(), the write
+    everything downstream (owner-lease-claim.py, owner-dispatch.py,
+    queue-supervisor.py) is fenced on. Mirrors lease_writer_cases()'s own
+    refusal-posture coverage for owner-lease-claim.py."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("orc", HERE / "owner-register.py")
+    orc = importlib.util.module_from_spec(spec); spec.loader.exec_module(orc)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    NEW = "tourguide"  # env() only pre-registers KB and DOTS; this label is fresh
+    NEW_PANE = ("w5:p5", "term_tg1")
+    NEW_SESS = hashlib.sha256(b"tg-session-1").hexdigest()
+    reg = {NEW: (*NEW_PANE, NEW_SESS)}
+
+    def run(label=NEW, project="tntpgh/tourguide", max_open=None, flags=True, dry_run=False, resolve=reg.get):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--project", project]
+        if max_open is not None:
+            argv += ["--max-open", str(max_open)]
+        if dry_run:
+            argv.append("--dry-run")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = orc.main(argv, resolve=resolve)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    os.chmod(lease_db, 0o600)
+    projects = lambda: lc.execute("SELECT label, project, max_open FROM owner_projects ORDER BY label").fetchall()
+    before = projects()
+    case("REGISTER: flags off -> refused, no row",
+         run(flags=False) == (4, "refused:flags_off") and projects() == before)
+    case("REGISTER: label not resolvable in the registry -> refused, no row",
+         run(label="ghost") == (2, "refused:not_registered_or_no_session") and projects() == before)
+    rc, out = run(dry_run=True)
+    case("REGISTER: --dry-run prints the exact row and never writes it",
+         rc == 0 and f"dry-run:owner_projects(label={NEW!r}" in out and "project='tntpgh/tourguide'" in out
+         and f"rollback: DELETE FROM owner_projects WHERE label={NEW!r}" in out and projects() == before)
+    case("REGISTER: non-canonical project is refused, no row",
+         run(project="not-a-github-url") == (2, "refused:InvalidOwner") and projects() == before)
+    case("REGISTER: max_open out of range is refused, no row",
+         run(max_open=ol.MAX_OPEN_LIMIT + 1) == (2, f"refused:max_open_out_of_range:1..{ol.MAX_OPEN_LIMIT}")
+         and projects() == before)
+    rc, out = run()
+    lines = out.splitlines()
+    case("REGISTER: writes the row and prints the rollback line",
+         rc == 0 and lines[0] == f"registered:{NEW}:tntpgh/tourguide"
+         and lines[1] == f"rollback: DELETE FROM owner_projects WHERE label={NEW!r} "
+                          f"(run against {lease_db}; refused by foreign_keys=ON once any lease/request exists for this label)"
+         and projects() == before + [(NEW, "tntpgh/tourguide", ol.DEFAULT_MAX_OPEN)])
+    after_write = projects()
+    case("REGISTER: idempotent re-run, same label/project -> succeeds again, no duplicate row",
+         run()[0] == 0 and projects() == after_write)
+    # (REVIEW.md round-2 Minor): once a lease exists for the label, the
+    # DELETE rollback line is guaranteed to be refused by foreign_keys=ON
+    # -- the idempotent re-registration case above is exactly that moment
+    # (SPEC.md item 2). The printed guidance must name the REAL procedure
+    # (lib/owner_lease.py's disable(), non-destructive, preserves grants and
+    # the audit trail) instead of only repeating a DELETE line that will
+    # fail. Fails without the change: the old _rollback_line() always
+    # printed the bare DELETE line, with no disable()/stop-admission
+    # guidance at all once it is refused.
+    ol.acquire(lc, NEW, *NEW_PANE, TTL, time.time(), session_digest=NEW_SESS)
+    rc, out = run()
+    lines = out.splitlines()
+    case("REGISTER: once a lease exists, idempotent re-run still succeeds and names the real rollback",
+         rc == 0 and lines[0] == f"registered:{NEW}:tntpgh/tourguide"
+         and lines[1] == f"rollback: DELETE FROM owner_projects WHERE label={NEW!r} "
+                          f"(run against {lease_db}; refused by foreign_keys=ON once any lease/request exists for this label)"
+         and "DELETE refused" in lines[2]
+         and "disable(" in out and "owner_state.enabled=0" in out
+         and "never delete once a lease or request references the label" in out)
+    case("REGISTER: same label, DIFFERENT project -> refused, row unchanged",
+         run(project="tntpgh/other-project") == (2, "refused:InvalidOwner") and projects() == after_write)
+    os.chmod(lease_db, 0o644)
+    case("REGISTER: group/other-readable lease DB -> refused before any write",
+         run(label="another-fresh-label")[1] == "refused:lease_db_not_private_regular" and projects() == after_write)
+    os.chmod(lease_db, 0o600)
+
+    # --- r15/F2: a plain re-run must REFUSE on an already-unregistered row,
+    # never silently clear it and resume as if nothing had happened ---
+    AR = "ar-label"
+    AR_RESOLVE = {AR: ("w6:p6", "term_ar1", hashlib.sha256(b"ar-session-1").hexdigest())}
+    ol.register_owner(lc, AR, "tntpgh/ar-project", now=T0, unregister_token="ar-old-tok")
+    ol.unregister_owner(lc, AR, "ar-old-tok", now=T0 + 1, dry_run=False)
+    before_ar = lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                           (AR,)).fetchone()
+    rc, out = run(label=AR, project="tntpgh/ar-project", resolve=AR_RESOLVE.get)
+    case("REGISTER: refuses an already-unregistered row (AlreadyUnregistered), never silently clears it",
+         rc == 2 and out.startswith("refused:AlreadyUnregistered:")
+         and lc.execute("SELECT unregistered_at, unregister_token FROM owner_projects WHERE label=?",
+                        (AR,)).fetchone() == before_ar)
+    lc.close()
+
+
+def register_pretracking_cases(base: Path) -> None:
+    """R17b: the live store's owner_projects/owner_leases were created by
+    code that predates owner_schema_version entirely (v1+v2+v3 applied by
+    an OLDER codebase, no CREATE TABLE owner_schema_version ever run) --
+    R17's own fix (open_and_migrate(), migrating on every open) was
+    rejected on review: a --dry-run silently advancing schema_version is a
+    real, unwanted write, not read-only. R17b's replacement: --dry-run
+    opens read-only (sqlite mode=ro) and reports `schema_pending:<cur>-><target>`
+    without ever migrating; the real write path refuses
+    `schema_migration_required:<cur>-><target>` instead of migrating
+    implicitly; owner-lease-migrate.py is the one explicit, auditable path
+    a schema now advances through (see verify-owner-lease-migrate.py for
+    that CLI's own suite). This builds the exact live-defect shape (NOT
+    verify-owner-lease.py's own v1_db() fixture, which seeds
+    owner_schema_version at version 1 -- that is the already-tracked case;
+    this one has no owner_schema_version table at all), drives it through
+    the real CLI, and separately proves a genuine REGRESSION: the SAME
+    scenario run against a real git-archived snapshot of a4516e1 (R17,
+    before this fix) shows the OLD code's --dry-run DID silently migrate
+    the file -- the exact defect REVIEW-r17 caught."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("orc_pt", HERE / "owner-register.py")
+    orc = importlib.util.module_from_spec(spec); spec.loader.exec_module(orc)
+
+    def pretracking_db(dest_base: Path) -> str:
+        fd, path = tempfile.mkstemp(suffix=".sqlite3", dir=dest_base)
+        os.close(fd)
+        d = sqlite3.connect(path, isolation_level=None)
+        for v in (1, 2, 3):
+            for stmt in ol.MIGRATIONS[v]:
+                d.execute(stmt)
+        reg_at, acq_at, exp_at = ol._iso(T0 - 3600), ol._iso(T0 - 1800), ol._iso(T0 + 3600)
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("kb", "tntpgh/knowledge-base", reg_at))
+        d.execute("INSERT INTO owner_projects VALUES (?,?,?,5)", ("tos", "tntpgh/thurber-os", reg_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L1", "kb", "w1:p1", "term_kb", acq_at, acq_at, exp_at))
+        d.execute("INSERT INTO owner_leases VALUES (?,?,?,?,1,?,?,?,NULL,NULL,'')",
+                  ("L2", "tos", "w1:p2", "term_tos", acq_at, acq_at, exp_at))
+        d.close()
+        os.chmod(path, 0o600)
+        return path
+
+    def snap(path: str) -> tuple[float, bytes]:
+        return os.stat(path).st_mtime, Path(path).read_bytes()
+
+    db = pretracking_db(base)
+    raw = lambda: sqlite3.connect(db)
+    tables_before = lambda c: {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    case("R17b fixture: no owner_schema_version table exists before any open",
+         "owner_schema_version" not in tables_before(raw()))
+    projects_full = lambda c: c.execute("SELECT * FROM owner_projects ORDER BY label").fetchall()
+    leases_full = lambda c: c.execute(
+        "SELECT lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,released_at,"
+        "release_reason,session_digest FROM owner_leases ORDER BY lease_id").fetchall()
+    pre_conn = raw()
+    pre_projects = projects_full(pre_conn)  # (label, project, registered_at, max_open) -- v3 shape, 4 cols
+    pre_leases = leases_full(pre_conn)
+    pre_conn.close()
+
+    NEW = "tourguide"
+    NEW_RESOLVE = {NEW: ("w5:p5", "term_tg1", hashlib.sha256(b"tg-session-1").hexdigest())}
+
+    def run(dry_run, db_path=None):
+        os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=db_path or db)
+        argv = ["--label", NEW, "--project", "tntpgh/tourguide"]
+        if dry_run:
+            argv.append("--dry-run")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = orc.main(argv, resolve=NEW_RESOLVE.get)
+        finally:
+            os.environ.pop("HERDR_OWNER_LEASE_WRITER", None)
+            os.environ.pop("HERDR_OWNER_LEASE_DB", None)
+        return rc, buf.getvalue().strip()
+
+    # --- R17b item 1: dry-run on the v3 fixture is truly read-only ---
+    before_dry = snap(db)
+    rc, out = run(dry_run=True)
+    after_dry = snap(db)
+    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->5",
+         rc == 0 and "schema_pending:3->5" in out)
+    case("R17b: dry-run bytes AND mtime unchanged (truly read-only, never migrates)",
+         before_dry == after_dry)
+
+    # --- R17b item 2: the real write path refuses, never migrates implicitly ---
+    before_w = snap(db)
+    rc, out = run(dry_run=False)
+    after_w = snap(db)
+    case("R17b: writer on a v3 store refuses schema_migration_required:3->5, names owner-lease-migrate.py",
+         rc == 4 and f"refused:schema_migration_required:3->5:owner-lease-migrate.py --db {db} --apply" in out)
+    case("R17b: writer refusal leaves bytes AND mtime unchanged", before_w == after_w)
+
+    # --- R17b item 3: owner-lease-migrate.py --apply is the one explicit path ---
+    mig_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1")
+    mig_rc = subprocess.run([sys.executable, str(HERE / "owner-lease-migrate.py"), "--db", db, "--apply"],
+                            capture_output=True, text=True, env=mig_env, timeout=30)
+    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v5",
+         mig_rc.returncode == 0 and "migrated:3->5" in mig_rc.stdout)
+    post_migrate = raw()
+    case("R17b: migration preserved kb/tos rows and leases, only v4/v5 newly tracked",
+         [r[:4] for r in projects_full(post_migrate)] == pre_projects
+         and all(r[4:] == (None, None, None) for r in projects_full(post_migrate))
+         and leases_full(post_migrate) == pre_leases
+         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5])
+    post_migrate.close()
+
+    # --- now-current store: dry-run reports no schema_pending; real write succeeds ---
+    rc, out = run(dry_run=True)
+    case("R17b: dry-run on the now-migrated store reports no schema_pending",
+         rc == 0 and "schema_pending" not in out and "dry-run:owner_projects" in out)
+    rc, out = run(dry_run=False)
+    post_apply = raw()
+    case("R17b: real register succeeds once the store is migrated",
+         rc == 0 and out.splitlines()[0] == f"registered:{NEW}:tntpgh/tourguide")
+    case("R17b: kb/tos rows stay byte-preserved across the real write (only tourguide is new)",
+         [r for r in projects_full(post_apply) if r[0] != NEW] ==
+         [(lbl, proj, reg, mo, None, None, None) for (lbl, proj, reg, mo) in pre_projects]
+         and leases_full(post_apply) == pre_leases)
+    case("R17b: tourguide registered with no lifecycle bound/token (CLI exposes neither flag)",
+         post_apply.execute("SELECT lifecycle_end_at, unregister_token FROM owner_projects WHERE label=?",
+                            (NEW,)).fetchone() == (None, None))
+    case("R17b: migrated-but-unbounded kb stays fail-closed -- renew_due refuses no_lifecycle_bound",
+         olr.renew_due(post_apply, "kb", ("w1:p1", "term_kb", ""), now=T0 + 10) == "no_lifecycle_bound")
+    case("R17b: migrated-but-untoken'd kb stays fail-closed -- unregister_owner raises Unauthorized",
+         raises(lambda: ol.unregister_owner(post_apply, "kb", "any-token", now=T0 + 10, dry_run=False),
+                ol.Unauthorized))
+    post_apply.close()
+
+    # --- REGRESSION PROOF: the SAME scenario against a real a4516e1 (R17) snapshot ---
+    # git-archived (never frozen-exec'd in memory -- owner-register.py resolves its
+    # own lib/ import path from __file__, which only a real file on disk gives it),
+    # run as a genuine subprocess so its --dry-run runs EXACTLY the code REVIEW-r17
+    # flagged, with no interference from the current (fixed) lib/owner_lease.py.
+    old_base = Path(tempfile.mkdtemp(dir=base))
+    old_db = pretracking_db(old_base)
+    snapshot_dir = old_base / "a4516e1-snapshot"
+    snapshot_dir.mkdir()
+    archive = subprocess.run(["git", "archive", "a4516e1", "lib", "owner-register.py"],
+                             cwd=HERE, capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(snapshot_dir)], input=archive, check=True)
+    old_cli = snapshot_dir / "owner-register.py"
+    before_old = snap(old_db)
+    old_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=old_db)
+    old_proc = subprocess.run([sys.executable, str(old_cli), "--label", "ghost", "--project", "tntpgh/ghost",
+                               "--dry-run"], capture_output=True, text=True, env=old_env, timeout=30)
+    after_old = snap(old_db)
+    old_tables = {r[0] for r in sqlite3.connect(old_db).execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    case("REGRESSION PROOF: a4516e1 (R17)'s --dry-run against a v3 store DID mutate the file "
+         "(schema silently migrated) -- the exact defect REVIEW-r17 caught; this file's own "
+         "'dry-run bytes unchanged' cases above would have FAILED against this snapshot",
+         before_old != after_old and "owner_schema_version" in old_tables)
+    _ = old_proc  # refusal/exit code irrelevant here -- the file mutation is what's being proven
+
+
+def raises(fn, exc):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def unregister_cases(base: Path) -> None:
+    """owner-lease-unregister.py: supported per-label rollback
+    (R12/R13-BOUNDS.md). Dry-run default; --apply required; authorization
+    token required (a label registered with none can never be
+    unregistered); live-lease identity+generation fence; refuses while any
+    OPEN owner_requests exist (even for dry-run); idempotent;
+    DeliveryGate.registered() (lib/owner_lease_delivery.py) flips to False
+    only after a successful --apply, returning the label to legacy
+    delivery under the per-label gate (R8-PERLABEL.md); no code path other
+    than this CLI ever calls unregister_owner()."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("olu", HERE / "owner-lease-unregister.py")
+    olu = importlib.util.module_from_spec(spec); spec.loader.exec_module(olu)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    os.chmod(lease_db, 0o600)
+    gate = old.DeliveryGate(lease_db)
+    UL, TOK = "ur-label", "secret-unregister-token-1"
+    UL_PANE, UL_BIRTH, UL_SESS = "w9:p9", "term_ur1", hashlib.sha256(b"ur-session-1").hexdigest()
+    ol.register_owner(lc, UL, "tntpgh/ur-project", now=T0, unregister_token=TOK)
+
+    def run(label=UL, token=TOK, generation=0, pane_id="", pane_birth="", apply=False, flags=True):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--token", token]
+        if generation:
+            argv += ["--generation", str(generation)]
+        if pane_id:
+            argv += ["--pane-id", pane_id]
+        if pane_birth:
+            argv += ["--pane-birth", pane_birth]
+        if apply:
+            argv.append("--apply")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = olu.main(argv)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    case("UNREGISTER: flags off -> refused, nothing changed",
+         run(flags=False) == (4, "refused:flags_off") and gate.registered(UL))
+    case("UNREGISTER: unmapped label -> refused",
+         run(label="ghost-label") == (2, "refused:owner_project_unmapped:ghost-label is not a registered owner"))
+    case("UNREGISTER: WRONG token -> refused:unauthorized, nothing changed (no auth, no fallback)",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:")
+         and gate.registered(UL))
+    case("UNREGISTER: no live lease yet, correct token -> dry-run succeeds",
+         run() == (0, f"dry-run:would_unregister:{UL}") and gate.registered(UL))
+
+    # --- live-lease identity+generation fence ---
+    gen1 = ol.acquire(lc, UL, UL_PANE, UL_BIRTH, TTL, T0, session_digest=UL_SESS)
+    case("fixture: UL now has a live lease", gen1 == 1)
+    case("UNREGISTER: correct token but WRONG generation/identity -> refused:unauthorized, nothing changed",
+         run(generation=99, pane_id="w0:p0", pane_birth="term_wrong")[0] == 2
+         and run(generation=99, pane_id="w0:p0", pane_birth="term_wrong")[1].startswith("refused:unauthorized:")
+         and gate.registered(UL) and ol.holder_tuple(lc, UL, T0 + 1) is not None)
+    case("UNREGISTER: correct token AND correct generation/identity -> dry-run succeeds",
+         run(generation=gen1, pane_id=UL_PANE, pane_birth=UL_BIRTH) == (0, f"dry-run:would_unregister:{UL}"))
+
+    # --- refuse while an OPEN owner_request exists, dry-run or apply ---
+    holder = ol.holder_tuple(lc, UL, T0 + 1)
+    ol.enqueue(lc, UL, holder[3], holder[0], holder[1], "r_open", now=T0 + 1)
+    good = dict(generation=gen1, pane_id=UL_PANE, pane_birth=UL_BIRTH)
+    case("UNREGISTER: open owner_request blocks even dry-run",
+         run(**good)[0] == 2 and run(**good)[1].startswith("refused:open_requests:"))
+    case("UNREGISTER: open owner_request blocks --apply too, nothing changed",
+         run(apply=True, **good)[0] == 2 and gate.registered(UL))
+    ol.transition(lc, "r_open", "delivering", UL, holder[3], holder[0], holder[1], now=T0 + 2)
+    ol.transition(lc, "r_open", "replied", UL, holder[3], holder[0], holder[1], now=T0 + 3)
+    case("UNREGISTER: once the request reaches a TERMINAL state, dry-run succeeds",
+         run(**good) == (0, f"dry-run:would_unregister:{UL}") and gate.registered(UL))
+
+    # --- apply: releases the live lease and sets unregistered_at ---
+    case("UNREGISTER: before apply, UL still has a live lease",
+         ol.holder_tuple(lc, UL, T0 + 3) is not None)
+    rc, out = run(apply=True, **good)
+    case("UNREGISTER: --apply releases the lease and unregisters",
+         rc == 0 and out == f"apply:unregistered:{UL}"
+         and ol.holder_tuple(lc, UL, T0 + 3) is None and not gate.registered(UL))
+    case("UNREGISTER: no cross-owner reroute -- KB and DOTS still registered and untouched",
+         gate.registered(KB) and gate.registered(DOTS)
+         and lc.execute("SELECT unregistered_at FROM owner_projects WHERE label IN (?,?)", (KB, DOTS)).fetchall()
+             == [(None,), (None,)])
+    case("UNREGISTER: idempotent re-run (dry-run), correct token -> already_unregistered",
+         run() == (0, f"dry-run:already_unregistered:{UL}"))
+    case("UNREGISTER: idempotent re-run (--apply), correct token -> already_unregistered, no error",
+         run(apply=True) == (0, f"apply:already_unregistered:{UL}"))
+    case("UNREGISTER: WRONG token after unregister learns nothing (still refused, not already_unregistered)",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:"))
+    gate.close()
+
+    # --- GUARD (R14-GUARD.md): no code path other than this CLI REALLY
+    # CALLS unregister_owner() -- detects ast.Call nodes only (func is a
+    # Name or Attribute named 'unregister_owner'), never a docstring/
+    # comment/string mention, so owner-register.py's and
+    # owner_lease_delivery.py's prose references to the name are correctly
+    # NOT flagged, with no allowlist needed for either. ---
+    import ast as _ast
+
+    def _real_calls(path: Path, name: str) -> list[int]:
+        tree = _ast.parse(path.read_text())
+        hits = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                fn = node.func
+                if (isinstance(fn, _ast.Name) and fn.id == name) or (isinstance(fn, _ast.Attribute) and fn.attr == name):
+                    hits.append(node.lineno)
+        return hits
+
+    allowed = {"owner-lease-unregister.py", "lib/owner_lease.py"}
+    offenders = []
+    for py in HERE.glob("**/*.py"):
+        rel = str(py.relative_to(HERE))
+        if rel in allowed or rel.startswith("tmp/") or "/.venv/" in rel or rel.startswith("verify-"):
+            continue
+        if _real_calls(py, "unregister_owner"):
+            offenders.append(rel)
+    case("GUARD: no production code path other than this CLI calls unregister_owner() automatically",
+         offenders == [])
+
+    # self-test: prove the guard is not vacuously true -- a REAL call in a
+    # file outside the allowlist/scan-excludes must actually be detected.
+    import tempfile as _tempfile
+    _selftest_dir = Path(_tempfile.mkdtemp())
+    _selftest_path = _selftest_dir / "would_be_offender.py"
+    _selftest_path.write_text("def x():\n    unregister_owner(None, 'l', 't')\n")
+    case("GUARD self-test: a real unregister_owner() call IS detected by _real_calls()",
+         _real_calls(_selftest_path, "unregister_owner") == [2])
+    case("GUARD self-test: a docstring/comment mention is NOT detected as a call",
+         _real_calls(HERE / "owner-register.py", "unregister_owner") == []
+         and _real_calls(HERE / "lib" / "owner_lease_delivery.py", "unregister_owner") == [])
+    import shutil as _shutil
+    _shutil.rmtree(_selftest_dir, ignore_errors=True)
+    lc.close()
+
+
+def reregister_cases(base: Path) -> None:
+    """owner-lease-reregister.py: r15/F2's explicit, authorized recovery
+    path for a label owner-lease-unregister.py has already turned off.
+    Dry-run default; --apply required; authorization is the label's
+    CURRENT unregister_token; the new token/bound NEVER inherit the old
+    ones; never creates or revives a lease."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("olrr", HERE / "owner-lease-reregister.py")
+    olrr = importlib.util.module_from_spec(spec); spec.loader.exec_module(olrr)
+    lc, av, roots, lease_db = env(base)
+    av.close()
+    os.chmod(lease_db, 0o600)
+    gate = old.DeliveryGate(lease_db)
+    RL, OLD_TOK = "rr-label", "old-tok-1"
+    ol.register_owner(lc, RL, "tntpgh/rr-project", now=T0, unregister_token=OLD_TOK)
+    ol.unregister_owner(lc, RL, OLD_TOK, now=T0 + 1, dry_run=False)
+    case("fixture: RL is unregistered", not gate.registered(RL))
+
+    def row():
+        return lc.execute("SELECT unregistered_at, unregister_token, lifecycle_end_at FROM owner_projects "
+                          "WHERE label=?", (RL,)).fetchone()
+
+    def run(label=RL, project="tntpgh/rr-project", token=OLD_TOK, new_token="new-tok-1", end=T0 + 5_000_000,
+            apply=False, flags=True):
+        saved = {k: os.environ.get(k) for k in ("HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DB")}
+        if flags:
+            os.environ.update(HERDR_OWNER_LEASE_WRITER="1", HERDR_OWNER_LEASE_DB=lease_db)
+        else:
+            for k in saved:
+                os.environ.pop(k, None)
+        argv = ["--label", label, "--project", project, "--token", token, "--new-token", new_token,
+                "--lifecycle-end", str(end)]
+        if apply:
+            argv.append("--apply")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = olrr.main(argv)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    before_row = row()
+    case("REREGISTER: flags off -> refused, nothing changed",
+         run(flags=False) == (4, "refused:flags_off") and row() == before_row)
+    case("REREGISTER: wrong token -> refused:unauthorized, row unchanged INCLUDING the old token",
+         run(token="wrong-token")[0] == 2 and run(token="wrong-token")[1].startswith("refused:unauthorized:")
+         and row() == before_row)
+    case("REREGISTER: project mismatch -> refused, row unchanged",
+         run(project="tntpgh/other-project")[0] == 2 and row() == before_row)
+    case("REREGISTER: dry-run (correct token) changes nothing",
+         run() == (0, f"dry-run:would_reregister:{RL}") and row() == before_row and not gate.registered(RL))
+    case("REREGISTER: never creates or revives a lease before apply",
+         ol.holder_tuple(lc, RL, T0 + 2) is None)
+    rc, out = run(apply=True)
+    case("REREGISTER: --apply flips registered() to True with the new token/bound",
+         rc == 0 and out == f"apply:reregistered:{RL}" and gate.registered(RL))
+    after_row = row()
+    case("REREGISTER: unregistered_at cleared, token is the NEW one, NOT the old",
+         after_row[0] is None and after_row[1] == "new-tok-1" and after_row[1] != OLD_TOK)
+    case("REREGISTER: lifecycle_end_at was set to the NEW supplied bound",
+         after_row[2] == ol._iso(T0 + 5_000_000))
+    case("REREGISTER: still never created or revived a lease",
+         ol.holder_tuple(lc, RL, T0 + 2) is None)
+    case("REREGISTER: the OLD token can no longer unregister the label (rotated, not retained)",
+         isinstance(_raises(lambda: ol.unregister_owner(lc, RL, OLD_TOK, now=T0 + 3, dry_run=True)), ol.Unauthorized))
+    case("REREGISTER: not-currently-unregistered label -> not_unregistered, nothing to do",
+         run(token="new-tok-1") == (0, f"dry-run:not_unregistered:{RL}"))
+    gate.close()
+
+    # --- r16/F3: two concurrent reregister_owner() calls (same old token,
+    # different new tokens) must NEVER both report "reregistered" -- the
+    # loser must see "race_lost" and write nothing, never silently
+    # overwritten while believing it won (tmp/in/ra/r16/reregister-toctou-
+    # check.py). Reproduced by monkeypatching ol._tx to let a SECOND
+    # connection's ENTIRE reregister_owner() call commit in the exact
+    # window between the FIRST caller's advisory read and its own _tx().
+    TC = "race-label"
+    ol.register_owner(lc, TC, "tntpgh/race-project", now=T0, unregister_token="tok-shared")
+    ol.unregister_owner(lc, TC, "tok-shared", now=T0 + 1, dry_run=False)
+    lc2 = ol.connect(lease_db)
+    real_tx = ol._tx
+
+    def spying_tx(conn, fn, mutation=True):
+        if spying_tx.armed:
+            spying_tx.armed = False
+            spying_tx.b_result = ol.reregister_owner(lc2, TC, "tntpgh/race-project", "tok-shared", "tok-B",
+                                                     T0 + 2_000_000, now=T0 + 2, dry_run=False)
+        return real_tx(conn, fn, mutation=mutation)
+
+    spying_tx.armed = True
+    spying_tx.b_result = None
+    ol._tx = spying_tx
+    try:
+        a_result = ol.reregister_owner(lc, TC, "tntpgh/race-project", "tok-shared", "tok-A",
+                                       T0 + 1_000_000, now=T0 + 3, dry_run=False)
+    finally:
+        ol._tx = real_tx
+    race_row = lc.execute("SELECT unregistered_at, unregister_token, lifecycle_end_at FROM owner_projects "
+                          "WHERE label=?", (TC,)).fetchone()
+    race_events = lc.execute("SELECT kind FROM owner_events WHERE label=? AND kind='reregistered'",
+                             (TC,)).fetchall()
+    case("r16/F3: interleaved caller B (landed first) reports reregistered",
+         spying_tx.b_result == "reregistered")
+    case("r16/F3: interleaved caller A (lost the race) reports race_lost, NOT reregistered",
+         a_result == "race_lost")
+    case("r16/F3: row holds the WINNER's (B's) token and bound, not A's",
+         race_row == (None, "tok-B", ol._iso(T0 + 2_000_000)))
+    case("r16/F3: audit has exactly ONE reregistered line, not two",
+         len(race_events) == 1)
+
+    # --- r16/F3: the CLI surfaces race_lost as a nonzero exit, not a
+    # false success (monkeypatch ol.reregister_owner itself, since driving
+    # an ACTUAL race through the CLI's own main() needs the same
+    # cross-connection interleaving already proven above at the library
+    # level -- this only needs to prove the CLI's result->exit mapping) ---
+    real_reregister = ol.reregister_owner
+    ol.reregister_owner = lambda *a, **k: "race_lost"
+    try:
+        rc_cli, out_cli = run(apply=True)
+    finally:
+        ol.reregister_owner = real_reregister
+    case("r16/F3: CLI exits nonzero (2) and prints race_lost, never a fake success",
+         rc_cli == 2 and out_cli == f"apply:race_lost:{RL}")
+    lc2.close()
+    lc.close()
 
 
 def cli_cases(base: Path) -> None:
@@ -798,9 +1387,13 @@ def operator_cases(base: Path) -> None:
 
 
 def publisher_tick_cases(base: Path) -> None:
-    """(7) remote-mcp/publisher.py result_availability_tick: default off; a
-    conductor without a registry-bound lease -> held:not_dispatched, nothing
-    typed; with one -> exactly one notice typed to the conductor pane."""
+    """remote-mcp/publisher.py result_availability_tick: STAGE ONLY since
+    tmp/in/BRIEF-optC.md's Option C split -- default off; never calls the
+    owner-lease gate's admit() or herdr-deliver.sh, even with a live
+    conductor lease and a fully staged request. SPEED: stays fast with
+    DELIVER configured to hang for 120s -- the actual send moved to
+    remote-mcp/ra-sender.py (see remote-mcp/verify-ra-sender.py for the
+    notify/budget/crash/alert proofs that used to live here)."""
     import importlib.util
     import time as _t
     root, J = base / "kb_root", base / "journal"
@@ -809,27 +1402,28 @@ def publisher_tick_cases(base: Path) -> None:
     lc = ol.connect(lease_db); ol.migrate(lc)
     ol.register_owner(lc, KB, "tntpgh/knowledge-base", now=_t.time())
     ol.register_owner(lc, "conductor", "tntpgh/thurber-os", now=_t.time())
-    typed = base / "typed.log"
-    fake = base / "fake-deliver.sh"
-    fake.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$1" "$2" >> {typed}\n')
-    fake.chmod(0o700)
+    hang, sentinel = base / "hang-deliver.sh", base / "hang-ran.marker"
+    hang.write_text(f"#!/bin/sh\ntouch {sentinel}\nsleep 120\nexit 0\n")  # SPEED: must never actually run
+    hang.chmod(0o700)
     env = {"HERDR_OWNER_LEASE_DELIVERY": "1", "HERDR_OWNER_LEASE_DB": lease_db,
            "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
            "HERDR_RESULT_AVAILABILITY_ROOTS": f"{KB}={root}", "HERDR_RESULT_AVAILABILITY_JOURNAL": str(J)}
     saved = {k: os.environ.get(k) for k in [*env, "HERDR_RESULT_AVAILABILITY", "HERDR_DELIVER"]}
-    os.environ.update(env); os.environ["HERDR_DELIVER"] = str(fake)
+    os.environ.update(env); os.environ["HERDR_DELIVER"] = str(hang)
     try:
         sys.path.insert(0, str(HERE / "remote-mcp"))
         spec = importlib.util.spec_from_file_location("publisher_under_test", HERE / "remote-mcp" / "publisher.py")
         pub = importlib.util.module_from_spec(spec); spec.loader.exec_module(pub)
-        pub.DELIVER = str(fake)
+        pub.DELIVER = str(hang)
         rows = {KB: {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "agent_session": "kb-sess"},
                 "conductor": {"pane_id": "w72:p1", "pane_birth": "term_cond", "agent_session": "cond-sess"}}
         pub.registry_owners = lambda: {k: dict(v, workspace="", registered_at="", updated_at="") for k, v in rows.items()}
         kb_digest = pub.owner_session_digest(KB, rows[KB])
         ol.acquire(lc, KB, *PANE[KB], TTL, _t.time(), session_digest=kb_digest)
+        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
+                   session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
         os.environ.pop("HERDR_RESULT_AVAILABILITY", None)
-        case("TICK default off: no flag -> None, nothing typed", pub.result_availability_tick() is None and not typed.exists())
+        case("TICK default off: no flag -> None", pub.result_availability_tick() is None)
         os.environ["HERDR_RESULT_AVAILABILITY"] = "1"
         av = ra.Availability(env["HERDR_RESULT_AVAILABILITY_DB"], {KB: str(root)}, str(J))
         d = od.Dispatcher(old.DeliveryGate(lease_db), av, lambda l, h, t: True, pub.registry_resolver,
@@ -837,84 +1431,22 @@ def publisher_tick_cases(base: Path) -> None:
         case("TICK fixture: dispatched through the publisher's own registry resolver",
              d.dispatch(KB, "r_tick", b"REQ tick\n", ["result.md"]) == "dispatched")
         (root / "r_tick" / "result.md").write_text("ACK r_tick")
-        pub.result_availability_tick(); pub.result_availability_tick()
+        pub.result_availability_tick()
+        case("TICK observe: pending -> observing after the first tick", av.state("r_tick")[0] == "observing")
+        pub.result_availability_tick()
+        case("TICK observe: observing -> staged after the second tick, content unchanged", av.state("r_tick")[0] == "staged")
+        # SPEED (tmp/in/BRIEF-optC.md #1,#9): a THIRD tick is exactly where the
+        # pre-split code reached prepare()/notify() for a staged row -- with a
+        # live conductor lease AND a DELIVER configured to sleep 120s, this
+        # must still return instantly and the hang script must never run.
+        t0 = _t.monotonic()
         out = pub.result_availability_tick()
-        case("TICK no conductor lease: typed pre-send held, row stays staged, nothing typed, no gate row",
-             out == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and av.state("r_tick")[0] == "staged"
-             and not typed.exists() and lc.execute("SELECT count(*) FROM owner_requests WHERE label='conductor'").fetchone()[0] == 0)
-        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(), session_digest=hashlib.sha256(b"wrong").hexdigest())
-        case("TICK conductor lease not matching the registry session: still held, nothing typed",
-             pub.result_availability_tick() == {"r_tick": "held:not_dispatched:conductor_identity_gone"} and not typed.exists())
-        lc.execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00.000000Z' WHERE label='conductor'")
-        ol.acquire(lc, "conductor", "w72:p1", "term_cond", TTL, _t.time(),
-                   session_digest=pub.owner_session_digest("conductor", rows["conductor"]))
-        gate = old.DeliveryGate(lease_db)
-        xid = ra.GatedNotice.exchange_id
-
-        def stage(rid):
-            assert d.dispatch(KB, rid, f"REQ {rid}\n".encode(), ["result.md"]) == "dispatched"
-            (root / rid / "result.md").write_text(f"ACK {rid}")
-            pub.result_availability_tick(); pub.result_availability_tick()
-            row = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid=?", (rid,)).fetchone()
-            return ra.notice_text(rid, row[0], row[1])
-
-        # RACE: ready/prepare saw the conductor, identity gone at the typing boundary.
-        real_resolver, calls = pub.registry_resolver, {"n": 0}
-
-        def flaky(label):
-            if label == "conductor":
-                calls["n"] += 1
-                if calls["n"] > 1:
-                    return None
-            return real_resolver(label)
-        pub.registry_resolver = flaky
-        text = av.conn.execute("SELECT observed, request_dir FROM ra_requests WHERE rid='r_tick'").fetchone()
-        text = ra.notice_text("r_tick", *text)
-        out = pub.result_availability_tick()
-        pub.registry_resolver = real_resolver
-        case("RACE identity gone at the boundary: typed pre-send held, row staged (never notifying/ambiguous), nothing typed",
-             out == {"r_tick": "held:not_dispatched:identity_changed_pre_send"} and av.state("r_tick")[0] == "staged"
-             and not typed.exists() and gate.record(xid(text))[2:] == ("blocked", "identity_changed_pre_send"))
-        case("RACE: the blocked notice is never re-admitted (no resend grant)",
-             pub.result_availability_tick()["r_tick"] == "held:not_dispatched:owner_lease_duplicate:blocked" and not typed.exists())
-        t2 = stage("r_tick2")
-        out = pub.result_availability_tick()
-        lines = typed.read_text().splitlines() if typed.exists() else []
-        case("TICK registry-bound conductor: notified through the gate, exactly one notice, body-bound exchange id delivering",
-             out["r_tick2"] == "notified" and len(lines) == 1 and lines[0] == f"w72:p1|{t2}"
-             and gate.record(xid(t2))[:3] == ("conductor", gate.record(xid(t2))[1], "delivering")
-             and "r_tick2" not in pub.result_availability_tick())
-        t3 = stage("r_tick3")
-        bad = base / "fail-deliver.sh"
-        bad.write_text("#!/bin/sh\nexit 1\n"); bad.chmod(0o700)
-        pub.DELIVER = str(bad)
-        out = pub.result_availability_tick()
-        pub.DELIVER = str(fake)
-        case("POST-SEND failure: ambiguous, gate blocked send_not_confirmed (not retryable)",
-             out["r_tick3"] == "ambiguous" and gate.record(xid(t3))[2:] == ("blocked", "send_not_confirmed"))
-        t4 = stage("r_tick4")
-
-        class Crash(BaseException):
-            pass
-        real_prepare = ra.GatedNotice.prepare
-
-        def crash_after_prepare(self, rid, text):
-            r = real_prepare(self, rid, text)
-            if rid != "r_tick4":
-                return r
-            raise Crash()  # killed after begin_notice, before the notifying CAS
-        ra.GatedNotice.prepare = crash_after_prepare
-        try:
-            pub.result_availability_tick()
-        except Crash:
-            pass
-        finally:
-            ra.GatedNotice.prepare = real_prepare
-        out = pub.result_availability_tick()
-        case("CRASH after begin_notice, before CAS: row staged, gate delivering, next tick held duplicate, never typed",
-             out["r_tick4"] == "held:not_dispatched:owner_lease_duplicate:delivering" and av.state("r_tick4")[0] == "staged"
-             and gate.record(xid(t4))[2] == "delivering" and len(typed.read_text().splitlines()) == 1)
-        gate.close()
+        elapsed = _t.monotonic() - t0
+        case("SPEED: staged + live conductor lease + a 120s-hanging DELIVER -> tick stays under 1s, hang script never ran",
+             elapsed < 1.0 and out == {"r_tick": "held:not_dispatched:staged_for_ra-sender"}
+             and av.state("r_tick")[0] == "staged" and not sentinel.exists())
+        case("TICK observe-only never touches the owner-lease gate: zero owner_requests rows for conductor",
+             lc.execute("SELECT count(*) FROM owner_requests WHERE label='conductor'").fetchone()[0] == 0)
         av.close()
     finally:
         for k, v in saved.items():
@@ -1345,11 +1877,12 @@ def issue_cases(base: Path) -> None:
     frozen = _frozen_gen1_module()
     d, lc, ldb, adb, rq, roots, proj = setup()
     fid, rec, asha = decision(d, proj)  # prev_gen=0 default -> classic shape, no successor keys at all
-    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes/render_form byte-identical to the frozen baseline",
+    case("FROZEN COMPAT (1a0b873): classic gen1 KEYS/approval_bytes byte-identical to the frozen baseline "
+         "(render_form's title/H1 deliberately changed, R12d -- it used to hardcode a fixed \"KB\" label "
+         "regardless of the real owner; see render_form()'s own docstring)",
          set(rec) == frozen.KEYS
          and frozen.validate_approval(dict(rec)) == rec
-         and frozen.approval_bytes(rec) == odi.approval_bytes(rec)
-         and frozen.render_form(rec) == odi.render_form(rec))
+         and frozen.approval_bytes(rec) == odi.approval_bytes(rec))
     frozen_successor = _frozen_gen1_module(ref="0ac8ba1f7f5431899819b3a7fd1713957e965bb8")  # SUCCESSOR_KEYS postdates 1a0b873
     saved_root = odi.STATE_ROOT
     odi.STATE_ROOT = os.path.realpath(d / "state")
@@ -1364,6 +1897,293 @@ def issue_cases(base: Path) -> None:
          and odi.window(dec_default, now) == dec_default["answered_at"] + rec["grant_window_s"]
          and odi.MAX_WINDOW_S == 3600 and odi.KEYS == frozen.KEYS and odi.SUCCESSOR_KEYS == frozen_successor.SUCCESSOR_KEYS)
     lc.close()
+
+def bind_live_cases(base: Path) -> None:
+    """owner-dispatch-issue.py --bind-live-generation (r12,
+    tmp/out/r12/ANSWER-r12.md): a THIRD issuance mode, for a lease that is
+    ALREADY live at generation N held by exactly the registry's current
+    identity. Never calls claim_initial/claim_successor -- binds a fresh
+    single-use grant to the live lease without claiming, renewing, or
+    bumping it. Also proves (FROZEN COMPAT, ffa64cc) that this round did
+    not change the initial/successor/standing paths' own behavior."""
+    import importlib.util
+    import io
+    import contextlib
+    spec = importlib.util.spec_from_file_location("odissue_bl", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    PANE2, SESS2 = ("w93:p9", "term_kb2bindlive"), hashlib.sha256(b"kb-session-2-bindlive").hexdigest()
+    HOLD2 = {"pane_id": PANE2[0], "pane_birth": PANE2[1], "session_digest": SESS2}
+    reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    reg_ok2 = {KB: (*PANE2, SESS2)}.get
+    body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
+    lease_exp_iso = ol._iso(T0 + TTL)
+    n = [0]
+
+    def setup(max_open=1, live=True, lease_ttl=None):
+        n[0] += 1
+        d = base / f"c{n[0]}"; d.mkdir(mode=0o700)
+        lc, av, roots, lease_db = env(d); av.close()
+        lc.execute("UPDATE owner_projects SET max_open=? WHERE label=?", (max_open, KB))
+        if live:
+            if lease_ttl is None:
+                acquire(lc, KB)  # -> gen 1, live until T0+TTL
+            else:
+                ol.acquire(lc, KB, PANE[KB][0], PANE[KB][1], lease_ttl, T0, session_digest=SESS[KB])
+        os.chmod(lease_db, 0o600)
+        adb = d / "auth.db"
+        c = sqlite3.connect(str(adb), isolation_level=None); oda.migrate(c); c.close(); os.chmod(adb, 0o600)
+        rq = d / "req"; rq.mkdir(); (rq / "req.txt").write_bytes(body)
+        (d / "state" / "forms").mkdir(parents=True)
+        proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+        return d, lc, lease_db, adb, rq, roots, proj
+
+    def decision(d, proj, bind_gen=1, over=None, answers=None, status="answered", answered_at=None, grant_window_s=1800):
+        rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1, "expected_holder": dict(HOLD),
+               "expected_generation": bind_gen, "lease_ttl_s": TTL, "request_id": f"bl-{n[0]}",
+               "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(), "manifest": ["result.md"],
+               "auth_id": f"auth-bl-{n[0]}", "grant_window_s": grant_window_s, "bind_live_generation": bind_gen}
+        rec.update(over or {})
+        emb = odi.approval_bytes(rec)
+        fid = f"20261028T1800{n[0] % 100:02d}-91{n[0] % 100:02d}"
+        html = odi.render_form(rec)
+        ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
+        row = {"id": fid, "status": status, "answers": ans, "answered_at": int((T0 - 60) * 1000) if answered_at is None else answered_at}
+        (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
+        (d / "state" / "forms" / f"{fid}.json").write_text(json.dumps(row))
+        return fid, rec, hashlib.sha256(emb).hexdigest()
+
+    KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+    real_root = odi.STATE_ROOT
+
+    def run(d, lease_db, adb, rq, fid, resolve=reg_ok, t=None):
+        E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+             "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)}
+        odi.STATE_ROOT = os.path.realpath(d / "state")
+        saved = {k: os.environ.get(k) for k in KEYS_ENV}
+        for k in saved: os.environ.pop(k, None)
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odi.main(["--form-id", fid, "--request-dir", str(rq)], resolve=resolve, now=T0 if t is None else t)
+        finally:
+            odi.STATE_ROOT = real_root
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    def q(adb, sql):
+        c = sqlite3.connect(str(adb)); r = c.execute(sql).fetchall(); c.close(); return r
+
+    def nothing_written(adb, lc, lease_rows_before=1):
+        return (q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+                and lc.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0] == lease_rows_before)
+
+    # 0. happy path: grant issued, lease provably untouched (no claim/renewal)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: issues against an already-live same-holder lease, no claim/renewal",
+         got == (0, f"issued:{rec['auth_id']}:gen1")
+         and lc.execute("SELECT generation, expires_at FROM owner_leases WHERE label=?", (KB,)).fetchone() == (1, lease_exp_iso))
+    lc.close()
+
+    # 1. different holder
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, resolve=reg_ok2)
+    case("BIND-LIVE: different holder refused, nothing written", got == (2, "refused:identity_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 2. stale generation (record claims live gen 2; lease is actually gen 1)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=2)
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: stale generation refused, nothing written", got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 3. expired lease between form and issue -- refused, NEVER renewed/rebound
+    # (short lease TTL, well inside the default grant window, so this exercises
+    # ONLY the lease-expiry path, never the unrelated approval-window-expiry one)
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    short_exp_iso = ol._iso(T0 + 600)
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, t=T0 + 700)
+    case("BIND-LIVE: lease expired between form and issue -> refused, not renewed/rebound, nothing written",
+         got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc)
+         and lc.execute("SELECT generation, expires_at, released_at FROM owner_leases WHERE label=?", (KB,)).fetchone() == (1, short_exp_iso, None))
+    lc.close()
+
+    # 4. reused auth_id
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid1, rec1, _ = decision(d, proj, bind_gen=1, over={"auth_id": "auth-bl-reused"})
+    first = run(d, ldb, adb, rq, fid1)
+    fid2, rec2, _ = decision(d, proj, bind_gen=1, over={"auth_id": "auth-bl-reused"})
+    second = run(d, ldb, adb, rq, fid2, t=T0 + 1)
+    case("BIND-LIVE: reused auth_id refused on replay, exactly one grant row total",
+         first == (0, "issued:auth-bl-reused:gen1") and second == (2, "refused:approval_already_used")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(1,)])
+    lc.close()
+
+    # 5. body hash mismatch (tampered after form was built)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    (rq / "req.txt").write_bytes(b"TAMPERED\n")
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: body hash mismatch refused, nothing written", got == (2, "refused:request_sha_mismatch") and nothing_written(adb, lc))
+    lc.close()
+
+    # 6. standing-scope confusion: a bind-live record is refused by the STANDING validator (disjoint schema)
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    standing_refused = False
+    try:
+        odi.validate_standing_approval(rec)
+    except odi.Refused:
+        standing_refused = True
+    case("BIND-LIVE: a bind-live record is refused by validate_standing_approval (disjoint schema)", standing_refused)
+    lc.close()
+
+    # 7. build-form refuses a bind-live request against the wrong live generation
+    d, lc, ldb, adb, rq, roots, proj = setup()
+    out_path = d / "form.html"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = odi.build_main(["--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                             "--request-id", "r1", "--auth-id", "auth-build-bl-1", "--out", str(out_path),
+                             "--manifest", "result.md", "--bind-live-generation", "2", "--lease-db", ldb],
+                            resolve=reg_ok, now=T0)
+    case("BIND-LIVE: build-form refuses the wrong live generation, no file written",
+         rc == 2 and buf.getvalue().strip() == "refused:live_generation_unresolved" and not out_path.exists())
+    lc.close()
+
+    # 8. grant_window_s pushing the grant's own expiry past the live lease's own expiry
+    # (short lease TTL again -- MAX_WINDOW_S equals this module's default lease TTL,
+    # so a short-TTL lease is required to get daylight between the two expiries)
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    fid, rec, asha = decision(d, proj, bind_gen=1, grant_window_s=1800)  # answered_at(T0-60)+1800 = T0+1740 > lease exp T0+600
+    got = run(d, ldb, adb, rq, fid)
+    case("BIND-LIVE: grant expiry capped at lease expiry -- refused (post-claim classification) when it would exceed it",
+         got == (5, "claimed_not_issued:grant_exceeds_lease_expiry") and nothing_written(adb, lc))
+    lc.close()
+
+    # 9. (tmp/in/r12/PACKET-ADDENDUM.md) ONLY an expired lease exists -- no live
+    # generation at all, no resume has happened. Neither build-form nor the issue
+    # path may perform or infer a recovery; both must simply refuse.
+    d, lc, ldb, adb, rq, roots, proj = setup(lease_ttl=600)
+    expired_now = T0 + 700  # 100s after the gen-1 lease's own expiry; no resume performed
+    out_path = d / "expired-only-form.html"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = odi.build_main(["--label", KB, "--project", proj, "--request-dir", str(rq), "--request-name", "req.txt",
+                             "--request-id", "r-expired-only", "--auth-id", "auth-build-expired-only",
+                             "--out", str(out_path), "--manifest", "result.md",
+                             "--bind-live-generation", "1", "--lease-db", ldb],
+                            resolve=reg_ok, now=expired_now)
+    case("BIND-LIVE (ADDENDUM): build-form against an only-expired lease (no resume done) refuses, no file written -- never infers recovery",
+         rc == 2 and buf.getvalue().strip() == "refused:live_generation_unresolved" and not out_path.exists())
+    # and independently: a record built some other way (bypassing build-form) naming
+    # the now-expired generation is ALSO refused by the issue path itself, never silently
+    # resumed/claimed/rebound -- owner-dispatch-issue.py has no code path that calls
+    # owner-lease-resume.py or ol.acquire() at all (confirmed by source: neither name
+    # appears anywhere in owner-dispatch-issue.py).
+    fid, rec, asha = decision(d, proj, bind_gen=1)
+    got = run(d, ldb, adb, rq, fid, t=expired_now)
+    case("BIND-LIVE (ADDENDUM): issue against an only-expired lease also refuses, nothing written -- never infers recovery",
+         got == (2, "refused:live_generation_mismatch") and nothing_written(adb, lc))
+    case("BIND-LIVE (ADDENDUM): owner-dispatch-issue.py source never names the resume tool or acquire() -- recovery is structurally unreachable from this file, not just behaviorally refused",
+         "owner-lease-resume" not in Path(HERE / "owner-dispatch-issue.py").read_text()
+         and "ol.acquire(" not in Path(HERE / "owner-dispatch-issue.py").read_text())
+    lc.close()
+
+    # --- FROZEN COMPAT (ffa64cc): r12 added a disjoint third mode; the initial/successor/standing
+    # paths this worktree already had at ffa64cc (before any r12 code) are byte-identical in schema
+    # and behavior -- never touched by this round's edit.
+    frozen = _frozen_gen1_module(ref="ffa64cc")
+    d, lc, ldb, adb, rq, roots, proj = setup(live=False)
+    classic_rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1,
+                   "expected_holder": dict(HOLD), "expected_generation": 1, "lease_ttl_s": TTL,
+                   "request_id": "classic-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+                   "manifest": ["result.md"], "auth_id": "auth-classic-1", "grant_window_s": 1800}
+    case("FROZEN COMPAT (ffa64cc): classic initial-claim KEYS/approval_bytes byte-identical "
+         "(render_form's title/H1 deliberately changed, R12d)",
+         odi.KEYS == frozen.KEYS
+         and odi.approval_bytes(classic_rec) == frozen.approval_bytes(classic_rec)
+         and odi.validate_approval(classic_rec) == frozen.validate_approval(classic_rec))
+    successor_rec = {"protocol": odi.PROTOCOL, "owner_label": KB, "project": proj, "max_open": 1,
+                     "expected_holder": dict(HOLD2), "expected_generation": 2, "lease_ttl_s": TTL,
+                     "expected_prev_generation": 1, "expected_prev_holder": dict(HOLD),
+                     "request_id": "successor-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+                     "manifest": ["result.md"], "auth_id": "auth-successor-1", "grant_window_s": 1800}
+    case("FROZEN COMPAT (ffa64cc): SUCCESSOR_KEYS/approval_bytes byte-identical "
+         "(render_form's title/H1 deliberately changed, R12d)",
+         odi.SUCCESSOR_KEYS == frozen.SUCCESSOR_KEYS
+         and odi.approval_bytes(successor_rec) == frozen.approval_bytes(successor_rec)
+         and odi.validate_approval(successor_rec) == frozen.validate_approval(successor_rec))
+    standing_rec = {"protocol": odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj,
+                    "expected_holder": dict(HOLD), "expected_generation": 1,
+                    "queue_sha256": hashlib.sha256(b"q").hexdigest(),
+                    "queue_items": [{"id": "i1", "request_sha256": hashlib.sha256(body).hexdigest(),
+                                     "manifest": ["result.md"], "cost_cents": None, "action": "dispatch"}],
+                    "item_cap": 5, "spend_cap_cents": 0, "auth_id": "auth-standing-1", "standing_window_s": 1800}
+
+    def _safe_validate_standing(mod, rec):
+        try:
+            return ("ok", mod.validate_standing_approval(rec))
+        except mod.Refused as exc:
+            return ("refused", str(exc))
+    case("FROZEN COMPAT (ffa64cc): STANDING_KEYS/STANDING_PROTOCOL/validate_standing_approval byte-identical",
+         odi.STANDING_KEYS == frozen.STANDING_KEYS and odi.STANDING_PROTOCOL == frozen.STANDING_PROTOCOL
+         and _safe_validate_standing(odi, standing_rec) == _safe_validate_standing(frozen, standing_rec))
+    # the initial claim CODE PATH itself (ol.claim_initial, via odi.main()) is untouched by r12 --
+    # confirmed end to end: issue a classic gen-1 grant (no bind_live_generation key at all) through
+    # the CURRENT module and check it behaves exactly as issue_cases()'s own happy path already does.
+    classic_emb = odi.approval_bytes(classic_rec)
+    classic_fid = "20261028T180099-9199"
+    (d / "state" / "forms" / f"{classic_fid}.html").write_bytes(odi.render_form(classic_rec))
+    (d / "state" / "forms" / f"{classic_fid}.json").write_text(json.dumps(
+        {"id": classic_fid, "status": "answered",
+         "answers": {"decision": "approve", "approval_sha256": hashlib.sha256(classic_emb).hexdigest()},
+         "answered_at": int((T0 - 60) * 1000)}))
+    got = run(d, ldb, adb, rq, classic_fid)
+    case("FROZEN COMPAT (ffa64cc): classic initial-claim still issues end to end via claim_initial, unchanged",
+         got == (0, "issued:auth-classic-1:gen1"))
+    lc.close()
+
+
+def title_cases(base: Path) -> None:
+    """owner-dispatch-issue.py render_form()'s title/H1 (R12d,
+    tmp/in/r12/TITLE-FIX.md): deployed build-form at d39e64d rendered a
+    FIXED 'KB owner-dispatch pilot' title/H1 for a thurber-os grant (form
+    20261028T204112-8740) -- every field below the heading was thurber-os,
+    only the heading lied. Title/H1 must derive from rec['owner_label']/
+    rec['project'] for EVERY label, never a fixed 'KB' string."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("odissue_title", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    body = b"READ-ONLY: list the newest result file name. Write nothing.\n"
+
+    def mk(label, project):
+        rec = {"protocol": odi.PROTOCOL, "owner_label": label, "project": project, "max_open": 1,
+               "expected_holder": dict(HOLD), "expected_generation": 1, "lease_ttl_s": 1800,
+               "request_id": "title-1", "request_name": "req.txt", "request_sha256": hashlib.sha256(body).hexdigest(),
+               "manifest": ["result.md"], "auth_id": "auth-title-1", "grant_window_s": 1800}
+        return odi.render_form(rec).decode()
+
+    for label, project in [("thurber-os", "tntpgh/thurber-os"), ("herdr-control-dots", "tntpgh/dotfiles"),
+                           ("some-other-label", "tntpgh/some-other-repo")]:
+        html = mk(label, project)
+        case(f"TITLE: build-form for label {label!r} -> title/H1 contain the real label, never a fixed KB",
+             html.count(label) >= 2  # once in <title>, once in <h1>
+             and "KB" not in html.split("<table>")[0]  # before the data table: no leftover fixed abbreviation
+             and "Approve ONE" in html)  # tampering-detection substring (verify-owner-dispatch.py's own
+                                         # "served page differs from the canonical rendering" case) still present
+    html_kb = mk(KB, "tntpgh/knowledge-base")
+    case("TITLE: build-form for label 'knowledge-base' -> title/H1 contain the real label (not a hardcoded 'KB')",
+         html_kb.count(KB) >= 2 and "Approve ONE" in html_kb)
 
 
 def standing_issue_cases(base: Path) -> None:
