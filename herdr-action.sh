@@ -398,15 +398,17 @@ cmd_surface() {                         # id -> wake the conductor once
 }
 
 _ha_serve_form() {                      # row task-json -> form path (served)
-  local row="$1" tj="$2" id dir f n
+  local row="$1" tj="$2" id dir f n label_plain title
   id="$(_ha_field "$row" request_id)"
   dir="$(run_state_root)/action-forms"; mkdir -p "$dir" 2>/dev/null || return 1
   n="$(ls "$dir" 2>/dev/null | grep -c "^${id}-")"
   f="$dir/${id}-$((n + 1)).html"
+  label_plain="$(_ha_field "$tj" label)"
+  title="Human-only action requested: $label_plain"
   cat > "$f" <<HTML
 <!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
-<title>Human-only action requested: $(_ha_esc "$(_ha_field "$tj" label)")</title>
+<title>$(_ha_esc "$title")</title>
 <style>
 :root{--ground:#eef2f2;--surface:#fff;--line:#c9d4d4;--ink:#10191c;--ink-2:#3d4e53;--accent:#1f6e7e;--accent-soft:#e2eef0}
 @media (prefers-color-scheme:dark){:root{--ground:#0c1316;--surface:#131e22;--line:#2c3b41;--ink:#e6edee;--ink-2:#a9bcc1;--accent:#58b6c8;--accent-soft:#12323a}}
@@ -440,7 +442,22 @@ if(fd.get("decision")==="supersede"&&!reason){f.elements.reason.focus();return}
 window.submitAnswers({request_id:"$(_ha_esc "$id")",action_sha256:"$(_ha_esc "$(_ha_field "$row" action_sha256)")",decision:fd.get("decision"),reason:reason})});</script>
 </body></html>
 HTML
-  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open --request-id "$id" </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
+  local log="$f.serve.log"
+  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open --request-id "$id" --title "$title" \
+      </dev/null >"$log" 2>&1
+    rc=$?
+    # >=2: formserve itself refused to start (config error). 1 is a normal
+    # expiry, not a refusal. Both used to go to /dev/null, so the one
+    # human-only approval path for this request could silently never reach
+    # the hub with no trace anywhere (independent review, 2026-10-30).
+    if [ "$rc" -ge 2 ]; then
+      append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_form_serve_refused \
+        "$(jq -nc --arg id "$id" --arg f "$f" --arg err "$(tail -c 2000 "$log" 2>/dev/null)" \
+           '{request_id:$id, form_path:$f, stderr:$err}')" \
+        "actformref_${id}_${n}" >/dev/null 2>&1 || true
+    fi
+    rm -f "$log" 2>/dev/null
+  ) 2>/dev/null & disown
   printf '%s\n' "$f"
 }
 

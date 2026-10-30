@@ -44,6 +44,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -377,10 +378,54 @@ def deliver(target: str, url: str, answers: dict) -> None:
 # never affect the form itself — the human's page comes first.
 FORMS_DIR = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr")) / "forms"
 # herdr-action.sh writes and answers its own action-request forms here
-# (run_state_root()/action-forms, lib/run-registry.sh); formserve must never
-# serve a hand-picked copy of one, since herdr-action's claim-once answer
-# path is bound to the request id, not to this file.
-ACTION_FORMS_DIR = FORMS_DIR.parent / "runs" / "action-forms"
+# (run_state_root()/action-forms, lib/run-registry.sh): run_state_root() is
+# `${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}` (lib/run-registry.sh
+# :50-52) -- a DIFFERENT variable from HERDR_STATE_ROOT above, and several
+# suites set them to different scratch dirs. Deriving this from the wrong one
+# would miss a hand copy under the real action-forms dir whenever an operator
+# overrides HERDR_RUN_STATE_DIR.
+ACTION_FORMS_DIR = Path(os.environ.get("HERDR_RUN_STATE_DIR",
+                                       Path.home() / ".local/state/herdr/runs")) / "action-forms"
+# Same file lib/run-registry.sh's registry_db() resolves to.
+ACTION_REGISTRY_DB = ACTION_FORMS_DIR.parent / "registry.sqlite3"
+
+
+_ACTION_FORM_ID_RE = re.compile(r"^(?P<id>.+)-\d+$")
+
+
+def action_form_request_id(form: Path) -> str:
+    """The <request_id> herdr-action.sh encoded into `<request_id>-N.html`
+    (herdr-action.sh:405). Falls back to the whole stem for a name that
+    doesn't fit the pattern, which then simply never matches a real request.
+    """
+    m = _ACTION_FORM_ID_RE.match(form.stem)
+    return m.group("id") if m else form.stem
+
+
+def is_herdr_actions_own_serve(form: Path, request_id: str) -> bool:
+    """True only for herdr-action.sh's OWN, current call on its OWN file:
+    the caller's --request-id must name the id encoded in the filename, AND
+    that id must still be a real row in the SAME registry herdr-action.sh
+    uses (lib/run-registry.sh's action_requests table) -- not merely a
+    plausible-looking filename, which a hand copy can trivially reproduce.
+    Read-only connection; formserve never writes to the control-plane registry.
+    """
+    if not request_id or request_id != action_form_request_id(form):
+        return False
+    if not ACTION_REGISTRY_DB.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{ACTION_REGISTRY_DB}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return False
+    try:
+        row = con.execute("SELECT 1 FROM action_requests WHERE request_id = ? LIMIT 1",
+                          (request_id,)).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
 
 
 _HEADING_RE = re.compile(rb"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
@@ -573,12 +618,15 @@ def main() -> int:
         print(f"formserve: no such file: {form}", file=sys.stderr)
         return 2
 
-    # herdr-action.sh writes and answers these itself, bound to the request
-    # id via claim-once (lib/run-registry.sh); a hand-served copy can collect
-    # a human answer that herdr-action then correctly refuses as unbound to
-    # any request.
-    if form.is_relative_to(ACTION_FORMS_DIR.resolve()):
-        ar_id = form.stem.rsplit("-", 1)[0]
+    # herdr-action.sh writes and answers these itself, bound to the request id
+    # via claim-once (lib/run-registry.sh). A hand-served copy can collect a
+    # human answer that herdr-action then correctly refuses as unbound to any
+    # request -- but herdr-action.sh's OWN call on its OWN file, naming the
+    # SAME request id that is still a real row in its registry, must go
+    # through: that is this guard's only legitimate caller.
+    if form.is_relative_to(ACTION_FORMS_DIR.resolve()) \
+            and not is_herdr_actions_own_serve(form, args.request_id):
+        ar_id = action_form_request_id(form)
         print(f"formserve: {form}: herdr-action serves this form itself; "
               f"use herdr-action.sh show {ar_id} for its id", file=sys.stderr)
         return 2

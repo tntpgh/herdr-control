@@ -17,11 +17,21 @@
 set -uo pipefail
 
 FORMSERVE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/formserve.py"
+# The live path formserve.py falls back to when HERDR_STATE_ROOT is unset —
+# captured BEFORE the export below, so it is the real default regardless of
+# the sandbox this script sets up for its own subprocesses (independent
+# review, 2026-10-30: F4).
+LIVE_FORMS_DIR="${HERDR_STATE_ROOT:-$HOME/.local/state/herdr}/forms"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/formserve-title.XXXXXX")" || exit 1
 trap 'rm -rf "$WORK"' EXIT
-export HERDR_STATE_ROOT="$WORK/state"
+export HERDR_STATE_ROOT="$WORK/state" HERDR_RUN_STATE_DIR="$WORK/runs"
 FORMS_DIR="$HERDR_STATE_ROOT/forms"
 fails=0
+
+live_snapshot() {
+  python3 -c "import os,sys; d=sys.argv[1]; print(sorted(os.listdir(d)) if os.path.isdir(d) else [])" "$LIVE_FORMS_DIR"
+}
+live_before="$(live_snapshot)"
 
 form_body() {  # <heading-tag> <heading-text> <title-tag-or-empty>
   local tag=$1 heading=$2 title=$3
@@ -114,11 +124,13 @@ else
   not_ok "--title override: rc=$rc title=$(jq -r .title "$rec" 2>/dev/null)"
 fi
 
-# 5. a file under $HERDR_STATE_ROOT/runs/action-forms/ is herdr-action's own
+# 5. a file under run_state_root()/action-forms/ (HERDR_RUN_STATE_DIR, NOT
+#    HERDR_STATE_ROOT -- lib/run-registry.sh:50-52) is herdr-action's own
 #    claim-once form; formserve must refuse to hand-serve a copy of it (a
 #    hand-served copy collected a human answer herdr-action then correctly
-#    rejected as unbound to any request).
-action_forms_dir="$HERDR_STATE_ROOT/runs/action-forms"
+#    rejected as unbound to any request). No --request-id here, so it can
+#    never match a registry row even if one existed.
+action_forms_dir="$HERDR_RUN_STATE_DIR/action-forms"
 mkdir -p "$action_forms_dir"
 cp "$WORK/match.html" "$action_forms_dir/req-55512-1.html"
 rm -rf "$FORMS_DIR"; mkdir -p "$FORMS_DIR"
@@ -148,6 +160,12 @@ else
   not_ok "false-positive: identical content outside action-forms/ was refused: $(printf '%s' "$out" | head -2)"
 fi
 
+live_after="$(live_snapshot)"
+if [ "$live_after" = "$live_before" ]; then
+  ok "live forms dir unchanged ($LIVE_FORMS_DIR)"
+else
+  not_ok "live forms dir changed: before=$live_before after=$live_after"
+fi
 if [ "$fails" -eq 0 ]; then
   echo "# all checks passed"
   exit 0

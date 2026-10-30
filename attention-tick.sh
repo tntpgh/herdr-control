@@ -261,8 +261,8 @@ _attn_maybe_escalate() {                # run_id task_id pane conductor_pane_id 
 # Terrence never gets an unstyled white page on the decisions hub. The page
 # carries what he needs to act without opening a terminal: the worker, why it
 # is here, and the exact command the worker is waiting on.
-_attn_serve_form() {                    # pane task_id reason label command_text
-  local pane="$1" task_id="$2" reason="$3" label="$4" cmd="$5"
+_attn_serve_form() {                    # run_id task_id pane reason label command_text
+  local run_id="$1" task_id="$2" pane="$3" reason="$4" label="$5" cmd="$6"
   local dir="${HERDR_ATTENTION_FORM_DIR:-$(run_state_root)/attention-forms}"
   mkdir -p "$dir" 2>/dev/null || return 0
   local f="$dir/attention-$(date -u +%Y%m%dT%H%M%SZ)-$$.html"
@@ -302,14 +302,29 @@ window.submitAnswers({acknowledged:true,pane:"$(_attn_esc "$pane")",task_id:"$(_
 HTML
   local formserve="${HERDR_ATTENTION_FORMSERVE:-$here/formserve.py}"
   local python="${HERDR_ATTENTION_PYTHON:-python3}"
-  ( "$python" "$formserve" "$f" --timeout 86400 --no-open >/dev/null 2>&1 & disown ) 2>/dev/null
+  local title="Attention needed: ${label:-$task_id} ($pane)"
+  local log="$f.serve.log"
+  ( "$python" "$formserve" "$f" --timeout 86400 --no-open --title "$title" </dev/null >"$log" 2>&1
+    rc=$?
+    # >=2: formserve itself refused to start (config error -- e.g. a shape
+    # unanswerable_reasons() rejects). 1 is a normal expiry, not a refusal;
+    # swallowing either used to mean this page silently never reached the
+    # human with no trace anywhere (independent review, 2026-10-30).
+    if [ "$rc" -ge 2 ]; then
+      append_event "$run_id" "$task_id" attention_form_serve_refused \
+        "$(jq -nc --arg p "$pane" --arg f "$f" --arg err "$(tail -c 2000 "$log" 2>/dev/null)" \
+           '{pane:$p, form_path:$f, stderr:$err}')" \
+        "attnformref_$(basename "$f")" >/dev/null 2>&1 || true
+    fi
+    rm -f "$log" 2>/dev/null
+  ) 2>/dev/null & disown
 }
 
 _attn_maybe_form() {                    # run_id task_id pane key reason label command_text
   local run_id="$1" task_id="$2" pane="$3" key="$4" reason="$5" label="$6" cmd="$7"
   claim_once "attn_form_${key}" "$run_id" "$task_id" "attention_form_served" \
     "$(jq -nc --arg p "$pane" --arg k "$key" --arg r "$reason" '{pane:$p, key:$k, reason:$r}')" || return 0
-  _attn_serve_form "$pane" "$task_id" "$reason" "$label" "$cmd"
+  _attn_serve_form "$run_id" "$task_id" "$pane" "$reason" "$label" "$cmd"
 }
 
 # The owner answering without the exact prompt clearing yet still counts as
