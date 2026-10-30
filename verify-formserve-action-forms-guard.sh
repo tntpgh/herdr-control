@@ -35,6 +35,7 @@ ok() { printf '  ok   %s\n' "$1"; }
 not_ok() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
 . "$here/lib/run-registry.sh"
+. "$here/lib/action-request.sh"
 
 accept_local_task_authorization guard-trusted w9:p9 conductor-birth "$wt" '' >/dev/null \
   || { not_ok "setup: accept_local_task_authorization"; exit 1; }
