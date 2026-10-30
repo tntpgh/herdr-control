@@ -339,12 +339,21 @@ if [ -n "$bound_request_id" ]; then
     echo "herdr-select: no pinned python3 interpreter can verify the bound request." >&2
     exit 8;
   }
+  # fix/decline-nonfs-target: a Deny executes nothing, so the verified
+  # proposal's target need not be a safe-to-write filesystem path -- only
+  # skips _canonical_target's target-SHAPE checks (scheme/symlink/
+  # worktree-boundary/directory/hardlink); occurrence identity, lifecycle,
+  # the exact request/digest/call-id binding and the payload hash are
+  # unchanged. Approve never sets this, so proc:// (and any other
+  # non-filesystem or unsafe target) stays rejected on Approve.
   _bound_proposal() {
+    _decline_flag=""
+    [ "$label" = Deny ] && _decline_flag="--decline"
     "$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
       --run "$own_run" --task "$own_task" --pane "$pane" --birth "$own_birth" \
       --worktree "$own_worktree" --approval-request-id "$bound_request_id" \
       --expect-arguments-digest "$bound_arguments_digest" \
-      --expect-tool-call-id "$bound_tool_call_id" --expect-sha "$bound_payload_sha"
+      --expect-tool-call-id "$bound_tool_call_id" --expect-sha "$bound_payload_sha" $_decline_flag
   }
   payload_json="$(_bound_proposal 2>/dev/null)"
   [ "$(printf '%s' "$payload_json" | jq -r '.ok == true' 2>/dev/null)" = true ] || {

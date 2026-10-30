@@ -1194,13 +1194,25 @@ def _payload_targets(tool: str, inp: object) -> list[str] | str:
     return targets or "cannot tell which file this edit touches"
 
 
-def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str) -> tuple[str, str]:
+def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str, *, decline: bool = False) -> tuple[str, str]:
     """(canonical path, "") or ("", refusal). Resolved NOW, so a symlink or
-    directory swapped in after the proposal was recorded is caught."""
+    directory swapped in after the proposal was recorded is caught.
+
+    decline=True (fix/decline-nonfs-target): a Deny executes nothing, so the
+    target-SHAPE checks below -- scheme, symlink, worktree-boundary,
+    directory, hardlink -- exist only to stop an APPROVE from resolving to
+    somewhere unsafe, and are skipped. Everything else that runs before and
+    after this call (occurrence match, identity_verified, lifecycle/terminal-
+    state, the exact approval_request_id + digest + tool_call_id binding, the
+    payload hash, audit logging) is unchanged -- this only stops a
+    non-filesystem or otherwise malformed target (e.g. OMP's own deferred
+    `write` to proc://bg_N/kill) from becoming an un-declinable stuck prompt."""
     p = raw.strip()
     if tool == "write" and p in NOTEPAD_XD:
         return p, ""
-    if not p or _SCHEME.match(p) or p[0] in "~@[":
+    if not p:
+        return "", f"target {raw!r} is not a plain filesystem path"
+    if not decline and (_SCHEME.match(p) or p[0] in "~@["):
         return "", f"target {raw!r} is not a plain filesystem path"
     if ".." in p.split("/"):
         # normpath would collapse `link/..` textually while the kernel follows
@@ -1210,6 +1222,8 @@ def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str) -> tuple[str,
         if not os.path.isabs(cwd):
             return "", f"relative target {raw!r} but the occurrence recorded no absolute cwd"
         p = os.path.join(cwd, p)
+    if decline:
+        return os.path.normpath(p), ""
     lexical = os.path.normpath(p)
     if os.path.islink(lexical):
         return "", f"target {lexical} is a symlink"
@@ -1233,11 +1247,16 @@ def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str) -> tuple[str,
 def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
                    screen_prompt_id: str, worktree: str, tool: str = "", expect_sha: str = "",
                    approval_request_id: str = "", expect_arguments_digest: str = "",
-                   expect_tool_call_id: str = "") -> dict:
+                   expect_tool_call_id: str = "", decline: bool = False) -> dict:
     """Verify the complete write/edit payload behind the prompt now on screen
     (#277). Fails closed on every missing, malformed, truncated, substituted,
     stale or out-of-scope case; `ok: true` only when the file hashes to the
-    registry row of the one unresolved occurrence that pane's screen shows."""
+    registry row of the one unresolved occurrence that pane's screen shows.
+
+    decline=True (fix/decline-nonfs-target): every check here still runs --
+    occurrence/identity, lifecycle, the exact binding, the payload hash --
+    only _canonical_target's target-SHAPE validation is skipped, since a
+    Deny executes nothing. See _canonical_target's docstring."""
     def no(reason: str) -> dict:
         return {"ok": False, "reason": reason, "checked_at_ms": int(time.time() * 1000)}
 
@@ -1336,7 +1355,7 @@ def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pan
         return no("the worker worktree is unknown or missing")
     targets: list[str] = []
     for raw in raw_targets:
-        canon, err = _canonical_target(raw, rec.get("cwd") or "", wt_real, rtool.lower())
+        canon, err = _canonical_target(raw, rec.get("cwd") or "", wt_real, rtool.lower(), decline=decline)
         if err:
             return no(err)
         if canon not in targets:
@@ -1508,6 +1527,9 @@ def main(argv: list[str]) -> int:
     s.add_argument("--approval-request-id", default="")
     s.add_argument("--expect-arguments-digest", default="")
     s.add_argument("--expect-tool-call-id", default="")
+    s.add_argument("--decline", action="store_true",
+                    help="skip target-SHAPE validation (symlink/worktree-boundary/hardlink/directory/scheme); "
+                         "a Deny executes nothing, so it does not need a safe-to-write target")
     s.add_argument("--show", action="store_true")
 
     s = sub.add_parser("pending-bound")
@@ -1613,7 +1635,7 @@ def main(argv: list[str]) -> int:
                                  worktree=args.worktree, tool=args.tool, expect_sha=args.expect_sha,
                                  approval_request_id=args.approval_request_id,
                                  expect_arguments_digest=args.expect_arguments_digest,
-                                 expect_tool_call_id=args.expect_tool_call_id)
+                                 expect_tool_call_id=args.expect_tool_call_id, decline=args.decline)
             if args.show:
                 sys.stdout.write(_format_show(out))
                 return 0
