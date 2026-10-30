@@ -114,6 +114,40 @@ else
   not_ok "--title override: rc=$rc title=$(jq -r .title "$rec" 2>/dev/null)"
 fi
 
+# 5. a file under $HERDR_STATE_ROOT/runs/action-forms/ is herdr-action's own
+#    claim-once form; formserve must refuse to hand-serve a copy of it (a
+#    hand-served copy collected a human answer herdr-action then correctly
+#    rejected as unbound to any request).
+action_forms_dir="$HERDR_STATE_ROOT/runs/action-forms"
+mkdir -p "$action_forms_dir"
+cp "$WORK/match.html" "$action_forms_dir/req-55512-1.html"
+rm -rf "$FORMS_DIR"; mkdir -p "$FORMS_DIR"
+out=$(python3 "$FORMSERVE" "$action_forms_dir/req-55512-1.html" --port 0 --no-open --timeout 1 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] \
+  && printf '%s' "$out" | grep -q "herdr-action serves this form itself" \
+  && printf '%s' "$out" | grep -q "herdr-action.sh show req-55512 for its id"; then
+  ok "a form under runs/action-forms/ is refused (exit 2), names req-55512"
+else
+  not_ok "runs/action-forms/ form: expected exit 2 + id in message, got exit $rc: $(printf '%s' "$out" | head -2)"
+fi
+if [ -z "$(ls -A "$FORMS_DIR" 2>/dev/null)" ]; then
+  ok "action-forms refusal registered nothing"
+else
+  not_ok "action-forms refusal left state behind: $(ls "$FORMS_DIR")"
+fi
+
+# 6. positive control: the identical bytes served from OUTSIDE action-forms/
+#    still serve fine — the guard is path-scoped, not a blanket content block.
+rm -rf "$FORMS_DIR"; mkdir -p "$FORMS_DIR"
+out=$(python3 "$FORMSERVE" "$WORK/match.html" --port 0 --no-open --timeout 1 2>&1)
+rc=$?
+if [ "$rc" -ne 2 ]; then
+  ok "the same bytes served from outside action-forms/ are not refused"
+else
+  not_ok "false-positive: identical content outside action-forms/ was refused: $(printf '%s' "$out" | head -2)"
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "# all checks passed"
   exit 0

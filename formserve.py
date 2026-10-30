@@ -376,6 +376,11 @@ def deliver(target: str, url: str, answers: dict) -> None:
 # hub treats "open but the port no longer answers" as gone. Registry failures
 # never affect the form itself — the human's page comes first.
 FORMS_DIR = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr")) / "forms"
+# herdr-action.sh writes and answers its own action-request forms here
+# (run_state_root()/action-forms, lib/run-registry.sh); formserve must never
+# serve a hand-picked copy of one, since herdr-action's claim-once answer
+# path is bound to the request id, not to this file.
+ACTION_FORMS_DIR = FORMS_DIR.parent / "runs" / "action-forms"
 
 
 _HEADING_RE = re.compile(rb"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
@@ -567,6 +572,17 @@ def main() -> int:
     if not form.is_file():
         print(f"formserve: no such file: {form}", file=sys.stderr)
         return 2
+
+    # herdr-action.sh writes and answers these itself, bound to the request
+    # id via claim-once (lib/run-registry.sh); a hand-served copy can collect
+    # a human answer that herdr-action then correctly refuses as unbound to
+    # any request.
+    if form.is_relative_to(ACTION_FORMS_DIR.resolve()):
+        ar_id = form.stem.rsplit("-", 1)[0]
+        print(f"formserve: {form}: herdr-action serves this form itself; "
+              f"use herdr-action.sh show {ar_id} for its id", file=sys.stderr)
+        return 2
+
     raw_html = form.read_bytes()
 
     # Refuse to serve a form nobody can answer. A configuration error, so it
