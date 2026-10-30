@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hub boundary regressions: python3 verify-hub.py (stdlib, mock secrets/DB only)."""
 import contextlib
+import fcntl
 import datetime as dt
 import importlib.util
 import io
@@ -2227,6 +2228,201 @@ class SentinelTrend(unittest.TestCase):
             status="degraded", failed=["rating_usefulness"])
         self.assertEqual(loop["outcome"], "degraded")
         self.assertIn("failed signals: rating_usefulness", loop["detail"])
+
+
+class FormServerIdentity(unittest.TestCase):
+    """A reused port must not keep a stale form id reading as alive.
+
+    20261029T141355-8737 and 20261029T141620-8737 (Terrence, 2026-10-29)
+    both died without answering, but `port_open(8737)` kept returning True
+    once a THIRD, unrelated run (20261029T141644-8737) later listened on
+    the same port -- `port_open()` alone proves nothing about WHICH
+    process answers there. A bare recorded `pid` is not enough either
+    (conductor, 2026-10-29): pid numbers are reusable. `_form_server_alive()`
+    requires an flock held on `<id>.lock` for the process's whole lifetime
+    -- the kernel releases it the instant that exact process exits or dies,
+    immune to the pid being later reused by anything unrelated. These pin
+    that binding at both call sites that used to trust `port_open()` (or a
+    bare pid) alone: `forms_data()`'s gone-status derivation and
+    `_loop_decisions()`'s open-with-url inclusion.
+    """
+
+    def _form(self, forms_dir, *, form_id, port, status="open", loops_key=None,
+              hub_servable=False):
+        row = {"id": form_id, "title": "t", "url": f"http://127.0.0.1:{port}",
+               "port": port, "pid": 999999, "status": status, "token": "tok",
+               "form_path": str(forms_dir / f"{form_id}.srcform"),
+               "created_at": 0, "expires_at": None}
+        (forms_dir / f"{form_id}.json").write_text(json.dumps(row))
+        if hub_servable:
+            (forms_dir / f"{form_id}.html").write_text("<html><body>x</body></html>")
+        if loops_key:
+            (forms_dir / f"{form_id}.key").write_text(loops_key)
+        return row
+
+    def _hold_lock(self, forms_dir, form_id):
+        """Stand-in for formserve.py's own long-held flock: acquired here,
+        in the TEST process, to simulate "the registering run is still
+        alive." flock() is scoped to the open file description, not the
+        process, so a second, independent open+trylock on the same path
+        genuinely conflicts even from within the same process."""
+        fh = open(forms_dir / f"{form_id}.lock", "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh  # caller keeps it open for "alive"; closes it for "died"
+
+    def _run(self, forms_dir, fn):
+        orig_forms_dir, orig_port_open = hub.FORMS_DIR, hub.port_open
+        hub.FORMS_DIR = forms_dir
+        hub.port_open = lambda *a, **k: True  # the port IS open -- reused, not this form's
+        try:
+            return fn()
+        finally:
+            hub.FORMS_DIR, hub.port_open = orig_forms_dir, orig_port_open
+
+    def test_not_hub_servable_form_with_no_lock_goes_gone_even_if_port_is_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, hub_servable=False)
+            data = self._run(forms_dir, hub.forms_data)
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141355-8737"], "gone")
+
+    def test_not_hub_servable_form_with_a_released_lock_goes_gone(self):
+        """The lockfile exists -- the run that registered it DID hold it --
+        but it has since exited and released it. A bare `os.kill(pid, 0)`
+        on a REUSED pid could have read this as alive; the lock cannot."""
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, hub_servable=False)
+            fh = self._hold_lock(forms_dir, "20261029T141355-8737")
+            fh.close()  # released, as a real process exiting would
+            data = self._run(forms_dir, hub.forms_data)
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141355-8737"], "gone")
+
+    def test_not_hub_servable_form_with_a_held_lock_stays_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141644-8737", port=8737, hub_servable=False)
+            fh = self._hold_lock(forms_dir, "20261029T141644-8737")
+            try:
+                data = self._run(forms_dir, hub.forms_data)
+            finally:
+                fh.close()
+        statuses = {f["id"]: f["status"] for f in data["history"] + data["open"]}
+        self.assertEqual(statuses["20261029T141644-8737"], "open")
+
+    def test_loop_decisions_does_not_offer_a_url_for_a_port_reused_by_a_dead_forms_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141355-8737", port=8737, loops_key="k1")
+            out = self._run(forms_dir, hub._loop_decisions)
+        self.assertEqual(out.get("k1"), {}, "a released lock behind a reused port must not surface a url")
+
+    def test_loop_decisions_offers_a_url_when_the_registering_run_actually_holds_its_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261029T141644-8737", port=8737, loops_key="k1")
+            fh = self._hold_lock(forms_dir, "20261029T141644-8737")
+            try:
+                out = self._run(forms_dir, hub._loop_decisions)
+            finally:
+                fh.close()
+        self.assertEqual(out["k1"], {"status": "open", "url": "http://127.0.0.1:8737"})
+
+
+class WithdrawnFormsHidden(unittest.TestCase):
+    """A withdrawn form is resolved and unanswerable -- herdr-action.sh's
+    _ha_retire_form already recorded why, in withdrawn_reason/withdrawn_from.
+    Before this fix every non-open status, including withdrawn, fell into
+    "history" and stayed there indefinitely (the 30-row cap meant a burst of
+    withdrawals could even crowd out real answered/declined history)."""
+
+    def _form(self, forms_dir, *, form_id, status, hub_servable=False):
+        row = {"id": form_id, "title": "t", "url": "http://127.0.0.1:9", "port": 9,
+               "pid": 999999, "status": status, "token": "tok",
+               "form_path": str(forms_dir / f"{form_id}.srcform"),
+               "created_at": 0, "expires_at": None}
+        if status == "withdrawn":
+            row.update(withdrawn_reason="task ended before a decision",
+                       withdrawn_from="open", withdrawn_at=0)
+        (forms_dir / f"{form_id}.json").write_text(json.dumps(row))
+        if hub_servable:
+            (forms_dir / f"{form_id}.html").write_text("<html><body>x</body></html>")
+        return row
+
+    def _run(self, forms_dir):
+        orig = hub.FORMS_DIR
+        hub.FORMS_DIR = forms_dir
+        try:
+            return hub.forms_data()
+        finally:
+            hub.FORMS_DIR = orig
+
+    def test_withdrawn_form_excluded_from_open_and_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261030T000000-1", status="withdrawn")
+            self._form(forms_dir, form_id="20261030T000001-2", status="answered")
+            data = self._run(forms_dir)
+        ids = {f["id"] for f in data["open"] + data["history"]}
+        self.assertNotIn("20261030T000000-1", ids,
+                          "a withdrawn form must not appear in open or history")
+        self.assertIn("20261030T000001-2", ids, "an answered form still appears in history")
+
+    def test_withdrawn_form_does_not_inflate_open_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            forms_dir = Path(d)
+            self._form(forms_dir, form_id="20261030T000002-3", status="open", hub_servable=True)
+            self._form(forms_dir, form_id="20261030T000003-4", status="withdrawn")
+            data = self._run(forms_dir)
+        self.assertEqual(data["open_count"], 1)
+        self.assertEqual({f["id"] for f in data["open"]}, {"20261030T000002-3"})
+
+
+class DraftFormIdentity(unittest.TestCase):
+    """Independent audit, 2026-10-29: Path(form_path).stem alone let two
+    forms with the same basename -- different directories, different
+    upstream requests -- share a sessionStorage draft key on the hub's
+    single origin (every served form lives at the same http://127.0.0.1:8600
+    origin). _draft_form_identity() must bind to request_id AND the full
+    form_path, neither alone."""
+
+    def test_stem_alone_would_have_collided(self):
+        # Pins the actual historical bug: these two rows are genuinely
+        # different forms (different directory, different request), but
+        # Path(form_path).stem cannot tell them apart.
+        self.assertEqual(Path("/tmp/dirA/same.html").stem, Path("/tmp/dirB/same.html").stem)
+
+    def test_same_basename_different_request_id_is_a_different_identity(self):
+        row_a = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_aaa"}
+        row_b = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_bbb"}
+        self.assertNotEqual(hub._draft_form_identity("f1", row_a),
+                             hub._draft_form_identity("f2", row_b))
+
+    def test_same_basename_same_request_id_different_directory_is_still_different(self):
+        # request_id alone is not enough either: a reused request_id string
+        # against two genuinely different source files must not collide.
+        row_a = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_shared"}
+        row_b = {"form_path": "/tmp/dirB/same.html", "request_id": "ar_shared"}
+        self.assertNotEqual(hub._draft_form_identity("f1", row_a),
+                             hub._draft_form_identity("f2", row_b))
+
+    def test_a_legacy_row_with_no_request_id_still_disambiguates_by_path(self):
+        # Registered before this fix shipped -- no request_id key at all.
+        row_a = {"form_path": "/tmp/dirA/same.html"}
+        row_b = {"form_path": "/tmp/dirB/same.html"}
+        ident_a = hub._draft_form_identity("f1", row_a)
+        ident_b = hub._draft_form_identity("f2", row_b)
+        self.assertNotEqual(ident_a, ident_b)
+        self.assertTrue(ident_a.startswith(":"), "an empty request_id degrades to an empty prefix, not a crash")
+
+    def test_a_restart_of_the_same_request_is_the_same_identity(self):
+        # The stable case the whole feature exists for: a restart of the
+        # SAME managed form (same source path, same upstream request) must
+        # produce the SAME key, or the draft could never be found again.
+        row = {"form_path": "/tmp/dirA/same.html", "request_id": "ar_aaa"}
+        self.assertEqual(hub._draft_form_identity("f1", row), hub._draft_form_identity("f2", row))
 
 
 class OwnersView(unittest.TestCase):

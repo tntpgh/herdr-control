@@ -392,10 +392,11 @@ Nothing here runs for a task spawned without the flag.
   Supersede records no grant of either kind. Decisions write an `approvals` row
   and `action_decided` (request id, action SHA, authority, reviewer, reason,
   form record and `form_outcome`; event timestamp), and notify the worker after
-  a pane-generation check. A conductor decision also retires the open human
-  form under the same record lock as withdrawal, resolving it by `form_path`
-  if not yet pinned; already-answered or expired forms are preserved. A human
-  answer losing the request-decision race is audited as `kept:answered:<decision>`.
+  a pane-generation check. A conductor decision also retires the open or
+  expired human form under the same record lock as withdrawal, resolving it
+  by `form_path` if not yet pinned; an already-answered form is preserved. A
+  human answer losing the request-decision race is audited as
+  `kept:answered:<decision>`.
 - **Abandoned research action**: the existing form under `runs/action-forms/`
   offers “Cancel this request (worker moved on)” alongside approve and decline,
   with no default choice. Cancellation records `superseded`, not approved.
@@ -412,11 +413,14 @@ Nothing here runs for a task spawned without the flag.
 - **Withdrawal** (`herdr-action.sh tick`, 2026-09-29): a pending request whose
   task is terminal (`completed|failed|cancelled|lost`) becomes `withdrawn`
   (authority `system`, event `action_withdrawn`) and its form record, if still
-  `open`, is flipped to `withdrawn` under `lib/record_store.py`'s lock — an
-  answered or expired record is never overwritten. Before this the tick skipped
-  inactive tasks, so such requests stayed pending forever and their forms stayed
-  listed on `/decisions` where an answer did nothing. A missing or unreadable
-  task row is left pending, never guessed at.
+  `open` or `expired`, is flipped to `withdrawn` under `lib/record_store.py`'s
+  lock — an answered record is never overwritten. Expiry alone used to leave a
+  form stuck, unwithdrawable and listed forever once its task also ended (the
+  `require_status` guard only ever accepted `open`); `claim_and_update` now
+  takes a set of acceptable source statuses. Before the original fix the tick
+  skipped inactive tasks, so such requests stayed pending forever and their
+  forms stayed listed on `/decisions` where an answer did nothing. A missing
+  or unreadable task row is left pending, never guessed at.
 - **Surfacing**: conductor route — `herdr-action.sh surface` wakes the conductor
   pane once (from the hook, detached; the hub's tick is the backstop).
   Human route — reserved requests, or conductor requests still pending after

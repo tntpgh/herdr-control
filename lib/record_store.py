@@ -33,7 +33,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 
 class NotClaimable(Exception):
@@ -65,7 +65,7 @@ def claim_and_update(
     path: Path,
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
     *,
-    require_status: str = "open",
+    require_status: str | Collection[str] | None = "open",
     indent: int = 1,
 ) -> dict[str, Any]:
     """Re-read under an exclusive lock, verify the record is still claimable,
@@ -74,17 +74,27 @@ def claim_and_update(
     The re-read inside the lock is the point: the caller's earlier read (for
     token checks, rendering) is stale by the time we get here.
 
+    `require_status` is the set of current statuses `mutate` may act on: a
+    bare string (the common case, "open") or a collection of several — a
+    withdrawal, for instance, is valid from either "open" or "expired", never
+    from "answered". `None` skips the check entirely.
+
     Raises NotClaimable when another surface already answered, FileNotFoundError
     when the record is gone, and json.JSONDecodeError when it is corrupt — all
     conditions the caller must report rather than paper over.
     """
     path = Path(path)
     lock_path = path.with_suffix(path.suffix + ".lock")
+    allowed = (
+        None if require_status is None
+        else {require_status} if isinstance(require_status, str)
+        else set(require_status)
+    )
     with open(lock_path, "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         row = json.loads(path.read_text(encoding="utf-8"))
         state = row.get("status")
-        if require_status is not None and state != require_status:
+        if allowed is not None and state not in allowed:
             raise NotClaimable(str(state), row)
         row = mutate(row)
         write_atomic(path, row, indent=indent)

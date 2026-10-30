@@ -440,7 +440,7 @@ if(fd.get("decision")==="supersede"&&!reason){f.elements.reason.focus();return}
 window.submitAnswers({request_id:"$(_ha_esc "$id")",action_sha256:"$(_ha_esc "$(_ha_field "$row" action_sha256)")",decision:fd.get("decision"),reason:reason})});</script>
 </body></html>
 HTML
-  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
+  ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open --request-id "$id" </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
   printf '%s\n' "$f"
 }
 
@@ -520,9 +520,13 @@ EOF
   fi
 }
 
-# Flip a form record open -> withdrawn under record_store's lock, so the hub
-# stops listing it and refuses an answer (409). A record already answered or
-# expired is left exactly as it is: a real answer is never overwritten.
+# Flip a form record open or expired -> withdrawn under record_store's lock,
+# so the hub stops listing it and refuses an answer (409). A record already
+# ANSWERED is left exactly as it is: a real answer is never overwritten. An
+# EXPIRED record used to be left exactly as it is too, by the same guard —
+# but expiry only means "still unanswered", so a form stuck at expired after
+# its task ended was never withdrawable and stayed listed forever. Expired is
+# now also a valid source state.
 # Prints what happened — withdrawn, kept:<status>[:<decision>], not-found,
 # error — so the withdrawal event says whether a human answer was dropped.
 _ha_retire_form() {                     # record-path reason -> outcome
@@ -532,10 +536,11 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from record_store import NotClaimable, claim_and_update
 def _withdraw(row):
-    row.update(status="withdrawn", withdrawn_reason=sys.argv[3], withdrawn_at=int(time.time() * 1000))
+    row.update(status="withdrawn", withdrawn_reason=sys.argv[3], withdrawn_at=int(time.time() * 1000),
+                withdrawn_from=row.get("status"))
     return row
 try:
-    claim_and_update(Path(sys.argv[2]), _withdraw)
+    claim_and_update(Path(sys.argv[2]), _withdraw, require_status=("open", "expired"))
     print("withdrawn")
 except NotClaimable as e:
     decision = (e.row.get("answers") or {}).get("decision") if isinstance(e.row.get("answers"), dict) else None

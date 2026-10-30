@@ -37,7 +37,9 @@ terminal.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hmac
+import html as html_module
 import json
 import os
 import re
@@ -59,6 +61,7 @@ from form_schema import parse_schema, validate_answers  # noqa: E402
 # Injected before </body> so a served page needs no boilerplate to answer back.
 SHIM = """
 <input type="hidden" id="__formserve_token" value="{{FORMSERVE_TOKEN}}">
+<input type="hidden" id="__formserve_request_id" value="{{FORMSERVE_REQUEST_ID}}">
 <script>
 (function () {
   if (window.submitAnswers) return;
@@ -93,6 +96,7 @@ SHIM = """
           ? "Cancelled. You can close this pane."
           : "Saved: " + pairs + ". You can close this pane.";
         document.body.appendChild(banner);
+        if (window.__herdrClearFormDraft) window.__herdrClearFormDraft();
         return true;
       });
     }).catch(function (e) {
@@ -107,6 +111,111 @@ SHIM = """
       throw e;
     });
   };
+})();
+</script>
+<script>
+// Draft preservation (Terrence, 2026-10-29; tightened by the conductor the
+// same day): a form restart or restyle must never silently DROP unsaved
+// edits, but must never silently APPLY one either. sessionStorage only --
+// nothing server-side, nothing auto-submitted, nothing auto-restored.
+//
+// Keyed by the request's own stable identity (the SOURCE filename, never
+// the per-run registry id -- a restart mints a brand new id, which would
+// defeat the whole point) AND a hash of the form's current semantic schema
+// (headings/legends, option values, and the field name+type set). Either
+// changing -- a different request, or the same request now asking a
+// different question -- produces a different storage key by construction,
+// so a stale draft is never even looked up: fails closed, not a migration.
+//
+// Sensitive and hidden fields are never captured: password/hidden types,
+// plus any field whose name/id/autocomplete reads as a credential.
+(function () {
+  var REQUEST_ID = (document.getElementById("__formserve_request_id") || {}).value || "";
+  var SENSITIVE_RE = /token|secret|password|passwd|credential|api[_-]?key|private[_-]?key|ssn|ccnum|card[_-]?number|cvv/i;
+  function isSensitive(el) {
+    if (el.type === "password" || el.type === "hidden") return true;
+    var ac = (el.autocomplete || "").toLowerCase();
+    if (ac === "current-password" || ac === "new-password" || ac.indexOf("cc-") === 0) return true;
+    return SENSITIVE_RE.test(el.name || "") || SENSITIVE_RE.test(el.id || "");
+  }
+  function fields() {
+    return Array.prototype.slice.call(document.querySelectorAll("input,textarea,select"))
+      .filter(function (el) { return !isSensitive(el) && (el.name || el.id); });
+  }
+  function fieldKey(el) { return el.name || el.id; }
+  function hashOf(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) { h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; }
+    return h.toString(36);
+  }
+  function schemaOf(current) {
+    // h1/h2/legend/label: a rewritten question, section heading, or option
+    // label changes this even when the underlying name/type/value does not
+    // -- "reworded questions can reuse an old draft" (independent audit,
+    // 2026-10-29) was exactly a label changing with everything else held
+    // fixed.
+    var headings = Array.prototype.slice.call(document.querySelectorAll("h1,h2,legend,label"))
+      .map(function (el) { return (el.textContent || "").trim(); });
+    // Both the VALUE and the visible text: an <option value=x>Old</option>
+    // reworded to <option value=x>New</option> has an unchanged value but a
+    // different meaning to a human.
+    var options = Array.prototype.slice.call(document.querySelectorAll("option,input[type=radio],input[type=checkbox]"))
+      .map(function (el) { return (el.value || "") + "|" + (el.textContent || "").trim(); }).sort();
+    var fieldSig = current.map(function (el) { return fieldKey(el) + ":" + el.type; }).sort();
+    return hashOf(JSON.stringify({ h: headings, o: options, f: fieldSig }));
+  }
+  var current = fields();
+  var key = "herdr-form-draft:" + REQUEST_ID + ":" + schemaOf(current);
+  function clearDraft() { try { sessionStorage.removeItem(key); } catch (e) {} }
+  function saveDraft() {
+    var data = {};
+    current.forEach(function (el) {
+      var k = fieldKey(el);
+      if (el.type === "checkbox" || el.type === "radio") { if (el.checked) data[k] = el.value; }
+      else { data[k] = el.value; }
+    });
+    try { sessionStorage.setItem(key, JSON.stringify(data)); } catch (e) {}
+  }
+  var draft = null;
+  try {
+    var raw = sessionStorage.getItem(key);
+    if (raw) draft = JSON.parse(raw);
+  } catch (e) { draft = null; }
+  // A non-empty, schema-matching draft exists -- OFFER it. Nothing is
+  // applied to a field until the human clicks Restore.
+  if (draft && Object.keys(draft).length) {
+    document.addEventListener("DOMContentLoaded", function () {
+      var bar = document.createElement("div");
+      bar.setAttribute("role", "status");
+      bar.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:99998;padding:8px 16px;" +
+        "font:600 13px system-ui,-apple-system,sans-serif;text-align:center;background:#3a5a3a;color:#fff";
+      var msg = document.createElement("span");
+      msg.textContent = "Unsaved edits found from before this page reloaded. ";
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Restore";
+      btn.style.cssText = "margin-left:8px;padding:2px 10px;font:600 12px system-ui,sans-serif;" +
+        "border:1px solid #fff;border-radius:3px;background:transparent;color:#fff;cursor:pointer";
+      btn.addEventListener("click", function () {
+        current.forEach(function (el) {
+          var k = fieldKey(el);
+          if (!(k in draft)) return;
+          if (el.type === "checkbox" || el.type === "radio") { el.checked = el.value === draft[k]; }
+          else { el.value = draft[k]; }
+        });
+        bar.textContent = "Restored.";
+        bar.style.background = "#1f6e7e";
+      });
+      bar.appendChild(msg);
+      bar.appendChild(btn);
+      document.body.insertBefore(bar, document.body.firstChild);
+    });
+  }
+  current.forEach(function (el) {
+    el.addEventListener("input", saveDraft);
+    el.addEventListener("change", saveDraft);
+  });
+  window.__herdrClearFormDraft = clearDraft;
 })();
 </script>
 """
@@ -277,7 +386,8 @@ def _title_of(html_bytes: bytes, fallback: str) -> str:
 
 
 def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
-                  token: str = "", deliver_to: str = "", schema: dict | None = None) -> Path | None:
+                  token: str = "", deliver_to: str = "", schema: dict | None = None,
+                  request_id: str = "") -> Path | None:
     """Register the form AND hand the hub a copy it can serve itself.
 
     The HTML copy plus the token are what make the decision outlive this
@@ -302,7 +412,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
             "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
             "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
-            "schema": schema or {},
+            "schema": schema or {}, "request_id": request_id,
             "created_at": int(now * 1000),
             "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
         }, indent=1))
@@ -417,6 +527,11 @@ def main() -> int:
                     help="seconds to wait for a submit (default 14400 = 4h; 0 = forever)")
     ap.add_argument("--no-open", action="store_true",
                     help="do not open the Herdr browser pane; just print the URL")
+    ap.add_argument("--request-id", default="",
+                    help="the upstream request this form answers (herdr-action.sh's "
+                         "action_requests.request_id); bound into the draft-preservation "
+                         "key alongside the form's own path so two forms that happen to "
+                         "share a basename never share a draft")
     args = ap.parse_args()
 
     form = Path(args.form).expanduser().resolve()
@@ -446,7 +561,9 @@ def main() -> int:
     # — generated fresh every invocation so it cannot be reused across runs or
     # guessed from a previous one.
     token = secrets.token_urlsafe(24)
-    shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token).encode()
+    shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token) \
+               .replace("{{FORMSERVE_REQUEST_ID}}",
+                        html_module.escape(f"{args.request_id}:{form}", quote=True)).encode()
 
     raw_html = form.read_bytes()
     # Required-field schema derived from the SOURCE markup, not the page's own
@@ -479,8 +596,21 @@ def main() -> int:
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
     registry = register_form(form, raw_html, url, port, args.timeout,
-                             token=token, deliver_to=args.deliver or "", schema=schema)
+                             token=token, deliver_to=args.deliver or "", schema=schema,
+                             request_id=args.request_id)
     result["registry"] = registry            # the handler claims against it before any 200
+    # Held open for this process's entire lifetime, never closed: the kernel
+    # releases the lock the instant this process exits or dies, which is what
+    # lets hub.py tell "this exact run is still alive" from "a LATER,
+    # unrelated run now happens to be reusing this id's port" -- a pid number
+    # alone is reusable across runs, this lock is not (conductor, 2026-10-29).
+    if registry is not None:
+        try:
+            _draft_lock_fh = open(FORMS_DIR / f"{registry.stem}.lock", "w")
+            fcntl.flock(_draft_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            print(f"formserve: liveness lock not held ({e}); this form may read as "
+                  "gone sooner than it should", file=sys.stderr)
 
     if not args.no_open:
         open_in_pane(url)
