@@ -4,10 +4,10 @@ name: queue-supervisor
 # result_availability code over disposable temp stores. No network, no secrets.
 on:
   pull_request:
-    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", ".github/workflows/queue-supervisor.yml"]
+    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", "owner-dispatch-issue.py", "factory-status.py", "verify-factory-on.py", "verify-owner-dispatch.py", ".github/workflows/queue-supervisor.yml"]
   push:
     branches: [main]
-    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", ".github/workflows/queue-supervisor.yml"]
+    paths: ["lib/queue_supervisor.py", "queue-supervisor.py", "verify-queue-supervisor.py", "verify-queue-supervisor-e2e.py", "lib/owner_dispatch.py", "lib/owner_dispatch_auth.py", "lib/owner_lease.py", "lib/owner_lease_delivery.py", "lib/result_availability.py", "owner-dispatch.py", "hub.py", "owner-dispatch-issue.py", "factory-status.py", "verify-factory-on.py", "verify-owner-dispatch.py", ".github/workflows/queue-supervisor.yml"]
 
 permissions:
   contents: read
@@ -25,3 +25,5 @@ jobs:
           python-version: "3.12"
       - run: python3 verify-queue-supervisor.py
       - run: python3 verify-queue-supervisor-e2e.py
+      # Factory-on: build-standing-form, kill switch, factory-status (offline fixtures).
+      - run: python3 verify-factory-on.py

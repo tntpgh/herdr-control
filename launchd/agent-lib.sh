@@ -637,6 +637,40 @@ render_hub_plist() {
     "$tpl" > "$out"
 }
 
+# The owner-dispatch / queue-supervisor ("factory") keys of the hub's
+# environment. The template deliberately carries none of them: turning the
+# factory on is a separate human decision, never an install default. But
+# install.sh --hub re-renders the WHOLE plist from that template, so every
+# documented repair (restart.sh:36, `install.sh --hub --bridge --auth --apply`)
+# used to silently turn a running factory OFF.
+HUB_FACTORY_ENV_KEYS="HERDR_OWNER_DISPATCH HERDR_OWNER_DISPATCH_AUTH_DB HERDR_OWNER_LEASE_DB
+HERDR_OWNER_LEASE_DELIVERY HERDR_OWNER_LEASE_REAP HERDR_QUEUE_SUPERVISOR HERDR_QUEUE_SUPERVISOR_LANES
+HERDR_QUEUE_SUPERVISOR_ROOT HERDR_QUEUE_SUPERVISOR_STANDING HERDR_RESULT_AVAILABILITY
+HERDR_RESULT_AVAILABILITY_DB HERDR_RESULT_AVAILABILITY_JOURNAL HERDR_RESULT_AVAILABILITY_ROOTS"
+
+# carry_hub_factory_env <live-plist> <rendered-tmp> — copy, verbatim, each
+# HUB_FACTORY_ENV_KEYS entry the LIVE plist already sets into the freshly
+# rendered temp plist. Never adds a key the live plist lacks (a re-render can
+# never turn the factory on) and never copies any other key. No live plist
+# (first install) is a no-op; an unparseable live plist is warned about and
+# carried from nothing, so the repair this render exists for still proceeds.
+# Returns 1 when a key the live plist sets could not be written into the
+# temp file: the caller must then NOT stage it, so the live plist is never
+# replaced by one that silently dropped the factory.
+carry_hub_factory_env() {
+  local live="$1" tmp="$2" k v
+  [ -f "$live" ] || return 0
+  if ! plutil -lint "$live" >/dev/null 2>&1; then
+    echo "  ! $live does not parse — factory env keys NOT carried into the re-render" >&2
+    return 0
+  fi
+  for k in $HUB_FACTORY_ENV_KEYS; do
+    v="$(plutil -extract "EnvironmentVariables.$k" raw -o - "$live" 2>/dev/null)" || continue
+    plutil -replace "EnvironmentVariables.$k" -string "$v" "$tmp" 2>/dev/null \
+      || { echo "  ! could not carry $k into $tmp" >&2; return 1; }
+  done
+}
+
 # stage_plist <rendered-tmp> <live-path> — the only safe way to put a
 # rendered plist where launchd (or the next reload_agent) will find it.
 # `render_hub_plist` must be called with a TEMP `out` path, never the live
