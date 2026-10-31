@@ -32,6 +32,23 @@ NON_TERMINAL_STATES = ("starting", "running", "blocked")
 # Changing it is a reviewed code change plus a new launcher release.
 ORCH_CHILD_CAP = 2
 
+# ---- conductor weekly authorization (docs/design/weekly-conductor-
+# authorization.md) -- a bounded, human-minted standing grant letting the
+# live Main conductor keep acting across a multi-day window without a fresh
+# daily confirm-form, used by: (1) owner-lease-recover.py's automated
+# `--conductor-grant` tick (clamps the recovered lease to at most this
+# grant's own expires_at, never the full 24h ceiling on its say-so alone),
+# and (2) conductor-handover.sh's recipient-side check (any transfer that
+# would make live Main a task's conductor draws against this grant's
+# CONDUCTOR_HANDOVER_CAP). Deliberately hard-coded, never env-overridable --
+# the mint command (grant-conductor-week.sh) is the one reviewed place these
+# numbers may change, exactly like RESIDENT_TTL_MS_MAX/ORCH_CHILD_CAP above.
+CONDUCTOR_WEEK_LABEL = "conductor"
+CONDUCTOR_WEEK_TTL_MS = 120 * 60 * 60 * 1000       # 120h: the fixed grant window: build computes it, never a caller choice
+CONDUCTOR_WEEK_CONFIRM_WINDOW_MS = 60 * 60 * 1000  # issue must land within 1h of the previewed build or the preview is stale
+CONDUCTOR_HANDOVER_CAP = 10                        # at most this many cross-task/to-Main handovers may draw on one grant
+CONDUCTOR_WEEK_REDEMPTION_TTL_MS = 5 * 60 * 1000   # per-call --conductor-grant token, mirrors RESIDENT_REDEMPTION_TTL_MS
+
 
 class Refused(ValueError):
     pass
@@ -501,6 +518,211 @@ def claim_resident_redemption(db, token_command_id, repo, job_class):
     return grant_command_id
 
 
+def expected_conductor_week_manifest():
+    return canonical({"labels": [CONDUCTOR_WEEK_LABEL], "handover_cap": CONDUCTOR_HANDOVER_CAP})
+
+
+def accept_conductor_week(db, command_id, minting_marker, reason, issued_at_ms, expires_at_ms):
+    """Inserts the STANDING weekly grant row. Called ONLY from
+    grant-conductor-week.sh's `issue` step, which already read back an
+    ANSWERED, digest-matching preview file — issued_at/expires_at here are
+    therefore the exact values T previewed and approved, never a fresh
+    `now()` computed at issue time (that would let the window silently
+    drift between preview and insert). `minting_marker` is a descriptive,
+    non-pane identity (T runs `build` from OUTSIDE herdr, caller_pane_
+    from_ancestry rc=2 — there is no pane to bind to); it is recorded for
+    audit only, never compared against anything live."""
+    for key, value in (("command id", command_id), ("minting marker", minting_marker), ("reason", reason)):
+        identifier(value, key)
+    try:
+        issued, expires = int(issued_at_ms), int(expires_at_ms)
+    except (TypeError, ValueError):
+        raise Refused("invalid conductor weekly authorization window") from None
+    if issued <= 0 or expires - issued != CONDUCTOR_WEEK_TTL_MS:
+        raise Refused("conductor weekly authorization window must be exactly the fixed TTL")
+    expected = expected_conductor_week_manifest()
+    payload = {"minting_marker": minting_marker, "reason": reason, "effective_scope": parse(expected)}
+    payload_hash = digest(canonical(payload))
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, command_id)
+    if previous:
+        db.rollback()
+        # docs/design/weekly-conductor-authorization.md (h) step 3 / (g)
+        # item 19: "the insert is CAS-keyed on that digest never having
+        # been consumed before (single-use...)" -- this is NOT the
+        # generic same-payload-is-idempotent-retry convention most other
+        # accept_* adapters in this file use (deliberately, for THEIR
+        # callers' retry-safety). A weekly grant's command_id is derived
+        # deterministically from the answered form's own id
+        # (issue_main(): f"conductor_week_{form_id}"), so a SAME-payload
+        # collision here means exactly one thing: this exact approved
+        # form has already been issued once -- re-presenting it (replay,
+        # or two issue attempts racing on the same answered form) must
+        # refuse, never silently re-report the first mint as a second
+        # success. A DIFFERENT-payload collision (a command_id reused by
+        # something else entirely) refuses for the same original reason
+        # as before. Both branches fold into one refusal: there is no
+        # legitimate reason for a second call to ever see a non-empty
+        # `previous` here. Checked inside the SAME BEGIN IMMEDIATE this
+        # function already opened, so a genuinely concurrent double-issue
+        # of one form is refused too, not just a sequential replay.
+        if previous["source"] != "conductor_weekly_authorization" or previous["payload_sha256"] != payload_hash:
+            raise Refused("conductor weekly authorization command id already has a different source")
+        raise Refused("conductor weekly authorization already issued for this exact window (single-use)")
+    claims = {"version": 1, "source": "conductor_weekly_authorization", "command_id": command_id,
+              "op": "conductor_week_grant", "remote_task_id": "", "requester_actor": minting_marker,
+              "actor_pane_birth": "outside_herdr", "requester_client": "local_process_ancestry",
+              "scope": "conductor_weekly_authorization", "repo": "", "mode": "", "reason": reason,
+              "effective_scope": parse(expected), "payload_sha256": payload_hash,
+              "issued_at": issued, "expires_at": expires}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def read_conductor_week(db):
+    """Most recent accepted, unexpired conductor_weekly_authorization row,
+    or {} if none/expired -- same read-only, revocation-sentinel-agnostic
+    shape as read_resident_for_repo (the revocation sentinel is a bash-side
+    file check, lib/run-registry.sh conductor_week_revoked, applied by every
+    caller of this on top of the read)."""
+    row = db.execute(
+        """SELECT * FROM task_authorizations
+           WHERE source='conductor_weekly_authorization' AND status='accepted' AND expires_at>?
+           ORDER BY issued_at DESC LIMIT 1""",
+        (now_ms(),)).fetchone()
+    if row is None:
+        return {}
+    _check_source(row)
+    return public(row)
+
+
+# ---- conductor weekly redemption token (mirrors resident_escalation_
+# redemption exactly): the standing grant's own command_id is never handed
+# to owner-lease-recover.py directly -- a fresh, short-TTL, single-use token
+# is minted per automated-tick attempt, carrying the CLAMP (min(now+24h,
+# grant.expires_at)) the tick already computed, so owner-lease-recover.py
+# need not re-read the standing grant itself.
+def accept_conductor_redemption(db, token_command_id, grant_command_id, label, clamp_expires_at_ms):
+    for key, value in (("token command id", token_command_id), ("grant command id", grant_command_id)):
+        identifier(value, key)
+    identifier(label, "conductor redemption label")
+    try:
+        clamp_expires = int(clamp_expires_at_ms)
+    except (TypeError, ValueError):
+        raise Refused("invalid conductor redemption clamp") from None
+    scope = {"grant_command_id": grant_command_id, "label": label, "clamp_expires_at": clamp_expires}
+    expected = canonical(scope)
+    payload_hash = digest(expected)
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, token_command_id)
+    if previous:
+        db.rollback()
+        raise Refused("conductor redemption token command id collision")
+    issued = now_ms()
+    claims = {"version": 1, "source": "conductor_weekly_redemption", "command_id": token_command_id,
+              "op": "conductor_redemption", "remote_task_id": "", "requester_actor": "conductor_week:" + grant_command_id,
+              "actor_pane_birth": "conductor-redemption", "requester_client": "conductor_weekly_authorization",
+              "scope": "conductor_weekly_redemption", "repo": "", "mode": "",
+              "grant_command_id": grant_command_id, "label": label, "clamp_expires_at": clamp_expires,
+              "effective_scope": parse(expected), "payload_sha256": payload_hash,
+              # §(f) item 4 / §(g) item 14: the token's OWN validity window
+              # must never outlive the grant that authorized it either -- a
+              # token minted near the end of a 120h grant does not get its
+              # normal full 5-minute redemption TTL if that would reach past
+              # the grant's own expires_at (clamp_expires IS grant.expires_at,
+              # passed in by the caller -- never re-derived here).
+              "issued_at": issued, "expires_at": min(issued + CONDUCTOR_WEEK_REDEMPTION_TTL_MS, clamp_expires)}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def peek_conductor_redemption(db, token_command_id, label):
+    """Read-only precheck for owner-lease-recover.py's --dry-run: the exact
+    same validity checks claim_conductor_redemption makes (existence,
+    source, label match, status=='accepted', not expired) but NEVER flips
+    status -- a dry-run preview must never burn the one real claim a
+    single-use token has."""
+    row = read(db, token_command_id)
+    if row is None or row["source"] != "conductor_weekly_redemption":
+        raise Refused("no such conductor redemption token")
+    claims = _check_source(row)
+    if claims.get("label") != label:
+        raise Refused("conductor redemption token does not match this label")
+    if row["status"] != "accepted" or row["expires_at"] <= now_ms():
+        raise Refused("conductor redemption token already consumed or expired")
+    return {"grant_command_id": claims["grant_command_id"], "clamp_expires_at": claims["clamp_expires_at"]}
+
+
+def claim_conductor_redemption(db, token_command_id, label):
+    """Atomically consumes a token minted ONLY by the automated tick (no
+    other caller in this codebase calls accept_conductor_redemption).
+    Returns {"grant_command_id", "clamp_expires_at"} on success -- the
+    clamp owner-lease-recover.py must then also enforce on its OWN
+    `new_lifecycle_end_at`, never trusting the caller to have applied it."""
+    db.execute("BEGIN IMMEDIATE")
+    row = read(db, token_command_id)
+    if row is None or row["source"] != "conductor_weekly_redemption":
+        db.rollback()
+        raise Refused("no such conductor redemption token")
+    claims = _check_source(row)
+    if claims.get("label") != label:
+        db.rollback()
+        raise Refused("conductor redemption token does not match this label")
+    if row["status"] != "accepted" or row["expires_at"] <= now_ms():
+        db.rollback()
+        raise Refused("conductor redemption token already consumed or expired")
+    cur = db.execute("UPDATE task_authorizations SET status='bound' WHERE command_id=? AND status='accepted'",
+                      (token_command_id,))
+    if cur.rowcount != 1:
+        db.rollback()
+        raise Refused("conductor redemption token lost the single-use claim race")
+    result = {"grant_command_id": claims["grant_command_id"], "clamp_expires_at": claims["clamp_expires_at"]}
+    db.commit()
+    return result
+
+
+# ---- cross-task/to-Main handover cap audit -------------------------------
+# conductor-handover.sh's recipient-side check: any transfer that would make
+# live Main a task's conductor must first mint ONE of these (atomically
+# cap-checked against CONDUCTOR_HANDOVER_CAP for the SAME grant, inside one
+# BEGIN IMMEDIATE transaction -- the cap-check and the insert that makes it
+# count can never race each other into letting an 11th through). Never
+# consumed/claimed -- it exists purely as an append-only counter row the cap
+# check can COUNT(*), same table, no new schema.
+def accept_conductor_handover_record(db, command_id, grant_command_id, task_id):
+    for key, value in (("command id", command_id), ("grant command id", grant_command_id), ("task id", task_id)):
+        identifier(value, key)
+    db.execute("BEGIN IMMEDIATE")
+    previous = read(db, command_id)
+    if previous:
+        db.rollback()
+        raise Refused("conductor handover record command id collision")
+    used = db.execute(
+        """SELECT COUNT(*) FROM task_authorizations
+           WHERE source='conductor_weekly_handover' AND json_extract(claims,'$.grant_command_id')=?""",
+        (grant_command_id,)).fetchone()[0]
+    if used >= CONDUCTOR_HANDOVER_CAP:
+        db.rollback()
+        raise Refused(f"conductor weekly authorization handover cap ({CONDUCTOR_HANDOVER_CAP}) reached for this grant")
+    issued = now_ms()
+    scope = {"grant_command_id": grant_command_id, "task_id": task_id}
+    expected = canonical(scope)
+    claims = {"version": 1, "source": "conductor_weekly_handover", "command_id": command_id,
+              "op": "conductor_handover_count", "remote_task_id": "", "requester_actor": "conductor_week:" + grant_command_id,
+              "actor_pane_birth": "conductor-handover", "requester_client": "conductor_weekly_authorization",
+              "scope": "conductor_weekly_handover", "repo": "", "mode": "",
+              "grant_command_id": grant_command_id, "task_id": task_id,
+              "effective_scope": parse(expected), "payload_sha256": digest(expected),
+              "issued_at": issued, "expires_at": issued + CONDUCTOR_WEEK_TTL_MS}
+    return _insert(db, claims, canonical(claims), expected)
+
+
+def conductor_week_handover_count(db, grant_command_id):
+    row = db.execute(
+        """SELECT COUNT(*) AS n FROM task_authorizations
+           WHERE source='conductor_weekly_handover' AND json_extract(claims,'$.grant_command_id')=?""",
+        (grant_command_id,)).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def event(db, run_id, task_id, kind, payload):
     db.execute("INSERT INTO events(event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
                ("ev_" + uuid.uuid4().hex, run_id, task_id, kind, now_iso(), canonical(payload)))
@@ -533,6 +755,17 @@ def _check_source(row):
         expected = canonical(claims["effective_scope"])
         identifier(claims.get("grant_command_id"), "resident redemption grant command id")
         identifier(claims.get("job_class"), "resident redemption job class")
+    elif row["source"] == "conductor_weekly_authorization":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("requester_actor"), "conductor weekly minting marker")
+    elif row["source"] == "conductor_weekly_redemption":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("grant_command_id"), "conductor redemption grant command id")
+        identifier(claims.get("label"), "conductor redemption label")
+    elif row["source"] == "conductor_weekly_handover":
+        expected = canonical(claims["effective_scope"])
+        identifier(claims.get("grant_command_id"), "conductor handover grant command id")
+        identifier(claims.get("task_id"), "conductor handover task id")
     else:
         raise Refused("unknown authorization source")
     if expected != row["expected_manifest"]:
@@ -895,7 +1128,9 @@ def action_decide(db, request_id, status, authority, decided_by, category, reaso
 
 def main():
     path, op, *args = sys.argv[1:]
-    with connect(path, readonly=op in ("read", "check", "pending-acks", "read-resident")) as db:
+    with connect(path, readonly=op in ("read", "check", "pending-acks", "read-resident",
+                                        "read-conductor-week", "conductor-handover-count",
+                                        "peek-conductor-redemption")) as db:
         if op == "schema":
             schema(db)
         elif op == "accept":
@@ -912,6 +1147,20 @@ def main():
             print(canonical(accept_resident_redemption(db, *args)))
         elif op == "claim-resident-redemption":
             print(claim_resident_redemption(db, *args))
+        elif op == "accept-conductor-week":
+            print(canonical(accept_conductor_week(db, *args)))
+        elif op == "read-conductor-week":
+            print(canonical(read_conductor_week(db)))
+        elif op == "accept-conductor-redemption":
+            print(canonical(accept_conductor_redemption(db, *args)))
+        elif op == "claim-conductor-redemption":
+            print(canonical(claim_conductor_redemption(db, *args)))
+        elif op == "peek-conductor-redemption":
+            print(canonical(peek_conductor_redemption(db, *args)))
+        elif op == "accept-conductor-handover":
+            print(canonical(accept_conductor_handover_record(db, *args)))
+        elif op == "conductor-handover-count":
+            print(conductor_week_handover_count(db, *args))
         elif op == "read":
             db.execute("BEGIN")
             row = read(db, *args)
