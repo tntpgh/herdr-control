@@ -7,6 +7,9 @@ an explicit scope profile (SPEC: .handoffs/DUET-IDENTITY-SPEC-20261031.md
     python3 remote-mcp/scripts/issue-client.py label duet --client-id CLIENT_ID --profile full [--apply]
     python3 remote-mcp/scripts/issue-client.py label dot --client-id CLIENT_ID [--apply]
     python3 remote-mcp/scripts/issue-client.py label dot --grant-id GRANT_ID [--apply]
+    python3 remote-mcp/scripts/issue-client.py label duet --client-id CLIENT_ID --profile full --peer [--apply]
+    python3 remote-mcp/scripts/issue-client.py peers
+    python3 remote-mcp/scripts/issue-client.py unpeer duet [--apply]
 
 Does NOT register an OAuth client and does NOT touch a token: an MCP client
 (Duet's, Dot's, ChatGPT's, Claude's -- any OAuth-2.1-capable MCP client)
@@ -46,9 +49,15 @@ Revoking one client's access later, independent of the others:
 (grant_id is what `list`/`label` below print; see grants.py's own docstring
 -- deleting one grant's tokens and queued sends never touches another's).
 
+Duet<->Dot coordination (remote-mcp/README.md section of that name):
+`label ... --peer` also pushes the label to the Worker (signed /admin/peers)
+so the two apps can address each other with send_peer_message; the Worker
+re-checks the grant is live and holds herdr:message.owner. `peers` lists the
+Worker's labels; `unpeer <name>` removes one. No reconnect needed.
+
 Signed with the publisher's HERDR_MCP_INGEST_KEY (same lookup as
-publisher.py/grants.py); the Worker audits every call (admin_list).
-label is a dry run unless --apply.
+publisher.py/grants.py); the Worker audits every call (admin_list,
+admin_peers_*). label and unpeer are dry runs unless --apply.
 """
 from __future__ import annotations
 
@@ -63,6 +72,7 @@ from grants import call, ingest_key, show  # noqa: E402
 
 STATE = Path(os.environ.get("HERDR_STATE_DIR", Path.home() / ".local/state/herdr"))
 LABELS_PATH = STATE / "remote-mcp" / "client-labels.json"
+PEERS_PATH = "/admin/peers"
 
 # The SPEC's "peer inbox only" scope, exactly: read assigned (get_owner_
 # message_status), reply/ack/report-blocked (send_owner_message -- its body
@@ -113,14 +123,16 @@ def find_grant(grants: list[dict], client_id: str | None, grant_id: str | None) 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("op", choices=["list", "label"])
+    ap.add_argument("op", choices=["list", "label", "peers", "unpeer"])
     ap.add_argument("name", nargs="?", help="label op only: duet, dot (alias: zero), ...")
     ap.add_argument("--client-id")
     ap.add_argument("--grant-id")
     ap.add_argument("--profile", choices=sorted(SCOPE_PROFILES), default="peer-inbox",
                      help="scope this grant must EXACTLY match (default: peer-inbox)")
     ap.add_argument("--user", default="tnt@teamthurber.com")
-    ap.add_argument("--apply", action="store_true", help="label: actually record it (default is a dry run)")
+    ap.add_argument("--peer", action="store_true",
+                     help="label: also set this as the Worker's peer label (Duet<->Dot coordination)")
+    ap.add_argument("--apply", action="store_true", help="label/unpeer: actually do it (default is a dry run)")
     a = ap.parse_args(argv)
     key = ingest_key()
     if not key:
@@ -142,6 +154,33 @@ def main(argv: list[str]) -> int:
                 match = next((g for g in grants if g["client_id"] == client_id), None)
                 print(f"  {name}: client={client_id}" + (f"  grant={match['grant_id']}" if match else "  (grant no longer listed)"))
         return 0
+
+    if a.op == "peers":
+        status, out = call(key, {"op": "list"}, PEERS_PATH)
+        if status != 200:
+            print(f"peers failed: HTTP {status} {out.get('error')}", file=sys.stderr)
+            return 1
+        print("worker peer labels:")
+        for p in out["peers"]:
+            print(f"  {p['label']}: client={p['client_id']}  user={p['actor']}  set={p['set_at']}")
+        return 0
+
+    if a.op == "unpeer":
+        if not a.name:
+            ap.error("unpeer needs a NAME (duet, dot, ...)")
+        name = NAME_ALIASES.get(a.name, a.name)
+        if not a.apply:
+            print(f"DRY RUN — would remove Worker peer label '{name}'. Re-run with --apply.")
+            return 0
+        status, out = call(key, {"op": "remove", "label": name}, PEERS_PATH)
+        if status != 200:
+            print(f"unpeer failed: HTTP {status} {out.get('error')}", file=sys.stderr)
+            return 1
+        print("===== VERIFY =====")
+        status, after = call(key, {"op": "list"}, PEERS_PATH)
+        gone = status == 200 and all(p["label"] != name for p in after["peers"])
+        print(f"OK  '{name}' removed from the Worker" if gone else "FAIL  label still listed")
+        return 0 if gone else 1
 
     if not a.name:
         ap.error("label needs a NAME (duet, dot, ...)")
@@ -171,7 +210,8 @@ def main(argv: list[str]) -> int:
         print(f"FAIL  client {g['client_id']} is already labelled '{existing}'; pick one name per client", file=sys.stderr)
         return 1
     if not a.apply:
-        print(f"DRY RUN — scope OK. Would label client={g['client_id']} as '{name}' ({a.profile}). Re-run with --apply.")
+        also = " and set it as the Worker peer label" if a.peer else ""
+        print(f"DRY RUN — scope OK. Would label client={g['client_id']} as '{name}' ({a.profile}){also}. Re-run with --apply.")
         return 0
     labels[g["client_id"]] = name
     save_labels(labels)
@@ -180,6 +220,14 @@ def main(argv: list[str]) -> int:
     good = after.get(g["client_id"]) == name
     print(f"  {LABELS_PATH}: {json.dumps(after, sort_keys=True)}")
     print(f"OK  '{name}' -> {g['client_id']}" if good else "FAIL  label did not persist")
+    if good and a.peer:
+        status, out = call(key, {"op": "set", "label": name, "user": a.user, "client_id": g["client_id"]}, PEERS_PATH)
+        if status != 200:
+            print(f"FAIL  Worker peer label: HTTP {status} {out.get('error')}", file=sys.stderr)
+            return 1
+        good = any(p["label"] == name and p["client_id"] == g["client_id"] for p in out["peers"])
+        print(f"OK  Worker peer label '{name}' -> {g['client_id']}" if good else "FAIL  Worker peer label not listed")
+        print(f"Rollback: python3 remote-mcp/scripts/issue-client.py unpeer {name} --apply")
     return 0 if good else 1
 
 

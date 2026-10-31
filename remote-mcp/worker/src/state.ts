@@ -178,6 +178,36 @@ export interface OwnerReplyRecord {
   body: string;
 }
 
+// Duet/Dot coordination (remote-mcp/README.md "Duet<->Dot coordination"). A peer label
+// names one verified (email, client_id) connection; set only by the signed
+// /admin/peers route, never by a client.
+export interface PeerLabel {
+  label: string;
+  actor: string;
+  client_id: string;
+  set_at: string;
+}
+
+export type SendPeerMessageOutcome =
+  | { ok: true; message_id: string; to: string; task_id: string }
+  | { ok: false; reason: string };
+
+export interface PeerMessage {
+  seq: number;
+  message_id: string;
+  from: string;
+  at: string;
+  body: string;
+  task_id: string | null; // a remote task the sender shared with you
+}
+
+export interface PeerInbox {
+  me: string | null;
+  peers: string[];
+  messages: PeerMessage[];
+  next_after_seq: number;
+}
+
 export interface View {
   snapshot: Snapshot | null;
   connection: Connection;
@@ -563,6 +593,25 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS owner_messages_dedupe
       ON owner_messages(sender_actor, sender_client, client_msg_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS owner_messages_by_status ON owner_messages(status, created_at)`);
+    // Duet<->Dot coordination (README section of that name). UNIQUE(actor,
+    // client_id): one label per connection, so INSERT OR REPLACE of a new
+    // label for an already-labelled connection drops its old one.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS peer_labels (label TEXT PRIMARY KEY, actor TEXT NOT NULL,
+      client_id TEXT NOT NULL, set_at INTEGER NOT NULL, UNIQUE(actor, client_id))`);
+    // App-to-app notes, held here (never sent to the Mac). The recipient is
+    // resolved to its verified identity at send time, so relabelling later
+    // never redirects an old note; only that identity can list it.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS peer_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+      sender_actor TEXT NOT NULL, sender_client TEXT NOT NULL, sender_label TEXT NOT NULL, client_msg_id TEXT NOT NULL,
+      recipient_actor TEXT NOT NULL, recipient_client TEXT NOT NULL, recipient_label TEXT NOT NULL,
+      body TEXT NOT NULL, task_id TEXT NOT NULL DEFAULT '', UNIQUE(sender_actor, sender_client, client_msg_id))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS peer_messages_inbox ON peer_messages(recipient_actor, recipient_client, seq)`);
+    // Shared-task handoff: read access (get_task_answer) to one remote task
+    // for one other connection. Never cancel/resume -- those stay with the
+    // connection that started it.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS task_shares (remote_task_id TEXT NOT NULL, actor TEXT NOT NULL,
+      client_id TEXT NOT NULL, shared_at INTEGER NOT NULL, PRIMARY KEY (remote_task_id, actor, client_id))`);
   }
 
   private staleAfterS(): number {
@@ -766,11 +815,15 @@ export class HerdrState extends DurableObject<Env> {
     return { ok: true, exchange_id: id, state: "queued" };
   }
 
-  ownerMessageStatus(exchangeId: string, actor: string): OwnerMessageRecord | null {
+  // `client`: the caller's verified client_id -- every MCP path passes it,
+  // so one connection never reads another's exchange under the same email.
+  // null only from in-DO test assertions that never held a token.
+  ownerMessageStatus(exchangeId: string, actor: string, client: string | null = null): OwnerMessageRecord | null {
     const m = this.sql.exec<{ exchange_id: string; created_at: number; updated_at: number; status: string; detail: string;
       attempts: number; owner_label: string; delivered_at: number | null; body: string }>(
       `SELECT exchange_id, created_at, updated_at, status, detail, attempts, owner_label, delivered_at, body
-       FROM owner_messages WHERE exchange_id=? AND sender_actor=?`, exchangeId, actor,
+       FROM owner_messages WHERE exchange_id=? AND sender_actor=? AND (? IS NULL OR sender_client=?)`,
+      exchangeId, actor, client, client,
     ).toArray()[0];
     if (!m) return null;
     return {
@@ -780,14 +833,16 @@ export class HerdrState extends DurableObject<Env> {
     };
   }
 
-  // Only the ORIGINAL sender may read a reply (SPEC item 4). A non-sender
-  // (or a wrong exchange_id) gets the identical null -- never a distinct
-  // "forbidden" that would confirm the exchange_id exists to someone else.
-  ownerReply(exchangeId: string, actor: string): OwnerReplyRecord | null {
+  // Only the ORIGINAL sender (actor AND, from MCP, client) may read a reply
+  // (SPEC item 4). A non-sender (or a wrong exchange_id) gets the identical
+  // null -- never a distinct "forbidden" that would confirm the exchange_id
+  // exists to someone else.
+  ownerReply(exchangeId: string, actor: string, client: string | null = null): OwnerReplyRecord | null {
     const m = this.sql.exec<{ owner_label: string; status: string; reply_body: string; reply_session: string;
       reply_artifact_revision: string; replied_at: number | null }>(
       `SELECT owner_label, status, reply_body, reply_session, reply_artifact_revision, replied_at
-       FROM owner_messages WHERE exchange_id=? AND sender_actor=?`, exchangeId, actor,
+       FROM owner_messages WHERE exchange_id=? AND sender_actor=? AND (? IS NULL OR sender_client=?)`,
+      exchangeId, actor, client, client,
     ).toArray()[0];
     if (!m || m.status !== "replied" || m.replied_at === null) return null;
     return {
@@ -802,6 +857,111 @@ export class HerdrState extends DurableObject<Env> {
     return this.sql.exec<{ actor: string; client_id: string }>(
       `SELECT DISTINCT sender_actor AS actor, sender_client AS client_id FROM owner_messages
        WHERE status='delivered' OR (status IN ('queued','delivering') AND expires_at > ?)`, nowMs).toArray();
+  }
+
+  // /admin/peers (index.ts) only, after admitAdmin and its own bounds/grant
+  // checks. Replaces the label's binding AND any older label the same
+  // connection had (UNIQUE(actor, client_id)).
+  setPeerLabel(nowMs: number, label: string, actor: string, clientId: string): void {
+    this.sql.exec(`INSERT OR REPLACE INTO peer_labels (label, actor, client_id, set_at) VALUES (?,?,?,?)`,
+      label, actor, clientId, nowMs);
+  }
+
+  removePeerLabel(label: string): boolean {
+    return this.sql.exec(`DELETE FROM peer_labels WHERE label=?`, label).rowsWritten > 0;
+  }
+
+  peerLabels(): PeerLabel[] {
+    return this.sql.exec<{ label: string; actor: string; client_id: string; set_at: number }>(
+      `SELECT label, actor, client_id, set_at FROM peer_labels ORDER BY label`).toArray()
+      .map((r) => ({ ...r, set_at: iso(r.set_at) }));
+  }
+
+  // App-to-app note: same throttle, sanitizer, OWNER_LIMITS and audit as
+  // sendOwnerMessage, but held here for the peer to list -- never leased to
+  // the Mac, so it needs no registered pane and no Mac online. Limits count
+  // per sending connection (segmentation: Duet's burst never spends Dot's).
+  sendPeerMessage(nowMs: number, caller: Caller, scopes: string[], to: string, rawBody: string,
+      clientMsgId: string, taskId: string): SendPeerMessageOutcome {
+    const refuse = (reason: string): SendPeerMessageOutcome => {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_peer_message", target: to,
+        decision: "refused", reason, message_id: "", detail: `chars=${rawBody.length}${taskId ? ` task=${taskId}` : ""}` });
+      return { ok: false, reason };
+    };
+    const limited = this.throttled(nowMs, caller, "send_peer_message");
+    if (limited) return { ok: false, reason: limited };
+    if (this.env.OWNER_INBOX_ENABLED !== "true") return refuse("owner_inbox_disabled");
+    if (!scopes.includes(SCOPE_OWNER_MESSAGE)) return refuse(`missing_scope ${SCOPE_OWNER_MESSAGE}`);
+    if (!clientMsgId || clientMsgId.length > 200) return refuse("bad_client_msg_id");
+    // Dedupe first, as sendOwnerMessage: a retry returns the original note.
+    const existing = this.sql.exec<{ message_id: string; recipient_label: string; task_id: string }>(
+      `SELECT message_id, recipient_label, task_id FROM peer_messages WHERE sender_actor=? AND sender_client=? AND client_msg_id=?`,
+      caller.email, caller.client_id, clientMsgId).toArray()[0];
+    if (existing) return { ok: true, message_id: existing.message_id, to: existing.recipient_label, task_id: existing.task_id };
+    const me = this.sql.exec<{ label: string }>(`SELECT label FROM peer_labels WHERE actor=? AND client_id=?`,
+      caller.email, caller.client_id).toArray()[0]?.label;
+    if (!me) return refuse("sender_not_labelled");
+    if (!OWNER_LABEL.test(to)) return refuse("peer_label_invalid");
+    const peer = this.sql.exec<{ actor: string; client_id: string }>(
+      `SELECT actor, client_id FROM peer_labels WHERE label=?`, to).toArray()[0];
+    if (!peer) return refuse("peer_not_found");
+    if (peer.actor === caller.email && peer.client_id === caller.client_id) return refuse("peer_is_self");
+    if (!emailAllowed(this.env, peer.actor)) return refuse("peer_not_allowed");
+    const text = sanitizeOwnerMessage(rawBody);
+    if (!text.ok) return refuse(text.reason);
+    if (taskId) {
+      // Only the starter can share; a missing task gets the same answer, so
+      // this never confirms someone else's task_id exists.
+      const rt = this.sql.exec<{ requester_email: string; requester_client: string }>(
+        `SELECT requester_email, requester_client FROM remote_tasks WHERE remote_task_id=?`, taskId).toArray()[0];
+      if (!rt || rt.requester_email !== caller.email || rt.requester_client !== caller.client_id) return refuse("not_your_task");
+    }
+    const recent = this.sql.exec<{ created_at: number }>(
+      `SELECT created_at FROM peer_messages WHERE sender_actor=? AND sender_client=? AND created_at > ?`,
+      caller.email, caller.client_id, nowMs - 3_600_000).toArray().map((r) => r.created_at);
+    const tooMany = rateLimited(recent, nowMs, OWNER_LIMITS);
+    if (tooMany) return refuse(tooMany);
+
+    const id = `pmsg_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`INSERT INTO peer_messages (message_id, created_at, sender_actor, sender_client, sender_label,
+        client_msg_id, recipient_actor, recipient_client, recipient_label, body, task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        id, nowMs, caller.email, caller.client_id, me, clientMsgId, peer.actor, peer.client_id, to, text.text, taskId);
+      if (taskId) {
+        this.sql.exec(`INSERT OR IGNORE INTO task_shares (remote_task_id, actor, client_id, shared_at) VALUES (?,?,?,?)`,
+          taskId, peer.actor, peer.client_id, nowMs);
+      }
+      // owner_private's principal columns are named sender_*; here they hold
+      // the RECIPIENT, the one connection allowed to see this event.
+      this.insertEvent(nowMs, { eventId: null, remoteTaskId: "", type: "peer.message_ready", source: "peer_inbox",
+        subjectKind: "peer_message", subjectId: id, visibility: "owner_private", senderActor: peer.actor,
+        senderClient: peer.client_id, correlationId: taskId || id, data: taskId ? { from: me, task_id: taskId } : { from: me } });
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_peer_message", target: to,
+        decision: "queued", reason: "", message_id: id, detail: `chars=${text.text.length}${taskId ? ` shared_task=${taskId}` : ""}` });
+    });
+    return { ok: true, message_id: id, to, task_id: taskId };
+  }
+
+  // The caller's own inbox only: rows addressed to its verified identity.
+  // next_after_seq is the last RAW row scanned, so a hidden note (sender's
+  // email since removed from ALLOWED_EMAILS) never stalls pagination.
+  listPeerMessages(caller: Caller, afterSeq: number, limit: number): PeerInbox {
+    const rows = this.sql.exec<{ seq: number; message_id: string; created_at: number; sender_actor: string;
+      sender_label: string; body: string; task_id: string }>(
+      `SELECT seq, message_id, created_at, sender_actor, sender_label, body, task_id FROM peer_messages
+       WHERE recipient_actor=? AND recipient_client=? AND seq > ? ORDER BY seq LIMIT ?`,
+      caller.email, caller.client_id, afterSeq, limit).toArray();
+    const labels = this.sql.exec<{ label: string; actor: string; client_id: string }>(
+      `SELECT label, actor, client_id FROM peer_labels ORDER BY label`).toArray();
+    const me = labels.find((l) => l.actor === caller.email && l.client_id === caller.client_id);
+    return {
+      me: me?.label ?? null, peers: labels.filter((l) => l !== me).map((l) => l.label),
+      messages: rows.filter((r) => emailAllowed(this.env, r.sender_actor)).map((r) => ({
+        seq: r.seq, message_id: r.message_id, from: r.sender_label, at: iso(r.created_at), body: r.body,
+        task_id: r.task_id || null,
+      })),
+      next_after_seq: rows.length ? rows[rows.length - 1]!.seq : afterSeq,
+    };
   }
 
   // Caps in force this tick: the Mac's own pushed config when we have one
@@ -1038,6 +1198,15 @@ export class HerdrState extends DurableObject<Env> {
   remoteTaskLocalId(remoteTaskId: string): string | null {
     const r = this.sql.exec<{ local_task_id: string }>(`SELECT local_task_id FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
     return r && r.local_task_id ? r.local_task_id : null;
+  }
+
+  // get_task_answer's segmentation: the connection that started it, or one
+  // it was explicitly shared with (send_peer_message task_id).
+  remoteTaskVisible(remoteTaskId: string, caller: Caller): boolean {
+    return this.sql.exec(`SELECT 1 FROM remote_tasks rt WHERE rt.remote_task_id=?
+      AND ((rt.requester_email=? AND rt.requester_client=?) OR EXISTS (SELECT 1 FROM task_shares s
+        WHERE s.remote_task_id=rt.remote_task_id AND s.actor=? AND s.client_id=?))`,
+      remoteTaskId, caller.email, caller.client_id, caller.email, caller.client_id).toArray().length > 0;
   }
 
   remoteTask(remoteTaskId: string): RemoteTaskRecord | null {
@@ -2004,12 +2173,12 @@ export class HerdrState extends DurableObject<Env> {
     // capture the highest cursor THIS delete may remove and raise the
     // durable floor before it runs, never after (a crash between the two
     // would otherwise let a stale cursor read past a gap it can't see).
-    // Owner events (subject_kind='owner_exchange') carry remote_task_id=''
-    // and so never match the terminal-task subquery; they expire on age
-    // alone, the same 30-day window Terrence chose for the event log
-    // (hub form 20261004T205923-8776, retention=30d).
+    // Owner and peer events (subject_kind owner_exchange / peer_message)
+    // carry remote_task_id='' and so never match the terminal-task subquery;
+    // they expire on age alone, the same 30-day window Terrence chose for
+    // the event log (hub form 20261004T205923-8776, retention=30d).
     const pruneCutoff = nowMs - 30 * 86_400_000;
-    const prunable = `at < ? AND (subject_kind='owner_exchange' OR remote_task_id IN
+    const prunable = `at < ? AND (subject_kind IN ('owner_exchange','peer_message') OR remote_task_id IN
       (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out')))`;
     const pruneMax = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events WHERE ${prunable}`,
       pruneCutoff).one().c;
@@ -2024,6 +2193,8 @@ export class HerdrState extends DurableObject<Env> {
 
     this.sql.exec(`DELETE FROM owner_messages WHERE (status='delivered' OR status='replied' OR status LIKE 'blocked:%') AND updated_at < ?`,
       nowMs - 30 * 86_400_000);
+    this.sql.exec(`DELETE FROM peer_messages WHERE created_at < ?`, nowMs - 30 * 86_400_000);
+    this.sql.exec(`DELETE FROM task_shares WHERE remote_task_id NOT IN (SELECT remote_task_id FROM remote_tasks)`);
 
     const audit = this.sql.exec<{ seq: number; at: number; actor: string; client_id: string; tool: string; target: string;
       decision: string; reason: string; message_id: string; detail: string }>(

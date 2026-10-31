@@ -11,7 +11,7 @@ import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
-import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, serverInfo } from "./policy";
+import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, OWNER_LABEL, serverInfo } from "./policy";
 import type { ScopedSender } from "./state";
 import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
 import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
@@ -234,6 +234,60 @@ async function adminLimits(request: Request, env: Env): Promise<Response> {
   return Response.json({ limits, defaults: DEFAULT_LIMITS, max: MAX_LIMITS }, { headers: { "cache-control": "no-store" } });
 }
 
+// Mac-only peer labelling (scripts/issue-client.py peer/unpeer), same
+// signing as /admin/grants. A label names ONE verified (user, client_id)
+// connection for send_peer_message/list_peer_messages; clients can never set
+// one. `set` refuses a client_id with no live grant for that user, or whose
+// grant lacks herdr:message.owner (the peer tools' scope), so a typo cannot
+// bind a label to nothing. Bodies:
+//   {"op":"list"}
+//   {"op":"set","label":"duet","user":"<email>","client_id":"<id>"}
+//   {"op":"remove","label":"duet"}
+async function adminPeers(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return text("Method not allowed", 405);
+  const check = await verifyIngest(request, env.INGEST_KEY, Math.floor(Date.now() / 1000));
+  if (!check.ok) return Response.json({ error: check.reason }, { status: check.status });
+  let body: { op?: unknown; label?: unknown; user?: unknown; client_id?: unknown };
+  try { body = JSON.parse(check.body); } catch { return Response.json({ error: "bad_json" }, { status: 400 }); }
+  const { op } = body;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const label = str(body.label);
+  const user = str(body.user).trim().toLowerCase();
+  const clientId = str(body.client_id);
+  if (op !== "list" && op !== "set" && op !== "remove") return Response.json({ error: "bad_request" }, { status: 400 });
+  if (op !== "list" && !OWNER_LABEL.test(label)) return Response.json({ error: "bad_label" }, { status: 400 });
+  if (op === "set" && (!user || user.length > 320 || !clientId || clientId.length > 500)) {
+    return Response.json({ error: "bad_request" }, { status: 400 });
+  }
+  const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
+  const now = Date.now();
+  const target = op === "set" ? `${label} ${user} ${clientId}` : label;
+  if (!(await stub.admitAdmin(now, check.nonce, `peers_${op}`, target))) {
+    return Response.json({ error: "replayed_nonce" }, { status: 409 });
+  }
+  if (op === "set") {
+    if (!emailAllowed(env, user)) return Response.json({ error: "user_not_allowed" }, { status: 400 });
+    const scopes = new Set<string>();
+    let found = false;
+    let cursor: string | undefined;
+    do {
+      const page = await env.OAUTH_PROVIDER.listUserGrants(user, { cursor });
+      for (const g of page.items) {
+        if (g.clientId !== clientId || (g.expiresAt !== undefined && g.expiresAt * 1000 <= now)) continue;
+        found = true;
+        for (const s of g.scope) scopes.add(s);
+      }
+      cursor = page.cursor;
+    } while (cursor);
+    if (!found) return Response.json({ error: "no_such_client" }, { status: 404 });
+    if (!scopes.has(SCOPE_OWNER_MESSAGE)) return Response.json({ error: "grant_lacks_scope" }, { status: 400 });
+    await stub.setPeerLabel(now, label, user, clientId);
+  } else if (op === "remove" && !(await stub.removePeerLabel(label))) {
+    return Response.json({ error: "no_such_label" }, { status: 404 });
+  }
+  return Response.json({ peers: await stub.peerLabels() }, { headers: { "cache-control": "no-store" } });
+}
+
 const defaultHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
@@ -241,6 +295,7 @@ const defaultHandler = {
     if (pathname === "/ingest/sync") return ingest(request, env);
     if (pathname === "/admin/grants") return adminGrants(request, env);
     if (pathname === "/admin/limits") return adminLimits(request, env);
+    if (pathname === "/admin/peers") return adminPeers(request, env);
     if (pathname === "/" || pathname === "/healthz") {
       return Response.json({ service: "herdr-mcp", mcp: `${env.PUBLIC_URL}/mcp`, auth: "OAuth 2.1 + PKCE", ...serverInfo(env) },
         { headers: { "cache-control": "no-store" } });
