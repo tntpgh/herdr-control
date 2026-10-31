@@ -15,18 +15,23 @@ Lane verdicts:
   RUNNING   an item is in flight (waiting on its accepted result)
   RUNNABLE  the next tick would dispatch the next item
   BLOCKED   every reason is listed, not just the first
-Exit: 0 every lane RUNNING/RUNNABLE; 1 anything BLOCKED; 2 the hub plist is unreadable.
+Exit: 0 every lane RUNNING/RUNNABLE; 1 anything BLOCKED, including a plist
+neither plistlib nor plutil can parse (reported as a reason, never a crash).
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import os
 import plistlib
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
@@ -42,9 +47,43 @@ FLAGS = ("HERDR_OWNER_DISPATCH", "HERDR_OWNER_LEASE_DELIVERY", "HERDR_RESULT_AVA
 PATHS = ("HERDR_QUEUE_SUPERVISOR_ROOT", "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
 
 
+class PlistUnreadable(Exception):
+    """Reason only (an exception class name), never file content: plists hold env values."""
+
+
 def plist_env(path: Path) -> dict:
-    with path.open("rb") as f:
-        return plistlib.load(f).get("EnvironmentVariables", {}) or {}
+    """EnvironmentVariables as launchd sees them. plistlib's expat parser is
+    stricter than CoreFoundation's: the rendered remote-mcp plist carries
+    `--` inside its header XML comment (illegal XML, ExpatError) yet launchd
+    loads it. On a strict-parse failure the file is normalised by plutil
+    (the CoreFoundation parser launchd uses) and parsed again. Raises
+    PlistUnreadable when neither accepts it."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise PlistUnreadable(type(exc).__name__) from None
+    try:
+        doc = plistlib.loads(data)
+    except (plistlib.InvalidFileException, ExpatError, ValueError) as exc:
+        doc = _cf_parse(path, type(exc).__name__)
+    env = doc.get("EnvironmentVariables") if isinstance(doc, dict) else None
+    if env is not None and not isinstance(env, dict):
+        raise PlistUnreadable("EnvironmentVariables_not_a_dict")
+    return env or {}
+
+
+def _cf_parse(path: Path, strict_err: str):
+    plutil = shutil.which("plutil")
+    if not plutil:
+        raise PlistUnreadable(f"{strict_err}:no_plutil")
+    try:
+        r = subprocess.run([plutil, "-convert", "xml1", "-o", "-", os.path.abspath(path)],
+                           capture_output=True, timeout=10)  # output never echoed: it is env values
+        if r.returncode == 0:
+            return plistlib.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, plistlib.InvalidFileException, ExpatError, ValueError):
+        pass
+    raise PlistUnreadable(strict_err)
 
 
 def lease_view(lease_db: str, label: str, now: float) -> tuple[dict, list[str]]:
@@ -141,8 +180,13 @@ def lane_view(env: dict, label: str, now: float) -> dict:
 
 
 def status(hub_plist: Path, remote_plist: Path, now: float) -> dict:
-    env = plist_env(hub_plist)
     shared = []
+    try:
+        env = plist_env(hub_plist)
+    except PlistUnreadable as exc:
+        # Without the tick's env every other check would only be noise.
+        return {"shared_blockers": [f"hub_plist_unreadable:{exc}"], "standing": False, "lease_renew": False,
+                "lanes": []}
     if QSUP.kill_switch_engaged():
         shared.append(f"kill_switch:{QSUP.KILL_SWITCH}")
     if env.get(qs.ENV_FLAG) != "1":
@@ -154,8 +198,10 @@ def status(hub_plist: Path, remote_plist: Path, now: float) -> dict:
         shared.append("not_configured:HERDR_QUEUE_SUPERVISOR_LANES")
     try:
         renew = plist_env(remote_plist).get("HERDR_OWNER_LEASE_RENEW") == "1"
-    except (OSError, plistlib.InvalidFileException):
+    except PlistUnreadable as exc:
         renew = False
+        if str(exc) != "FileNotFoundError":  # not installed = renewal off, as before
+            shared.append(f"remote_mcp_plist_unreadable:{exc}")
     out = {"shared_blockers": shared, "standing": env.get(QSUP.STANDING_ENV_FLAG) == "1",
            "lease_renew": renew, "lanes": []}
     if all(env.get(k) for k in PATHS):
@@ -172,11 +218,7 @@ def main(argv=None, now=None) -> int:
     ap.add_argument("--hub-plist", default=str(AGENTS / "com.herdr-control.hub.plist"))
     ap.add_argument("--remote-mcp-plist", default=str(AGENTS / "com.herdr-control.remote-mcp.plist"))
     a = ap.parse_args(argv)
-    try:
-        st = status(Path(a.hub_plist), Path(a.remote_mcp_plist), time.time() if now is None else now)
-    except (OSError, plistlib.InvalidFileException) as exc:
-        print(f"unreadable:hub_plist:{type(exc).__name__}")
-        return 2
+    st = status(Path(a.hub_plist), Path(a.remote_mcp_plist), time.time() if now is None else now)
     if a.json:
         print(json.dumps(st, sort_keys=True, default=str))
     else:
