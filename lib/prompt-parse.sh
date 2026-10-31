@@ -1767,3 +1767,106 @@ prompt_occurrence_display() {           # <pane>
     printf 'no_prompt\n'
   fi
 }
+
+# ---- operational fix (proposal, herdr-control#267 follow-up): Deny is
+# always pressable on tall write panels, even when the footer is clipped
+# -------------------------------------------------------------------------
+# docs/design/stuck-save-operational-fix.md. `_menu_gate`/`prompt_menu_options`
+# above require the LITERAL "navigate"/"select" footer hint text; a write
+# panel tall enough to push that one trailing line out of the capture makes
+# both fail, and `_current_offer` (herdr-select.sh:420-436) then falls
+# through to the numbered-prompt parser, which can match an unrelated
+# Steering block instead -- the "Deny-not-pressable" bug (confirmed,
+# verify-write-panel-267-repro.sh's "Deny-not-pressable repro").
+#
+# This is a SEPARATE, narrower detector, not a change to the hardened
+# pass-1/pass-2 state machine above (poisoning checks, F8/F9 fixes,
+# multiple security-review rounds) -- rewriting that in place was the
+# explicit "not small/local" call in the design doc. It is zero-caller:
+# `_current_offer` is untouched, so no live pane's resolution changes.
+# Deliberately conservative, narrower than loosening pass 2 would be:
+#   - requires a real "Allow tool:" header line, so it never fires on
+#     ordinary pane text that happens to end in the words Approve/Deny;
+#   - requires EXACTLY ONE such header in the window -- two is the
+#     injection shape pass 1's poisoning defense exists for, so this
+#     refuses rather than risk being fooled by a fake second header;
+#   - requires the window to NOT already satisfy `_menu_gate` -- if the
+#     footer IS present, the existing hardened parser is authoritative,
+#     never bypassed by this;
+#   - requires Deny then (going up, blanks only between) Approve as the
+#     last two non-blank content rows, same adjacency rule pass 2 uses
+#     for its footer-anchored walk, just without the footer requirement.
+# Activating this means wiring it as a fallback in `_current_offer` only
+# AFTER both existing passes fail and the numbered-prompt parser also
+# fails to gate ambiguously (a separate, reviewed change) -- not done here.
+_prompt_footer_clipped_options() {       # <mode>; window on stdin
+  local mode="$1" win
+  win="$(cat)"
+  if _menu_gate "$win"; then
+    return 1  # the real footer is present; defer to the hardened parser
+  fi
+  case "$win" in *"Allow tool:"*) ;; *) return 1 ;; esac
+  local header_count
+  header_count="$(printf '%s\n' "$win" \
+    | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+    | grep -c 'Allow tool:')"
+  [ "$header_count" = 1 ] || return 1
+  # Walk the window as an array so the highlight check (below, selected
+  # mode) can look at the ORIGINAL ansi-carrying line for the two rows
+  # options mode already located by their stripped text -- stripping ansi
+  # globally up front, as the old implementation did, throws away exactly
+  # the byte that tells Approve from Deny apart as "currently highlighted".
+  local -a raw clean
+  local i=0 line stripped
+  while IFS= read -r line || [ -n "$line" ]; do
+    raw[i]="$line"
+    stripped="$(printf '%s' "$line" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//')"
+    clean[i]="$stripped"
+    i=$((i + 1))
+  done <<EOF_WIN
+$win
+EOF_WIN
+  local n=$i j
+  local -a idx=()
+  for ((j = 0; j < n; j++)); do
+    [ -n "${clean[j]}" ] && idx+=("$j")
+  done
+  local cnt=${#idx[@]}
+  [ "$cnt" -ge 2 ] || return 1
+  local approve_i="${idx[cnt-2]}" deny_i="${idx[cnt-1]}"
+  [ "${clean[approve_i]}" = Approve ] && [ "${clean[deny_i]}" = Deny ] || return 1
+  case "$mode" in
+    options)
+      printf '1\tApprove\n2\tDeny\n'
+      return 0
+      ;;
+    selected)
+      # Same highlight signal pass 2 uses (lib/prompt-parse.sh:785,
+      # \x1b[48;2;R;G;Bm, a 24-bit background colour SGR): checked on the
+      # row's RAW (ansi-carrying) text, before the stripping above. Both or
+      # neither highlighted -> empty, same as the hardened parser's own
+      # `invalid = invalid or bool(selected)` rule -- never guess.
+      local approve_hl=0 deny_hl=0
+      printf '%s' "${raw[approve_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && approve_hl=1
+      printf '%s' "${raw[deny_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && deny_hl=1
+      if [ "$approve_hl" = 1 ] && [ "$deny_hl" = 0 ]; then printf '1'; return 0; fi
+      if [ "$deny_hl" = 1 ] && [ "$approve_hl" = 0 ]; then printf '2'; return 0; fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# Pane-level wrappers, same shape as prompt_menu_options()/prompt_menu_selected()
+# above -- each reads the window itself so a caller never has to know
+# _menu_window exists. Used by herdr-select.sh's _current_offer and its
+# navigation loop AFTER the hardened parser has already failed, so neither
+# competes with or duplicates it.
+prompt_footer_clipped_options() {        # <pane>
+  _menu_window "$1" | _prompt_footer_clipped_options options
+}
+prompt_footer_clipped_selected() {       # <pane>
+  _menu_window "$1" | _prompt_footer_clipped_options selected
+}

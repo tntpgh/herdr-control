@@ -6878,6 +6878,160 @@ _cp_write_menu_verdict() {
   return 0
 }
 
+# _cp_write_content_verdict <path> <content> <worktree> [manifest] -> UNWIRED
+# PROTOTYPE for herdr-control#267 (docs/design/write-panel-ceiling-267.md).
+# Zero callers. Judges a write/edit panel's STRUCTURED fields instead of a
+# size-capped screen scrape: the 4096-byte ceiling in
+# `_cp_input_ceiling_hit` never applies here, but every existing semantic
+# check still runs on the FULL content, not a truncated prefix.
+#
+# Returns on stdout: "allow", "deny:<reason>", or "escalate:<reason>".
+# "allow" here means "path containment and content checks found nothing to
+# refuse" -- it is NOT a bypass of herdr-control#277 (write/edit stays
+# categorically human-only for every non-human authority; the caller that
+# eventually wires this in must keep applying that rule exactly as today).
+#
+# Activation is a separate, explicit, human-reviewed change (see the design
+# doc's checklist) -- this function existing does not change behavior.
+_cp_write_content_verdict() {
+  local path="$1" content="$2" wt="$3" manifest="${4:-}"
+  case "$path" in
+    ''|*[[:space:]]*) printf 'deny:empty or whitespace-containing path'; return 0 ;;
+  esac
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read)
+      : ;; # allowlisted targets below still get the content scan
+    xd://*)
+      printf 'deny:unrecognized xd:// write target'; return 0 ;;
+    *[!A-Za-z0-9._/-]*)
+      printf 'deny:path contains characters no real filesystem write target can'; return 0 ;;
+  esac
+  # Security-review-adjacent hardening (stuck-save operational fix,
+  # docs/design/stuck-save-operational-fix.md): empty content has nothing
+  # to review, so "the content was judged" is never actually true for it --
+  # this is exactly the shape of "approve by asserting a hash matches,
+  # without supplying real content", not just one hash-shaped payload.
+  if [ -z "${content//[[:space:]]/}" ]; then
+    printf 'deny:empty content — nothing to review'
+    return 0
+  fi
+  # The established codebase convention for "this text is a clipped view,
+  # not the real thing" (herdr-select.sh:1008-1012, lib/alert-gate.sh:89-90)
+  # is a literal elided/truncated substring check, applied today only to
+  # the SCRAPED panel text. Apply the same guard here, defense-in-depth: a
+  # caller that passed through an already-clipped payload instead of the
+  # real structured content must not have it judged as if it were complete.
+  case "$content" in
+    *elided*|*truncated*)
+      printf 'escalate:content carries an elision/truncation marker — this is not the complete payload, refusing to judge a partial view'
+      return 0 ;;
+  esac
+  # Reject content that is not valid UTF-8 or ends mid multi-byte sequence --
+  # a structured-input path has no terminal scrape to be torn, so a bad
+  # encoding here means the recorded payload itself is suspect, not a
+  # rendering artifact; never silently judge a truncated/invalid prefix.
+  if ! printf '%s' "$content" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null; then
+    printf 'deny:content is not valid UTF-8 — cannot be reviewed as text'
+    return 0
+  fi
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read) ;;
+    *)
+      if [ -z "$wt" ]; then
+        printf 'escalate:worker worktree unknown — cannot judge write path containment'
+        return 0
+      fi
+      if ! _cp_path_within_worktree "$path" "$wt"; then
+        printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
+        return 0
+      fi
+      # N8 (round-2 security review; security-review REJECT at 63fc395,
+      # Requirement 6): threaded through identically to
+      # `_cp_write_menu_verdict` (`:6826-6876`) -- a manifest naming
+      # `handoffs_write` marks a write-restricted job class (research/
+      # explore) whose write tool may touch exactly that one `.handoffs`
+      # file and nothing else. Unlike `_cp_write_menu_verdict`, a match
+      # here does NOT return `allow` immediately -- it falls through to
+      # the content scan below, which is strictly MORE scrutiny than the
+      # menu path ever had, never less.
+      local hw
+      hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
+      if [ -n "$hw" ]; then
+        local abs wt_abs rel
+        case "$path" in
+          /*) abs="$path" ;;
+          *) abs="$wt/$path" ;;
+        esac
+        abs="$(_cp_lexical_abspath "$abs")"
+        wt_abs="$(_cp_lexical_abspath "$wt")"
+        rel="${abs#"$wt_abs"/}"
+        if [ "$rel" != ".handoffs/$hw" ]; then
+          printf 'escalate:this task'"'"'s manifest restricts its write tool to .handoffs/%s only' "$hw"
+          return 0
+        fi
+        # R3-4/R4-2 parity: refuse when the one allowed path is actually a
+        # symlink elsewhere (checked against the REAL, resolved worktree
+        # root, not the lexical one -- see `_cp_write_menu_verdict` for why).
+        if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
+          local real real_wt
+          real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
+          real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+          if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
+            printf 'escalate:this task'"'"'s one allowed .handoffs file is a symlink to somewhere else — remains human-only'
+            return 0
+          fi
+        fi
+      fi
+      ;;
+  esac
+  # Security review (Requirement 2/3, REJECT at 63fc395): a single CR byte
+  # mid-pattern (`.np` + \r + `mrc`) defeats `conductor_reserved_reason`'s
+  # literal `grep -E` matching the same way it would any literal-substring
+  # scanner -- pre-existing in that function, but never reachable for
+  # write/edit content until this prototype adds content scanning at all.
+  # Normalize on the FULL content, ONCE, before windowing -- not per-window
+  # -- so a CR sitting exactly at a window boundary cannot interact with
+  # the split. Strips every C0 control byte except tab/newline (which have
+  # legitimate structural meaning in real text) and DEL: CR/CRLF/bare-CR
+  # are the proven case, but any other C0 byte breaks a literal match the
+  # identical way, so the whole class is normalized, not just \r.
+  local normalized
+  normalized="$(printf '%s' "$content" | python3 -c '
+import sys
+data = sys.stdin.buffer.read()
+drop = bytes(b for b in range(0x20) if b not in (0x09, 0x0A)) + bytes([0x7F])
+sys.stdout.buffer.write(bytes(b for b in data if b not in drop))
+')"
+  # Reuse the SAME reserved-pattern / secret-path scanner a shell command
+  # gets, against the full (now control-char-normalized) content, never a
+  # clipped prefix -- but `conductor_reserved_reason` has its OWN
+  # unconditional 4096-byte ceiling (`lib/command-policy.sh` ~line 8205)
+  # that this prototype must not silently inherit (that would just
+  # reproduce #267 one level down, as verified while drafting this). Reuse
+  # the function completely UNMODIFIED -- never touch its pattern list --
+  # by scanning it in <=4000-byte windows with a 512-byte overlap
+  # (comfortably longer than any reserved pattern below) so a match sitting
+  # across a window boundary is still caught by the window that contains it
+  # whole. This is the scan write/edit content has never gotten at any size
+  # until wired in; splitting is scan-granularity only, never a new allow
+  # rule.
+  local reserved clen off win step=3488 wsize=4000
+  clen=${#normalized}
+  off=0
+  while :; do
+    win="${normalized:$off:$wsize}"
+    reserved="$(conductor_reserved_reason "$win")"
+    if [ -n "$reserved" ]; then
+      printf 'deny:%s' "$reserved"
+      return 0
+    fi
+    off=$((off + step))
+    [ "$off" -lt "$clen" ] || break
+  done
+  printf 'allow'
+  return 0
+}
+
 # A script runner's quoted arguments are data to its script, not command
 # position. Do not let a prose/data argument such as
 # `bash probe.sh 'git push origin feat/x'` reserve the outer approval. Inline
