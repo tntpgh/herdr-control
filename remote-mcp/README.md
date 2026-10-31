@@ -64,6 +64,27 @@ Scopes:
   rate limit (10/minute, 120/hour per sender) separate from message/task
   limits. `list_capabilities` reports `owner_inbox: {enabled, scope, limits}`.
 
+**Per-client identity** (SPEC: `.handoffs/DUET-IDENTITY-SPEC-20261031.md`,
+T first-hand YES 2026-10-31, applied to "duet" and "zero"): every connected
+client gets its own OAuth client_id the instant it does its own DCR —
+nothing here is shared, and the Worker derives `caller.client_id` from the
+verified resource token (`mcp.ts`'s `apiHandler`), never from request body
+or the self-declared `client_name` a DCR registration can claim to be
+anything. `owner_outbox` (and `sendOwnerMessage`'s audit rows) carry that
+verified `sender_client` alongside `sender` (the account email, the same
+for every client) and the self-declared `client_name` — so two connections
+under one account, e.g. two peer-inbox-only clients named "duet" and
+"zero", are told apart by the field that cannot be spoofed, never the one
+that can. Scoping a new client to the peer inbox only (read assigned,
+reply, ack, report-blocked — `herdr:read` + `herdr:message.owner`, never a
+`herdr:task.*` box) is still a manual consent-page tick; after Terrence
+completes it himself in his browser,
+`python3 remote-mcp/scripts/issue-client.py label <name> --client-id <id>
+--apply` verifies the resulting grant's scope is EXACTLY that set (fails
+loud, refuses to label, if a task scope snuck in) and records a local,
+non-secret `client_id -> name` mapping for `grants.py list`/`revoke` to
+reference later — it never touches `/oauth/token` and never sees a token.
+
 Messaging was off for the first connection and turned on as its own decision.
 Turning it on, in order:
 
@@ -714,11 +735,17 @@ deploys. The reverse order (old Mac, new Worker) is always safe: the
 `/ingest/sync` REQUEST schema is unchanged by this field, so an old
 publisher keeps working against a new Worker without modification.
 
-Tests: `cd worker && npx vitest run` (four projects: `read-only` = the
+Tests: `cd worker && npx vitest run` (seven projects: `read-only` = the
 first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
 and tasks both on, `owner-inbox` = messaging and the owner-inbox scope both
-on; OAuth flow, tools, scope, throttle, allowlist and
-task-lifecycle enforcement in workerd) and `python3
+on, `events` and `consumers` share owner-inbox's bindings, `client-identity`
+(`test/client-identity.test.ts`) is tasks AND owner-inbox both on — the one
+combination the others don't cover, proving the duet/zero per-client
+identity above end to end: verified sender_client distinct per connection
+under the same account, client_message_id dedupe, task.* denied to a
+peer-inbox-only token, delivered_at/replied_at recorded, and revoking one
+grant never touching another's queued message; OAuth flow, tools, scope,
+throttle, allowlist and task-lifecycle enforcement in workerd) and `python3
 remote-mcp/verify-publisher.py` (snapshot, redaction, link and envelope
 handling, delivery re-checks, lost-ack dedup, and graceful degradation
 against a genuine pre-v7 registry — the publisher's own registry read never

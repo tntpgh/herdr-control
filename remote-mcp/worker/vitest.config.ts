@@ -43,6 +43,11 @@ export default defineConfig({
       { plugins: [worker("true", "false", "true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },
       { plugins: [worker("true", "false", "true")], test: { name: "events", include: ["test/events.test.ts"] } },
       { plugins: [worker("true", "false", "true", "true")], test: { name: "consumers", include: ["test/consumers.test.ts"] } },
+      // Needs BOTH tasks=true (herdr:task.start/implement/cancel actually
+      // offered, so denying them to duet/zero is a deliberate scope choice,
+      // not an availability no-op) and ownerInbox=true (the peer-inbox
+      // tools duet/zero DO get): no existing project combines the two.
+      { plugins: [worker("true", "true", "true")], test: { name: "client-identity", include: ["test/client-identity.test.ts"] } },
     ],
   },
 });

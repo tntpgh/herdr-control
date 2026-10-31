@@ -1984,8 +1984,8 @@ export class HerdrState extends DurableObject<Env> {
     }
 
     const dueOwners = body.lease && !ownerGate.hold ? this.sql.exec<{ exchange_id: string; owner_label: string; client_msg_id: string;
-      body: string; sender_actor: string; sender_client_name: string; attempts: number }>(
-      `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client_name, attempts FROM owner_messages
+      body: string; sender_actor: string; sender_client: string; sender_client_name: string; attempts: number }>(
+      `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client, sender_client_name, attempts FROM owner_messages
        WHERE ((status='queued' AND lease_until <= ?) OR (status='delivering' AND lease_until < ?))
          AND detail <> 'deliver_failed:4' AND expires_at > ? ORDER BY created_at LIMIT 20`,
       nowMs, nowMs, nowMs).toArray() : [];
@@ -2042,7 +2042,7 @@ export class HerdrState extends DurableObject<Env> {
         })),
         owner_outbox: dueOwners.map((m) => ({
           exchange_id: m.exchange_id, owner_label: m.owner_label, client_msg_id: m.client_msg_id, body: m.body,
-          sender: m.sender_actor, client_name: m.sender_client_name, attempts: m.attempts + 1,
+          sender: m.sender_actor, sender_client: m.sender_client, client_name: m.sender_client_name, attempts: m.attempts + 1,
         })),
         audit, audit_cursor: cursor,
         owner_reply_results: ownerReplyResults,

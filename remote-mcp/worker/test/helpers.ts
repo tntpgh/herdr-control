@@ -24,10 +24,11 @@ const b64url = (buf: ArrayBuffer) =>
 
 // Full OAuth 2.1 authorization-code + PKCE flow, the way ChatGPT runs it:
 // DCR, /authorize behind Access, consent, code exchange with `resource`.
-export async function oauthToken(scopes: string[], email = "tnt@teamthurber.com"): Promise<{ access_token: string; scope: string }> {
+export async function oauthToken(scopes: string[], email = "tnt@teamthurber.com", clientName = "Zero"):
+    Promise<{ access_token: string; scope: string }> {
   const reg = await SELF.fetch(`${BASE}/oauth/register`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ redirect_uris: [REDIRECT], client_name: "Zero", token_endpoint_auth_method: "none",
+    body: JSON.stringify({ redirect_uris: [REDIRECT], client_name: clientName, token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
   });
   if (reg.status !== 201) throw new Error(`register ${reg.status} ${await reg.text()}`);
