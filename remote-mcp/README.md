@@ -591,8 +591,8 @@ change, no sync-shape change.
    client_id is a shared platform URL (every Claude.ai user has the same
    one), so the email half matters; only allowlisted emails ever get a grant.
 2. **Labels** are set only from the Mac:
-   `python3 remote-mcp/scripts/issue-client.py peer duet --client-id <id> --apply`
-   (and `dot`), `… unpeer <name> --apply` to remove. Route `/admin/peers`
+   `python3 remote-mcp/scripts/issue-client.py label duet --client-id <id> --profile full --peer --apply`
+   (and `dot`); `… peers` lists them, `… unpeer <name> --apply` removes one. Route `/admin/peers`
    (`list`/`set`/`remove`), signed like `/admin/grants`, audited
    `admin_peers_*`. `set` refuses a client_id with no live grant for that
    user, or whose grant lacks `herdr:message.owner`. One label per
