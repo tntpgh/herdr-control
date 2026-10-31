@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """owner-dispatch-issue.py --form-id ID --request-dir D
 One-shot writer for ONE approved owner-dispatch pilot (OFF BY DEFAULT, INERT).
+Subcommands: build-form (offline page for one request), build-standing-form
+(offline page for a standing lane grant) and issue-standing (writes it).
 
 TRUST ROOT: the answered formserve decision record, not a caller-supplied
 file or digest. The writer reads, from the PINNED forms directory
@@ -725,6 +727,109 @@ def build_main(argv, resolve=None, now=None) -> int:
     return 0
 
 
+def build_standing_main(argv, resolve=None, now=None) -> int:
+    """OFFLINE: write the deterministic STANDING decision page that
+    issue-standing later requires byte-for-byte (render_standing_form). Until
+    this existed, render_standing_form had no CLI caller, so a standing grant
+    could not be built outside a test fixture and every queue item needed its
+    own single-use form.
+    Binds exactly what issue-standing re-checks: the holder resolved fresh from
+    the registry; the generation of the lease ALREADY live for exactly that
+    identity (read-only --lease-db -- issue-standing claims nothing, so the
+    floor must already be live); the sha256 of the EXACT queue bytes, read once
+    the same way issue-standing reads them; and canonical_queue_items() of
+    those bytes. Refused before any page exists (rc 2): an unreadable or
+    invalid queue; a queue with no dispatch item; a dispatch item naming any
+    auth_id but --auth-id (StandingDispatch consumes the ITEM's auth_id as the
+    standing parent, so such an item would freeze the lane at dispatch time,
+    after a human already approved); a dispatch item without cost_cents (the
+    grant always carries a spend cap, so consume_standing would refuse it
+    standing_cost_missing at dispatch time -- the same late freeze); an item
+    whose rid fails the queue's own _RID_RE; an owner_projects mismatch; no
+    live lease for the registry identity. --item-cap 0 (default) = the number
+    of dispatch items.
+    Serves nothing, records nothing, writes only --out (O_EXCL)."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-standing-form")
+    for a in ("--label", "--project", "--queue-dir", "--queue-name", "--auth-id", "--lease-db", "--out"):
+        ap.add_argument(a, required=True)
+    ap.add_argument("--spend-cap-cents", type=int, required=True)
+    ap.add_argument("--item-cap", type=int, default=0)
+    ap.add_argument("--standing-window-s", type=int, default=1800)
+    a = ap.parse_args(argv)
+    clock = (lambda: now) if now is not None else time.time
+    try:
+        data = oda.read_request_once(a.queue_dir, a.queue_name)
+    except (ValueError, OSError):
+        print("refused:queue_unreadable")
+        return 2
+    try:
+        items = qs.validate_queue(json.loads(data))
+        canon = canonical_queue_items(data)
+    except ValueError:
+        print("refused:queue_invalid")
+        return 2
+    dispatch = [it for it in items if not it.get("hold")]
+    if not dispatch:
+        print("refused:queue_no_dispatch_items")
+        return 2
+    if any(it["auth_id"] != a.auth_id for it in dispatch):
+        print("refused:queue_item_auth_id_mismatch")
+        return 2
+    if any("cost_cents" not in it for it in dispatch):
+        print("refused:queue_item_cost_missing")
+        return 2
+    if not all(qs._RID_RE.match(qs.rid_for(a.label, it["id"])) for it in items):
+        print("refused:queue_item_rid_invalid")
+        return 2
+    if resolve is None:
+        import publisher  # noqa: E402
+        resolve = publisher.registry_resolver
+    ident = resolve(a.label)
+    if not ident:
+        print("refused:identity_unresolved")
+        return 2
+    try:
+        lconn = ol.open_ro(a.lease_db, require_table="owner_leases")
+    except (ValueError, sqlite3.Error) as exc:
+        print(f"refused:lease_{exc}")
+        return 4
+    try:
+        row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (a.label,)).fetchone()
+        live = ol.holder_tuple(lconn, a.label, clock())
+    except sqlite3.Error as exc:
+        print(f"refused:lease_{type(exc).__name__}")
+        return 4
+    finally:
+        lconn.close()
+    if not row or row[0] != a.project:
+        print("refused:owner_project_mismatch")
+        return 2
+    if live is None or live[:3] != (ident[0], ident[1], ident[2]):
+        print("refused:live_generation_unresolved")
+        return 2
+    rec = {"protocol": STANDING_PROTOCOL, "owner_label": a.label, "project": a.project,
+           "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
+           "expected_generation": live[3], "queue_sha256": hashlib.sha256(data).hexdigest(), "queue_items": canon,
+           "item_cap": a.item_cap or len(dispatch), "spend_cap_cents": a.spend_cap_cents, "auth_id": a.auth_id,
+           "standing_window_s": a.standing_window_s}
+    try:
+        validate_standing_approval(rec)
+    except Refused as exc:
+        print(f"refused:{exc}")
+        return 2
+    os.umask(0o077)
+    html = render_standing_form(rec)
+    try:
+        fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        print("refused:out_exists")
+        return 2
+    with os.fdopen(fd, "wb") as f:
+        f.write(html)
+    print(f"built:{a.out}:html_sha256={hashlib.sha256(html).hexdigest()}:approval_sha256={hashlib.sha256(approval_bytes(rec)).hexdigest()}")
+    return 0
+
+
 def issue_standing_main(argv, resolve=None, now=None) -> int:
     """Standing-grant counterpart to main(): reuses read_decision (bound to
     validate_standing_approval/render_standing_form), the pinned forms dir,
@@ -841,6 +946,8 @@ def main(argv=None, resolve=None, now=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["build-form"]:
         return build_main(argv[1:], resolve=resolve)
+    if argv[:1] == ["build-standing-form"]:
+        return build_standing_main(argv[1:], resolve=resolve, now=now)
     if argv[:1] == ["issue-standing"]:
         return issue_standing_main(argv[1:], resolve=resolve, now=now)
     ap = argparse.ArgumentParser()

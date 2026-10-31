@@ -457,7 +457,14 @@ if [ "$HUB" = 1 ]; then
         # untouched" was claimed and was false.
         TMP_PLIST="$PLIST.rendering.$$"
         render_hub_plist "$here/com.herdr-control.hub.plist.template" "$TMP_PLIST" "$HUB_PY_BIN"
-        if stage_plist "$TMP_PLIST" "$PLIST"; then
+        # Keep the factory keys the live plist already sets (agent-lib.sh
+        # carry_hub_factory_env): a repair re-render must not turn it off.
+        if ! carry_hub_factory_env "$PLIST" "$TMP_PLIST"; then
+          rm -f "$TMP_PLIST"
+          INSTALL_RC=2
+          echo "  ! hub NOT installed: could not carry the factory env keys (above)." >&2
+          echo "    The previous plist and the running hub are untouched." >&2
+        elif stage_plist "$TMP_PLIST" "$PLIST"; then
           reload_agent com.herdr-control.hub "$PLIST" \
             && echo "  hub -> http://127.0.0.1:8600/ (python: $HUB_PY_BIN)"
         else
@@ -484,6 +491,13 @@ if [ "$HUB" = 1 ]; then
     if HUB_PY_BIN="$(resolve_hub_python)"; then
       echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
       echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600, python: $HUB_PY_BIN)"
+      carried=""
+      if [ -f "$PLIST" ]; then
+        for k in $HUB_FACTORY_ENV_KEYS; do
+          plutil -extract "EnvironmentVariables.$k" raw -o - "$PLIST" >/dev/null 2>&1 && carried="$carried $k"
+        done
+      fi
+      [ -z "$carried" ] || echo "  + would carry the live factory env keys:$carried"
     else
       echo "  ! would FAIL: no pinned python3 interpreter found under /opt/homebrew/bin" >&2
       echo "    or /usr/local/bin (e.g. python3.14) — --apply would refuse to install." >&2

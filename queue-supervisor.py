@@ -14,6 +14,10 @@ Env: HERDR_QUEUE_SUPERVISOR_ROOT (queue + ledger dir), HERDR_QUEUE_SUPERVISOR_LA
 (comma-separated owner labels). Escalations append to <root>/escalations.jsonl
 for the hub/attention surface; this script contacts no one.
 
+KILL SWITCH: while ~/.local/state/herdr/owner-dispatch.revoked exists (any
+file type), a pass prints `stopped:kill_switch <path>`, opens no store and
+dispatches nothing. Delete it to resume on the next tick; no restart needed.
+
 HERDR_QUEUE_SUPERVISOR_STANDING=1 (default OFF) swaps GrantDispatch for
 StandingDispatch: the per-item fence (lease, DeliveryGate, journal) is
 IDENTICAL, only which grant each dispatch consumes changes -- a single-use
@@ -58,6 +62,25 @@ class GrantDispatch:
 
         return od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
             label, rid, request_text, manifest)
+
+
+# The factory's one-file stop, same shape as merge-delegation.revoked /
+# resident-escalation.revoked. Pinned under $HOME, never read from env (a
+# caller cannot point it elsewhere); tests rebind this module attribute.
+KILL_SWITCH = Path.home() / ".local" / "state" / "herdr" / "owner-dispatch.revoked"
+
+
+def kill_switch_engaged() -> bool:
+    """Present, or unknowable (any lstat error but ENOENT) -> stopped: an
+    unreadable state dir never reads as 'switch off'."""
+    try:
+        os.lstat(KILL_SWITCH)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
 
 
 STANDING_ENV_FLAG = "HERDR_QUEUE_SUPERVISOR_STANDING"
@@ -158,6 +181,9 @@ def journal_state(jroot: Path, label: str, rid: str) -> str | None:
 def main(environ=os.environ, send=None, resolve=None) -> int:
     if not qs.enabled(environ):
         print("off")
+        return 0
+    if kill_switch_engaged():
+        print(f"stopped:kill_switch {KILL_SWITCH}")
         return 0
     if environ.get("HERDR_OWNER_DISPATCH") != "1" or environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
         print("refused:flags_off")
