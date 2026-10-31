@@ -233,6 +233,12 @@ export interface OwnerOutboxItem {
   client_msg_id: string;
   body: string;
   sender: string; // the validated grant email, never free text
+  // The verified OAuth client_id that authenticated this call (caller.client_id,
+  // set server-side from the resource token -- never from client_name, which is
+  // self-declared at DCR registration and never trustworthy as an identity).
+  // Distinguishes two connections under the SAME sender email (e.g. duet vs.
+  // zero), which client_name alone cannot: any client can claim any client_name.
+  sender_client: string;
   client_name: string;
   attempts: number;
 }

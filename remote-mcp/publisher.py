@@ -1350,6 +1350,22 @@ def result_availability_tick() -> dict | None:
         avail.close()
 
 
+def _owner_sender(item: dict) -> str:
+    """The displayed/persisted sender for an owner message: the verified
+    grant email, plus the verified OAuth client_id (sender_client) when the
+    Worker sent one. client_id is set server-side from the resource token
+    (remote-mcp/worker/src/state.ts sync()'s dueOwners), never from the
+    self-declared client_name a DCR registration can claim to be anything
+    -- the ONLY way to tell two connections under the same email apart
+    (e.g. two separate credentials both labelled "duet" and "zero" at
+    issuance) is this field. Omitted (older Worker, or no client on the
+    token) falls back to the email alone, unchanged from before this field
+    existed."""
+    actor = clean(str(item.get("sender") or ""))
+    client = clean(str(item.get("sender_client") or ""))
+    return f"{actor} (client {client})" if client else actor
+
+
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
     only the fixed notice pointing at it. Pre-send exit 5 keeps its
@@ -1401,7 +1417,7 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
     adm = gate.admit(label, pane_id, pane_birth, exchange_id)
     if not adm.ok:
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": adm.reason}
-    sender = clean(str(item.get("sender") or ""))
+    sender = _owner_sender(item)
     body = str(item.get("body") or "")
     if not write_inbox_message(label, exchange_id, sender, body):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}  # stays queued
@@ -1447,7 +1463,7 @@ def persisted_payload_matches(label: str, exchange_id: str, sender: str, body: s
 
 def _send_owner_notice(item: dict, label: str, pane_id: str, write: bool = True) -> dict:
     exchange_id = item["exchange_id"]
-    sender = clean(str(item.get("sender") or ""))
+    sender = _owner_sender(item)
     if write and not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
     # M7 (REVIEW-219): exchange_id's own fixed format (oex_<compact-iso>Z_<hex>)
