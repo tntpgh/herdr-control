@@ -297,8 +297,79 @@ def status_cases(base: Path) -> None:
     case("STATUS: supervisor off + store unconfigured -> both shared blockers, no lane opened",
          rc == 1 and "supervisor_off" in st["shared_blockers"]
          and "not_configured:HERDR_OWNER_DISPATCH_AUTH_DB" in st["shared_blockers"] and st["lanes"] == [])
-    rc, out = quiet(FS.main, ["--hub-plist", str(d / "absent.plist")])
-    case("STATUS: unreadable hub plist -> exit 2", rc == 2 and out.startswith("unreadable:hub_plist"))
+    plist_cases(d, env)
+    lc.close()
+
+
+# The live remote-mcp plist's header comment carries `--` (install.sh --remote-mcp) on line 14:
+# illegal in an XML comment, so plistlib/expat raised ExpatError and factory-status crashed, while
+# launchd (CoreFoundation) loads the same file. The fixture puts that `--` on line 14 too.
+SENTINEL = "SENTINEL_VALUE_7f3a"
+CF_ONLY_PLIST = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                 '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                 '<!-- com.herdr-control.remote-mcp\n' + "".join(f"\t\t     header line {n}\n" for n in range(4, 14))
+                 + '\t\t     Render (install.sh --remote-mcp): /opt/homebrew/bin/python3.14 -> an\n'
+                 '\t\t     explicit interpreter.\n-->\n<plist version="1.0">\n<dict>\n'
+                 '  <key>EnvironmentVariables</key>\n  <dict>\n'
+                 '    <key>HERDR_OWNER_LEASE_RENEW</key><string>1</string>\n'
+                 f'    <key>SOME_TOKEN</key><string>{SENTINEL}</string>\n  </dict>\n</dict>\n</plist>\n')
+BROKEN_PLIST = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+                f'  <key>EnvironmentVariables</key>\n  <dict>\n    <key>SOME_TOKEN</key><string>{SENTINEL} & x</string>\n')
+
+
+def plist_cases(d: Path, env: dict) -> None:
+    hub, remote = d / "p-hub.plist", d / "p-remote.plist"
+    hub.write_bytes(plistlib.dumps({"EnvironmentVariables": env}))
+    has_cf = shutil.which("plutil") is not None
+
+    def run(*extra, h=hub, r=remote):
+        rc, out = quiet(FS.main, [*extra, "--hub-plist", str(h), "--remote-mcp-plist", str(r)], now=NOW)
+        return rc, out
+
+    remote.write_text(CF_ONLY_PLIST)
+    case("PLIST precondition: the fixture has `--` in its comment on line 14 and plistlib rejects it",
+         "--remote-mcp" in CF_ONLY_PLIST.splitlines()[13] and _strict_fails(CF_ONLY_PLIST))
+    rc, out = run("--json")
+    st = json.loads(out)
+    remote_blk = [b for b in st["shared_blockers"] if b.startswith("remote_mcp_plist_unreadable")]
+    if has_cf:
+        case("PLIST `--` in comment (live shape): no crash; read as launchd reads it -> lease_renew on, no blocker",
+             st["lease_renew"] is True and remote_blk == [])
+    else:
+        case("PLIST `--` in comment, no plutil on this host: no crash; BLOCKED with the reason",
+             remote_blk == ["remote_mcp_plist_unreadable:ExpatError:no_plutil"] and rc == 1)
+    remote.write_text(BROKEN_PLIST)
+    rc, out = run("--json")
+    st = json.loads(out)
+    case("PLIST unparseable by both parsers (raw '&', truncated): BLOCKED remote_mcp_plist_unreadable:ExpatError, exit 1",
+         rc == 1 and any(b.startswith("remote_mcp_plist_unreadable:ExpatError") for b in st["shared_blockers"])
+         and all(ln["verdict"] == "BLOCKED" for ln in st["lanes"]) and st["lease_renew"] is False)
+    rc, out = run()
+    case("PLIST unparseable, text mode: exit 1, reason shown, no env value echoed",
+         rc == 1 and "remote_mcp_plist_unreadable:ExpatError" in out and SENTINEL not in out)
+    rc, out = run("--json", r=d / "absent-remote.plist")
+    st = json.loads(out)
+    case("PLIST remote-mcp not installed: renewal off, not a blocker (unchanged)",
+         st["lease_renew"] is False and not any("remote_mcp" in b for b in st["shared_blockers"]))
+    hub.write_text(BROKEN_PLIST)
+    remote.write_bytes(plistlib.dumps({"EnvironmentVariables": {"HERDR_OWNER_LEASE_RENEW": "1"}}))
+    rc, out = run("--json")
+    st = json.loads(out)
+    case("PLIST hub unparseable: exit 1, the ONLY blocker is hub_plist_unreadable:<reason>, no lane opened",
+         rc == 1 and len(st["shared_blockers"]) == 1
+         and st["shared_blockers"][0].startswith("hub_plist_unreadable:ExpatError") and st["lanes"] == []
+         and SENTINEL not in out)
+    rc, out = run(h=d / "absent-hub.plist")
+    case("PLIST hub missing: exit 1, hub_plist_unreadable:FileNotFoundError (text mode, no crash)",
+         rc == 1 and "hub_plist_unreadable:FileNotFoundError" in out)
+
+
+def _strict_fails(text: str) -> bool:
+    try:
+        plistlib.loads(text.encode())
+    except Exception:  # noqa: BLE001 -- the precondition is "plistlib does not accept it", whatever it raises
+        return True
+    return False
     lc.close()
 
 
