@@ -587,23 +587,27 @@ owner inbox needs a registered pane on the Mac, so notes are held in the
 Durable Object and pulled by the recipient — no Mac, no pane, no publisher
 change, no sync-shape change.
 
-1. **Identity** is the verified pair `(email, client_id)`. With CIMD the
-   client_id is a shared platform URL (every Claude.ai user has the same
-   one), so the email half matters; only allowlisted emails ever get a grant.
+1. **Identity** is the verified pair `(email, client_id)`, where client_id is
+   the app platform's CIMD URL — one shared value for every Claude.ai (or
+   every ChatGPT) connection, not one per chat, session or install. So
+   identity means "this email on this platform": two Claude.ai connections
+   under the same email are the SAME peer (one label, one inbox, one task
+   set, one rate limit) and cannot be told apart. Different emails stay
+   separate; only allowlisted emails ever get a grant.
 2. **Labels** are set only from the Mac:
    `python3 remote-mcp/scripts/issue-client.py label duet --client-id <id> --profile full --peer --apply`
    (and `dot`); `… peers` lists them, `… unpeer <name> --apply` removes one. Route `/admin/peers`
    (`list`/`set`/`remove`), signed like `/admin/grants`, audited
    `admin_peers_*`. `set` refuses a client_id with no live grant for that
    user, or whose grant lacks `herdr:message.owner`. One label per
-   connection; relabelling drops the old one. No reconnect.
+   identity; relabelling drops the old one. No reconnect.
 3. **`send_peer_message`**, in order: per-call throttle → `OWNER_INBOX_ENABLED`
    → `herdr:message.owner` → `client_msg_id` dedupe (a retry returns the
    original) → sender labelled (`sender_not_labelled`) → peer exists, not
    self, email still allowlisted → `sanitizeOwnerMessage` → `task_id` (if
-   given) must be a remote task THIS connection started (`not_your_task`,
+   given) must be a remote task THIS identity started (`not_your_task`,
    also for an unknown id) → `OWNER_LIMITS` (10/minute, 120/hour per sending
-   connection) → one transaction: note, share, `peer.message_ready` event,
+   identity) → one transaction: note, share, `peer.message_ready` event,
    audit (`chars=`, never the body). The recipient identity is fixed when the
    note is sent; relabelling later never redirects it.
 4. **`list_peer_messages`** returns only notes addressed to the caller's own
@@ -611,9 +615,9 @@ change, no sync-shape change.
    labels. A note from an email since removed from `ALLOWED_EMAILS` is hidden.
    `wait_for_events` wakes on `peer.message_ready`, visible only to the
    recipient.
-5. **Segmentation.** Each connection sees its own remote tasks
-   (`get_task_answer`, `cancel_task`, `resume_task`), owner exchanges and
-   peer notes. Sharing is explicit: a note's `task_id` gives the peer
+5. **Segmentation** is per identity, not per connection. Each identity sees
+   its own remote tasks (`get_task_answer`, `cancel_task`, `resume_task`),
+   owner exchanges and peer notes. Sharing is explicit: a note's `task_id` gives the peer
    `get_task_answer` read access, never cancel/resume. The fleet view
    (`list_tasks`, `get_task`, `get_task_result`, `list_blockers`) and public
    lifecycle events in `list_events` stay fleet-wide metadata.
