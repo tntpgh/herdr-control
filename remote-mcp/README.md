@@ -208,7 +208,7 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `send_message` | message (listed only when enabled) | `target` (task_id, agent_id, or task label), `text` | `message_id`, status `queued`, resolved target |
 | `list_capabilities` | read | — | what `start_task` can do right now: `mac_enabled`, allow-listed `repos`, each mode's git/secrets/write policy, today's `caps` — from the Mac's own `task-allowlist.json`, never a hand-duplicated table |
 | `start_task` | task.start (research) or task.implement | `repo` (allow-listed), `mode` research\|implement, `objective` ≤4000 chars | `task_id` immediately, state `queued`, before the Mac has acted |
-| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `verified_kind` (`source_link_present`/`pushed_sha_matches`, which closure check `verified` is), `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md` |
+| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `verified_kind` (`source_link_present`/`pushed_sha_matches`, which closure check `verified` is), `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md`. Only the connection that started the task, or one it was shared with (`send_peer_message` `task_id`); anyone else gets the same `not_found` |
 | `follow_up` | message | `task_id`, `text` | = `send_message` addressed by remote `task_id`; refused if the task was never actually spawned |
 | `cancel_task` | task.cancel | `task_id` | new state (`cancelled` if never spawned, else `cancelling`); refused if already terminal |
 | `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
@@ -218,8 +218,10 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `commit_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id`, `expected_committed_cursor`, `new_cursor`, `lease_epoch` (nonnegative safe integers) | conditional ACK of a fully handled prefix; stale cursor/epoch, scope change, retention gap, backwards or past-latest commits are refused without changing the row |
 | `rebase_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id`, `expected_committed_cursor`, `resume_cursor`, `lease_epoch` (nonnegative safe integers), `current_authorization_scope_hash` (64 lowercase hex chars), `reconciled: true` | conditional, audited acknowledgement of a reconciled replay gap or scope rebind; increments the checkpoint generation; stale cursor/epoch/scope, below-floor, backwards or past-latest resumes are refused without changing the row |
 | `send_owner_message` | message.owner (listed only when enabled) | `owner_label`, `body` (≤4000 chars), `client_msg_id` | `exchange_id`, `state` `queued` |
-| `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only your own messages) |
-| `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only your own messages) |
+| `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only messages this connection — email AND client_id — sent) |
+| `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only messages this connection sent) |
+| `send_peer_message` | message.owner (listed with it) | `to` (peer label), `body` (≤4000 chars), `client_msg_id`, `task_id?` | `message_id`, `to`, `shared_task_id` — see "Duet<->Dot coordination" |
+| `list_peer_messages` | message.owner | `after_seq` (0), `limit` 1–50 (20) | `me`, `peers`, `messages` (seq, message_id, from, at, body, task_id), `next_after_seq` |
 
 `tools/list` on the live server is the authoritative JSON Schema.
 
@@ -576,6 +578,47 @@ outbox are added.
    inbox switch for reply acceptance as well as delivery. A grant-lookup
    hold remains transient; revoked/expired grants, removed scope, disabled
    inboxes and mismatched labels do not gain reply access.
+
+### Duet<->Dot coordination
+
+Two app connections (Duet = Claude.ai, Dot = ChatGPT) both run tasks AND
+leave each other notes. There is no client-to-client channel in MCP and the
+owner inbox needs a registered pane on the Mac, so notes are held in the
+Durable Object and pulled by the recipient — no Mac, no pane, no publisher
+change, no sync-shape change.
+
+1. **Identity** is the verified pair `(email, client_id)`. With CIMD the
+   client_id is a shared platform URL (every Claude.ai user has the same
+   one), so the email half matters; only allowlisted emails ever get a grant.
+2. **Labels** are set only from the Mac:
+   `python3 remote-mcp/scripts/issue-client.py peer duet --client-id <id> --apply`
+   (and `dot`), `… unpeer <name> --apply` to remove. Route `/admin/peers`
+   (`list`/`set`/`remove`), signed like `/admin/grants`, audited
+   `admin_peers_*`. `set` refuses a client_id with no live grant for that
+   user, or whose grant lacks `herdr:message.owner`. One label per
+   connection; relabelling drops the old one. No reconnect.
+3. **`send_peer_message`**, in order: per-call throttle → `OWNER_INBOX_ENABLED`
+   → `herdr:message.owner` → `client_msg_id` dedupe (a retry returns the
+   original) → sender labelled (`sender_not_labelled`) → peer exists, not
+   self, email still allowlisted → `sanitizeOwnerMessage` → `task_id` (if
+   given) must be a remote task THIS connection started (`not_your_task`,
+   also for an unknown id) → `OWNER_LIMITS` (10/minute, 120/hour per sending
+   connection) → one transaction: note, share, `peer.message_ready` event,
+   audit (`chars=`, never the body). The recipient identity is fixed when the
+   note is sent; relabelling later never redirects it.
+4. **`list_peer_messages`** returns only notes addressed to the caller's own
+   identity; `me` is its label (null until labelled), `peers` the other
+   labels. A note from an email since removed from `ALLOWED_EMAILS` is hidden.
+   `wait_for_events` wakes on `peer.message_ready`, visible only to the
+   recipient.
+5. **Segmentation.** Each connection sees its own remote tasks
+   (`get_task_answer`, `cancel_task`, `resume_task`), owner exchanges and
+   peer notes. Sharing is explicit: a note's `task_id` gives the peer
+   `get_task_answer` read access, never cancel/resume. The fleet view
+   (`list_tasks`, `get_task`, `get_task_result`, `list_blockers`) and public
+   lifecycle events in `list_events` stay fleet-wide metadata.
+6. Retention: notes and their events 30 days; shares go with their task row.
+   Revoking the sender's grant does not pull back a note already sent.
 
 ### Audit and limits
 
