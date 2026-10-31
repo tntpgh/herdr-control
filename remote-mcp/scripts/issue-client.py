@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
-"""Confirm and label a herdr-mcp OAuth connection as a peer-inbox-only
-client (SPEC: .handoffs/DUET-IDENTITY-SPEC-20261031.md -- "duet", "zero",
-and any future client of the same kind).
+"""Confirm and label a herdr-mcp OAuth connection as a known client, with
+an explicit scope profile (SPEC: .handoffs/DUET-IDENTITY-SPEC-20261031.md
+-- "duet", "dot" (alias: "zero"), and any future client of the same kind).
 
     python3 remote-mcp/scripts/issue-client.py list
-    python3 remote-mcp/scripts/issue-client.py label duet --client-id CLIENT_ID [--apply]
-    python3 remote-mcp/scripts/issue-client.py label duet --grant-id GRANT_ID [--apply]
+    python3 remote-mcp/scripts/issue-client.py label duet --client-id CLIENT_ID --profile full [--apply]
+    python3 remote-mcp/scripts/issue-client.py label dot --client-id CLIENT_ID [--apply]
+    python3 remote-mcp/scripts/issue-client.py label dot --grant-id GRANT_ID [--apply]
 
 Does NOT register an OAuth client and does NOT touch a token: an MCP client
-(Duet's, Zero's, ChatGPT's, Claude's -- any OAuth-2.1-capable MCP client)
+(Duet's, Dot's, ChatGPT's, Claude's -- any OAuth-2.1-capable MCP client)
 already does its own DCR + PKCE + consent the moment Terrence adds
 https://herdr-mcp.teamthurber.com/mcp as a connector in its settings and
-signs in. This script runs AFTER that: Terrence completes the consent page
-in HIS OWN browser himself (ticking ONLY "herdr:read" and
-"herdr:message.owner" -- never a herdr:task.* box), then `list` to find the
-new grant, then `label <name>` to record which one is duet/zero going
-forward AND to refuse, loudly, if its scope is not EXACTLY the peer-inbox
-set -- catching a stray task.* tick before the credential is ever used.
+signs in. A client registered via CIMD (client ID metadata document --
+Claude.ai's own id is the URL https://claude.ai/oauth/mcp-oauth-client-metadata,
+ChatGPT's is https://chatgpt.com/oauth/client.json) has that URL AS its
+client_id, compared byte-for-byte below like any other id -- no special
+casing needed. This script runs AFTER consent: Terrence completes the
+consent page in HIS OWN browser himself (ticking exactly the boxes for the
+chosen --profile), then `list` to find the new grant, then `label <name>`
+to record which one is duet/dot going forward AND to refuse, loudly, if its
+scope is not EXACTLY that profile's set -- catching a stray or missing tick
+before the credential is ever used.
+
+--profile (default peer-inbox):
+  peer-inbox  herdr:read, herdr:message.owner -- read assigned, reply,
+              ack, report-blocked. Never herdr:message, never any
+              herdr:task.*.
+  full        peer-inbox plus herdr:message, herdr:task.start,
+              herdr:task.implement, herdr:task.cancel -- app-to-app
+              messaging and task start/implement/cancel, for a client
+              trusted with the whole surface.
+Either way the check is an EXACT set match: anything extra or missing is
+refused, never silently narrowed or widened.
 
 What this never does, by construction (no code path touches /oauth/token):
 mint a credential, see a bearer token, or print one. `--apply` only writes
@@ -56,6 +72,21 @@ LABELS_PATH = STATE / "remote-mcp" / "client-labels.json"
 # consent page.
 PEER_INBOX_SCOPE = frozenset({"herdr:read", "herdr:message.owner"})
 
+# The full surface: peer-inbox plus app-to-app messaging and all three task
+# verbs. Still an EXACT-set check below -- granting this profile is a
+# deliberate per-client decision, never a default.
+FULL_SCOPE = frozenset({
+    "herdr:read", "herdr:message", "herdr:task.start",
+    "herdr:task.implement", "herdr:task.cancel", "herdr:message.owner",
+})
+
+SCOPE_PROFILES: dict[str, frozenset[str]] = {"peer-inbox": PEER_INBOX_SCOPE, "full": FULL_SCOPE}
+
+# "zero" was the peer-inbox client's working name before it was renamed to
+# "dot"; keep it resolving to the same label rather than minting a second
+# name for the same client.
+NAME_ALIASES: dict[str, str] = {"zero": "dot"}
+
 
 def load_labels() -> dict[str, str]:
     try:
@@ -83,9 +114,11 @@ def find_grant(grants: list[dict], client_id: str | None, grant_id: str | None) 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("op", choices=["list", "label"])
-    ap.add_argument("name", nargs="?", help="label op only: duet, zero, ...")
+    ap.add_argument("name", nargs="?", help="label op only: duet, dot (alias: zero), ...")
     ap.add_argument("--client-id")
     ap.add_argument("--grant-id")
+    ap.add_argument("--profile", choices=sorted(SCOPE_PROFILES), default="peer-inbox",
+                     help="scope this grant must EXACTLY match (default: peer-inbox)")
     ap.add_argument("--user", default="tnt@teamthurber.com")
     ap.add_argument("--apply", action="store_true", help="label: actually record it (default is a dry run)")
     a = ap.parse_args(argv)
@@ -111,38 +144,42 @@ def main(argv: list[str]) -> int:
         return 0
 
     if not a.name:
-        ap.error("label needs a NAME (duet, zero, ...)")
+        ap.error("label needs a NAME (duet, dot, ...)")
     if not a.client_id and not a.grant_id:
         ap.error("label needs --client-id or --grant-id (see `list`)")
+    name = NAME_ALIASES.get(a.name, a.name)
+    if name != a.name:
+        print(f"'{a.name}' is an alias for '{name}'; labelling as '{name}'.")
+    want = SCOPE_PROFILES[a.profile]
     g = find_grant(grants, a.client_id, a.grant_id)
     if g is None:
         print(f"no grant matches --client-id/--grant-id among {a.user}'s {len(grants)} grant(s); run `list` first", file=sys.stderr)
         return 1
     have = frozenset(g["scope"])
     print(f"grant {g['grant_id']}  client={g['client_id']}  scope={','.join(sorted(have))}")
-    if have != PEER_INBOX_SCOPE:
-        extra = have - PEER_INBOX_SCOPE
-        missing = PEER_INBOX_SCOPE - have
-        print(f"FAIL  not the peer-inbox-only scope (SPEC: duet/zero get exactly {sorted(PEER_INBOX_SCOPE)}).", file=sys.stderr)
+    if have != want:
+        extra = have - want
+        missing = want - have
+        print(f"FAIL  not the '{a.profile}' scope (SPEC: '{a.profile}' gets exactly {sorted(want)}).", file=sys.stderr)
         if extra:
             print(f"  extra (must be removed -- revoke this grant and re-consent without ticking it): {sorted(extra)}", file=sys.stderr)
         if missing:
             print(f"  missing: {sorted(missing)}", file=sys.stderr)
         return 1
-    existing = next((n for c, n in labels.items() if c == g["client_id"] and n != a.name), None)
+    existing = next((n for c, n in labels.items() if c == g["client_id"] and n != name), None)
     if existing:
         print(f"FAIL  client {g['client_id']} is already labelled '{existing}'; pick one name per client", file=sys.stderr)
         return 1
     if not a.apply:
-        print(f"DRY RUN — scope OK. Would label client={g['client_id']} as '{a.name}'. Re-run with --apply.")
+        print(f"DRY RUN — scope OK. Would label client={g['client_id']} as '{name}' ({a.profile}). Re-run with --apply.")
         return 0
-    labels[g["client_id"]] = a.name
+    labels[g["client_id"]] = name
     save_labels(labels)
     print("===== VERIFY =====")
     after = load_labels()
-    good = after.get(g["client_id"]) == a.name
+    good = after.get(g["client_id"]) == name
     print(f"  {LABELS_PATH}: {json.dumps(after, sort_keys=True)}")
-    print(f"OK  '{a.name}' -> {g['client_id']}" if good else "FAIL  label did not persist")
+    print(f"OK  '{name}' -> {g['client_id']}" if good else "FAIL  label did not persist")
     return 0 if good else 1
 
 

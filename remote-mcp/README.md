@@ -65,25 +65,33 @@ Scopes:
   limits. `list_capabilities` reports `owner_inbox: {enabled, scope, limits}`.
 
 **Per-client identity** (SPEC: `.handoffs/DUET-IDENTITY-SPEC-20261031.md`,
-T first-hand YES 2026-10-31, applied to "duet" and "zero"): every connected
-client gets its own OAuth client_id the instant it does its own DCR —
-nothing here is shared, and the Worker derives `caller.client_id` from the
-verified resource token (`mcp.ts`'s `apiHandler`), never from request body
-or the self-declared `client_name` a DCR registration can claim to be
-anything. `owner_outbox` (and `sendOwnerMessage`'s audit rows) carry that
-verified `sender_client` alongside `sender` (the account email, the same
-for every client) and the self-declared `client_name` — so two connections
-under one account, e.g. two peer-inbox-only clients named "duet" and
-"zero", are told apart by the field that cannot be spoofed, never the one
-that can. Scoping a new client to the peer inbox only (read assigned,
-reply, ack, report-blocked — `herdr:read` + `herdr:message.owner`, never a
-`herdr:task.*` box) is still a manual consent-page tick; after Terrence
-completes it himself in his browser,
+T first-hand YES 2026-10-31, applied to "duet" and "dot", alias "zero"):
+every connected client gets its own OAuth client_id the instant it does its
+own DCR — nothing here is shared, and the Worker derives `caller.client_id`
+from the verified resource token (`mcp.ts`'s `apiHandler`), never from
+request body or the self-declared `client_name` a DCR registration can
+claim to be anything. A client registered via CIMD (client ID metadata
+document) has that document's URL AS its client_id — Claude.ai's is
+`https://claude.ai/oauth/mcp-oauth-client-metadata` (labelled "duet"),
+ChatGPT's is `https://chatgpt.com/oauth/client.json` (labelled "dot") —
+compared byte-for-byte like any other client_id, no special casing.
+`owner_outbox` (and `sendOwnerMessage`'s audit rows) carry that verified
+`sender_client` alongside `sender` (the account email, the same for every
+client) and the self-declared `client_name` — so two connections under one
+account are told apart by the field that cannot be spoofed, never the one
+that can. Scoping a new client is still a manual consent-page tick, checked
+against an EXACT named profile, not assumed from the tick count:
+`issue-client.py`'s `--profile peer-inbox` (default — read assigned, reply,
+ack, report-blocked: `herdr:read` + `herdr:message.owner`, never a
+`herdr:task.*` box) or `--profile full` (peer-inbox plus `herdr:message`
+and all three `herdr:task.*` verbs, for a client trusted with the whole
+surface). After Terrence completes consent himself in his browser,
 `python3 remote-mcp/scripts/issue-client.py label <name> --client-id <id>
---apply` verifies the resulting grant's scope is EXACTLY that set (fails
-loud, refuses to label, if a task scope snuck in) and records a local,
-non-secret `client_id -> name` mapping for `grants.py list`/`revoke` to
-reference later — it never touches `/oauth/token` and never sees a token.
+[--profile full] --apply` verifies the resulting grant's scope is EXACTLY
+the chosen profile's set (fails loud, refuses to label, if a scope snuck in
+or is missing) and records a local, non-secret `client_id -> name` mapping
+for `grants.py list`/`revoke` to reference later — it never touches
+`/oauth/token` and never sees a token.
 
 Messaging was off for the first connection and turned on as its own decision.
 Turning it on, in order:
