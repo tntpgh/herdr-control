@@ -488,6 +488,23 @@ _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
     if [ -n "$key" ]; then printf 'keyhint\t%s' "$opts"; else printf 'menu\t%s' "$opts"; fi
     return
   fi
+  # herdr-control#267 follow-up (docs/design/stuck-save-operational-fix.md):
+  # a write/edit panel tall enough to push ONLY the trailing navigation
+  # footer out of the capture -- header and Approve/Deny rows still
+  # visible -- used to fall straight through to the numbered parser below,
+  # which can match an unrelated queued Steering row instead ("Deny-not-
+  # pressable", GBP wB4:p4). prompt_footer_clipped_options is a SEPARATE,
+  # narrower detector (lib/prompt-parse.sh) that only ever fires on that
+  # one shape: it requires a real header, requires the hardened parser
+  # above to have already failed, and refuses outright (same as this
+  # function falling through today) whenever Approve/Deny themselves are
+  # ALSO clipped -- the original Steering-truncated incident shape stays
+  # fail-closed, unchanged by this addition.
+  opts=$(prompt_footer_clipped_options "$pane")
+  if [ -n "$opts" ]; then
+    printf 'menu\t%s' "$opts"
+    return
+  fi
   opts=$(prompt_options "$pane")
   [ -n "$opts" ] && printf 'numbered\t%s' "$opts"
 }
@@ -1299,10 +1316,13 @@ _reopen_blocked_period() {
 # only if a prompt is still on screen: a mismatch usually means someone else
 # answered, and a pane with nothing pending is running, not blocked.
 _require_unchanged_after_close() {
+  local menu_selected
+  menu_selected="$(prompt_menu_selected "$pane")"
+  [ -n "$menu_selected" ] || menu_selected="$(prompt_footer_clipped_selected "$pane")"
   _require_current_authority && require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
     { [ "$mechanism" = numbered ] ||
       { [ "$mechanism" = keyhint ] && [ "$(prompt_keyhint_action_key "$pane" "$choice" 2>/dev/null)" = "$action_key" ]; } ||
-      [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
+      [ "$menu_selected" = "$choice" ]; } &&
     [ "$(prompt_content_digest "$pane")" = "$current_content" ] && return 0
   prompt_any_visible "$pane" >/dev/null 2>&1 && _reopen_blocked_period
   echo "herdr-select: the prompt in $pane changed while its answer was being recorded — refusing." >&2
@@ -1389,6 +1409,7 @@ else
   # presses — generous for any real menu, finite so a pathological/wrapping
   # menu can't spin forever.
   cur=$(prompt_menu_selected "$pane")
+  [ -n "$cur" ] || cur=$(prompt_footer_clipped_selected "$pane")
   [ -n "$cur" ] || {
     echo "herdr-select: cannot tell which option is currently highlighted in $pane — refusing to navigate blind." >&2
     exit 6
@@ -1408,6 +1429,7 @@ else
     }
     sleep 0.1
     cur=$(prompt_menu_selected "$pane")
+    [ -n "$cur" ] || cur=$(prompt_footer_clipped_selected "$pane")
     [ -n "$cur" ] || {
       echo "herdr-select: the prompt in $pane vanished or its highlight became unreadable mid-navigation — aborting." >&2
       exit 6
