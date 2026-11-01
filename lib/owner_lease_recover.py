@@ -1,4 +1,16 @@
-"""owner_lease_recover.py — the ONE authorized emergency-recovery path for a
+"""owner_lease_recover.py — two authorized, narrowly-scoped emergency-recovery
+paths for a REGISTERED label's lifecycle_end_at, mutually exclusive by
+construction (each refuses cleanly on the other's precondition, never
+silently falling through):
+
+  recover_lifecycle()       -- bound is SET and has already PASSED.
+  bind_missing_lifecycle()  -- bound was NEVER SET at all (NULL).
+
+The original docstring below (recover_lifecycle()'s own design) is
+unchanged except for this lead-in; bind_missing_lifecycle()'s own
+docstring (below recover_lifecycle()) repeats only what differs from it.
+
+recover_lifecycle() is the authorized emergency-recovery path for a
 REGISTERED label whose lifecycle_end_at has already passed with an empty (or
 otherwise unknown-to-the-caller) unregister_token, so neither the normal
 renewal pass (owner_lease_renew.renew_due: "lifecycle_ended", never revives
@@ -150,5 +162,87 @@ def recover_lifecycle(conn, label: str, project: str, new_lifecycle_end_at: floa
         ol._event(conn, now, label, "lifecycle_recovered", ref=confirmation_ref,
                   detail=f"new_lifecycle_end_at:{new_end_iso}")
         return "recovered", new_token
+
+    return ol._tx(conn, body)
+
+
+def bind_missing_lifecycle(conn, label: str, project: str, new_lifecycle_end_at: float,
+                           caller_pane_id: str, caller_pane_birth: str, confirmation_ref: str,
+                           now: float | None = None, dry_run: bool = True) -> tuple[str, str | None]:
+    """The companion to recover_lifecycle(), for the OTHER gap neither
+    renew_due() nor recover_lifecycle() itself covers: a REGISTERED label
+    whose lifecycle_end_at was never recorded at all (NULL), predating
+    R13-BOUNDS.md or inserted by a caller that omitted it. recover_lifecycle()
+    refuses this exact row ("no_lifecycle_bound") on purpose -- it is strictly
+    the already-expired-bound emergency, never a first-time bind. This
+    function is strictly the opposite: it refuses ("already_bound") the
+    moment lifecycle_end_at is anything but NULL, so it can never be used as
+    a second way to move a bound recover_lifecycle() already owns.
+
+    Same two-leg authorization (confirmation_ref required and checked by the
+    CLI, never self-extension), same CAS discipline keyed on the EXACT
+    (unregistered_at, lifecycle_end_at) pair this call read -- a concurrent
+    bind/recover/reregister that already committed a different pair makes
+    the WHERE clause match nothing ("race_lost"), nothing written.
+
+    Deliberately narrower than recover_lifecycle(): mints NO fresh
+    unregister_token (the row's existing token, however empty, is left
+    exactly as-is -- unregister capability is a separate, unrequested
+    concern; this call's only job is the missing bound) and touches no
+    table but owner_projects -- existing owner_leases/owner_requests
+    history for the label is never read or written here.
+
+    status is one of: "bound", "would_bind", "race_lost", "already_bound".
+
+    Raises InvalidOwner (no such label, project mismatch, or already
+    unregistered), Unauthorized (self-extension), ValueError (missing
+    confirmation_ref or an out-of-bounds new_lifecycle_end_at), ol.Disabled
+    (owner_state.enabled != 1)."""
+    now = time.time() if now is None else now
+    ol._check_holder(caller_pane_id, caller_pane_birth)
+    if not confirmation_ref or not isinstance(confirmation_ref, str):
+        raise ValueError("confirmation_ref is required")
+    if not isinstance(new_lifecycle_end_at, (int, float)) or isinstance(new_lifecycle_end_at, bool):
+        raise ValueError("new_lifecycle_end_at must be an epoch-seconds value")
+    if new_lifecycle_end_at <= now:
+        raise ValueError("new_lifecycle_end_at must be in the future")
+    if new_lifecycle_end_at - now > ol.MAX_TTL_S:
+        raise ValueError(f"new_lifecycle_end_at exceeds the {ol.MAX_TTL_S}s bound")
+    proj = ol.canonical_project(project)
+
+    if conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone() != (1,):
+        raise ol.Disabled("owner leasing is disabled")
+
+    row = conn.execute("SELECT project, unregistered_at, lifecycle_end_at, unregister_token "
+                       "FROM owner_projects WHERE label=?", (label,)).fetchone()
+    if not row:
+        raise ol.InvalidOwner(f"{label} is not a registered owner")
+    stored_project, unregistered_at, end_iso, stored_token = row
+    if stored_project != proj:
+        raise ol.InvalidOwner(f"{label} is registered to {stored_project!r}, not {proj!r}")
+    if unregistered_at is not None:
+        raise ol.InvalidOwner(f"{label} is unregistered; use owner-lease-reregister.py, not this path")
+    if end_iso is not None:
+        return "already_bound", None
+
+    cur = ol._live(conn, label, now)
+    if cur and (cur[1], cur[2]) == (caller_pane_id, caller_pane_birth):
+        raise ol.Unauthorized(f"{label}: self-extension refused -- caller is the current live holder")
+
+    if dry_run:
+        return "would_bind", None
+
+    new_end_iso = ol._iso(new_lifecycle_end_at)
+
+    def body():
+        cur2 = conn.execute(
+            "UPDATE owner_projects SET lifecycle_end_at=? "
+            "WHERE label=? AND unregistered_at IS NULL AND lifecycle_end_at IS NULL AND unregister_token IS ?",
+            (new_end_iso, label, stored_token))
+        if cur2.rowcount == 0:
+            return "race_lost", None
+        ol._event(conn, now, label, "lifecycle_bound", ref=confirmation_ref,
+                  detail=f"new_lifecycle_end_at:{new_end_iso}")
+        return "bound", None
 
     return ol._tx(conn, body)
