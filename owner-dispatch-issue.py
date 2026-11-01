@@ -50,7 +50,9 @@ Nothing retries.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -64,6 +66,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
 
+import kill_switch  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
 import queue_supervisor as qs  # noqa: E402
@@ -117,6 +120,27 @@ class Refused(Exception):
 # any argument: the caller cannot choose where the "answered" record lives.
 # (Tests rebind this module attribute; no runtime path does.)
 STATE_ROOT = os.path.join(os.path.expanduser("~"), ".local", "state", "herdr")
+
+# consume-pending's own stop conditions, same shape as queue-supervisor.py's
+# KILL_SWITCH: pinned under $HOME, never read from env, fail-closed on an
+# unreadable (not just present) marker. Tests rebind these module attributes.
+DISPATCH_KILL_SWITCH = os.path.join(STATE_ROOT, "owner-dispatch.revoked")
+MERGE_KILL_SWITCH = os.path.join(os.path.expanduser("~"), ".local", "state", "herdr", "merge-delegation.revoked")
+
+
+def _append_jsonl(path: str, record: dict) -> None:
+    """Append one audit line, private file, directory created 0700 if
+    missing. Best-effort ordering only -- callers that need exactly-once
+    issuance rely on owner_dispatch_auth's own transaction, never on this
+    log; this is provenance, not a second source of truth."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.umask(0o077)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+    finally:
+        os.close(fd)
 
 
 def _safe_dir_fd(path: str) -> int:
@@ -845,6 +869,24 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
     typed config refusal before any write. The signed record's queue_items
     must equal canonical_queue_items() derived from the EXACT queue bytes,
     so a caller cannot show one queue and sign another.
+
+    --recovery-of/--reason/--actor (all three or none -- partial is a usage
+    error) name an EXPLICIT owner-override recovery: the record Terrence
+    approves is STILL a completely normal standing form, built fresh against
+    the CURRENT queue/generation by build-standing-form, with the SAME
+    validate_standing_approval/render_standing_form this function already
+    uses -- recovery never widens or relaxes a single check below. The three
+    flags are a pure CLI/audit annotation: --recovery-of must name a row that
+    ALREADY exists in owner_dispatch_auth (refused recovery_target_unknown
+    otherwise, so this can never mint a first grant under cover of
+    'recovery'); on successful issuance only, one line is appended to
+    ~/.local/state/herdr/owner-dispatch/recovery.jsonl recording actor,
+    reason, old/new auth_id, old/new lease_generation, old/new
+    queue_sha256, approval_id and timestamp -- written whether or not the
+    issuance itself was later verified 'present' after an error, never for
+    a refusal (nothing to record recovering FROM a write that never
+    happened). consume-pending never passes these three flags: recovery is
+    always a deliberate, separately-invoked human action.
     Exit: 0 issued; 2 refused before any write; 4 config; 6 issue_uncertain
     (an error after the prior-use/identity checks passed, or a failed commit,
     and the row could not be verified absent: inspect the store, never
@@ -853,10 +895,23 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
     ap.add_argument("--form-id", required=True)
     ap.add_argument("--queue-dir", required=True)
     ap.add_argument("--queue-name", required=True)
+    ap.add_argument("--recovery-of")
+    ap.add_argument("--reason")
+    ap.add_argument("--actor")
     a = ap.parse_args(argv)
+    recovery_flags = (a.recovery_of, a.reason, a.actor)
+    if any(recovery_flags) and not all(recovery_flags):
+        print("refused:recovery_flags_partial")
+        return 2
     if not all(os.environ.get(f) == "1" for f in ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER",
                                                    "HERDR_OWNER_LEASE_DELIVERY")):
         print("refused:flags_off")
+        return 4
+    if kill_switch.engaged(DISPATCH_KILL_SWITCH):
+        print(f"refused:kill_switch:{DISPATCH_KILL_SWITCH}")
+        return 4
+    if kill_switch.engaged(MERGE_KILL_SWITCH):
+        print(f"refused:kill_switch:{MERGE_KILL_SWITCH}")
         return 4
     os.umask(0o077)
     clock = (lambda: now) if now is not None else time.time
@@ -903,10 +958,30 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
         store.close()
         print("refused:auth_store_not_migrated")
         return 4
+    old_row = None
+    if a.recovery_of is not None:
+        old_row = store.execute(
+            "SELECT lease_generation, queue_sha256 FROM owner_dispatch_auth WHERE auth_id=?", (a.recovery_of,)).fetchone()
+        if old_row is None:
+            lconn.close()
+            store.close()
+            print("refused:recovery_target_unknown")
+            return 2
     if resolve is None:
         import publisher  # noqa: E402
         resolve = publisher.registry_resolver
     h = rec["expected_holder"]
+
+    def audit_recovery() -> None:
+        if old_row is None:
+            return
+        _append_jsonl(os.path.join(STATE_ROOT, "owner-dispatch", "recovery.jsonl"), {
+            "actor": a.actor, "reason": a.reason, "approval_id": dec["form_id"],
+            "old_auth_id": a.recovery_of, "new_auth_id": rec["auth_id"],
+            "old_lease_generation": old_row[0], "new_lease_generation": rec["expected_generation"],
+            "old_queue_sha256": old_row[1], "new_queue_sha256": rec["queue_sha256"],
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))})
+
     try:
         try:
             same_identity(resolve, rec)                                # revalidation 1: before issue
@@ -928,6 +1003,7 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
         except Exception as exc:  # noqa: BLE001  after the prior-use/identity checks passed
             st = standing_grant_state(auth_db, dec, exp)
             if st == "present":
+                audit_recovery()
                 print(f"issued:{rec['auth_id']} (after error_{type(exc).__name__}; verified in store)")
                 return 0
             print(f"issue_uncertain:error_{type(exc).__name__}:store_{st}")
@@ -938,8 +1014,116 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
+    audit_recovery()
     print(f"issued:{rec['auth_id']}")
     return 0
+
+
+def consume_pending_main(argv, resolve=None, now=None) -> int:
+    """DEFAULT-OFF automatic counterpart to issue-standing: scans the pinned
+    forms dir for ANSWERED, APPROVED standing-grant records and calls
+    issue_standing_main (same process, same env-flag gate, same checks --
+    nothing new is trusted here) once per candidate. Fixes the actual
+    2026-11-01 incident: formserve/hub answering a form was never wired to
+    anything that calls issue-standing, so three approved standing forms
+    sat delivered-but-unconsumed. This subcommand is the wiring; it is NOT
+    on by default anywhere (no launchd entry, no install.sh change) and
+    never passes --recovery-of/--reason/--actor -- recovery stays a
+    separate, explicit, human-invoked action (see issue_standing_main).
+
+    Candidate selection is a CHEAP, UNTRUSTED peek (read the form's own
+    served .html, pull the embedded JSON, check protocol ==
+    STANDING_PROTOCOL) purely to decide which form ids to attempt and which
+    queue-name to pass -- issue_standing_main's own read_decision +
+    validate_standing_approval is the ONLY authority; a wrong or hostile
+    peek just causes a wasted, cleanly-refused attempt, never a trust
+    decision. --queue-root names the SAME root queue-supervisor.py's own
+    HERDR_QUEUE_SUPERVISOR_ROOT points at (<root>/<label>.queue.json, the
+    existing lib/queue_supervisor.py convention -- reused, not invented).
+
+    Kill switches: owner-dispatch.revoked AND merge-delegation.revoked, both
+    fail-closed on unreadable (not just present), checked BEFORE opening the
+    forms dir -- a revoked factory dispatches nothing and issues nothing.
+
+    Idempotent by construction: issue_standing_main's own
+    approval_already_used check makes a repeat pass over an already-issued
+    form a clean, logged no-op; running this on a schedule (ticked) or by
+    hand is equally safe.
+    Exit: 0 every candidate ended issued or approval_already_used; 2 the
+    kill switch is engaged; nonzero (count of non-clean outcomes) otherwise,
+    so a periodic caller can alert without masking a real refusal."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py consume-pending")
+    ap.add_argument("--queue-root", required=True)
+    a = ap.parse_args(argv)
+    if kill_switch.engaged(DISPATCH_KILL_SWITCH):
+        print(f"stopped:kill_switch:{DISPATCH_KILL_SWITCH}")
+        return 2
+    if kill_switch.engaged(MERGE_KILL_SWITCH):
+        print(f"stopped:kill_switch:{MERGE_KILL_SWITCH}")
+        return 2
+    forms_dir = os.path.join(STATE_ROOT, "forms")
+    try:
+        dfd = _safe_dir_fd(forms_dir)
+    except Refused as exc:
+        print(f"stopped:{exc}")
+        return 2
+    try:
+        names = [n for n in os.listdir(dfd) if n.endswith(".json")]
+    finally:
+        os.close(dfd)
+    audit_path = os.path.join(STATE_ROOT, "owner-dispatch", "consume.jsonl")
+    clock = (lambda: now) if now is not None else time.time
+    bad = 0
+    seen = 0
+    for name in sorted(names):
+        form_id = name[:-len(".json")]
+        if not FORM_ID.match(form_id):
+            continue
+        dfd2 = _safe_dir_fd(forms_dir)
+        try:
+            try:
+                row_bytes = _read_at(dfd2, name)
+                html = _read_at(dfd2, form_id + ".html")
+            except Refused:
+                continue
+        finally:
+            os.close(dfd2)
+        try:
+            row = json.loads(row_bytes)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("status") != "answered":
+            continue
+        ans = row.get("answers")
+        if not isinstance(ans, dict) or ans.get("decision") != "approve":
+            continue
+        found = EMBED.findall(html)
+        if len(found) != 1:
+            continue
+        try:
+            peek = json.loads(found[0])
+        except ValueError:
+            continue
+        if not isinstance(peek, dict) or peek.get("protocol") != STANDING_PROTOCOL:
+            continue
+        label = peek.get("owner_label")
+        if not isinstance(label, str) or not SAFE_ID.match(label):
+            continue
+        seen += 1
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = issue_standing_main(
+                ["--form-id", form_id, "--queue-dir", a.queue_root, "--queue-name", f"{label}.queue.json"],
+                resolve=resolve, now=clock())
+        outcome = buf.getvalue().strip()
+        print(outcome)
+        _append_jsonl(audit_path, {"form_id": form_id, "owner_label": label, "exit_code": rc, "outcome": outcome,
+                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))})
+        if rc == 0 or outcome.startswith("refused:approval_already_used"):
+            continue  # issued, or already consumed by an earlier pass -- both clean
+        bad += 1
+    print(f"pass_complete:candidates={seen}:failures={bad}")
+    return 0 if bad == 0 else 1
 
 
 def main(argv=None, resolve=None, now=None) -> int:
@@ -950,6 +1134,8 @@ def main(argv=None, resolve=None, now=None) -> int:
         return build_standing_main(argv[1:], resolve=resolve, now=now)
     if argv[:1] == ["issue-standing"]:
         return issue_standing_main(argv[1:], resolve=resolve, now=now)
+    if argv[:1] == ["consume-pending"]:
+        return consume_pending_main(argv[1:], resolve=resolve, now=now)
     ap = argparse.ArgumentParser()
     ap.add_argument("--form-id", required=True)
     ap.add_argument("--request-dir", required=True)

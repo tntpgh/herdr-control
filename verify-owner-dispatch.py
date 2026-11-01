@@ -399,6 +399,7 @@ def main() -> int:
     bind_live_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     title_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    consumer_recovery_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 
@@ -2432,6 +2433,179 @@ def standing_issue_cases(base: Path) -> None:
          "(another issuance row with the same form_id still exists)",
          odi.standing_grant_state(str(adb), dec_bad, now + 1800) == "unknown")
     ac.close(); lc.close()
+
+
+def consumer_recovery_cases(base: Path) -> None:
+    """owner-dispatch-issue.py consume-pending (the 2026-11-01 incident fix:
+    nothing previously turned an answered, approved standing form into an
+    actual grant -- this is that missing wiring, default-off, idempotent via
+    issue_standing_main's own approval_already_used check) and
+    issue-standing --recovery-of/--reason/--actor (explicit owner-override
+    recovery: still a completely normal issuance through the SAME checks,
+    only a CLI/audit annotation naming the stale grant being replaced)."""
+    import importlib.util
+    import io
+    import contextlib
+    import time as _t
+    spec = importlib.util.spec_from_file_location("odi_consumer", HERE / "owner-dispatch-issue.py")
+    odi = importlib.util.module_from_spec(spec); spec.loader.exec_module(odi)
+    now = float(int(_t.time()))
+    HOLD = {"pane_id": PANE[KB][0], "pane_birth": PANE[KB][1], "session_digest": SESS[KB]}
+    reg_ok = {KB: (*PANE[KB], SESS[KB])}.get
+    items = [{"id": "i1", "request": "do one\n", "auth_id": "consume-auth", "manifest": ["result.md"], "cost_cents": 10}]
+    queue_bytes = json.dumps(items).encode()
+    queue_sha = hashlib.sha256(queue_bytes).hexdigest()
+    canon_items = odi.canonical_queue_items(queue_bytes)
+    n = [0]
+
+    def setup():
+        n[0] += 1
+        d = base / f"c{n[0]}"; d.mkdir(mode=0o700)
+        lc, av, roots, lease_db = env(d); av.close()
+        os.chmod(lease_db, 0o600)
+        acquire(lc, KB, now=now - 10)
+        adb = d / "auth.db"
+        ac0 = sqlite3.connect(str(adb), isolation_level=None)
+        oda.migrate(ac0)
+        ac0.close()
+        os.chmod(adb, 0o600)
+        qroot = d / "qroot"; qroot.mkdir()
+        (qroot / f"{KB}.queue.json").write_bytes(queue_bytes)
+        (d / "state" / "forms").mkdir(parents=True)
+        proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+        return d, lc, lease_db, adb, qroot, proj
+
+    def decision(d, proj, auth_id, over=None, answers=None, protocol=None):
+        rec = {"protocol": protocol or odi.STANDING_PROTOCOL, "owner_label": KB, "project": proj,
+               "expected_holder": dict(HOLD), "expected_generation": 1, "queue_sha256": queue_sha,
+               "queue_items": [dict(it) for it in canon_items], "item_cap": 5, "spend_cap_cents": 100,
+               "auth_id": auth_id, "standing_window_s": 1800}
+        rec.update(over or {})
+        emb = odi.approval_bytes(rec)
+        n[0] += 1
+        fid = f"20261101T0900{n[0] % 100:02d}-93{n[0] % 100:02d}"
+        html = odi.render_standing_form(rec)
+        ans = {"decision": "approve", "approval_sha256": hashlib.sha256(emb).hexdigest()} if answers is None else answers
+        row = {"id": fid, "status": "answered", "answers": ans, "answered_at": int((now - 60) * 1000)}
+        (d / "state" / "forms" / f"{fid}.html").write_bytes(html)
+        (d / "state" / "forms" / f"{fid}.json").write_text(json.dumps(row))
+        return fid, rec
+
+    KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+    real_root = odi.STATE_ROOT
+    real_dks, real_mks = odi.DISPATCH_KILL_SWITCH, odi.MERGE_KILL_SWITCH
+
+    def run(d, lease_db, adb, argv, resolve=reg_ok, flags=True, dks=None, mks=None):
+        E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+             "HERDR_OWNER_LEASE_DB": str(lease_db), "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
+        odi.STATE_ROOT = os.path.realpath(d / "state")
+        odi.DISPATCH_KILL_SWITCH = str(dks) if dks else os.path.join(odi.STATE_ROOT, "owner-dispatch.revoked")
+        odi.MERGE_KILL_SWITCH = str(mks) if mks else os.path.join(odi.STATE_ROOT, "merge-delegation.revoked")
+        saved = {k: os.environ.get(k) for k in KEYS_ENV}
+        for k in saved: os.environ.pop(k, None)
+        os.environ.update(E)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = odi.main(argv, resolve=resolve, now=now)
+        finally:
+            odi.STATE_ROOT = real_root
+            odi.DISPATCH_KILL_SWITCH, odi.MERGE_KILL_SWITCH = real_dks, real_mks
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, buf.getvalue().strip()
+
+    def q(adb, sql, params=()):
+        c = sqlite3.connect(str(adb)); r = c.execute(sql, params).fetchall(); c.close(); return r
+
+    # 1. happy path: an answered, approved standing form sitting unconsumed -> one pass issues it
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid, rec = decision(d, proj, "consume-auth-1")
+    rc1, out1 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)])
+    g = q(adb, "SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (rec["auth_id"],))
+    case("CONSUME-PENDING: answered+approved standing form with nobody having run issue-standing -> "
+         "one pass issues the grant (the actual 2026-11-01 incident, fixed)",
+         rc1 == 0 and g == [("granted",)] and "candidates=1:failures=0" in out1)
+    # idempotent: a second pass is a clean no-op, not a failure
+    rc2, out2 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)])
+    case("CONSUME-PENDING: a repeat pass over an already-issued form is a clean no-op (approval_already_used, "
+         "not counted as a failure)", rc2 == 0 and "candidates=1:failures=0" in out2)
+    lc.close()
+
+    # 2. kill switch engaged -> stopped, nothing opened, nothing issued
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid, rec = decision(d, proj, "consume-auth-2")
+    dks = d / "state" / "owner-dispatch.revoked"; dks.parent.mkdir(parents=True, exist_ok=True); dks.write_text("x")
+    rc3, out3 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)], dks=dks)
+    case("CONSUME-PENDING: owner-dispatch.revoked present -> stopped, nothing issued",
+         rc3 == 2 and out3.startswith("stopped:kill_switch")
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # 3. a non-standing answered form (different protocol) is skipped, never attempted
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid, rec = decision(d, proj, "consume-auth-3", protocol="some-other-protocol/1")
+    rc4, out4 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)])
+    case("CONSUME-PENDING: a non-standing-protocol answered form is skipped entirely (never counted as a candidate)",
+         rc4 == 0 and "candidates=0:failures=0" in out4
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # 4. queue sha mismatch at consume time -> refused, counted as a real failure, nothing written
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid, rec = decision(d, proj, "consume-auth-4")
+    (qroot / f"{KB}.queue.json").write_bytes(b'[{"id":"different"}]')
+    rc5, out5 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)])
+    case("CONSUME-PENDING: live queue no longer matches the approved queue_sha256 -> refused, counted as a "
+         "real failure (never silently swallowed as a clean no-op)",
+         rc5 == 1 and "candidates=1:failures=1" in out5
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
+
+    # ---- explicit owner-override recovery ----
+    # 5. recovery-of naming a REAL existing grant -> issues normally, durable audit record written
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid_old, rec_old = decision(d, proj, "orig-auth-5")
+    run(d, ldb, adb, ["issue-standing", "--form-id", fid_old, "--queue-dir", str(qroot), "--queue-name", f"{KB}.queue.json"])
+    fid_new, rec_new = decision(d, proj, "recovered-auth-5")
+    rc6, out6 = run(d, ldb, adb, ["issue-standing", "--form-id", fid_new, "--queue-dir", str(qroot),
+                                   "--queue-name", f"{KB}.queue.json", "--recovery-of", "orig-auth-5",
+                                   "--reason", "queue re-signed after resume", "--actor", "terrence"])
+    audit_path = d / "state" / "owner-dispatch" / "recovery.jsonl"
+    audit = [json.loads(line) for line in audit_path.read_text().splitlines()] if audit_path.exists() else []
+    case("RECOVERY: --recovery-of a REAL existing grant -> issues through the UNCHANGED normal path, "
+         "durable audit record (actor, reason, old/new auth_id+generation+queue_sha, approval_id)",
+         rc6 == 0 and q(adb, "SELECT status FROM owner_dispatch_auth WHERE auth_id=?", ("recovered-auth-5",)) == [("granted",)]
+         and len(audit) == 1
+         and audit[0]["old_auth_id"] == "orig-auth-5" and audit[0]["new_auth_id"] == "recovered-auth-5"
+         and audit[0]["actor"] == "terrence" and audit[0]["reason"] == "queue re-signed after resume"
+         and audit[0]["approval_id"] == fid_new and audit[0]["old_lease_generation"] == 1
+         and audit[0]["old_queue_sha256"] == queue_sha)
+    lc.close()
+
+    # 6. recovery-of naming an UNKNOWN auth_id -> refused before any write, no audit line, cannot mint a first grant
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid_new, rec_new = decision(d, proj, "recovered-auth-6")
+    rc7, out7 = run(d, ldb, adb, ["issue-standing", "--form-id", fid_new, "--queue-dir", str(qroot),
+                                   "--queue-name", f"{KB}.queue.json", "--recovery-of", "never-existed",
+                                   "--reason", "x", "--actor", "terrence"])
+    case("RECOVERY: --recovery-of naming an auth_id that never existed -> refused before any write "
+         "(cannot mint a first grant under cover of recovery)",
+         rc7 == 2 and out7 == "refused:recovery_target_unknown"
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)]
+         and not (d / "state" / "owner-dispatch" / "recovery.jsonl").exists())
+    lc.close()
+
+    # 7. partial recovery flags -> usage refusal, nothing written
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid_new, rec_new = decision(d, proj, "recovered-auth-7")
+    rc8, out8 = run(d, ldb, adb, ["issue-standing", "--form-id", fid_new, "--queue-dir", str(qroot),
+                                   "--queue-name", f"{KB}.queue.json", "--recovery-of", "orig-auth-7"])
+    case("RECOVERY: --recovery-of without --reason/--actor -> refused:recovery_flags_partial, nothing written",
+         rc8 == 2 and out8 == "refused:recovery_flags_partial"
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    lc.close()
 
 
 

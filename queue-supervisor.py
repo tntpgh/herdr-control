@@ -37,6 +37,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
+import kill_switch  # noqa: E402
 import owner_dispatch as od  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
@@ -72,14 +73,11 @@ KILL_SWITCH = Path.home() / ".local" / "state" / "herdr" / "owner-dispatch.revok
 
 def kill_switch_engaged() -> bool:
     """Present, or unknowable (any lstat error but ENOENT) -> stopped: an
-    unreadable state dir never reads as 'switch off'."""
-    try:
-        os.lstat(KILL_SWITCH)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
+    unreadable state dir never reads as 'switch off'. Delegates to
+    lib/kill_switch.engaged -- the SAME logic, shared with
+    owner-dispatch-issue.py's consume-pending so the two callers cannot
+    drift (KILL_SWITCH stays a rebindable module attribute for tests)."""
+    return kill_switch.engaged(KILL_SWITCH)
 
 
 
