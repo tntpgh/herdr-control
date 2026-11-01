@@ -20,13 +20,24 @@
 # confirms the composer actually consumed the submit.
 #
 # What changed 2026-09-04 (durable-supervision pass): the SCHEDULED path no
-# longer spawns at all — an unattended, unisolated executory worker is
-# forbidden by policy until an isolated worker boundary exists, so first
-# Fridays now emit a failed "isolation-required" ledger row (a pre-triaged
-# page) instead of quietly launching a worker nothing owns. Manual (attended)
-# runs still dispatch, but no longer claim `succeeded` at dispatch: the
+# longer spawns a host pane at all — an unattended, unisolated executory
+# worker is forbidden by policy. For one day (2026-09-04) that meant first
+# Fridays failed closed with an "isolation-required" ledger row and nothing
+# else; Terrence's isolation_first decision replaced that the very next day.
+# As of 2026-09-05 the SCHEDULED path instead runs the pass INSIDE the
+# isolated worker (isolated-worker.py — no host pane, no herdr socket, no
+# credentials, model-relay network only; see the --scheduled branch below).
+# Its returned patch is accepted ONLY if the sole change is
+# docs/tracking/<date>-stage2-diagnose-pass.md; anything else is refused (a
+# failed ledger row, patch not applied — a doc-only hunk is still extracted
+# as a PROPOSAL artifact for human review, 2026-10-21, see
+# lib/extract-doc-only-patch.py). Manual (attended) runs still dispatch a
+# host pane, but no longer claim `succeeded` at dispatch either way: the
 # diagnose lane's succeeded row comes only from `--record-completion`, which
-# verifies a tracking doc actually committed on the pass branch first.
+# verifies a tracking doc actually committed on the pass branch first. A
+# first-Friday no-op (every other Friday) reports `skipped`, not
+# `succeeded` — a no-op is a real run worth dead-man coverage, but it is not
+# a diagnosis outcome and must not read as one (2026-10-21).
 #
 # What this still does NOT automate, honestly (charter §8 item 3 is still
 # open): a mid-run interactive permission prompt only a human/conductor can
@@ -62,16 +73,31 @@ if [ "${1:-}" = "--scheduled" ]; then
     # STAGE2_ASSUME_FIRST_FRIDAY=1 is a test seam ONLY: it can force the
     # first-Friday branch, which below always refuses to dispatch — so the
     # seam can only make this script MORE closed, never spawn anything.
-    if { [ "$(date +%u)" != "5" ] || [ "$(date +%-d)" -gt 7 ]; } \
+    # STAGE2_ASSUME_NOT_FIRST_FRIDAY=1 is the symmetric seam for the skip
+    # branch itself (2026-10-21): wall-clock dependence made the skip path
+    # untestable on the 7 days a month it is actually first-Friday-eligible;
+    # this can only force MORE skipping, never a dispatch.
+    if { [ "$(date +%u)" != "5" ] || [ "$(date +%-d)" -gt 7 ] \
+        || [ "${STAGE2_ASSUME_NOT_FIRST_FRIDAY:-0}" = "1" ]; } \
         && [ "${STAGE2_ASSUME_FIRST_FRIDAY:-0}" != "1" ]; then
         echo "stage2-diagnose: $(date '+%F %A') is not the first Friday of the month - skipping"
-        # Report the skip. A no-op is still a RUN of this stage, and reporting it
-        # keeps the dead-man window at ~7 days (weekly trigger) instead of ~38
-        # (monthly full pass) — so a dead loop is caught in a week rather than
-        # after it has already missed its real slot. The note says exactly what
-        # this row proves: the SCHEDULER is alive. It is not a diagnosis
-        # outcome, and the emit API's two states cannot say more than the note.
-        emit_loop_run diagnose succeeded 0 "scheduler-liveness: skipped, not the first Friday — no pass due, NOT a diagnosis outcome"
+        # Report the skip — a no-op is still a RUN of this stage, and
+        # reporting it keeps the dead-man window at ~7 days (weekly trigger)
+        # instead of ~38 (monthly full pass), so a dead loop is caught in a
+        # week rather than after it has already missed its real slot. This
+        # is NOT a diagnosis outcome, so it is no longer reported as one:
+        # `skipped` here used to be `succeeded`, which let scheduler
+        # liveness read as a diagnosis success (.handoffs/SPEC.md T4,
+        # 2026-10-21). NEXT GATE before a real scheduled run reaches this
+        # line: knowledge-base/scripts/emit_loop_run.py's `--state` choices
+        # (and job_ledger._ALLOWED_JOB_STATES) are `("succeeded", "failed")`
+        # only today — `skipped` is not yet a value that CLI accepts, so
+        # until that repo adds it this call logs a swallowed ledger-write
+        # failure (emit_loop_run is best-effort by construction) and the
+        # dead-man goes unfed for the skip week. Add `skipped` to that
+        # allowlist (it already satisfies watchdog._SATISFYING_STATES'
+        # superset check only if added there too) before relying on this.
+        emit_loop_run diagnose skipped 0 "scheduler-liveness: skipped, not the first Friday — no pass due, NOT a diagnosis outcome"
         exit 0
     fi
     # First Friday: the scheduled path runs the pass INSIDE the isolated
@@ -339,8 +365,22 @@ if [ "${SCHEDULED:-0}" = 1 ]; then
     # is untrusted; scope is the review gate this unattended path has.
     TOUCHED="$(jq -r '[.added[].path, .modified[].path, .deleted[].path, .symlinks_created[]?.path?] | map(select(. != null)) | join("\n")' "$CHANGES" 2>/dev/null || true)"
     if [ "$TOUCHED" != "$EXPECT_DOC" ]; then
-        emit_loop_run diagnose failed 0 "isolated pass returned out-of-scope changes (expected only $EXPECT_DOC): $(printf '%s' "$TOUCHED" | tr '\n' ' ' | cut -c1-200) — patch NOT applied, task_dir=$ISO_DIR"
-        echo "stage2-diagnose: patch touches more than the tracking doc; refusing to apply. Review $PATCH by hand." >&2
+        # Recovery path, not auto-apply: a patch that is out of scope because
+        # of ONE unrelated byproduct file alongside a fine doc (the real
+        # 2026-10-02 case — scripts/__pycache__/findings_to_okf.cpython-311.pyc
+        # next to a clean tracking doc) still loses a month's pass entirely
+        # today. Pull just the target doc's hunk out as a PROPOSAL artifact a
+        # human reviews and applies by hand; the refusal and the non-apply are
+        # unchanged — nothing beyond this extraction is automatic.
+        PROPOSAL="$ISO_DIR/artifacts/doc-only-proposal.patch"
+        if python3 "$HERE/lib/extract-doc-only-patch.py" "$PATCH" "$EXPECT_DOC" > "$PROPOSAL" 2>/dev/null; then
+            PROPOSAL_NOTE=" doc-only hunk extracted as a PROPOSAL (never applied): $PROPOSAL"
+        else
+            rm -f "$PROPOSAL"
+            PROPOSAL_NOTE=" no doc-only hunk found to extract"
+        fi
+        emit_loop_run diagnose failed 0 "isolated pass returned out-of-scope changes (expected only $EXPECT_DOC): $(printf '%s' "$TOUCHED" | tr '\n' ' ' | cut -c1-200) —$PROPOSAL_NOTE — patch NOT applied, task_dir=$ISO_DIR"
+        echo "stage2-diagnose: patch touches more than the tracking doc; refusing to apply. Review $PATCH by hand.$PROPOSAL_NOTE" >&2
         exit 1
     fi
     WTROOT="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")"

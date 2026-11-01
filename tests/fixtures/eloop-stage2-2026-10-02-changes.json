@@ -1,0 +1,26 @@
+{
+  "added": [
+    {
+      "path": "docs/tracking/2026-10-02-stage2-diagnose-pass.md",
+      "size": 41515
+    },
+    {
+      "path": "scripts/__pycache__/findings_to_okf.cpython-311.pyc",
+      "size": 23259
+    }
+  ],
+  "modified": [],
+  "deleted": [],
+  "symlinks_created": [],
+  "binary": [
+    "scripts/__pycache__/findings_to_okf.cpython-311.pyc"
+  ],
+  "skipped": [],
+  "exported_bytes": 64774,
+  "counts": {
+    "added": 2,
+    "modified": 0,
+    "deleted": 0,
+    "symlinks": 0
+  }
+}
