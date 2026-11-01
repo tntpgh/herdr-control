@@ -2492,13 +2492,15 @@ def consumer_recovery_cases(base: Path) -> None:
         return fid, rec
 
     KEYS_ENV = ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER", "HERDR_OWNER_LEASE_DELIVERY",
-                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB")
+                "HERDR_OWNER_LEASE_DB", "HERDR_OWNER_DISPATCH_AUTH_DB", "HERDR_OWNER_DISPATCH_CONSUMER")
     real_root = odi.STATE_ROOT
     real_dks, real_mks = odi.DISPATCH_KILL_SWITCH, odi.MERGE_KILL_SWITCH
 
-    def run(d, lease_db, adb, argv, resolve=reg_ok, flags=True, dks=None, mks=None):
+    def run(d, lease_db, adb, argv, resolve=reg_ok, flags=True, dks=None, mks=None, consumer=True):
         E = {"HERDR_OWNER_DISPATCH_ISSUE": "1", "HERDR_OWNER_LEASE_WRITER": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
              "HERDR_OWNER_LEASE_DB": str(lease_db), "HERDR_OWNER_DISPATCH_AUTH_DB": str(adb)} if flags else {}
+        if consumer:
+            E["HERDR_OWNER_DISPATCH_CONSUMER"] = "1"
         odi.STATE_ROOT = os.path.realpath(d / "state")
         odi.DISPATCH_KILL_SWITCH = str(dks) if dks else os.path.join(odi.STATE_ROOT, "owner-dispatch.revoked")
         odi.MERGE_KILL_SWITCH = str(mks) if mks else os.path.join(odi.STATE_ROOT, "merge-delegation.revoked")
@@ -2518,6 +2520,23 @@ def consumer_recovery_cases(base: Path) -> None:
 
     def q(adb, sql, params=()):
         c = sqlite3.connect(str(adb)); r = c.execute(sql, params).fetchall(); c.close(); return r
+
+    # 0. master switch: HERDR_OWNER_DISPATCH_CONSUMER unset -> refused before anything is touched
+    #    (p5G PR #397 review, NEEDS-FIXES: the design doc claimed this switch existed and was
+    #    merely left unset; nothing checked it. This proves the structural check is real --
+    #    unset refuses, set proceeds through to the SAME existing gates as before.)
+    d, lc, ldb, adb, qroot, proj = setup()
+    fid, rec = decision(d, proj, "consume-auth-0")
+    rc0, out0 = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)], consumer=False)
+    case("CONSUME-PENDING: HERDR_OWNER_DISPATCH_CONSUMER unset -> refused:consumer_flag_off, "
+         "forms dir never opened, nothing issued",
+         rc0 == 4 and out0 == "refused:consumer_flag_off"
+         and q(adb, "SELECT COUNT(*) FROM owner_dispatch_auth") == [(0,)])
+    rc0b, out0b = run(d, ldb, adb, ["consume-pending", "--queue-root", str(qroot)], consumer=True)
+    case("CONSUME-PENDING: HERDR_OWNER_DISPATCH_CONSUMER=1 -> proceeds through to the SAME existing "
+         "gates (3 issue-standing flags + 2 kill switches), issues normally",
+         rc0b == 0 and q(adb, "SELECT status FROM owner_dispatch_auth WHERE auth_id=?", (rec["auth_id"],)) == [("granted",)])
+    lc.close()
 
     # 1. happy path: an answered, approved standing form sitting unconsumed -> one pass issues it
     d, lc, ldb, adb, qroot, proj = setup()

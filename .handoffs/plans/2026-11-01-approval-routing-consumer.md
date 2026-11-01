@@ -68,17 +68,26 @@ supervision pattern. This fix follows that same shape, not a new one.
 owner-dispatch-issue.py consume-pending --queue-root DIR [--forms-dir DIR]
 ```
 
-- Refuses (exit 4) unless the same three flags `issue-standing` itself
-  requires are set — this subcommand calls `issue_standing_main` **in
-  process** (same Python module, same function), so it inherits exactly
-  the privilege `issue-standing` already has, nothing new.
+- Refuses (exit 4) unless `HERDR_OWNER_DISPATCH_CONSUMER=1` **and** the
+  same three flags `issue-standing` itself requires are all set. The
+  consumer switch is checked FIRST, structurally, inside
+  `consume_pending_main()` itself — not left to a wrapper script to
+  remember to set (p5G's PR #397 review, NEEDS-FIXES, caught an earlier
+  draft of this doc claiming the switch existed and was merely left
+  unset, when no code checked it; fixed by adding the check in code, not
+  by weakening this doc). Unset (the shipped default), the subcommand
+  refuses before the forms dir, the kill switches, or `issue_standing_main`
+  are ever touched. This subcommand calls `issue_standing_main` **in
+  process** (same Python module, same function) once past both gates, so
+  it inherits exactly the privilege `issue-standing` already has, nothing
+  new.
 - Kill switch: reuses `queue-supervisor.py`'s own
-  `kill_switch_engaged()` (`~/.local/state/herdr/owner-dispatch.revoked`,
-  imported, not reimplemented) — unreadable or present stops the whole
-  pass before any store is opened, exactly the existing rule. Also checks
-  `merge-delegation.revoked` the same way (same fail-closed-on-unreadable
-  semantics) before any management-adjacent action, per the plan's
-  explicit requirement.
+  `kill_switch_engaged()` logic, extracted to `lib/kill_switch.py` and
+  imported by both callers (`queue-supervisor.py` now delegates to it) —
+  unreadable or present stops the whole pass before any store is opened,
+  exactly the existing rule. Also checks `merge-delegation.revoked` the
+  same way (same fail-closed-on-unreadable semantics) before any
+  management-adjacent action, per the plan's explicit requirement.
 - Scans the pinned forms dir (`~/.local/state/herdr/forms/*.json`, the
   SAME trust root `read_decision`/`issue_standing_main` already use) for
   records whose embedded `rec.protocol == STANDING_PROTOCOL`, `status ==
@@ -93,8 +102,8 @@ owner-dispatch-issue.py consume-pending --queue-root DIR [--forms-dir DIR]
   "--queue-name", f"{label}.queue.json"], resolve=resolve, now=now)`
   in-process. Idempotency needs no new state: a form already consumed
   returns `refused:approval_already_used` from `issue_standing_main`
-  itself (existing check, line 916-918) — running the tick twice, or
-  across a restart, is a safe no-op for anything already issued.
+  itself (existing check) — running this twice, or across a restart, is a
+  safe no-op for anything already issued.
 - Every attempt (issued / refused:<reason> / issue_uncertain) is appended
   to `~/.local/state/herdr/owner-dispatch/consume.jsonl` (one line per
   attempt, form_id + outcome + timestamp) — an audit trail distinct from
@@ -104,23 +113,28 @@ owner-dispatch-issue.py consume-pending --queue-root DIR [--forms-dir DIR]
   `refused:approval_already_used` (already-done, not a failure); nonzero
   if anything ended in a genuine refusal or `issue_uncertain` — so a
   periodic caller can alert without masking a real problem as "ran fine."
+- Tests: `verify-owner-dispatch.py`'s `consumer_recovery_cases` proves
+  both directions — `HERDR_OWNER_DISPATCH_CONSUMER` unset refuses
+  `consumer_flag_off` with nothing touched (DB row count stays 0); set to
+  `1` proceeds through to the same existing gates and issues normally.
 
-### Periodic tick: `owner-dispatch-consume-tick.sh`
+### Periodic tick (NOT shipped in this PR — reference design only)
 
-Same shape as `stall-watchdog.sh`/`attention.sh` — a thin shell wrapper
-setting the required env (queue root, lease/auth DB paths, the three
-`HERDR_OWNER_*` flags) and calling `consume-pending` once, meant to be
-installed as a LaunchAgent on the SAME cadence as the existing tickers.
-**Gated by a NEW master switch, `HERDR_OWNER_DISPATCH_CONSUMER=1`, default
-OFF** — matching every prior standing/auth feature in this repo (#353,
-#354, #356, #357 all shipped default OFF; activation is always a later,
-separate, Terrence-approved step). This PR does **not** flip it on, does
-**not** add it to `install.sh`'s LaunchAgent list, and does **not** run it
-against the three real pending 2026-11-01 forms — per the plan's own
-"Preserve current approvals... do not replay the already-issued approvals
-until the consumer fix is reviewed." Once reviewed, activation is a
-one-line env flip plus an `install.sh --apply` the same way every other
-switch here goes live, outside this PR's own scope.
+A future activation PR may add a thin shell wrapper (shape of
+`stall-watchdog.sh`/`attention.sh`) that sets the required env (queue
+root, lease/auth DB paths, `HERDR_OWNER_DISPATCH_CONSUMER=1`, the three
+`issue-standing` flags) and calls `consume-pending` on a schedule under
+launchd, the SAME cadence as the existing tickers. This PR does **not**
+ship that script, does **not** add anything to `install.sh`'s LaunchAgent
+list, does **not** flip `HERDR_OWNER_DISPATCH_CONSUMER` on anywhere, and
+does **not** run it against the three real pending 2026-11-01 forms — per
+the plan's own "Preserve current approvals... do not replay the
+already-issued approvals until the consumer fix is reviewed." The master
+switch this future wrapper would set is already implemented and tested in
+`consume_pending_main()` today, per the previous section — only the
+wrapper/LaunchAgent/activation itself is future work, outside this PR's
+scope, matching every prior standing/auth feature here (#353, #354,
+#356, #357 all shipped the check first, activated separately later).
 
 ## 3. Explicit owner override for recovery — zero schema/record-shape change
 
@@ -186,13 +200,15 @@ signed `rec`:
 | Expired approval → refused | `window()` check inside `issue_standing_main` (unchanged) |
 | Owner override recovery → durable audit record and exactly one recovery action | `issue-standing --recovery-of/--reason/--actor`, `recovery.jsonl`, unmodified `issue_standing_main` for the actual issuance |
 | Kill switch present/unreadable → refused | `consume-pending`/`issue-standing --recovery-of` both reuse `lib/kill_switch.engaged()` (extracted from `queue-supervisor.py`'s own `kill_switch_engaged()`) against `owner-dispatch.revoked` and `merge-delegation.revoked`, fail-closed on unreadable |
+| Automatic path stays structurally inert until deliberately activated | `consume_pending_main()`'s own `HERDR_OWNER_DISPATCH_CONSUMER` check, first thing in the function, refused `consumer_flag_off` before any other gate; proven both directions by `consumer_recovery_cases` |
 | Scope/lane/spend widening → refused | Recovery form re-derives caps from the CURRENT queue via unmodified `build_standing_main` validation; nothing copied from the stale grant |
 | Existing denied noMedia import remains denied, never replayed | Out of this subsystem entirely (unrelated queue/lane); this design touches no denied-row state, confirmed by scope (standing-grant forms only) |
 
 ## Explicit non-goals, this PR
 
-- No activation (`HERDR_OWNER_DISPATCH_CONSUMER` stays unset; not added to
-  `install.sh`).
+- No activation (`HERDR_OWNER_DISPATCH_CONSUMER` stays unset in every real
+  environment; the check that enforces it exists and is tested, but
+  nothing in this PR sets it, and it is not added to `install.sh`).
 - No replay of the three real 2026-11-01 answered forms.
 - No `owner_dispatch_auth` schema change / migration.
 - No change to `hub.py`'s request-handling path.

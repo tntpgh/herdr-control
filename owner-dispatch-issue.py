@@ -1031,6 +1031,16 @@ def consume_pending_main(argv, resolve=None, now=None) -> int:
     never passes --recovery-of/--reason/--actor -- recovery stays a
     separate, explicit, human-invoked action (see issue_standing_main).
 
+    HERDR_OWNER_DISPATCH_CONSUMER=1 is a SEPARATE master switch, required
+    in addition to the three issue-standing flags, checked structurally
+    here (not left to a not-yet-written wrapper script to remember) --
+    p5G's PR #397 review (NEEDS-FIXES) found the design doc claimed this
+    switch existed and was merely left unset, when no code checked it at
+    all. Unset (the shipped default), this subcommand refuses before
+    touching the forms dir, the kill switches, or anything else -- the
+    automatic/periodic path stays structurally inert until a SEPARATE,
+    later, reviewed activation step sets it.
+
     Candidate selection is a CHEAP, UNTRUSTED peek (read the form's own
     served .html, pull the embedded JSON, check protocol ==
     STANDING_PROTOCOL) purely to decide which form ids to attempt and which
@@ -1050,11 +1060,15 @@ def consume_pending_main(argv, resolve=None, now=None) -> int:
     form a clean, logged no-op; running this on a schedule (ticked) or by
     hand is equally safe.
     Exit: 0 every candidate ended issued or approval_already_used; 2 the
-    kill switch is engaged; nonzero (count of non-clean outcomes) otherwise,
-    so a periodic caller can alert without masking a real refusal."""
+    kill switch is engaged; 4 the master switch is off; nonzero (count of
+    non-clean outcomes) otherwise, so a periodic caller can alert without
+    masking a real refusal."""
     ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py consume-pending")
     ap.add_argument("--queue-root", required=True)
     a = ap.parse_args(argv)
+    if os.environ.get("HERDR_OWNER_DISPATCH_CONSUMER") != "1":
+        print("refused:consumer_flag_off")
+        return 4
     if kill_switch.engaged(DISPATCH_KILL_SWITCH):
         print(f"stopped:kill_switch:{DISPATCH_KILL_SWITCH}")
         return 2
