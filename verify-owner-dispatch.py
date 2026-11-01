@@ -254,6 +254,39 @@ def main() -> int:
          and files(J / KB / "r_err") == ["intent.json", "uncertain.json"] and not s2.calls)
     G["gate"].conn.execute("UPDATE owner_requests SET state='blocked' WHERE request_id='r_pre'")
 
+    # --- stale-generation reconcile: a renewal/resume force-transitions every
+    # still-OPEN request of a superseded generation to `stale`
+    # (owner_lease.py _successor_insert), bypassing this module's own fenced
+    # settle() calls entirely. _reconcile must classify what the PRE-rollover
+    # gate state already proved, never surface a false mismatch and never
+    # resend (2026-10-31 live incident: both of the first two needed a hand
+    # DB edit -- mismatch:uncertain:stale and mismatch:settled:stale).
+    s6 = Sender(RuntimeError("boom"))
+    case("dispatch r_stale_unc: ambiguous (send raised, uncertain.json)",
+         mk(s6).dispatch(KB, "r_stale_unc", b"REQ\n", ["result.md"], T0) == "ambiguous")
+    case("r_stale_unc gate row is blocked/send_not_confirmed before any rollover",
+         G["gate"].record("r_stale_unc")[2:] == ("blocked", od.POST_SEND_DETAIL))
+    s7 = Sender()
+    case("dispatch r_stale_settled: dispatched (settled.json)",
+         mk(s7).dispatch(KB, "r_stale_settled", b"REQ\n", ["result.md"], T0) == "dispatched")
+    case("r_stale_settled gate row is delivering before any rollover",
+         G["gate"].state("r_stale_settled") == "delivering")
+    # simulate the rollover: owner_lease._successor_insert's UPDATE touches
+    # only `state`, never `detail` -- reproduced exactly here, not re-derived.
+    for rid in ("r_stale_unc", "r_stale_settled", "r_pre"):
+        G["gate"].conn.execute("UPDATE owner_requests SET state='stale' WHERE request_id=?", (rid,))
+    s8 = Sender()
+    out_stale = mk(s8).recover(T0 + 3)
+    case("RECOVER: uncertain+stale (post-send detail preserved) -> ambiguous, never resent",
+         out_stale[f"{KB}/r_stale_unc"] == "ambiguous"
+         and files(J / KB / "r_stale_unc") == ["intent.json", "uncertain.json"] and not s8.calls)
+    case("RECOVER: settled+stale is durable evidence of a completed send -> dispatched, not a mismatch",
+         out_stale[f"{KB}/r_stale_settled"] == "dispatched" and av.state("r_stale_settled")[0] == "pending"
+         and not s8.calls)
+    case("RECOVER: refused+stale fence UNCHANGED -- still a surfaced mismatch, never inferred refused",
+         out_stale[f"{KB}/r_pre"] == "mismatch:refused:stale" and not s8.calls)
+    G["gate"].conn.execute("UPDATE owner_requests SET state='blocked' WHERE request_id='r_pre'")
+
     # --- fence moved between preflight and send ---
     calls = {"n": 0}
     real = ol.holder_tuple

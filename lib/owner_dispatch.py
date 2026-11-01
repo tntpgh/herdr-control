@@ -291,7 +291,28 @@ class Dispatcher:
                                                  -> blocked) and refused.json written
           ambiguous                              post-send uncertainty (never retried)
           mismatch:<outcome>:<gate state>        journal and gate disagree: surfaced, untouched
-          unrecorded:<outcome>                   gate has no row for a durable outcome"""
+          unrecorded:<outcome>                   gate has no row for a durable outcome
+
+        A generation rollover (owner_lease._successor_insert, on renew/resume)
+        force-transitions every still-OPEN row of the superseded generation to
+        `stale` outside this module's normal fenced transitions, so a journal
+        outcome recorded against the PRE-rollover state can land on a `stale`
+        row here. Two rules, from what each journal outcome actually proves:
+          uncertain.json + stale pretending detail==POST_SEND_DETAIL: still
+            post-send ambiguous (the row was `blocked`/send_not_confirmed, the
+            only path to POST_SEND_DETAIL, immediately before staling) -- same
+            as uncertain.json + blocked/send_not_confirmed, never resent.
+          settled.json + stale: the ONLY OPEN state settle(outcome="delivered")
+            ever leaves a row in is `delivering` (it never writes to the DB),
+            so settled.json + stale can only descend from settled.json +
+            delivering -- durable proof the send already completed, staled by
+            a LATER rollover. Treated identically to settled.json + delivering:
+            dispatched/registered, not a mismatch.
+        refused.json + stale is left exactly as it was: the pre-send gate
+        state at refusal time is `blocked`, never `delivering`, so stale can
+        only mean the SAME terminal refusal was later superseded -- but
+        nothing here distinguishes that from a genuine disagreement, so it
+        still surfaces as mismatch:refused:stale rather than being inferred."""
         now = self.clock() if now is None else now
         out: dict[str, str] = {}
         jroot = ra._open_dir(self.avail.journal_root)
@@ -323,7 +344,7 @@ class Dispatcher:
     def _reconcile(self, jfd, label, rid, now) -> str:
         rec = self.gate.record(rid)
         gstate, gdetail = (rec[2], rec[3]) if rec and rec[0] == label else (None, None)
-        post_send = gstate == "delivering" or (gstate == "blocked" and gdetail == POST_SEND_DETAIL)
+        post_send = gstate == "delivering" or (gstate in ("blocked", "stale") and gdetail == POST_SEND_DETAIL)
         outcome = next((o for o in OUTCOMES if _exists(jfd, o)), None)
         if outcome is None:  # crashed between intent and a durable outcome
             if gstate is None or gstate == "queued" or (gstate == "blocked" and not post_send):
@@ -346,7 +367,7 @@ class Dispatcher:
                     return "refused"
             return f"unrecorded:{outcome}"
         if outcome == ra.SETTLED_FILE:
-            if gstate not in SETTLED_GATE_STATES:
+            if gstate not in SETTLED_GATE_STATES and gstate != "stale":
                 return f"mismatch:settled:{gstate}"
             if self.avail.conn.execute("SELECT 1 FROM ra_requests WHERE rid=?", (rid,)).fetchone():
                 return "dispatched"
