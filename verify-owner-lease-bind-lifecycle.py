@@ -95,6 +95,9 @@ def main():
     case("new bound in the past -> ValueError, rejected",
          isinstance(_raises(lambda: olrec.bind_missing_lifecycle(
              c, "unbound", PROJ, T0 - 1, P2, B2, "form-1", now=T0, dry_run=True)), ValueError))
+    case("non-finite new bound -> ValueError, rejected",
+         isinstance(_raises(lambda: olrec.bind_missing_lifecycle(
+             c, "unbound", PROJ, float("nan"), P2, B2, "form-1", now=T0, dry_run=True)), ValueError))
     case("missing confirmation_ref -> ValueError, rejected",
          isinstance(_raises(lambda: olrec.bind_missing_lifecycle(
              c, "unbound", PROJ, T0 + 3600, P2, B2, "", now=T0, dry_run=True)), ValueError))
@@ -133,6 +136,10 @@ def main():
     case("already has a (PASSED) bound -> still already_bound here, that is recover_lifecycle's job",
          olrec.bind_missing_lifecycle(c, "already-expired", "tntpgh/already-expired", T0 + 3600, P2, B2,
                                       "form-1", now=T0, dry_run=True) == ("already_bound", None))
+    case("recover path also rejects a non-finite new bound",
+         isinstance(_raises(lambda: olrec.recover_lifecycle(
+             c, "already-expired", "tntpgh/already-expired", float("nan"), P2, B2,
+             "form-1", now=T0, dry_run=True)), ValueError))
 
     # --- never self-extension: a label with NULL lifecycle can still have a
     # LIVE lease (acquire()/claim never consult the bound) -- the caller
@@ -246,32 +253,37 @@ def cli_env_cases():
     os.environ["HERDR_STATE_ROOT"] = str(state_root)
     try:
         case("read_confirmation: missing file -> form_unreadable",
-             cli.read_confirmation("nope", "lab", "tntpgh/lab", 123.0) == "form_unreadable")
+             cli.read_confirmation("nope", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_unreadable")
         case("read_confirmation: path traversal in form id -> invalid_form_id, never opened",
-             cli.read_confirmation("../../etc/passwd", "lab", "tntpgh/lab", 123.0) == "invalid_form_id")
+             cli.read_confirmation("../../etc/passwd", "lab", "tntpgh/lab", 123.0, P2, B2) == "invalid_form_id")
         write_form("f1", status="open", answers={})
         case("read_confirmation: not yet answered -> form_not_answered",
-             cli.read_confirmation("f1", "lab", "tntpgh/lab", 123.0) == "form_not_answered")
+             cli.read_confirmation("f1", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_not_answered")
         write_form("f2", status="answered", answers={"decision": "hold", "label": "lab",
                                                        "project": "tntpgh/lab", "lifecycle_end_at": 123.0})
         case("read_confirmation: answered but held -> form_not_approved",
-             cli.read_confirmation("f2", "lab", "tntpgh/lab", 123.0) == "form_not_approved")
+             cli.read_confirmation("f2", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_not_approved")
         write_form("f3", status="answered", answers={"decision": "approve", "label": "WRONG",
                                                        "project": "tntpgh/lab", "lifecycle_end_at": 123.0})
         case("read_confirmation: approved for a different label -> form_label_mismatch",
-             cli.read_confirmation("f3", "lab", "tntpgh/lab", 123.0) == "form_label_mismatch")
+             cli.read_confirmation("f3", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_label_mismatch")
         write_form("f4", status="answered", answers={"decision": "approve", "label": "lab",
                                                        "project": "tntpgh/OTHER", "lifecycle_end_at": 123.0})
         case("read_confirmation: approved for a different project -> form_project_mismatch",
-             cli.read_confirmation("f4", "lab", "tntpgh/lab", 123.0) == "form_project_mismatch")
+             cli.read_confirmation("f4", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_project_mismatch")
         write_form("f5", status="answered", answers={"decision": "approve", "label": "lab",
                                                        "project": "tntpgh/lab", "lifecycle_end_at": 999999.0})
         case("read_confirmation: approved for a different bound -> form_bound_mismatch",
-             cli.read_confirmation("f5", "lab", "tntpgh/lab", 123.0) == "form_bound_mismatch")
+             cli.read_confirmation("f5", "lab", "tntpgh/lab", 123.0, P2, B2) == "form_bound_mismatch")
         write_form("f6", status="answered", answers={"decision": "approve", "label": "lab",
-                                                       "project": "tntpgh/lab", "lifecycle_end_at": 123.4})
-        case("read_confirmation: exactly bound, approved -> None (valid)",
-             cli.read_confirmation("f6", "lab", "tntpgh/lab", 123.0) is None)
+                   "project": "tntpgh/lab", "lifecycle_end_at": 123.4,
+                   "caller_pane_id": P2, "caller_pane_birth": B2})
+        case("read_confirmation: exactly bound caller and request -> None (valid)",
+             cli.read_confirmation("f6", "lab", "tntpgh/lab", 123.0, P2, B2) is None)
+        case("read_confirmation: missing caller binding -> form_caller_mismatch",
+             cli.read_confirmation("f5", "lab", "tntpgh/lab", 999999.0, P2, B2) == "form_caller_mismatch")
+        case("read_confirmation: non-finite CLI bound -> form_bound_mismatch",
+             cli.read_confirmation("f6", "lab", "tntpgh/lab", float("nan"), P2, B2) == "form_bound_mismatch")
     finally:
         if old_env is None:
             os.environ.pop("HERDR_STATE_ROOT", None)
@@ -309,7 +321,9 @@ def cli_env_cases():
 
     write_form("good", status="answered", answers={"decision": "approve", "label": "cli-unbound",
                                                      "project": "tntpgh/cli-unbound",
-                                                     "lifecycle_end_at": new_end})
+                                                     "lifecycle_end_at": new_end,
+                                                     "caller_pane_id": P2,
+                                                     "caller_pane_birth": B2})
 
     rc, out = run(writer=None)
     case("CLI: writer flag off -> refused:flags_off, exit 4", rc == 4 and out == "refused:flags_off")

@@ -14,13 +14,11 @@ owner-lease-recover.py's --confirm-form): --confirm-form names a formserve
 answer id, read from the PINNED forms state dir
 (~/.local/state/herdr/forms/<id>.json, HERDR_STATE_ROOT overridable). The
 record must be status=="answered", answers.decision=="approve", and bound to
-THIS EXACT request: answers.label, answers.project, and answers.lifecycle_end_at
-(within 1s) must all match this invocation's own arguments. Unlike
-owner-lease-recover.py's confirmation, this one does NOT bind caller_pane_id/
-caller_pane_birth -- the approval is over WHICH label/project/bound, not WHO
-runs the recovery; the self-extension guard below is still always enforced,
-independent of what the form says, so no caller identity needs to be
-pre-approved. This script never serves or creates a form -- it only ever
+THIS EXACT request: answers.label, answers.project, answers.lifecycle_end_at
+(within 1s), answers.caller_pane_id, and answers.caller_pane_birth must all
+match this invocation's own arguments. Binding the caller prevents the live
+holder from bypassing the self-extension guard by supplying another pane
+identity on argv. This script never serves or creates a form -- it only ever
 reads one that was already answered elsewhere; serving the decision form
 itself is the conductor's job, never a worker's.
 
@@ -40,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -61,7 +60,8 @@ def forms_dir() -> Path:
     return Path(os.environ.get("HERDR_STATE_ROOT", str(Path.home() / ".local/state/herdr"))) / "forms"
 
 
-def read_confirmation(form_id: str, label: str, project: str, lifecycle_end_at: float) -> str | None:
+def read_confirmation(form_id: str, label: str, project: str, lifecycle_end_at: float,
+                      caller_pane_id: str, caller_pane_birth: str) -> str | None:
     """None on a valid, exactly-bound confirmation. A short refusal reason
     string otherwise. Never raises on a missing/corrupt/mismatched form --
     every outcome here is a typed refusal the caller prints and exits on."""
@@ -81,10 +81,16 @@ def read_confirmation(form_id: str, label: str, project: str, lifecycle_end_at: 
     if answers.get("project") != project:
         return "form_project_mismatch"
     try:
-        if abs(float(answers.get("lifecycle_end_at")) - lifecycle_end_at) > 1.0:
+        approved_end = float(answers.get("lifecycle_end_at"))
+        if not math.isfinite(approved_end) or not math.isfinite(lifecycle_end_at):
+            return "form_bound_mismatch"
+        if abs(approved_end - lifecycle_end_at) > 1.0:
             return "form_bound_mismatch"
     except (TypeError, ValueError):
         return "form_bound_mismatch"
+    if (answers.get("caller_pane_id") != caller_pane_id
+            or answers.get("caller_pane_birth") != caller_pane_birth):
+        return "form_caller_mismatch"
     return None
 
 
@@ -106,7 +112,8 @@ def main(argv=None) -> int:
         return 4
     db = os.environ.get("HERDR_OWNER_LEASE_DB", "")
 
-    refusal = read_confirmation(a.confirm_form, a.label, a.project, a.lifecycle_end)
+    refusal = read_confirmation(
+        a.confirm_form, a.label, a.project, a.lifecycle_end, a.pane_id, a.pane_birth)
     if refusal:
         print(f"refused:unconfirmed:{refusal}")
         return 4

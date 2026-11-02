@@ -83,6 +83,7 @@ owner_projects-row-only update, same scope as reregister_owner().
 """
 from __future__ import annotations
 
+import math
 import secrets
 import time
 from datetime import datetime, timezone
@@ -116,6 +117,8 @@ def recover_lifecycle(conn, label: str, project: str, new_lifecycle_end_at: floa
         raise ValueError("confirmation_ref is required")
     if not isinstance(new_lifecycle_end_at, (int, float)) or isinstance(new_lifecycle_end_at, bool):
         raise ValueError("new_lifecycle_end_at must be an epoch-seconds value")
+    if not math.isfinite(new_lifecycle_end_at):
+        raise ValueError("new_lifecycle_end_at must be finite")
     if new_lifecycle_end_at <= now:
         raise ValueError("new_lifecycle_end_at must be in the future")
     if new_lifecycle_end_at - now > ol.MAX_TTL_S:
@@ -204,6 +207,8 @@ def bind_missing_lifecycle(conn, label: str, project: str, new_lifecycle_end_at:
         raise ValueError("confirmation_ref is required")
     if not isinstance(new_lifecycle_end_at, (int, float)) or isinstance(new_lifecycle_end_at, bool):
         raise ValueError("new_lifecycle_end_at must be an epoch-seconds value")
+    if not math.isfinite(new_lifecycle_end_at):
+        raise ValueError("new_lifecycle_end_at must be finite")
     if new_lifecycle_end_at <= now:
         raise ValueError("new_lifecycle_end_at must be in the future")
     if new_lifecycle_end_at - now > ol.MAX_TTL_S:
