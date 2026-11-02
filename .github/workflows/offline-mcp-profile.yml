@@ -1,15 +1,27 @@
 name: offline-mcp-profile
 # Runs verify-offline-mcp-profile.sh: isolated, stub-bounded spawn-task.sh --dry-run
 # composition checks. It never executes spawn-agent.sh or a real launcher.
+# Also runs verify-launcher-profile-identity.sh (default mode, CI-safe: a
+# stub launcher + an isolated copy of this checkout, same technique as
+# verify-offline-mcp-profile.sh's own $ctl fixture above -- never the real
+# installed HERDR_OMP_BIN, which does not exist on ubuntu-latest) -- an
+# earlier version of that script SKIPped unconditionally whenever the real
+# binary was absent, so CI never exercised it at all (independent review,
+# PR #400). --live (a real spawn, requires the real installed launcher) is
+# intentionally never run here. Also runs verify-close-done-workers.sh,
+# which close-done-workers.sh's own pane-close-failure reporting (same PR)
+# is pinned against.
 # No install step: bash, git, jq, sqlite3, python3 and shasum ship on ubuntu-latest.
 on:
   pull_request:
-    paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
+    paths: ["verify-offline-mcp-profile.sh", "verify-launcher-profile-identity.sh", "verify-close-done-workers.sh",
+            "spawn-task.sh", "spawn-agent.sh", "close-done-workers.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
             "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
   push:
     branches: [main]
-    paths: ["verify-offline-mcp-profile.sh", "spawn-task.sh", "spawn-agent.sh", "ensure-workspace.sh", "config.sh",
+    paths: ["verify-offline-mcp-profile.sh", "verify-launcher-profile-identity.sh", "verify-close-done-workers.sh",
+            "spawn-task.sh", "spawn-agent.sh", "close-done-workers.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
             "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
 
@@ -37,3 +49,7 @@ jobs:
           OFFLINE_MCP_GUARD_SOURCE: fixture
           # run-registry pins python3.11+ from these dirs; the default is the Homebrew dirs, absent on Ubuntu
           HERDR_HUB_PYTHON_DIRS: /usr/bin
+      - run: bash verify-launcher-profile-identity.sh
+        env:
+          HERDR_HUB_PYTHON_DIRS: /usr/bin
+      - run: bash verify-close-done-workers.sh
