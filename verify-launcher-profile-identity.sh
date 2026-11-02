@@ -103,34 +103,55 @@ fi
 # instead of silently breaking --live's extraction. This is the exact bug
 # an earlier version shipped (independent review, PR #400): the task_id
 # regex matched the literal substring "task=", which never appears in
-# "task_id=..." (so task_id always came out empty), and the worktree path
-# was reconstructed via `git rev-parse --show-toplevel` run from inside
-# THIS script's own linked worktree -- which returns that worktree's own
-# root, not the shared repo root spawn-task.sh actually used (the exact
-# bug class spawn-task.sh's own repo_root() comment warns about,
-# spawn-task.sh:407-411).
+# "task_id=..." (so task_id always came out empty).
 fixture_out='spawned deep-review:smoke/example ws=w9T tab=w9T:t1 pane=w9T:p1  [background]
   worktree: /Users/thurbs/.herdr/worktrees/herdr-control/smoke/example
   launch:   /path/to/omp --model opus ...
 HERDR_SPAWN_RECEIPT task_id=task_20261102T012630Z_14770_60d75ff3994d4c43 run_id=run_20261102T012630Z_14770_a2c1dfd68b4c816b'
 f_pane="$(printf '%s\n' "$fixture_out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p')"
 f_task="$(printf '%s\n' "$fixture_out" | sed -n 's/.*task_id=\([^ ]*\).*/\1/p')"
-f_wt="$(printf '%s\n' "$fixture_out" | sed -n 's/^  worktree: //p')"
 [ "$f_pane" = "w9T:p1" ] && ok "fixture: pane= extraction correct" \
   || bad "fixture: pane= extraction got '$f_pane', want w9T:p1"
 [ "$f_task" = "task_20261102T012630Z_14770_60d75ff3994d4c43" ] \
   && ok "fixture: task_id= extraction correct (matches 'task_id=', not the bare 'task=' substring that never appears in real output)" \
   || bad "fixture: task_id= extraction got '$f_task', want task_20261102T012630Z_14770_60d75ff3994d4c43"
-[ "$f_wt" = "/Users/thurbs/.herdr/worktrees/herdr-control/smoke/example" ] \
-  && ok "fixture: worktree path read directly from spawn-task.sh's own '  worktree: ' line, never reconstructed" \
-  || bad "fixture: worktree extraction got '$f_wt', want /Users/thurbs/.herdr/worktrees/herdr-control/smoke/example"
-# Static source check (not just a fixture exercise): a future edit that
-# drops the --pane= filter from the real close-done-workers.sh call below
-# fails THIS check on every default run, not only a rare --live one.
-if grep -q 'close-done-workers.sh" --apply --reason=no-follow-on --pane="\$pane"' "$here/verify-launcher-profile-identity.sh"; then
+# Static source checks (not just a fixture exercise) on the real --live
+# code path below:
+#  - the close-done-workers.sh call must stay --pane=-scoped (an earlier
+#    version called --apply with no filter at all: batch mode, would close
+#    every OTHER eligible pane in the registry, not just this canary);
+#  - --live must never fabricate a completion event to get its own canary
+#    closed. close-done-workers.sh's own closability rule for
+#    --reason=no-follow-on is purely "pane idle + worktree clean + no
+#    unpushed commits" (close-done-workers.sh:30-45,125-178) -- no proof,
+#    no event required, no --reason=shipped/abandoned/superseded in play.
+#    An earlier version wrote a synthetic `{"status":"completed",...}`
+#    event into the spawned worktree's events.jsonl before closing it --
+#    pure fabrication with zero functional effect on close-done-workers.sh,
+#    but a forged audit record in a real events.jsonl, and a test that
+#    could mask whether the close genuinely succeeded (independent review
+#    finding, PR #400). The real closure outcome must be captured and
+#    checked, never thrown away with `|| true`.
+# These three checks scan ONLY section 4 below (sed range from the "---- 4."
+# marker) -- a plain `grep -q PATTERN "$0"` would also match this check's
+# own comment prose and bad-message text, which necessarily contain the
+# same words, and always pass/fail regardless of what section 4 actually
+# does. Scoping past this point is what makes the check real.
+live_section="$(sed -n '/^# ---- 4\./,$p' "$here/verify-launcher-profile-identity.sh")"
+if printf '%s' "$live_section" | grep -q 'close-done-workers.sh" --apply --reason=no-follow-on --pane="\$pane"'; then
   ok "close-done-workers.sh call stays scoped to --pane=\$pane (never unscoped batch mode)"
 else
   bad "close-done-workers.sh call is no longer scoped by --pane= -- this would close every OTHER eligible pane in the registry, not just this test's own canary"
+fi
+if printf '%s' "$live_section" | grep -q 'events\.jsonl'; then
+  bad "--live still writes to events.jsonl -- no-follow-on needs no proof/event; a fabricated completion event is a forged audit record (independent review finding, PR #400)"
+else
+  ok "--live never fabricates a completion event -- relies only on close-done-workers.sh's real idle+clean-worktree closability check"
+fi
+if printf '%s' "$live_section" | grep -q -- '|| true'; then
+  bad "--live swallows a command's outcome with '|| true' -- a genuine cleanup failure would be silently hidden instead of failing the check"
+else
+  ok "--live captures and checks every command's real outcome (a failure fails this check, never silently swallowed)"
 fi
 
 # ---- 4. --live: a real registered deep-review worker actually reaches OMP -
@@ -150,11 +171,8 @@ if [ "$live" = 1 ]; then
     # about, spawn-task.sh:407-411) -- and matched on "task=" which
     # never appears in the real HERDR_SPAWN_RECEIPT line (it prints
     # "task_id=", not "task="), so task_id always came out empty.
-    # spawn-task.sh prints `  worktree: <path>` unconditionally on a real
-    # (non-dry) run (spawn-task.sh:1379) -- read that path directly.
     pane="$(printf '%s\n' "$out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p')"
     task_id="$(printf '%s\n' "$out" | sed -n 's/.*task_id=\([^ ]*\).*/\1/p')"
-    wt="$(printf '%s\n' "$out" | sed -n 's/^  worktree: //p')"
     sleep 8
     status="$(herdr pane list 2>/dev/null | python3 -c "
 import sys, json
@@ -170,25 +188,32 @@ for p in panes:
     else
       bad "--live: registered deep-review worker ($pane, $task_id) did not reach a live OMP status (agent_status='${status:-<pane not found>}')"
     fi
-    # events.jsonl does not pre-exist at spawn time (no worker turn has run
-    # yet to create it) -- `>>` creates it, so gate on the .handoffs/ DIR
-    # existing (proves $wt resolved to the real worktree) rather than the
-    # file, which would always be false for a freshly-spawned canary.
-    if [ -n "$wt" ] && [ -d "$wt/.handoffs" ]; then
-      printf '{"event":"deep-review:%s_done","status":"completed","reason":"no-follow-on","proof":"verify-launcher-profile-identity.sh --live smoke check"}\n' "$branch" >> "$wt/.handoffs/events.jsonl"
+    # Cleanup: no completion event is posted. close-done-workers.sh's own
+    # --reason=no-follow-on closability rule is purely idle pane + clean
+    # worktree + no unpushed commits (close-done-workers.sh:30-45) -- this
+    # canary does zero work, so it already satisfies that honestly, with
+    # no proof and no --reason=shipped/abandoned/superseded in play
+    # (close-done-workers.sh:125-178 only gates those three). An earlier
+    # version of this script invented a synthetic status:completed record
+    # for a task that never did anything -- a forged audit entry with no
+    # functional effect on the close, caught by independent review of
+    # PR #400. SCOPED to exactly this canary via --pane= (close-done-
+    # workers.sh:87-88,110-137) -- an earlier version called --apply with
+    # no filter at all, which is batch mode and would close every OTHER
+    # eligible pane in the registry too. The outcome is captured and
+    # checked below, never discarded: a cleanup failure must fail this
+    # check, not vanish.
+    if [ -z "$pane" ]; then
+      bad "--live: no pane id was parsed from spawn-task.sh's output -- cannot clean up the canary"
     else
-      bad "--live: could not resolve the spawned worktree's .handoffs dir (parsed wt='$wt') -- not posting a completion event"
-    fi
-    # SCOPED to exactly this canary -- --pane=/--task= is close-done-workers.sh's
-    # own documented filter (its usage header shows --task=; --pane= is the
-    # "convenience form" of the same scoping, close-done-workers.sh:87-88,110-137).
-    # An earlier version of this script called --apply with NO filter, which
-    # is batch mode: it would close every OTHER eligible idle/clean pane in
-    # the registry too, not just the one this test spawned -- unacceptable
-    # blast radius for a routine regression check (independent review finding,
-    # PR #400). Only attempted when $pane actually resolved.
-    if [ -n "$pane" ]; then
-      bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --pane="$pane" >/dev/null 2>&1 || true
+      close_out="$(bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --pane="$pane" 2>&1)"
+      close_rc=$?
+      case "$close_out" in
+        *"closed 1, held back 0, refused 0"*)
+          ok "--live: canary $pane closed cleanly (close-done-workers.sh --reason=no-follow-on --pane=$pane)" ;;
+        *)
+          bad "--live: close-done-workers.sh did not cleanly close its own canary $pane (rc=$close_rc):\n$close_out" ;;
+      esac
     fi
   fi
 fi
