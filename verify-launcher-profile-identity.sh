@@ -96,7 +96,44 @@ else
   esac
 fi
 
-# ---- 3. --live: a real registered deep-review worker actually reaches OMP -
+# ---- 3. regression guard: receipt parsing + close-done-workers scoping ----
+# Exercises the exact parsing --live depends on against a frozen fixture of
+# spawn-task.sh's real (non-dry) output shape, so a future output-format
+# edit to either script breaks THIS cheap, always-on check immediately
+# instead of silently breaking --live's extraction. This is the exact bug
+# an earlier version shipped (independent review, PR #400): the task_id
+# regex matched the literal substring "task=", which never appears in
+# "task_id=..." (so task_id always came out empty), and the worktree path
+# was reconstructed via `git rev-parse --show-toplevel` run from inside
+# THIS script's own linked worktree -- which returns that worktree's own
+# root, not the shared repo root spawn-task.sh actually used (the exact
+# bug class spawn-task.sh's own repo_root() comment warns about,
+# spawn-task.sh:407-411).
+fixture_out='spawned deep-review:smoke/example ws=w9T tab=w9T:t1 pane=w9T:p1  [background]
+  worktree: /Users/thurbs/.herdr/worktrees/herdr-control/smoke/example
+  launch:   /path/to/omp --model opus ...
+HERDR_SPAWN_RECEIPT task_id=task_20261102T012630Z_14770_60d75ff3994d4c43 run_id=run_20261102T012630Z_14770_a2c1dfd68b4c816b'
+f_pane="$(printf '%s\n' "$fixture_out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p')"
+f_task="$(printf '%s\n' "$fixture_out" | sed -n 's/.*task_id=\([^ ]*\).*/\1/p')"
+f_wt="$(printf '%s\n' "$fixture_out" | sed -n 's/^  worktree: //p')"
+[ "$f_pane" = "w9T:p1" ] && ok "fixture: pane= extraction correct" \
+  || bad "fixture: pane= extraction got '$f_pane', want w9T:p1"
+[ "$f_task" = "task_20261102T012630Z_14770_60d75ff3994d4c43" ] \
+  && ok "fixture: task_id= extraction correct (matches 'task_id=', not the bare 'task=' substring that never appears in real output)" \
+  || bad "fixture: task_id= extraction got '$f_task', want task_20261102T012630Z_14770_60d75ff3994d4c43"
+[ "$f_wt" = "/Users/thurbs/.herdr/worktrees/herdr-control/smoke/example" ] \
+  && ok "fixture: worktree path read directly from spawn-task.sh's own '  worktree: ' line, never reconstructed" \
+  || bad "fixture: worktree extraction got '$f_wt', want /Users/thurbs/.herdr/worktrees/herdr-control/smoke/example"
+# Static source check (not just a fixture exercise): a future edit that
+# drops the --pane= filter from the real close-done-workers.sh call below
+# fails THIS check on every default run, not only a rare --live one.
+if grep -q 'close-done-workers.sh" --apply --reason=no-follow-on --pane="\$pane"' "$here/verify-launcher-profile-identity.sh"; then
+  ok "close-done-workers.sh call stays scoped to --pane=\$pane (never unscoped batch mode)"
+else
+  bad "close-done-workers.sh call is no longer scoped by --pane= -- this would close every OTHER eligible pane in the registry, not just this test's own canary"
+fi
+
+# ---- 4. --live: a real registered deep-review worker actually reaches OMP -
 if [ "$live" = 1 ]; then
   branch="smoke/launcher-profile-identity-$$"
   out="$(bash "$here/spawn-task.sh" "$here" "$branch" deep-review omp --no-focus 2>&1)"
@@ -104,8 +141,20 @@ if [ "$live" = 1 ]; then
   if [ "$rc" != 0 ]; then
     bad "--live: real spawn exited $rc:\n$out"
   else
+    # Parse spawn-task.sh's OWN printed values rather than reconstructing
+    # them -- a prior version of this script rebuilt the worktree path via
+    # `git rev-parse --show-toplevel`, which (run from inside a linked
+    # worktree, as this script itself is) returns the WORKTREE's own
+    # root, not the shared repo root spawn-task.sh actually used (the
+    # exact bug class spawn-task.sh's own repo_root() comment warns
+    # about, spawn-task.sh:407-411) -- and matched on "task=" which
+    # never appears in the real HERDR_SPAWN_RECEIPT line (it prints
+    # "task_id=", not "task="), so task_id always came out empty.
+    # spawn-task.sh prints `  worktree: <path>` unconditionally on a real
+    # (non-dry) run (spawn-task.sh:1379) -- read that path directly.
     pane="$(printf '%s\n' "$out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p')"
-    task_id="$(printf '%s\n' "$out" | sed -n 's/.*task=\([^ ]*\)$/\1/p')"
+    task_id="$(printf '%s\n' "$out" | sed -n 's/.*task_id=\([^ ]*\).*/\1/p')"
+    wt="$(printf '%s\n' "$out" | sed -n 's/^  worktree: //p')"
     sleep 8
     status="$(herdr pane list 2>/dev/null | python3 -c "
 import sys, json
@@ -121,11 +170,26 @@ for p in panes:
     else
       bad "--live: registered deep-review worker ($pane, $task_id) did not reach a live OMP status (agent_status='${status:-<pane not found>}')"
     fi
-    wt="$HOME/.herdr/worktrees/$(basename "$(cd "$here" && git rev-parse --show-toplevel)")/$branch"
-    if [ -f "$wt/.handoffs/events.jsonl" ]; then
+    # events.jsonl does not pre-exist at spawn time (no worker turn has run
+    # yet to create it) -- `>>` creates it, so gate on the .handoffs/ DIR
+    # existing (proves $wt resolved to the real worktree) rather than the
+    # file, which would always be false for a freshly-spawned canary.
+    if [ -n "$wt" ] && [ -d "$wt/.handoffs" ]; then
       printf '{"event":"deep-review:%s_done","status":"completed","reason":"no-follow-on","proof":"verify-launcher-profile-identity.sh --live smoke check"}\n' "$branch" >> "$wt/.handoffs/events.jsonl"
+    else
+      bad "--live: could not resolve the spawned worktree's .handoffs dir (parsed wt='$wt') -- not posting a completion event"
     fi
-    bash "$here/close-done-workers.sh" --apply --reason=no-follow-on >/dev/null 2>&1 || true
+    # SCOPED to exactly this canary -- --pane=/--task= is close-done-workers.sh's
+    # own documented filter (its usage header shows --task=; --pane= is the
+    # "convenience form" of the same scoping, close-done-workers.sh:87-88,110-137).
+    # An earlier version of this script called --apply with NO filter, which
+    # is batch mode: it would close every OTHER eligible idle/clean pane in
+    # the registry too, not just the one this test spawned -- unacceptable
+    # blast radius for a routine regression check (independent review finding,
+    # PR #400). Only attempted when $pane actually resolved.
+    if [ -n "$pane" ]; then
+      bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --pane="$pane" >/dev/null 2>&1 || true
+    fi
   fi
 fi
 
