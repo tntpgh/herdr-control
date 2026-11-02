@@ -176,6 +176,19 @@ def journal_state(jroot: Path, label: str, rid: str) -> str | None:
     return "intent_only"
 
 
+def _queue_rids(qroot: Path, label: str) -> set[str]:
+    """The rids of items currently live in label's queue.json -- used only to
+    decide whether a historical bad journal/auth entry still names something
+    that could be duplicated. Never mutates; a missing/invalid queue reads as
+    empty (validate_queue already enforces the queue's own shape elsewhere;
+    this is advisory scoping, not a second validation pass)."""
+    try:
+        items, _ = qs.Lane(qroot, label).queue_snapshot()
+    except (OSError, ValueError):
+        return set()
+    return {qs.rid_for(label, it["id"]) for it in items}
+
+
 def main(environ=os.environ, send=None, resolve=None) -> int:
     if not qs.enabled(environ):
         print("off")
@@ -256,18 +269,24 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
             # failure reading the journal/auth store itself, is genuinely
             # shared uncertainty and still fails closed globally below.
             bad_by_label: dict[str, dict[str, str]] = {}
+            bad_rids: dict[str, set[str]] = {}  # label -> rids its bad entries name
             for key, v in recov.items():
                 if not v.startswith(("mismatch", "unrecorded")):
                     continue
-                label, _, _ = key.partition("/")
+                label, _, rid = key.partition("/")
                 bad_by_label.setdefault(label, {})[key] = v
+                bad_rids.setdefault(label, set()).add(rid)
             shared_bad: dict[str, str] = {}
             for aid in oda.unresolved(store, str(avail.journal_root)):
-                row = store.execute("SELECT owner_label FROM owner_dispatch_auth WHERE auth_id=?", (aid,)).fetchone()
+                row = store.execute("SELECT owner_label, request_id FROM owner_dispatch_auth WHERE auth_id=?",
+                                    (aid,)).fetchone()
                 if row is None or not row[0]:
                     shared_bad[f"auth:{aid}"] = "consumed_unsent:lane_unknown"
                 else:
-                    bad_by_label.setdefault(row[0], {})[f"auth:{aid}"] = "consumed_unsent"
+                    label, rid = row
+                    bad_by_label.setdefault(label, {})[f"auth:{aid}"] = "consumed_unsent"
+                    if rid:
+                        bad_rids.setdefault(label, set()).add(rid)
         except Exception as exc:
             print(f"refused:recovery_needs_operator shared_store={type(exc).__name__}")
             return 4
@@ -278,14 +297,25 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
             print("refused:recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(all_bad.items())))
             return 4
         lane_labels = [x for x in lanes.split(",") if x]
-        runnable = [lb for lb in lane_labels if lb not in bad_by_label]
+        # A label's bad entries stop the WHOLE lane only when at least one
+        # names a request_id STILL PRESENT in that lane's current queue --
+        # real risk of re-processing an item whose prior state is ambiguous.
+        # A bad entry whose request_id is no longer queued is purely
+        # historical: nothing left to duplicate, so it cannot block a
+        # DIFFERENT, unrelated item in the same lane. It is still reported,
+        # as a non-blocking note on that lane's real tick result, never
+        # silently dropped -- this only changes which labels enter
+        # `runnable` below; no journal/receipt is touched here.
+        blocking_labels = {lb for lb, rids in bad_rids.items() if rids & _queue_rids(qroot, lb)}
+        runnable = [lb for lb in lane_labels if lb not in blocking_labels]
         dispatcher = (StandingDispatch(gate, avail, send, resolve, store, lconn, qroot)
                      if standing_enabled(environ) else GrantDispatch(gate, avail, send, resolve, store))
         out = qs.tick(qroot, runnable, dispatcher, accepted, events, notify, journal, environ=environ)
         for lb in lane_labels:
-            if lb in bad_by_label:
-                out[lb] = ("refused:recovery_needs_operator "
-                          + " ".join(f"{k}={v}" for k, v in sorted(bad_by_label[lb].items())))
+            if lb not in bad_by_label:
+                continue
+            note = "recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad_by_label[lb].items()))
+            out[lb] = f"refused:{note}" if lb in blocking_labels else f"{out[lb]} [{note}]"
     finally:
         store.close()
         gate.close()
