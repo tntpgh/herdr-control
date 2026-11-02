@@ -68,6 +68,14 @@ else
 exit 78
 STUBEOF
   chmod +x "$stub"
+  # Save/restore: HERDR_OMP_BIN is a plain top-level variable, not scoped
+  # to this block, so overwriting it here would otherwise leak the STUB
+  # path into section 4's "is the REAL launcher installed" --live precheck
+  # below -- the stub is still executable at that point ($WORK is only
+  # removed on script EXIT), so that precheck would see something
+  # executable and wrongly conclude the real launcher is present,
+  # defeating its one job (independent review finding, PR #400).
+  real_omp_bin="$HERDR_OMP_BIN"
   HERDR_OMP_BIN="$stub"
   got="$(bound_config_path "$accept")"
   [ "$got" = "$accept" ] && ok "bound_config_path accepts the path the stub launcher names" \
@@ -78,6 +86,7 @@ STUBEOF
   got="$(bound_config_path "$accept" "$foreign")"
   [ "$got" = "$accept" ] && ok "bound_config_path prefers an earlier accepted candidate over a later one" \
     || bad "bound_config_path did not prefer the first accepted candidate (got '$got')"
+  HERDR_OMP_BIN="$real_omp_bin"
 fi
 
 # ---- 2. integration: spawn-task.sh --dry-run resolves the ACCEPTED path, --
@@ -205,6 +214,34 @@ if printf '%s' "$live_section" | grep -q 'post_status="\$(pane_status_now'; then
 else
   bad "--live does not independently verify the target pane is actually absent after closing — close-done-workers.sh can report success while the physical pane close silently failed (independent review finding, PR #400)"
 fi
+if printf '%s' "$live_section" | grep -q 'QUERY_FAILED'; then
+  ok "pane_status_now distinguishes a genuinely ABSENT pane from a failed/malformed herdr query (QUERY_FAILED) -- a query failure never reads as proof of closure"
+else
+  bad "pane_status_now no longer distinguishes query failure from genuine absence -- a herdr error or malformed JSON would read as 'pane confirmed absent', a false positive proof of closure (independent review finding, PR #400)"
+fi
+if printf '%s' "$live_section" | grep -q 'case "\$post_status" in' \
+  && printf '%s' "$live_section" | grep -q 'ABSENT)' \
+  && printf '%s' "$live_section" | grep -q 'QUERY_FAILED)'; then
+  ok "the post-close status check branches on the ABSENT/QUERY_FAILED case statement, not a bare empty-string test that cannot tell a genuine close from a failed query"
+else
+  bad "the post-close check no longer branches \$post_status through ABSENT/QUERY_FAILED case arms -- a bare empty-string test cannot distinguish a genuinely closed pane from a herdr query that simply failed"
+fi
+# Section 1 (unit tests, above $live_section's slice) temporarily overwrites
+# HERDR_OMP_BIN with a throwaway stub to test bound_config_path() in
+# isolation. A plain top-level reassignment is NOT scoped to that block --
+# left unrestored, it would leak into section 4's "is the REAL launcher
+# installed" --live precheck below, which would then see the (still
+# executable) stub and wrongly conclude the real launcher is present even
+# when it is not, defeating that precheck's one job (independent review
+# finding, PR #400). Scanned over the WHOLE file, not $live_section --
+# section 1 runs before the "---- 4." marker this script scopes the other
+# checks to.
+if grep -q 'real_omp_bin="\$HERDR_OMP_BIN"' "$here/verify-launcher-profile-identity.sh" \
+  && grep -q 'HERDR_OMP_BIN="\$real_omp_bin"' "$here/verify-launcher-profile-identity.sh"; then
+  ok "section 1 saves and restores the real HERDR_OMP_BIN around its stub-launcher override (section 4's --live precheck never sees the stub)"
+else
+  bad "section 1 no longer saves/restores HERDR_OMP_BIN around its stub override -- the stub would leak into section 4's --live precheck, making it ineffective"
+fi
 
 # ---- 4. --live: a real registered deep-review worker actually reaches OMP -
 if [ "$live" = 1 ]; then
@@ -229,22 +266,45 @@ if [ "$live" = 1 ]; then
       pane="$(printf '%s\n' "$out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p')"
       task_id="$(printf '%s\n' "$out" | sed -n 's/.*task_id=\([^ ]*\).*/\1/p')"
       sleep 8
-      pane_status_now() {  # <pane_id> -> herdr's current agent_status for it, or empty
+      # Distinguishes three outcomes, never conflating "query failed" with
+      # "pane genuinely absent" -- an earlier version printed the agent_status
+      # field (or empty) for either a found pane OR a failed/malformed
+      # `herdr pane list` call (empty stdin, herdr erroring, JSON shape
+      # wrong), so a genuine query failure after close-done-workers.sh
+      # --apply read as "confirmed absent" -- a false positive proof that
+      # the pane closed (independent review finding, PR #400). Prints
+      # exactly one of: the real agent_status (pane found, value present),
+      # literal ABSENT (JSON parsed fine, pane genuinely not in the list),
+      # or literal QUERY_FAILED (unparseable/malformed output, or the pane
+      # was found but its own agent_status field was itself missing/empty
+      # -- a shape surprise, not a clean absence, treated the same as a
+      # failure rather than guessed at).
+      pane_status_now() {  # <pane_id> -> status string | ABSENT | QUERY_FAILED
         herdr pane list 2>/dev/null | python3 -c "
 import sys, json
-d = json.load(sys.stdin)
-panes = d.get('result', {}).get('panes') or d.get('panes') or []
+try:
+    d = json.load(sys.stdin)
+    panes = d.get('result', {}).get('panes')
+    if panes is None:
+        panes = d.get('panes')
+    if not isinstance(panes, list):
+        raise ValueError('panes is not a list')
+except Exception:
+    print('QUERY_FAILED')
+    sys.exit(0)
 for p in panes:
     if p.get('pane_id') == '$1':
-        print(p.get('agent_status', ''))
-        break
+        st = p.get('agent_status')
+        print(st if st else 'QUERY_FAILED')
+        sys.exit(0)
+print('ABSENT')
 " 2>/dev/null
       }
       status="$(pane_status_now "$pane")"
       if [ "$status" = idle ] || [ "$status" = working ]; then
         ok "--live: registered deep-review worker ($pane, $task_id) reached OMP (agent_status=$status)"
       else
-        bad "--live: registered deep-review worker ($pane, $task_id) did not reach a live OMP status (agent_status='${status:-<pane not found>}')"
+        bad "--live: registered deep-review worker ($pane, $task_id) did not reach a live OMP status (agent_status='$status')"
       fi
       # Cleanup: no completion event is posted. close-done-workers.sh's own
       # --reason=no-follow-on closability rule is purely idle pane + clean
@@ -280,11 +340,14 @@ for p in panes:
           bad "--live: close-done-workers.sh exited $close_rc for canary $pane/$task_id:\n$close_out"
         fi
         post_status="$(pane_status_now "$pane")"
-        if [ -z "$post_status" ]; then
-          ok "--live: canary $pane confirmed ABSENT from herdr after close-done-workers.sh --apply (independently re-queried, not trusting its own report)"
-        else
-          bad "--live: canary $pane is still LIVE after close-done-workers.sh --apply (agent_status=$post_status) — the registry row settled but the physical pane close did not take; close it by hand"
-        fi
+        case "$post_status" in
+          ABSENT)
+            ok "--live: canary $pane confirmed ABSENT from herdr after close-done-workers.sh --apply (independently re-queried, not trusting its own report)" ;;
+          QUERY_FAILED)
+            bad "--live: could not verify canary $pane's post-close status -- herdr pane list query failed, returned malformed JSON, or the pane's agent_status field was itself missing; failing closed rather than assuming the pane is gone" ;;
+          *)
+            bad "--live: canary $pane is still LIVE after close-done-workers.sh --apply (agent_status=$post_status) — the registry row settled but the physical pane close did not take; close it by hand" ;;
+        esac
       fi
     fi
   fi
