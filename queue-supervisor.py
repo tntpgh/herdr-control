@@ -315,7 +315,17 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
             if lb not in bad_by_label:
                 continue
             note = "recovery_needs_operator " + " ".join(f"{k}={v}" for k, v in sorted(bad_by_label[lb].items()))
-            out[lb] = f"refused:{note}" if lb in blocking_labels else f"{out[lb]} [{note}]"
+            if lb in blocking_labels:
+                out[lb] = f"refused:{note}"
+            elif lb in out:
+                out[lb] = f"{out[lb]} [{note}]"
+            else:
+                # tick() short-circuited globally (busy lock / off / refused
+                # lanes list) before producing ANY per-label result this
+                # pass -- out holds only "_", never lb. Nothing real to
+                # annotate onto; carry the "_" status forward instead of
+                # reading a key tick() never wrote (was a KeyError here).
+                out[lb] = f"{out.get('_', 'unavailable')} [{note}]"
     finally:
         store.close()
         gate.close()

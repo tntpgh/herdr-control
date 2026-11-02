@@ -10,6 +10,7 @@ issued by a TEST-ONLY issuer into the disposable auth store (production has none
 exactly like verify-owner-dispatch.py's insert_grant."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -497,6 +498,32 @@ check("STILL-BLOCKING when the bad rid matches a LIVE queued item: C's whole lan
 check("exactly A and B sent this pass, C held back",
       len(send.calls) == sent_before + 2
       and {c[0] for c in send.calls[sent_before:]} == {ISO_A, ISO_B})
+
+# --- regression (independent review finding on this fix): a lane with ONLY
+# historical, non-blocking bad entries must not crash main()'s result-
+# emission path when qs.tick() itself short-circuits globally (another
+# pass holds qroot/.tick.lock) and therefore returns NO per-label entry at
+# all for that lane -- out == {"_": "busy"}. The non-blocking branch used
+# to read out[lb] unconditionally, raising KeyError the instant out lacked
+# lb. A carries only a historical entry (q-isoa-stale, proven non-blocking
+# above); C's bad entry still matches its own live item (still blocking,
+# unaffected by the lock). ---
+lock_fd = os.open(qroot / ".tick.lock", os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # simulate a concurrent pass holding it
+try:
+    rc_busy, out_busy = run_cli(env_iso)
+finally:
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+result_busy = json.loads(out_busy)
+check("OLD-BAD-ONLY + LOCK-HELD through the real CLI: no crash (no KeyError), A's historical note still surfaces",
+      rc_busy == 0 and result_busy[ISO_A].startswith("busy [")
+      and f"{ISO_A}/q-isoa-stale" in result_busy[ISO_A])
+check("LOCK-HELD: a blocking lane's refusal is unaffected by the lock (plain write, never read out[lb])",
+      result_busy[ISO_C].startswith("refused:recovery_needs_operator")
+      and f"{ISO_C}/{qs.rid_for(ISO_C, 'i1')}" in result_busy[ISO_C])
+check("LOCK-HELD: nothing new sent while the lock is held",
+      len(send.calls) == sent_before + 2)
 
 # ===== item 9b (SPEC.md): wired production chain, public entrypoints =====
 # LABELING: every "crash" below is SIMULATED -- an injected exception in a
