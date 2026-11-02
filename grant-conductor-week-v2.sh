@@ -78,7 +78,8 @@ for path in forms.glob("*.json"):
         row = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         continue
-    if (str(Path(row.get("form_path", "")).resolve()) == form_path
+    candidate = row.get("form_path")
+    if (candidate and str(Path(candidate).resolve()) == form_path
             and int(row.get("created_at", 0)) >= created_after_ms):
         matches.append((int(row["created_at"]), row["id"]))
 if matches:
@@ -144,7 +145,7 @@ _status() {
     return
   fi
   printf '%s\n' "$row" | jq -c --argjson revoked "$revoked" \
-    '{active:(.status=="accepted"),revoked:$revoked,command_id,issued_at,expires_at,labels:.effective_scope.labels,handover_cap:.effective_scope.handover_cap}'
+    '{active:(.status=="accepted" and ($revoked|not)),revoked:$revoked,command_id,issued_at,expires_at,labels:.effective_scope.labels,handover_cap:.effective_scope.handover_cap}'
 }
 
 _revoke() {

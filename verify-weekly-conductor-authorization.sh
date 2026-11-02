@@ -584,7 +584,7 @@ printf '%s' "$c22_status" | jq -e '.active == true and .revoked == false and (.l
 bash "$here/grant-conductor-week-v2.sh" revoke >/dev/null
 c22_revoked="$(bash "$here/grant-conductor-week-v2.sh" status)"
 c22_admit="$(conductor_week_admits conductor 2>/dev/null)"; c22_admit_rc=$?
-printf '%s' "$c22_revoked" | jq -e '.revoked == true' >/dev/null \
+printf '%s' "$c22_revoked" | jq -e '.active == false and .revoked == true' >/dev/null \
   && [ "$c22_admit_rc" != 0 ] && [ -z "$c22_admit" ] \
   && ok "22: revoke is immediate and blocks admission" \
   || bad "22: revoke/status (status=[$c22_revoked] rc=$c22_admit_rc admit=[$c22_admit])"
