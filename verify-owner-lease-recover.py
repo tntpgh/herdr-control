@@ -268,11 +268,26 @@ def cli_env_cases():
                                                        "caller_pane_id": P1, "caller_pane_birth": B1})
         case("read_confirmation: approved for a different bound -> form_bound_mismatch",
              cli.read_confirmation("f4", "lab", 123.0, P1, B1) == "form_bound_mismatch")
+        write_form("f4nan", status="answered", answers={"decision": "approve", "label": "lab",
+                                                          "new_lifecycle_end_at": float("nan"),
+                                                          "caller_pane_id": P1, "caller_pane_birth": B1})
+        case("read_confirmation: NaN bound -> form_bound_mismatch",
+             cli.read_confirmation("f4nan", "lab", 123.0, P1, B1) == "form_bound_mismatch")
+        write_form("f4inf", status="answered", answers={"decision": "approve", "label": "lab",
+                                                          "new_lifecycle_end_at": float("inf"),
+                                                          "caller_pane_id": P1, "caller_pane_birth": B1})
+        case("read_confirmation: infinite bound -> form_bound_mismatch",
+             cli.read_confirmation("f4inf", "lab", 123.0, P1, B1) == "form_bound_mismatch")
         write_form("f5", status="answered", answers={"decision": "approve", "label": "lab",
                                                        "new_lifecycle_end_at": 123.0,
                                                        "caller_pane_id": "someone-else", "caller_pane_birth": B1})
         case("read_confirmation: approved for a different caller -> form_caller_mismatch",
              cli.read_confirmation("f5", "lab", 123.0, P1, B1) == "form_caller_mismatch")
+        write_form("f5birth", status="answered", answers={"decision": "approve", "label": "lab",
+                                                            "new_lifecycle_end_at": 123.0,
+                                                            "caller_pane_id": P1, "caller_pane_birth": "someone-else"})
+        case("read_confirmation: approved for a different caller birth -> form_caller_mismatch",
+             cli.read_confirmation("f5birth", "lab", 123.0, P1, B1) == "form_caller_mismatch")
         write_form("f6", status="answered", answers={"decision": "approve", "label": "lab",
                                                        "new_lifecycle_end_at": 123.4,
                                                        "caller_pane_id": P1, "caller_pane_birth": B1})
