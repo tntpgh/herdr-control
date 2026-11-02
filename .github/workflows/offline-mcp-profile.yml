@@ -53,3 +53,5 @@ jobs:
         env:
           HERDR_HUB_PYTHON_DIRS: /usr/bin
       - run: bash verify-close-done-workers.sh
+        env:
+          HERDR_HUB_PYTHON_DIRS: /usr/bin
