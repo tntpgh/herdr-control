@@ -279,6 +279,24 @@ same honesty `ack.sh`'s own ready_review marker keeps. A signal whose
 underlying evidence CHANGES (the artifact is rewritten, a fresh denial
 lands) re-arms on its own regardless of an earlier ack.
 
+**Weekly factory key.** From a shell outside Herdr, one command builds and
+serves the exact approval, waits for Terrence's answer, issues the key, and
+clears an older emergency revocation only after a valid answer:
+
+```bash
+./grant-conductor-week-v2.sh renew --reason "Run the factory this week"
+./grant-conductor-week-v2.sh status
+./grant-conductor-week-v2.sh revoke
+```
+
+The key lasts exactly seven days and is limited to `conductor`, `thurber-os`,
+`tntpgh-dev`, `tourguide`, `knowledge-base`, and `herdr-control`. Each lease
+recovery still gets a short-lived single-use token bound to one listed label.
+It does not bypass deny-class tool decisions, secrets, destructive actions,
+external writes, merges, or governance signatures. If the serving shell exits
+after the form is answered but before issue, resume with
+`./grant-conductor-week-v2.sh issue --confirm-form <form-id>`.
+
 **Conductor exit.** Before a conductor stops, meaning it has saved its session
 and handoff and retained its lessons, it closes its shipped workers:
 

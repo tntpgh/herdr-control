@@ -171,6 +171,30 @@ to_birth="$_to_birth_read"
 to_conductor_id="conductor_${to_pane}"
 by="conductor_${caller_pane}"
 
+# ---- conductor weekly authorization: recipient-side cap/scope check -------
+# docs/design/weekly-conductor-authorization.md (c): ANY transfer that would
+# make live Main a task's conductor -- regardless of which side initiated
+# it (Main pulling a task cross-task, OR a non-Main conductor handing its
+# own task TO Main) -- draws against the SAME standing weekly grant and its
+# CONDUCTOR_HANDOVER_CAP. Reuses the exact Main-identity read already done
+# above for `is_main` (_main_pane/_main_birth/_main_live_rc), never a
+# second lookup that could race the first.
+#
+# `to_is_main` is a property of the TARGET pane and does not change mid-
+# batch, so it stays computed once, here. The grant itself (revocation OR
+# natural expiry) is NOT computed here -- REVIEW-WEEKLY-SECURITY-DELTA
+# (p35, 2026-10-30): a single conductor_week_admits call made once before
+# the loop left every task after the first trusting a SNAPSHOT that a
+# revocation or expiry landing mid-invocation would not retroactively
+# invalidate, for the rest of that one already-running --apply. Fixed by
+# moving the admits call INSIDE the per-task loop below, so every task
+# this invocation processes re-verifies the grant fresh, at the moment it
+# is actually used -- never trusting a value read before the loop began.
+to_is_main=0
+if [ "$_main_live_rc" = 0 ] && [ "$_main_pane" = "$to_pane" ] && [ "$_main_birth" = "$to_birth" ]; then
+  to_is_main=1
+fi
+
 # ---- resolve the task set --------------------------------------------------
 # One row per task: task_id|run_id|current-conductor-pane|current-conductor-birth|label|worker-pane|state
 if [ -n "$task_id" ]; then
@@ -199,9 +223,47 @@ while IFS='|' read -r t_id r_id cur_cpane cur_cbirth label worker_pane t_state; 
       refused=$((refused+1)); continue
     fi
   fi
+  # Recipient-side weekly-conductor-authorization bound (fixes independent
+  # review addendum (b), §(c)): applies whenever the NEW conductor is the
+  # live Main, on EITHER side of the transfer -- a Main-initiated
+  # cross-task pull (is_main=1 above) and a non-Main conductor voluntarily
+  # self-handing its own task TO Main both reach the identical end state
+  # and both draw against the SAME grant/cap. No grant active -> refused
+  # outright (§(g) item 17's first half), same REFUSED shape as every
+  # other check in this loop.
+  #
+  # REVIEW-WEEKLY-SECURITY-DELTA (p35): re-queried HERE, fresh, on EVERY
+  # task iteration -- never hoisted above the loop and reused. A grant
+  # revoked or that naturally expired between the previous task and this
+  # one must refuse THIS task too, not just the next invocation; a grant
+  # reads BOTH properties (conductor_week_revoked's file-stat + the DB's
+  # own expiry) in one call per docs/design/weekly-conductor-
+  # authorization.md (d)/(e), so one fresh call per task covers both.
+  _conductor_week_grant=""
+  if [ "$to_is_main" = 1 ]; then
+    _conductor_week_grant="$(conductor_week_admits conductor 2>/dev/null)"
+    if [ -z "$_conductor_week_grant" ]; then
+      echo "  REFUSED $t_id ($label): no valid weekly conductor authorization active (grant absent/expired/revoked) -- recipient is Main" >&2
+      refused=$((refused+1)); continue
+    fi
+    if [ "$dry_run" = 1 ]; then
+      _cwk_used="$(conductor_week_handover_count "$_conductor_week_grant" 2>/dev/null)"
+      if [ "${_cwk_used:-0}" -ge "$CONDUCTOR_HANDOVER_CAP" ]; then
+        echo "  REFUSED $t_id ($label): weekly conductor-handover cap ($CONDUCTOR_HANDOVER_CAP) reached for the active grant" >&2
+        refused=$((refused+1)); continue
+      fi
+    fi
+  fi
   if [ "$dry_run" = 1 ]; then
     echo "  would hand over $t_id ($label): $cur_cpane -> $to_pane"
     ok=$((ok+1)); continue
+  fi
+  if [ "$to_is_main" = 1 ]; then
+    _cwk_cmd_id="$(gen_id conductor_handover)"
+    if ! record_conductor_week_handover "$_cwk_cmd_id" "$_conductor_week_grant" "$t_id" >/dev/null 2>&1; then
+      echo "  REFUSED $t_id ($label): weekly conductor-handover cap ($CONDUCTOR_HANDOVER_CAP) reached for the active grant" >&2
+      refused=$((refused+1)); continue
+    fi
   fi
   if ! set_task_conductor "$r_id" "$t_id" "$cur_cpane" "$cur_cbirth" "$to_pane" "$to_birth" "$to_conductor_id" \
        "$by" "$reason" 2>/dev/null; then
