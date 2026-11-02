@@ -651,7 +651,7 @@ _superseded_check() {
   _DPR_ARCHIVE_MANIFEST="$archive_dir"
 }
 
-closable=0; held=0; refused=0
+closable=0; held=0; refused=0; pane_close_failed=0
 while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
   [ -n "$pane" ] || continue
   dpr_tuple=""; dpr_detail=""; _DPR_VIA=""
@@ -779,15 +779,31 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
     continue
   fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
-  [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
+  # The registry is ALREADY settled above (by design, see the comment on
+  # set_task_state just above) — a failure here means the row correctly
+  # reads `completed` but the pane itself may still be physically live.
+  # Previously `herdr pane close`'s own exit code was discarded
+  # (`>/dev/null 2>&1` with nothing checking $?), so this script's own
+  # "closed N" summary counted a pane as closed purely because the
+  # REGISTRY accepted the transition, never because the pane actually
+  # went away — a caller trusting that summary line as proof of a real
+  # close (independent review finding, PR #400) could be wrong. Surface
+  # it instead: warn per-row, count it, and fail the run.
+  if [ "$(pane_status "$pane")" != absent ]; then
+    if ! herdr pane close "$pane" >/dev/null 2>&1; then
+      pane_close_failed=$((pane_close_failed+1))
+      printf '  WARN   %-8s %-46s registry settled completed, but herdr pane close FAILED — pane may still be live; close it by hand\n' "$pane" "$label"
+    fi
+  fi
 done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || pane_birth || '|' || worktree || '|' || label || '|' || trunk
                || '|' || repo || '|' || review_pr_repo || '|' || review_pr_number
                FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
 
 echo
 if [ "$apply" = 1 ]; then
-  printf 'closed %d, held back %d, refused %d\n' "$((closable - refused))" "$held" "$refused"
-  [ "$refused" -eq 0 ] || exit 1
+  printf 'closed %d, held back %d, refused %d, pane-close failed %d\n' \
+    "$((closable - refused))" "$held" "$refused" "$pane_close_failed"
+  [ "$refused" -eq 0 ] && [ "$pane_close_failed" -eq 0 ] || exit 1
 else
   printf '%d closable, %d held back — DRY RUN, nothing changed. Re-run with --apply\n' "$closable" "$held"
 fi
