@@ -219,6 +219,12 @@ if printf '%s' "$live_section" | grep -q 'QUERY_FAILED'; then
 else
   bad "pane_status_now no longer distinguishes query failure from genuine absence -- a herdr error or malformed JSON would read as 'pane confirmed absent', a false positive proof of closure (independent review finding, PR #400)"
 fi
+if printf '%s' "$live_section" | grep -q 'herdr_rc=\$?' \
+  && printf '%s' "$live_section" | grep -q '\[ "\$herdr_rc" != 0 \]'; then
+  ok "pane_status_now checks herdr's OWN exit code separately from python's parse result -- a nonzero herdr exit fails closed even if it printed parseable JSON before failing"
+else
+  bad "pane_status_now no longer checks herdr's own exit code separately -- \`herdr pane list | python3 ...\` only hands a \$(...) capture python's exit code, never herdr's; herdr can exit nonzero while still printing a parseable empty panes list, which would wrongly certify ABSENT (independent review finding, PR #400)"
+fi
 if printf '%s' "$live_section" | grep -q 'case "\$post_status" in' \
   && printf '%s' "$live_section" | grep -q 'ABSENT)' \
   && printf '%s' "$live_section" | grep -q 'QUERY_FAILED)'; then
@@ -280,7 +286,27 @@ if [ "$live" = 1 ]; then
       # -- a shape surprise, not a clean absence, treated the same as a
       # failure rather than guessed at).
       pane_status_now() {  # <pane_id> -> status string | ABSENT | QUERY_FAILED
-        herdr pane list 2>/dev/null | python3 -c "
+        local raw herdr_rc
+        # Capture herdr's OWN exit code separately from python's parse
+        # result -- `herdr pane list 2>/dev/null | python3 ...` under this
+        # script's own `set -o pipefail` still only hands a straight
+        # `$(...)` capture the LAST command's exit code (python3's), never
+        # herdr's; \$PIPESTATUS would work too but this is simpler and
+        # reads the same either way. herdr can exit nonzero (daemon
+        # hiccup, socket error, partial write) while still having printed
+        # SOME parseable-looking JSON on stdout before failing -- that
+        # JSON parsing cleanly to an empty/absent panes list must NOT
+        # read as a confirmed close; herdr's own exit code is checked
+        # FIRST and fails closed on any nonzero, independent of whether
+        # python could parse what it printed (independent review finding,
+        # PR #400).
+        raw="$(herdr pane list 2>/dev/null)"
+        herdr_rc=$?
+        if [ "$herdr_rc" != 0 ]; then
+          printf 'QUERY_FAILED\n'
+          return 0
+        fi
+        printf '%s' "$raw" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
