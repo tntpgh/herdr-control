@@ -241,6 +241,46 @@ if [ "$op_mode" = withhold ]; then
   # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
   op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
 fi
+# ---- bound_config_path: ask the bound launcher, never guess its path ------
+# omp-herdr-bound literal-compares every --config argument against its own
+# hardcoded `$control/...` paths (content hash is not checked there — the
+# ARGUMENT STRING itself must match, or it dies "only the bound Herdr
+# worker overlays are allowed" and omp never starts). A path built from
+# $here (this checkout's own location) matches only when spawn-task.sh
+# happens to be running FROM the bound app dir; any other invocation
+# location — including the dev checkout AGENTS.md says to avoid, but also
+# any future relocation of either tree — silently builds a launch the
+# bound binary was always going to refuse, after worktree/registry setup
+# already ran (root cause, 2026-11-02: a registered deep-review spawn
+# built --config /Users/thurbs/Code/herdr-control/lib/offline-mcp-profile.yml,
+# omp-herdr-bound rejected it, the agent never started, and the task/
+# worktree it had already created were left behind as a shell).
+#
+# Fix: never trust $here OR the configured HERDR_CONTROL_APP_DIR alone.
+# --herdr-bound-check is side-effect-free (no agent spawn, no write — it
+# only runs the launcher's own pinned-hash checks and its --config
+# allowlist, then exits 0 and prints) IF AND ONLY IF it is $1 (the wrapper
+# checks "${1:-}" = --herdr-bound-check literally; any other position
+# falls through to `exec "$binary" ... "$@"`, handing --herdr-bound-check
+# to the real omp binary as an unknown flag instead). The --config
+# allowlist loop runs over the full argv regardless of position, so
+# `"$HERDR_OMP_BIN" --herdr-bound-check --config "$candidate"` is a real,
+# side-effect-free probe of exactly the decision the eventual launch will
+# make, as long as --herdr-bound-check leads.
+# Try the
+# configured app dir first (the one actually pinned in production), then
+# $here as a fallback (covers spawn-task.sh genuinely running from the
+# bound app dir itself); print the first ACCEPTED candidate; print
+# nothing and return 1 if neither is -- never fall back to an unverified
+# path.
+bound_config_path() {
+  local c
+  for c in "$@"; do
+    [ -n "$c" ] && [ -r "$c" ] || continue
+    "$HERDR_OMP_BIN" --herdr-bound-check --config "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
 # ---- offline MCP launch profile (SPEC.md "launch profile by job class") ----
 # Read-only/offline job classes and any secrets-withheld spawn get the
 # project's MCP servers switched off before omp ever starts one: a project
@@ -254,9 +294,11 @@ fi
 # lib/agent-profiles.sh's offline_mcp_profile_path overlay sets
 # mcp.enableProjectConfig:false (omp://mcp-config.md), removing every
 # project-level MCP source before any server process is ever spawned.
-# Non-interactive preflight: a missing/unreadable overlay file refuses the
-# whole spawn (below, once run_id/task_id exist to record it against)
-# rather than silently launching a worker this profile cannot protect.
+# Non-interactive preflight: a missing/unreadable/unaccepted overlay file
+# refuses the whole spawn (below, once run_id/task_id exist to record it
+# against) rather than silently launching a worker this profile cannot
+# protect, or launching with a --config the bound binary was always going
+# to reject after the fact.
 # Decision only here (job/op_mode are known); the actual `cli` mutation is
 # applied AFTER the --approval hook/menu case statement below (fix/offline-
 # launch-profile review: that block suffix-matches cli for "... --approval-
@@ -264,8 +306,8 @@ fi
 # broke the match — "could not find the write-floor approval flag").
 offline_mcp_cfg="" offline_mcp_missing=0
 if [ "$managed" = 1 ] && { [ "$(offline_mcp_profile_for_job "$job")" = 1 ] || [ "$op_mode" = withhold ]; }; then
-  offline_mcp_cfg="$(offline_mcp_profile_path)"
-  [ -r "$offline_mcp_cfg" ] || offline_mcp_missing=1
+  offline_mcp_cfg="$(bound_config_path "$HERDR_CONTROL_APP_DIR/lib/offline-mcp-profile.yml" "$(offline_mcp_profile_path)")" \
+    || offline_mcp_missing=1
 fi
 # The posture actually in force for this spawn (floor composed with the
 # request — can only tighten). Stamped into the worker below as ITS floor,
@@ -351,6 +393,16 @@ case "$approval_req" in
       echo "spawn-task: --approval hook: omp (\$HERDR_OMP_BIN) would not load this checkout's hook, lib/ tree, spawn-task.sh, worker overlay or selector — refusing an --auto-approve worker with no judge" >&2
       exit 2
     fi
+    # Content-hash identity is proven above; that alone does not guarantee
+    # the literal $worker_overlay PATH is one omp-herdr-bound's --config
+    # allowlist accepts (it compares the argument string, not a hash —
+    # see bound_config_path's header comment). Resolve to an accepted
+    # path now, same probe as the offline-MCP profile, so a mismatch
+    # refuses HERE rather than after omp has already been invoked.
+    worker_overlay="$(bound_config_path "$HERDR_CONTROL_APP_DIR/agent-hooks/omp-worker-overlay.yml" "$worker_overlay")" || {
+      echo "spawn-task: --approval hook: worker overlay content matched the bound pins, but neither $HERDR_CONTROL_APP_DIR/agent-hooks/omp-worker-overlay.yml nor $here/agent-hooks/omp-worker-overlay.yml was accepted by the bound launcher's --config allowlist — refusing rather than building a launch it will reject after worktree/registry setup" >&2
+      exit 2
+    }
     case "$cli" in
       *" --approval-mode write") cli="${cli% --approval-mode write} --auto-approve --config $(printf '%q' "$worker_overlay")" ;;
       *) echo "spawn-task: --approval hook: could not find the write-floor approval flag in the launch line; refusing" >&2; exit 2 ;;
@@ -540,14 +592,16 @@ run_id="${HERDR_RUN_ID:-$(gen_id run)}"
 task_id=$(gen_id task)
 worker_id=$(gen_id worker)
 # offline_mcp_missing (computed above, before run_id/task_id existed to
-# record it against): the overlay this spawn needs to stay non-interactive
-# is missing — refuse now rather than launch a worker an interactive MCP
-# credential prompt could stall.
+# record it against): either the overlay file is missing/unreadable at
+# both candidate locations, or the bound launcher's --config allowlist
+# accepted neither — refuse now rather than launch a worker an
+# interactive MCP credential prompt could stall, or one omp-herdr-bound
+# was always going to reject after worktree/registry setup already ran.
 if [ "$offline_mcp_missing" = 1 ]; then
-  echo "spawn-task: refusing — job class '$job' (or withheld secrets) requires the offline MCP launch profile, but it is missing or unreadable at $offline_mcp_cfg. Restore lib/offline-mcp-profile.yml; refusing rather than starting a worker an interactive MCP credential prompt could stall." >&2
+  echo "spawn-task: refusing — job class '$job' (or withheld secrets) requires the offline MCP launch profile, but neither $HERDR_CONTROL_APP_DIR/lib/offline-mcp-profile.yml nor $(offline_mcp_profile_path) is readable AND accepted by the bound launcher's --config allowlist. Restore lib/offline-mcp-profile.yml at the bound app dir, or check HERDR_CONTROL_APP_DIR in config.sh; refusing rather than starting a worker an interactive MCP credential prompt could stall." >&2
   append_event "$run_id" "$task_id" "offline_mcp_profile_missing" \
-    "$(jq -nc --arg job "$job" --arg op "$op_mode" --arg path "$offline_mcp_cfg" \
-       '{job:$job, op_mode:$op, path:$path}')" >/dev/null 2>&1 || true
+    "$(jq -nc --arg job "$job" --arg op "$op_mode" --arg app_path "$HERDR_CONTROL_APP_DIR/lib/offline-mcp-profile.yml" --arg here_path "$(offline_mcp_profile_path)" \
+       '{job:$job, op_mode:$op, app_path:$app_path, here_path:$here_path}')" >/dev/null 2>&1 || true
   exit 1
 fi
 conductor_pane_id="${HERDR_PANE_ID:-}"

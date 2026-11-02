@@ -12,6 +12,19 @@
 : "${HERDR_DEFAULT_AGENT:=omp}"
 HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-30-s4-v27b/omp"
 HERDR_OMP_LAUNCHER_SHA256="ae746812333a6fa07489c4e3951a55c307dd89fb8a242f39f329513017f4e6c4"
+# The deployed app directory the bound omp launcher above trusts as its own
+# control tree (every release's wrapper hardcodes this as `$control`, and
+# literal-compares every --config argument against `$control/agent-hooks/
+# omp-worker-overlay.yml` / `$control/lib/offline-mcp-profile.yml` — content
+# hash is not enough, the ARGUMENT STRING itself must match). spawn-task.sh
+# builds those two --config paths from this constant, never from its own
+# checkout location ($here) — a dev checkout and this app dir can be
+# content-identical and the bound launcher still refuses a --config pointed
+# at the wrong one. spawn-task.sh independently PROVES acceptance before
+# ever launching (bound_config_path's --herdr-bound-check probe) rather than
+# trusting this value alone, so a stale constant here fails the spawn
+# loudly instead of silently launching unprotected.
+: "${HERDR_CONTROL_APP_DIR:=$HOME/.local/share/herdr-control/app}"
 
 # Extra dirs prepended to PATH so git/gh/jq/python3 (and your agent) resolve even
 # when herdr runs a script with a minimal environment (e.g. from a keybinding).
@@ -295,7 +308,7 @@ unset _herdr_main_db _herdr_main_row
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
-export HERDR_DEFAULT_AGENT HERDR_OMP_BIN HERDR_OMP_LAUNCHER_SHA256 HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
+export HERDR_DEFAULT_AGENT HERDR_OMP_BIN HERDR_OMP_LAUNCHER_SHA256 HERDR_CONTROL_APP_DIR HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
 export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES HERDR_BOUND_BASH
