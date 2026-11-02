@@ -10,6 +10,7 @@ issued by a TEST-ONLY issuer into the disposable auth store (production has none
 exactly like verify-owner-dispatch.py's insert_grant."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -414,8 +415,8 @@ check("STANDING MALFORMED: a non-int cost_cents is rejected by the shared queue 
 # ===== recovery scoping (queue-supervisor.py main()), through the REAL CLI
 # entrypoint -- not lib/queue_supervisor.tick() in isolation -- since that is
 # the actual process boundary the hub drives (hub.py's TickRunner argv). =====
-ISO_A, ISO_B = "proj-isoa", "proj-isob"
-for i, lb in enumerate((ISO_A, ISO_B)):
+ISO_A, ISO_B, ISO_C = "proj-isoa", "proj-isob", "proj-isoc"
+for i, lb in enumerate((ISO_A, ISO_B, ISO_C)):
     PANE[lb] = (f"wI:p{i}", f"term_{lb.replace('-', '')}")
     SESS[lb] = hashlib.sha256(f"session-{lb}".encode()).hexdigest()
     ol.register_owner(lc, lb, f"tntpgh/{lb}", now=time.time())
@@ -426,12 +427,13 @@ for i, lb in enumerate((ISO_A, ISO_B)):
     av.roots[lb] = str(roots[lb])
 queue(ISO_A, [{"id": "i1", "request": "isoA one\n", "manifest": M, "auth_id": grant(ISO_A, "i1", "isoA one\n", M)}])
 queue(ISO_B, [{"id": "i1", "request": "isoB one\n", "manifest": M, "auth_id": grant(ISO_B, "i1", "isoB one\n", M)}])
+queue(ISO_C, [{"id": "i1", "request": "isoC one\n", "manifest": M, "auth_id": grant(ISO_C, "i1", "isoC one\n", M)}])
 env_iso = {**ON, "HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
-           "HERDR_QUEUE_SUPERVISOR_ROOT": str(qroot), "HERDR_QUEUE_SUPERVISOR_LANES": f"{ISO_A},{ISO_B}",
+           "HERDR_QUEUE_SUPERVISOR_ROOT": str(qroot), "HERDR_QUEUE_SUPERVISOR_LANES": f"{ISO_A},{ISO_B},{ISO_C}",
            "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": str(base / "auth.db"),
            "HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra.db"),
            "HERDR_RESULT_AVAILABILITY_JOURNAL": str(base / "journal"),
-           "HERDR_RESULT_AVAILABILITY_ROOTS": os.pathsep.join(f"{lb}={roots[lb]}" for lb in (ISO_A, ISO_B))}
+           "HERDR_RESULT_AVAILABILITY_ROOTS": os.pathsep.join(f"{lb}={roots[lb]}" for lb in (ISO_A, ISO_B, ISO_C))}
 for private_path in (lease_db, str(base / "auth.db")):
     os.chmod(private_path, 0o600)  # private_sqlite.open_private requires no group/other bits
     for sfx in ("-wal", "-shm", "-journal"):
@@ -446,7 +448,7 @@ def run_cli(env):
     return rc, buf.getvalue().strip()
 
 
-# --- shared-store failure FIRST (before either lane has dispatched, so an
+# --- shared-store failure FIRST (before any lane has dispatched, so an
 # otherwise-eligible proj-isob is genuinely blocked, not merely in-flight).
 # A REAL admitted (gate state 'queued') request whose journal intent.json is
 # malformed: recover()'s crash-recovery path cannot even read it to decide
@@ -465,20 +467,63 @@ check("SHARED-STORE FAILURE through the real CLI: a corrupt journal entry fails 
       and len(send.calls) == sent_before)
 shutil.rmtree(bad_j)  # clear the corrupt entry: recover() would otherwise re-raise on every later pass
 
-# --- lane isolation: proj-isoa carries a PRE-EXISTING bad journal entry
-# (settled.json with no matching gate row -> recover() reports
-# "unrecorded:settled.json"), independent of proj-isob (distinct label,
-# project and auth rows) ---
+# --- lane-scoped recovery, three lanes in ONE pass:
+#   A: a bad journal entry for a rid NO LONGER in A's queue (q-isoa-stale,
+#      A's real item is i1/q-isoa-i1) -- purely historical, nothing it could
+#      duplicate, so it must not block A's unrelated, still-queued i1: A
+#      dispatches, with the finding surfaced as a non-blocking note.
+#   B: no bad entry at all -- the untouched control, still dispatches plainly
+#      (reconfirms cross-label isolation from the mixed state below).
+#   C: a bad journal entry for the EXACT rid of its still-queued i1
+#      (q-isoc-i1) -- genuine risk of re-processing an item with ambiguous
+#      prior state, so C's WHOLE lane still refuses, unchanged from before
+#      this fix. ---
 bad_dir = base / "journal" / ISO_A / "q-isoa-stale"
 bad_dir.mkdir(parents=True)
 (bad_dir / "intent.json").write_text("{}")
 (bad_dir / "settled.json").write_text("{}")
+blocking_dir = base / "journal" / ISO_C / qs.rid_for(ISO_C, "i1")
+blocking_dir.mkdir(parents=True)
+(blocking_dir / "intent.json").write_text("{}")
+(blocking_dir / "settled.json").write_text("{}")
 rc_iso, out_iso = run_cli(env_iso)
 result = json.loads(out_iso)
-check("LANE ISOLATION through the real CLI: independent lane B ticks while A's bad journal entry holds only A",
-      rc_iso == 0 and result[ISO_B] == "dispatched:i1"
-      and result[ISO_A].startswith("refused:recovery_needs_operator") and f"{ISO_A}/q-isoa-stale" in result[ISO_A]
-      and len(send.calls) == sent_before + 1 and send.calls[-1][0] == ISO_B)
+check("NON-BLOCKING HISTORICAL through the real CLI: A's stale, unqueued rid no longer stops A's real item",
+      rc_iso == 0 and result[ISO_A].startswith("dispatched:i1 [")
+      and f"{ISO_A}/q-isoa-stale" in result[ISO_A])
+check("UNTOUCHED CONTROL through the real CLI: B ticks plainly, unaffected by A's or C's state",
+      result[ISO_B] == "dispatched:i1")
+check("STILL-BLOCKING when the bad rid matches a LIVE queued item: C's whole lane refuses, i1 never sent",
+      result[ISO_C].startswith("refused:recovery_needs_operator") and f"{ISO_C}/{qs.rid_for(ISO_C, 'i1')}" in result[ISO_C])
+check("exactly A and B sent this pass, C held back",
+      len(send.calls) == sent_before + 2
+      and {c[0] for c in send.calls[sent_before:]} == {ISO_A, ISO_B})
+
+# --- regression (independent review finding on this fix): a lane with ONLY
+# historical, non-blocking bad entries must not crash main()'s result-
+# emission path when qs.tick() itself short-circuits globally (another
+# pass holds qroot/.tick.lock) and therefore returns NO per-label entry at
+# all for that lane -- out == {"_": "busy"}. The non-blocking branch used
+# to read out[lb] unconditionally, raising KeyError the instant out lacked
+# lb. A carries only a historical entry (q-isoa-stale, proven non-blocking
+# above); C's bad entry still matches its own live item (still blocking,
+# unaffected by the lock). ---
+lock_fd = os.open(qroot / ".tick.lock", os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # simulate a concurrent pass holding it
+try:
+    rc_busy, out_busy = run_cli(env_iso)
+finally:
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+result_busy = json.loads(out_busy)
+check("OLD-BAD-ONLY + LOCK-HELD through the real CLI: no crash (no KeyError), A's historical note still surfaces",
+      rc_busy == 0 and result_busy[ISO_A].startswith("busy [")
+      and f"{ISO_A}/q-isoa-stale" in result_busy[ISO_A])
+check("LOCK-HELD: a blocking lane's refusal is unaffected by the lock (plain write, never read out[lb])",
+      result_busy[ISO_C].startswith("refused:recovery_needs_operator")
+      and f"{ISO_C}/{qs.rid_for(ISO_C, 'i1')}" in result_busy[ISO_C])
+check("LOCK-HELD: nothing new sent while the lock is held",
+      len(send.calls) == sent_before + 2)
 
 # ===== item 9b (SPEC.md): wired production chain, public entrypoints =====
 # LABELING: every "crash" below is SIMULATED -- an injected exception in a
