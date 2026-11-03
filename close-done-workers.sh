@@ -743,7 +743,7 @@ while IFS= read -r row; do
       echo "close-done-workers: malformed registry row — refusing" >&2
       exit 1
     }
-  dpr_tuple=""; dpr_detail=""; _DPR_VIA=""
+  dpr_tuple=""; dpr_detail=""; _DPR_VIA=""; candidate_mode=absent
   if [ "$panes_ok" != 1 ]; then
     reason="herdr pane list is unavailable or unparseable; status cannot be verified"
   else
@@ -777,6 +777,7 @@ while IFS= read -r row; do
   fi
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
+      candidate_mode=branch
       br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || reason="branch name could not be read"
       if [ -z "$reason" ]; then
         porcelain=$(git -C "$wt" -c status.showUntrackedFiles=all status --porcelain --untracked-files=all 2>/dev/null) || reason="worktree status could not be read"
@@ -828,6 +829,7 @@ while IFS= read -r row; do
         fi
       fi
     else
+      candidate_mode=detached
       # Detached HEAD: no branch, no upstream, nothing the checks above can
       # evaluate. Closable only via the stricter PR-recoverability path.
       _detached_pr_check "$wt" "$run_id" "$task_id" "$repo" "$review_pr_repo" "$review_pr_number" \
@@ -868,13 +870,14 @@ while IFS= read -r row; do
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
   [ "$apply" = 1 ] || continue
 
-  # Branch worktrees get a complete fresh dry check immediately before the
-  # irreversible transition. Detached checks may archive ignored artifacts
-  # during apply, so rerunning their pre-archive dry path would reject the
-  # archive it just created; refresh pane identity and authority evidence
-  # directly instead.
+  # Recheck according to the mode that passed the initial gate. An initially
+  # branched candidate MUST take the complete recursive path even if HEAD is
+  # detached or Git becomes unreadable between checks; that change then HOLDs.
+  # Detached checks may archive ignored artifacts during apply, so rerunning
+  # their pre-archive dry path would reject the archive they just created;
+  # refresh pane identity and authority evidence directly instead.
   recheck_reason=""
-  if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
+  if [ "$candidate_mode" = branch ]; then
     recheck_args=("--task=$task_id")
     [ "$include_lost" = 0 ] || recheck_args+=(--include-lost)
     [ -z "$closure_reason" ] || recheck_args+=("--reason=$closure_reason")
