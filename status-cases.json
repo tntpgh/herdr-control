@@ -80,6 +80,14 @@
    "why": "acceptance is a fact herdr cannot know; a reused pane must not resurrect a closed task."
   },
   {
+   "name": "stored unverified closure survives a live pane",
+   "stored": "closed_unverified",
+   "pane": "working",
+   "done_event": false,
+   "want": "closed_unverified",
+   "why": "a deliberate terminal closure without completion proof must not be resurrected by a reused pane."
+  },
+  {
    "name": "stored failed survives a live pane",
    "stored": "failed",
    "pane": "working",

@@ -490,7 +490,7 @@ class Cached:
 # and ONE liveness source (the subscription below): the shell half that used to
 # duplicate this in bash had no caller, and it had already drifted from this
 # code in two ways no suite could see.
-TERMINAL = ("completed", "failed", "cancelled", "lost")
+TERMINAL = ("completed", "closed_unverified", "failed", "cancelled", "lost")
 
 
 def pane_statuses() -> dict | None:

@@ -10,8 +10,8 @@
 # claude/codex process, matching spawn-task.sh's cli_for_agent routing and
 # smart-name.sh's SMART_NAME_BACKEND default.
 : "${HERDR_DEFAULT_AGENT:=omp}"
-HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-11-02-s4-v27c/omp"
-HERDR_OMP_LAUNCHER_SHA256="502a67ec09847fcfefae24633500abc27a22bdf0669156fa52d4d76ce47f7db0"
+HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-11-03-s4-v27d/omp"
+HERDR_OMP_LAUNCHER_SHA256="cabdc6cd5487fdea4de7338e74694fb5f6bfd489d06b45fca7f8d9298e7b07f6"
 # The deployed app directory the bound omp launcher above trusts as its own
 # control tree (every release's wrapper hardcodes this as `$control`, and
 # literal-compares every --config argument against `$control/agent-hooks/

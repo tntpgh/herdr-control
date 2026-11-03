@@ -102,9 +102,9 @@ else
   ok "shipped with a malformed proof refused"
 fi
 check "state still unchanged after every refusal" "$(read_task run1 task1 | jq -r .state)" "running"
-set_task_state run1 task1 completed "handed_off_to:reviewer" \
+set_task_state run1 task1 closed_unverified "handed_off_to:reviewer" \
   || bad "handed_off_to needs no proof and was refused"
-check "handed_off_to closes without proof" "$(read_task run1 task1 | jq -r .state)" "completed"
+check "handed_off_to closes unverified without proof" "$(read_task run1 task1 | jq -r .state)" "closed_unverified"
 
 printf '== shipped WITH a valid proof: accepted, event carries both ==\n'
 register_task runShip taskShip w c cp cb paneShip birthShip /repo/s /wt/s "ship" \
@@ -282,14 +282,17 @@ set_task_state runOpen taskOpen completed shipped "$pr153 f1579a62" \
 check "merged PR + merge sha completes the task" "$(read_task runOpen taskOpen | jq -r .state)" "completed"
 
 
-# The gap correction 2 named: "nothing stops completed -> running".
+# The gap correction 2 named: "nothing stops completed -> running" --
+# task1 is closed_unverified here (the handed_off_to closure above), which
+# shares _legal_transition's same terminal "nothing leaves this state" arm
+# as completed, so it proves the identical invariant.
 if set_task_state run1 task1 running 2>/dev/null; then
-  bad "illegal completed -> running was ACCEPTED"
+  bad "illegal closed_unverified -> running was ACCEPTED"
 else
-  ok "illegal completed -> running refused"
+  ok "illegal closed_unverified -> running refused"
 fi
-check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "completed"
-set_task_state run1 task1 completed || bad "idempotent re-assert of same state refused"
+check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "closed_unverified"
+set_task_state run1 task1 closed_unverified || bad "idempotent re-assert of same state refused"
 ok "idempotent same-state re-assert allowed"
 
 printf '== set_task_state compare-and-swap under CONCURRENT racing sweeps ==\n'
@@ -495,12 +498,17 @@ check "policy verdict retained" "$(q policy_verdict)" "allow"
 printf '== prune only touches OLD terminal tasks ==\n'
 register_task run2 taskOld w c cp cb paneOld birthOld /repo/o /wt/o "old" || bad "register taskOld failed"
 set_task_state run2 taskOld failed || bad "-> failed refused"
-# Backdate it past the retention window.
-sqlite3 "$(registry_db)" "UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE task_id='taskOld';"
+register_task run2 taskOldUnverified w c cp cb paneOldU birthOldU /repo/ou /wt/ou "old-unverified" \
+  || bad "register taskOldUnverified failed"
+set_task_state run2 taskOldUnverified closed_unverified no-follow-on \
+  || bad "-> closed_unverified refused"
+# Backdate both terminal states past the retention window.
+sqlite3 "$(registry_db)" "UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE task_id IN ('taskOld','taskOldUnverified');"
 prune_completed_tasks 14 || bad "prune returned non-zero"
-check "old terminal task pruned"      "$(read_task run2 taskOld)" ""
-check "recent completed task KEPT"    "$(read_task run1 task1 | jq -r .task_id)" "task1"
-check "non-terminal task KEPT"        "$(read_task run1 taskEvil | jq -r .state)" "starting"
+check "old verified terminal task pruned"   "$(read_task run2 taskOld)" ""
+check "old unverified terminal task pruned" "$(read_task run2 taskOldUnverified)" ""
+check "recent terminal task KEPT"           "$(read_task run1 task1 | jq -r .task_id)" "task1"
+check "non-terminal task KEPT"              "$(read_task run1 taskEvil | jq -r .state)" "starting"
 if prune_completed_tasks abc 2>/dev/null; then bad "prune accepted a non-integer"; else ok "prune rejects a non-integer day count"; fi
 
 printf '== #3b ownership grant: branch/trunk stored and read back; empty by default ==\n'

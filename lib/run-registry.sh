@@ -1007,6 +1007,71 @@ resident_grant_admits() {
   printf '%s\n' "$(printf '%s' "$row" | jq -r '.command_id // empty' 2>/dev/null)"
 }
 
+# ---- conductor weekly authorization (docs/design/weekly-conductor-
+# authorization.md) -- same adapter-wrapper shape as the resident
+# escalation block above, one standing grant (never per-repo: there is
+# exactly one "conductor" label) plus a redemption-token layer for
+# owner-lease-recover.py's automated --conductor-grant tick and a
+# cap-counted audit layer for conductor-handover.sh's recipient check.
+# CONDUCTOR_HANDOVER_CAP mirrors lib/task-authorization.py's own constant
+# of the same name (NOT independently authoritative -- the Python side's
+# atomic insert-time recheck inside record_conductor_week_handover is the
+# real enforcement; this value is display-only, for a --dry-run estimate
+# that never writes).
+CONDUCTOR_HANDOVER_CAP=10
+accept_conductor_weekly_authorization() {   # command_id minting_marker reason issued_at_ms expires_at_ms
+  registry_init || return 1
+  _task_authorization_adapter accept-conductor-week "$1" "$2" "$3" "$4" "$5"
+}
+read_conductor_weekly_authorization() {     # -> grant JSON, or {} if none/expired
+  _task_authorization_adapter read-conductor-week
+}
+mint_conductor_redemption() {   # token_command_id grant_command_id label clamp_expires_at_ms
+  registry_init || return 1
+  _task_authorization_adapter accept-conductor-redemption "$1" "$2" "$3" "$4"
+}
+claim_conductor_redemption() {   # token_command_id label -> prints {"grant_command_id","clamp_expires_at"} on success
+  registry_init || return 1
+  _task_authorization_adapter claim-conductor-redemption "$1" "$2"
+}
+peek_conductor_redemption() {   # token_command_id label -> same checks as claim, never consumes (dry-run use)
+  _task_authorization_adapter peek-conductor-redemption "$1" "$2"
+}
+# conductor_week_revoked -> 0 iff the global revocation sentinel is present.
+# Same "touch one file, instant effect on the next check" shape as
+# resident_grant_revoked above and the house merge-delegation.revoked
+# pattern (AGENTS.md). Checked fresh every call, never cached.
+conductor_week_revoked() {
+  local f="${HERDR_CONDUCTOR_WEEK_REVOKED_FILE:-$HOME/.local/state/herdr/conductor-weekly-authorization.revoked}"
+  [ -f "$f" ]
+}
+# conductor_week_admits <label> -> prints the admitting grant's command_id
+# and returns 0 iff an unrevoked, unexpired, accepted
+# conductor_weekly_authorization row exists whose fixed label list
+# contains <label>. Read-only; never binds, never consumes the grant row.
+conductor_week_admits() {
+  local label="$1" row lbl
+  conductor_week_revoked && return 1
+  [ -n "$label" ] || return 1
+  row="$(read_conductor_weekly_authorization 2>/dev/null)"
+  [ -n "$row" ] && [ "$row" != '{}' ] || return 1
+  lbl="$(printf '%s' "$row" | jq -r --arg l "$label" '.effective_scope.labels // [] | index($l) // empty' 2>/dev/null)"
+  [ -n "$lbl" ] || return 1
+  printf '%s\n' "$(printf '%s' "$row" | jq -r '.command_id // empty' 2>/dev/null)"
+}
+# record_conductor_week_handover <command_id> <grant_command_id> <task_id>
+# -> mints ONE cap-counted audit row (atomically refuses the
+# CONDUCTOR_HANDOVER_CAP+1'th for the same grant). Called by
+# conductor-handover.sh's recipient-side check BEFORE the set_task_conductor
+# CAS it guards -- a refused mint here must block the handover outright.
+record_conductor_week_handover() {
+  registry_init || return 1
+  _task_authorization_adapter accept-conductor-handover "$1" "$2" "$3"
+}
+conductor_week_handover_count() {   # grant_command_id -> prints the current count
+  _task_authorization_adapter conductor-handover-count "$1"
+}
+
 # Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
 # enumeration/confirmation are read of the SAME protected registry row the
 # accept/register/launch adapters above already write -- no new storage,
@@ -1212,12 +1277,12 @@ _legal_transition() {                   # from to -> 0 if allowed
   local from="$1" to="$2"
   [ "$from" = "$to" ] && return 0       # idempotent re-assert, always fine
   case "$from" in
-    ''|starting) case "$to" in running|blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
-    running)     case "$to" in blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
-    blocked)     case "$to" in running|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    ''|starting) case "$to" in running|blocked|completed|closed_unverified|failed|cancelled|lost) return 0 ;; esac ;;
+    running)     case "$to" in blocked|completed|closed_unverified|failed|cancelled|lost) return 0 ;; esac ;;
+    blocked)     case "$to" in running|completed|closed_unverified|failed|cancelled|lost) return 0 ;; esac ;;
     # Terminal. Nothing leaves these; `lost` in particular must not be
     # resurrected by a stale hook firing after the sweep already buried it.
-    completed|failed|cancelled|lost) return 1 ;;
+    completed|closed_unverified|failed|cancelled|lost) return 1 ;;
   esac
   return 1
 }
@@ -1244,10 +1309,34 @@ _legal_transition() {                   # from to -> 0 if allowed
 # direct set_task_state caller is trusted to use them for that case alone.
 # Each still needs a checkable proof below, same gate as `shipped`, just not
 # a merged-PR claim.
-_valid_closure_reason() {               # reason -> 0 if one of the seven
+# `(i)` revision (docs/design/weekly-conductor-authorization.md, "zero
+# outstanding holds != verified completion"): `completed` now accepts ONLY
+# the three reasons that already carry a real, checked proof requirement
+# below (shipped/abandoned's merged-or-closed-PR citation, superseded's
+# GitHub-verified detached-close detail) -- `canceled`/`no-follow-on`/
+# `handed_off_to:<x>`/`blocked_on:<x>` used to reach `completed` with ZERO
+# evidence check (the gap behind the 2026-10 incident: 15 tasks batch-
+# closed `--reason=no-follow-on` while still holding unconsumed approvals
+# and unanswered prompts, and nothing here ever checked). Those four now
+# target `closed_unverified` instead -- see _valid_unverified_closure_reason
+# and the closed_unverified branch below.
+_valid_closure_reason() {               # reason -> 0 if one of the three VERIFIED reasons
   local reason="$1"
   case "$reason" in
-    shipped|canceled|no-follow-on|abandoned|superseded) return 0 ;;
+    shipped|abandoned|superseded) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# closed_unverified: "session-closed / not-completed" -- a batch or weak-
+# reason closure that genuinely has no per-task proof. Never read as
+# completion by any consumer (attention views, hub.py, this file's own
+# `completed`-filtered queries) -- it is a DIFFERENT terminal state, not a
+# `completed` synonym.
+_valid_unverified_closure_reason() {    # reason -> 0 if one of the four UNVERIFIED reasons
+  local reason="$1"
+  case "$reason" in
+    canceled|no-follow-on) return 0 ;;
     handed_off_to:?*|blocked_on:?*) return 0 ;;
     *) return 1 ;;
   esac
@@ -1534,8 +1623,8 @@ _valid_superseded_detail() {
   return 0
 }
 
-set_task_state() {                      # run_id task_id state [reason] [proof] [detail-json-object]
-  local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}" detail="${6:-}"
+set_task_state() {                      # run_id task_id state [reason] [proof] [detail-json-object] [session_close_json-object]
+  local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}" detail="${6:-}" session_close="${7:-}"
   registry_init || return 1
   local attempt=0
   while [ "$attempt" -lt 3 ]; do
@@ -1561,7 +1650,7 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     local waived_proof=0
     if [ "$state" = "completed" ]; then
       if ! _valid_closure_reason "$reason"; then
-        printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on|abandoned|superseded, got %s)\n' \
+        printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|abandoned|superseded with real proof -- canceled/no-follow-on/handed_off_to:<x>/blocked_on:<x> now close as closed_unverified, not completed; got %s)\n' \
           "$run_id" "$task_id" "${reason:-<empty>}" >&2
         return 1
       fi
@@ -1606,6 +1695,12 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
           fi
           ;;
       esac
+    elif [ "$state" = "closed_unverified" ]; then
+      if ! _valid_unverified_closure_reason "$reason"; then
+        printf 'run-registry: refusing closed_unverified for %s/%s: reason must be one of canceled|no-follow-on|handed_off_to:<x>|blocked_on:<x> (shipped/abandoned/superseded require real proof and belong in `completed`), got %s\n' \
+          "$run_id" "$task_id" "${reason:-<empty>}" >&2
+        return 1
+      fi
     fi
     # `detail` (optional): a JSON object recorded verbatim under .detail in
     # this transition's state_changed payload — e.g. close-done-workers.sh's
@@ -1614,6 +1709,17 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     # refused before the transaction, so a malformed detail never half-writes.
     if [ -n "$detail" ] && ! printf '%s' "$detail" | jq -e 'type == "object"' >/dev/null 2>&1; then
       printf 'run-registry: refusing %s for %s/%s: detail is not a JSON object\n' "$state" "$run_id" "$task_id" >&2
+      return 1
+    fi
+    # §(i): "closure is never unconditional" — session_close, when given,
+    # records WHEN A SESSION ENDED as its own, conceptually separate
+    # `session_closed` event, in the SAME transaction as this state write
+    # (never a second, non-atomic call) — so close-done-workers.sh can
+    # never end up with the pane closed, the event missing, and the
+    # state written (or vice versa). Never implies completion by itself
+    # (§(i) item 5): nothing here reads this event as proof of anything.
+    if [ -n "$session_close" ] && ! printf '%s' "$session_close" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      printf 'run-registry: refusing %s for %s/%s: session_close is not a JSON object\n' "$state" "$run_id" "$task_id" >&2
       return 1
     fi
 
@@ -1657,6 +1763,16 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     if [ -n "$detail" ]; then
       payload="$(printf '%s' "$payload" | jq -c --argjson d "$detail" '. + {detail: $d}')" || return 1
     fi
+    local sc_eid="" sc_insert=""
+    if [ -n "$session_close" ]; then
+      sc_eid="$(gen_id ev)"
+      local sc_payload
+      sc_payload="$(printf '%s' "$session_close" | jq -c --arg reason "$reason" '. + {reason:$reason}')" || return 1
+      sc_insert="INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+        SELECT $(_sq "$sc_eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'session_closed', $(_sq "$at"),
+          $(_sq "$sc_payload")
+        WHERE (SELECT changes()) > 0;"
+    fi
     changed=$(_sql "BEGIN IMMEDIATE;
       UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
         WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND state=$(_sq "$cur");
@@ -1664,6 +1780,7 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
         SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed', $(_sq "$at"),
           $(_sq "$payload")
         WHERE (SELECT changes()) > 0;
+      $sc_insert
       COMMIT;
       SELECT changes();" 2>/dev/null)
     [ "$changed" = "1" ] && return 0
@@ -2263,12 +2380,12 @@ all_tasks_json() {
 # belong to them. Nothing else prunes, so this is the only thing keeping the
 # registry from growing forever on a long-lived host.
 #
-# Deliberately narrow, unchanged from the file-layout version: only the true
-# TERMINAL states (completed/failed/cancelled/lost) are eligible —
-# starting/running/blocked are left alone, and `blocked` in particular can
-# still resolve, it is not a dead end. Date arithmetic is SQLite's own
-# (julianday), which removes the BSD-vs-GNU `date -v`/`date -d` fallback pair
-# the old implementation needed.
+# Deliberately narrow: only terminal states are eligible. `closed_unverified`
+# is terminal even though it is not completion evidence; retaining it forever
+# would leak every no-follow-on/session-closed row. starting/running/blocked
+# are left alone, and `blocked` in particular can still resolve.
+# Date arithmetic is SQLite's own (julianday), avoiding BSD/GNU `date`
+# differences.
 prune_completed_tasks() {               # max_age_days
   local days="$1"
   registry_init || return 1
@@ -2276,10 +2393,10 @@ prune_completed_tasks() {               # max_age_days
   _sql "BEGIN IMMEDIATE;
     DELETE FROM events WHERE task_id IN (
       SELECT task_id FROM tasks
-       WHERE state IN ('completed','failed','cancelled','lost')
+       WHERE state IN ('completed','closed_unverified','failed','cancelled','lost')
          AND julianday(updated_at) < julianday('now', '-${days} days'));
     DELETE FROM tasks
-     WHERE state IN ('completed','failed','cancelled','lost')
+     WHERE state IN ('completed','closed_unverified','failed','cancelled','lost')
        AND julianday(updated_at) < julianday('now', '-${days} days');
     COMMIT;" >/dev/null 2>&1
 }

@@ -239,8 +239,8 @@ if wt:
         check("action is orchestrator_close", actions[0]["action"] == "orchestrator_close", str(actions[0]))
         check("real close-done-workers.sh --apply succeeded", actions[0]["ok"], actions[0]["detail"])
     row = registry_row(task_id)
-    check("registry state is 'completed' after the real close-done-workers.sh ran",
-          bool(row) and row.get("state") == "completed", row)
+    check("registry state is 'closed_unverified' after the real close-done-workers.sh ran (no-follow-on is an unverified closure)",
+          bool(row) and row.get("state") == "closed_unverified", row)
 
 print("== a second task: real registry-bridge.sh cancel ==")
 out2 = process_command({
@@ -439,13 +439,14 @@ check("R2-2: a SECOND cancel on an ALREADY-CANCELLED row is idempotent (exits 0,
       bridge_out_f2_second.returncode == 0, bridge_out_f2_second.stderr)
 check("F2: no `herdr pane list` or `pane close` call was ever made for the already-terminal row (refused before touching any pane)",
       fake_herdr_log.read_text().strip() == "", fake_herdr_log.read_text())
-# F2's OWN refusal (a cancel that must NOT succeed) only still applies to
-# completed/failed/lost, per R2-2 -- the very first task in this file
-# auto-closed to 'completed' at the top and is still in scope.
+# F2's OWN refusal (a cancel that must NOT succeed) applies to
+# completed/closed_unverified/failed/lost, per R2-2 -- the very first task
+# in this file auto-closed to 'closed_unverified' at the top and is still
+# in scope.
 fake_herdr_log.write_text("")
 f2_completed_argv = [tsk.REGISTRY_BRIDGE, "cancel", run_id, task_id, "cancel_a_completed_task"]
 bridge_out_f2_completed = subprocess.run(f2_completed_argv, capture_output=True, text=True)
-check("F2: a cancel on a COMPLETED row (not idempotently-cancellable) still refuses and exits nonzero",
+check("F2: a cancel on a CLOSED_UNVERIFIED row (not idempotently-cancellable) still refuses and exits nonzero",
       bridge_out_f2_completed.returncode != 0, bridge_out_f2_completed.stderr)
 check("F2: the refusal message says 'already terminal'", "already terminal" in bridge_out_f2_completed.stderr, bridge_out_f2_completed.stderr)
 check("F2: no `herdr pane list` or `pane close` call was ever made for the completed row either",

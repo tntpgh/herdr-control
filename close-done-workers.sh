@@ -101,10 +101,17 @@ if [ "$task_given" = 1 ] && [ -z "${task_filter//[[:space:]]/}" ]; then
   exit 1
 fi
 if [ "$apply" = 1 ]; then
-  _valid_closure_reason "$closure_reason" || {
+  # docs/design/weekly-conductor-authorization.md (i): the vocabulary
+  # accepted here is the UNION of the two sets lib/run-registry.sh's
+  # set_task_state itself now enforces (shipped|abandoned|superseded ->
+  # completed; canceled|no-follow-on|handed_off_to:<x>|blocked_on:<x> ->
+  # closed_unverified) -- which label results is decided per-row below by
+  # _closure_target_state, not here; this gate only rejects a reason that
+  # belongs to NEITHER set.
+  if ! _valid_closure_reason "$closure_reason" && ! _valid_unverified_closure_reason "$closure_reason"; then
     printf 'close-done-workers: --apply requires --reason=<shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on|abandoned|superseded>\n' >&2
     exit 1
-  }
+  fi
 fi
 
 # `--pane=<id>` is herdr's own pane numbering, and herdr reuses a pane_id
@@ -651,6 +658,59 @@ _superseded_check() {
   _DPR_ARCHIVE_MANIFEST="$archive_dir"
 }
 
+# ---- §(i) checks 5/6 (docs/design/weekly-conductor-authorization.md):
+# evidence of OUTSTANDING AUTHORITY the worktree/pane checks above never
+# look at -- a clean git tree and an idle pane prove only hygiene, not
+# that the work finished. Either check failing HOLDS the SAME way checks
+# 1-4 already do (named reason, state and pane both left untouched) --
+# never a silent skip. A query that cannot even be READ holds too (fail
+# closed, mirrors panes_ok's own F2 discipline above): "could not check"
+# is never read as "assume clean."
+_evidence_hold_reason() {   # task_id run_id -> reason on stdout; empty = clean
+  local task_id="$1" run_id="$2" ap_out ap_rc po_out po_rc po_key py
+  ap_out="$(_sql "SELECT approval_id FROM approvals WHERE task_id=$(_sq "$task_id") AND decided_at IS NOT NULL AND outcome IS NULL LIMIT 1;")"
+  ap_rc=$?
+  if [ "$ap_rc" != 0 ]; then
+    printf 'approvals evidence could not be read for this task (query failed) -- held, never assumed clean'
+    return 0
+  fi
+  if [ -n "$ap_out" ]; then
+    printf 'approved action not yet consumed (approval_unconsumed:%s)' "$ap_out"
+    return 0
+  fi
+  py="$(_registry_python 2>/dev/null)"
+  if [ -z "$py" ]; then
+    printf 'prompt-occurrence evidence could not be read for this task (no usable python3) -- held, never assumed clean'
+    return 0
+  fi
+  po_out="$("$py" "$HERE/lib/prompt-occurrence.py" fold --db "$(registry_db)" --run "$run_id" --task "$task_id" 2>/dev/null)"
+  po_rc=$?
+  if [ "$po_rc" != 0 ] || ! printf '%s' "$po_out" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    printf 'prompt-occurrence evidence could not be read for this task (fold failed) -- held, never assumed clean'
+    return 0
+  fi
+  po_key="$(printf '%s' "$po_out" | jq -r 'to_entries[] | select(.value.unresolved_reason != null and .value.resolution_reason == null) | .key' 2>/dev/null | head -1)"
+  [ -n "$po_key" ] && printf 'prompt seen but never resolved (prompt_unresolved:%s)' "$po_key"
+  return 0
+}
+
+# §(i) item 4: `completed` is reached ONLY through one of the three
+# existing, per-task-checked proof paths (shipped+proof, superseded's own
+# GitHub-verified rule set, the detached-PR path's own merged/closed
+# state) -- every other closure reason that passes checks 1-6 writes
+# closed_unverified instead, never completed. Mirrors
+# _valid_closure_reason/_valid_unverified_closure_reason's own split
+# (lib/run-registry.sh) so the CLI picks the same label the storage layer
+# would itself enforce, rather than relying on set_task_state's own
+# refusal to catch a mismatch after the fact.
+_closure_target_state() {   # closure_reason -> completed | closed_unverified
+  case "$1" in
+    shipped|abandoned|superseded) printf 'completed' ;;
+    *) printf 'closed_unverified' ;;
+  esac
+}
+
+
 closable=0; held=0; refused=0; pane_close_failed=0
 while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
   [ -n "$pane" ] || continue
@@ -752,6 +812,13 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
     fi
   fi
 
+  # §(i) checks 5/6: evidence of outstanding authority — unconsumed
+  # approval or unresolved prompt — HOLDS the same way checks 1-4 already
+  # do, symmetric with them (close-done-workers.sh header, item 3): this
+  # must run on EVERY candidate row, dry-run included, same as every
+  # other check here.
+  [ -z "$reason" ] && reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+
   if [ -n "$reason" ]; then
     held=$((held+1))
     printf '  HOLD   %-8s %-46s %s\n' "$pane" "$label" "$reason"
@@ -763,11 +830,23 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
   [ "$apply" = 1 ] || continue
 
+  # §(i) item 4: which label results depends on the closure reason, never
+  # on checks 1-6 alone — passing them proves only the absence of a
+  # specific list of negative signals, not positive completion proof.
+  target_state="$(_closure_target_state "$closure_reason")"
+  # §(i) item 3: the session_closed event records WHEN this session ended,
+  # conceptually separate from WHETHER the work was verified done (the
+  # state write) — produced together, atomically, in set_task_state's own
+  # transaction, only once checks 1-6 have all passed above. Never read
+  # by anything as proof of completion (§(i) item 5).
+  session_close_payload="$(jq -nc --arg pane "$pane" --arg birth "$pane_birth" --arg by "close-done-workers.sh" \
+    '{pane_id:$pane, pane_birth:$birth, closed_by:$by}')"
+
   # Settle the registry FIRST. If the pane close succeeds and this did not
   # run, the task stays `running` forever against a pane that no longer
   # exists — which is precisely the stale state that made the attention view
   # report seven phantom items all day.
-  if ! set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" "$dpr_detail" >/dev/null 2>&1; then
+  if ! set_task_state "$run_id" "$task_id" "$target_state" "$closure_reason" "$closure_proof" "$dpr_detail" "$session_close_payload" >/dev/null 2>&1; then
     # NEVER silently fall back to `cancelled` here — that used to convert
     # ANY refusal (a proof that doesn't actually match THIS task, a race,
     # an illegal transition) into a fabricated successful outcome: pane
@@ -775,7 +854,7 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
     # means something is wrong with this exact row; leave its state and
     # pane untouched so the operator sees it, instead of a lie.
     refused=$((refused+1))
-    printf '  REFUSED %-8s %-46s registry refused the completed transition — left running, pane not closed\n' "$pane" "$label"
+    printf '  REFUSED %-8s %-46s registry refused the %s transition — left running, pane not closed\n' "$pane" "$label" "$target_state"
     continue
   fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
