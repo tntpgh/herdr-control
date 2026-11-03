@@ -67,14 +67,14 @@ DISPLAY = {
     "stalled":         {"label": "Stalled, owes an action", "icon": "\u25B3", "attention": True},
     "in_review":       {"label": "Ready for review, not done", "icon": "\u25C9", "attention": True},
     "done_with_proof": {"label": "Completed, proof on file", "icon": "\u2714", "attention": False},
-    "closed":          {"label": "Completed, no proof on file", "icon": "\u25A0", "attention": False},
+    "closed":          {"label": "Closed, completion unverified", "icon": "\u25A0", "attention": False},
     "failed":          {"label": "Failed", "icon": "\u2716", "attention": True},
     "cancelled":       {"label": "Cancelled", "icon": "\u2298", "attention": False},
     "lost":            {"label": "Lost", "icon": "\u2205", "attention": True},
     "gone":            {"label": "Pane gone", "icon": "\u2205", "attention": True},
     "unknown":         {"label": "Unrecognized state", "icon": "\u00BF", "attention": True},
 }
-TERMINAL = ("completed", "failed", "cancelled", "lost", "gone")
+TERMINAL = ("completed", "closed_unverified", "failed", "cancelled", "lost", "gone")
 RECENT_FINISHED_S = 24 * 3600
 SHIP_TASK_CAP = 60
 
@@ -256,6 +256,8 @@ def display_of(t: dict) -> tuple[str, str]:
         key = "in_review"
     elif st == "completed":
         key = "done_with_proof" if proof else "closed"
+    elif st == "closed_unverified":
+        key = "closed"
     elif st in DISPLAY:
         key = st
     else:
@@ -268,7 +270,9 @@ def display_of(t: dict) -> tuple[str, str]:
         "stalled": "Idle while owing the conductor an action.",
         "in_review": "Finished; waiting on review. Not done until reviewed.",
         "done_with_proof": f"Completed ({reason or 'no reason recorded'}). Proof: {proof}.",
-        "closed": f"Completed: {reason or 'no reason recorded'}. No proof on file.",
+        "closed": (f"Closed without verified completion ({reason or 'no reason recorded'})."
+                   if st == "closed_unverified"
+                   else f"Completed: {reason or 'no reason recorded'}. No proof on file."),
         "failed": "Failed.",
         "cancelled": f"Cancelled ({reason or 'no reason recorded'}).",
         "lost": "Lost: the worker disappeared without a result.",

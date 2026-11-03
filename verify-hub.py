@@ -884,6 +884,24 @@ class FinishedButUnseen(unittest.TestCase):
     def test_ready_review_is_an_attention_state(self):
         self.assertIn("ready_review", hub.ATTENTION)
 
+    def test_unverified_closure_is_terminal_without_claiming_completion(self):
+        task = self._task(state="closed_unverified", state_source="registry",
+                          closure_reason="pane closed after a no-follow-on review")
+        key, words = hub_ui.display_of(task)
+        self.assertEqual(key, "closed")
+        self.assertFalse(hub_ui.DISPLAY[key]["attention"])
+        self.assertIn("Closed without verified completion", words)
+        self.assertNotIn("Completed", words)
+
+    def test_old_unverified_closure_is_retired_from_ship_view(self):
+        task = self._task(state="closed_unverified", updated_at="2026-09-05T00:00:00Z")
+        now = dt.datetime(2026, 9, 7, tzinfo=dt.timezone.utc).timestamp()
+        snapshot = hub_ui.ship_snapshot(
+            {"tasks": [task]}, {}, {}, {}, {"connected": False}, now,
+        )
+        self.assertEqual(snapshot["tasks"], [])
+        self.assertEqual(snapshot["hidden_finished"], 1)
+
     def test_an_ack_at_or_after_the_evidence_clears_it(self):
         with patch.object(hub, "_evidence_at", lambda w: 1000.0), \
              patch.object(hub, "_central_done_at", lambda t: None), \
