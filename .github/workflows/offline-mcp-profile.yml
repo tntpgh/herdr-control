@@ -15,12 +15,14 @@ name: offline-mcp-profile
 on:
   pull_request:
     paths: ["verify-offline-mcp-profile.sh", "verify-launcher-profile-identity.sh", "verify-close-done-workers.sh",
+            "verify-conductor-exit.sh", "verify-factory-cleanup.sh", "factory-cleanup.sh", "conductor-exit.sh",
             "spawn-task.sh", "spawn-agent.sh", "close-done-workers.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
             "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
   push:
     branches: [main]
     paths: ["verify-offline-mcp-profile.sh", "verify-launcher-profile-identity.sh", "verify-close-done-workers.sh",
+            "verify-conductor-exit.sh", "verify-factory-cleanup.sh", "factory-cleanup.sh", "conductor-exit.sh",
             "spawn-task.sh", "spawn-agent.sh", "close-done-workers.sh", "ensure-workspace.sh", "config.sh",
             "lib/**", "agent-hooks/omp-worker-overlay.yml", "agent-hooks/omp-herdr-control.ts", "herdr-select.sh",
             "tests/fixtures/launcher-argv-guard.v26d.sh", "launchd/resolve-hub-python.sh", "tests/bounded-run.py", ".github/workflows/offline-mcp-profile.yml"]
@@ -55,3 +57,7 @@ jobs:
       - run: bash verify-close-done-workers.sh
         env:
           HERDR_HUB_PYTHON_DIRS: /usr/bin
+      - run: bash verify-conductor-exit.sh
+        env:
+          HERDR_HUB_PYTHON_DIRS: /usr/bin
+      - run: bash verify-factory-cleanup.sh

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# conductor-exit.sh — a conductor's exit step: close every worker pane it
-# dispatched whose work has SHIPPED, with the merged PR as proof. DRY-RUN BY
-# DEFAULT.
+# conductor-exit.sh — close worker panes whose branches have shipped, with the
+# merged PR as proof. DRY-RUN BY DEFAULT.
 #
 #   conductor-exit.sh                          # this pane's workers ($HERDR_PANE_ID)
 #   conductor-exit.sh --conductor=w19:p7       # a named conductor's workers
+#   conductor-exit.sh --all                    # every registered worker
 #   conductor-exit.sh --orphans                # workers whose conductor pane is gone
 #   conductor-exit.sh --summary                # one line: "<closable> <held>", for hooks
 #   ... --apply                                # actually close
@@ -25,23 +25,44 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
+CLOSE_DONE_SH=$HERE/close-done-workers.sh
+if [ "${HERDR_CONDUCTOR_EXIT_TEST_MODE:-0}" = 1 ]; then
+  CLOSE_DONE_SH=${HERDR_CLOSE_DONE_SH:-$CLOSE_DONE_SH}
+elif [ -n "${HERDR_CLOSE_DONE_SH:-}" ]; then
+  echo "conductor-exit: dependency overrides require HERDR_CONDUCTOR_EXIT_TEST_MODE=1" >&2
+  exit 3
+fi
 
-apply=0; summary=0; orphans=0; conductor="${HERDR_PANE_ID:-}"
+apply=0; summary=0; orphans=0; all=0; conductor="${HERDR_PANE_ID:-}"; conductor_explicit=0
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
     --summary) summary=1 ;;
+    --all) all=1 ;;
     --orphans) orphans=1 ;;
-    --conductor=*) conductor="${a#--conductor=}" ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --conductor=*) conductor="${a#--conductor=}"; conductor_explicit=$((conductor_explicit+1)) ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'conductor-exit: unknown flag %s\n' "$a" >&2; exit 2 ;;
   esac
 done
 
-live_panes=$(herdr pane list 2>/dev/null | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)
+scope_count=$((all + orphans + conductor_explicit))
+[ "$scope_count" -le 1 ] || {
+  echo "conductor-exit: --all, --orphans, and --conductor are mutually exclusive" >&2
+  exit 2
+}
+
+pane_list_rc=0
+pane_list_json=$(herdr pane list 2>/dev/null) || pane_list_rc=$?
+live_panes=""
+if [ "$pane_list_rc" -eq 0 ]; then
+  live_panes=$(printf '%s' "$pane_list_json" | jq -er '(.result.panes // .panes) | if type == "array" then .[]?.pane_id else error("panes is not an array") end' 2>/dev/null) || live_panes=""
+fi
 is_live() { printf '%s\n' "$live_panes" | grep -qxF "$1"; }
 
-if [ "$orphans" = 1 ]; then
+if [ "$all" = 1 ]; then
+  scope="1=1"
+elif [ "$orphans" = 1 ]; then
   # An empty pane list (herdr down) would make every conductor look gone.
   [ -n "$live_panes" ] || { echo "conductor-exit: herdr returned no panes; refusing --orphans" >&2; exit 3; }
   scope="conductor_pane_id IS NOT NULL AND conductor_pane_id != ''"
@@ -50,12 +71,27 @@ else
   scope="conductor_pane_id=$(_sq "$conductor")"
 fi
 
-closable=0; held=0
-while IFS='|' read -r task_id pane cpane wt label; do
-  [ -n "$task_id" ] || continue
+query="SELECT json_object('task_id',task_id,'pane',pane_id,'conductor',conductor_pane_id,'worktree',worktree,'label',label)
+       FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;"
+rows=$(_sql "$query") || {
+  echo "conductor-exit: registry query failed" >&2
+  exit 3
+}
+
+closable=0; held=0; apply_failed=0
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  task_id=$(printf '%s' "$row" | jq -er '.task_id | strings') \
+    && pane=$(printf '%s' "$row" | jq -er '.pane | strings') \
+    && cpane=$(printf '%s' "$row" | jq -r '.conductor // ""') \
+    && wt=$(printf '%s' "$row" | jq -er '.worktree | strings') \
+    && label=$(printf '%s' "$row" | jq -er '.label | strings') || {
+      echo "conductor-exit: malformed registry row — refusing" >&2
+      exit 3
+    }
   # --orphans: only tasks whose conductor pane no longer exists.
   if [ "$orphans" = 1 ] && is_live "$cpane"; then continue; fi
-  why=""; proof=""
+  why=""; proof=""; expected_branch=""; expected_head=""
   if [ ! -d "$wt" ]; then
     why="worktree missing"
   else
@@ -66,11 +102,41 @@ while IFS='|' read -r task_id pane cpane wt label; do
     else
       IFS='|' read -r pr_state pr_url pr_oid <<<"$pr"
       case "$pr_state" in
-        MERGED) if [ -n "$pr_oid" ]; then proof="$pr_url ${pr_oid:0:8}"; else why="merged PR reports no merge commit: $pr_url"; fi ;;
+        MERGED)
+          if [ -z "$pr_oid" ]; then
+            why="merged PR reports no merge commit: $pr_url"
+          else
+            local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || why="branch HEAD could not be read"
+            pr_head=""
+            if [ -z "$why" ]; then
+              pr_head=$(gh pr view "$pr_url" -R "$slug" --json headRefOid -q '.headRefOid' 2>/dev/null) \
+                || why="merged PR head lookup failed: $pr_url"
+            fi
+            if [ -z "$why" ] && [ "$pr_head" != "$local_head" ]; then
+              why="branch HEAD is not the merged PR head: $pr_url"
+            elif [ -z "$why" ]; then
+              proof="$pr_url ${pr_oid:0:8}"
+              expected_branch="$br"
+              expected_head="$pr_head"
+            fi
+          fi
+          ;;
         OPEN)   why="PR still open: $pr_url" ;;
         CLOSED) why="PR closed unmerged: $pr_url" ;;
         *)      why="no PR for $slug:$br" ;;
       esac
+    fi
+  fi
+  # A merged PR is only a candidate. Run the same dry safety gate that --apply
+  # will re-run so --summary and the stop hook never call dirty, unpushed, or
+  # prompted work "closable".
+  if [ -z "$why" ]; then
+    gate_rc=0
+    gate_out=$(bash "$CLOSE_DONE_SH" --task="$task_id" 2>&1) || gate_rc=$?
+    close_count=$(printf '%s\n' "$gate_out" | grep -Ec '^[[:space:]]*close[[:space:]]')
+    if [ "$gate_rc" -ne 0 ] || [ "$close_count" -ne 1 ] || printf '%s\n' "$gate_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]'; then
+      why=$(printf '%s\n' "$gate_out" | sed -En 's/^ *(HOLD|REFUSED) +[^ ]+ +[^ ]+ +//p' | sed -n '1p')
+      [ -n "$why" ] || why="close-done-workers safety gate failed (exit $gate_rc)"
     fi
   fi
   if [ -n "$why" ]; then
@@ -82,15 +148,23 @@ while IFS='|' read -r task_id pane cpane wt label; do
   [ "$summary" = 1 ] && continue
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
-  bash "$HERE/close-done-workers.sh" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
+  close_rc=0
+  close_out=$(bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" \
+    --expected-branch="$expected_branch" --expected-head="$expected_head" 2>&1) || close_rc=$?
+  printf '%s\n' "$close_out" \
     | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
-done < <(_sql "SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
-               FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;")
+  if [ "$close_rc" -ne 0 ] || printf '%s\n' "$close_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]' \
+    || ! printf '%s\n' "$close_out" | grep -q '^closed 1, held back 0, refused 0, pane-close failed 0$'; then
+    apply_failed=$((apply_failed+1))
+    printf '    close-done-workers: apply did not close exactly one task (exit %d)\n' "$close_rc" >&2
+  fi
+done <<<"$rows"
 
 if [ "$summary" = 1 ]; then printf '%d %d\n' "$closable" "$held"; exit 0; fi
 echo
 if [ "$apply" = 1 ]; then
-  printf '%d shipped task(s) sent to close-done-workers, %d held\n' "$closable" "$held"
+  printf '%d shipped task(s) sent to close-done-workers, %d held, %d failed\n' "$closable" "$held" "$apply_failed"
+  [ "$apply_failed" -eq 0 ] || exit 4
 else
   printf '%d shipped (closable), %d held — DRY RUN, nothing changed. Re-run with --apply\n' "$closable" "$held"
 fi

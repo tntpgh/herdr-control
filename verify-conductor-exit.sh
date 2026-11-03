@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # verify-conductor-exit.sh — conductor-exit.sh closes ONLY workers whose PR
 # merged (as `shipped`, with the PR URL + merge sha as proof), holds the rest,
-# scopes to one conductor, and --orphans picks only workers whose conductor
-# pane is gone. herdr and gh are stubbed functions; the registry is a
-# throwaway HERDR_RUN_STATE_DIR. Nothing live is touched.
+# scopes to one conductor, --all covers every worker, and --orphans picks only
+# workers whose conductor pane is gone. herdr and gh are stubbed functions; the
+# registry is a throwaway HERDR_RUN_STATE_DIR. Nothing live is touched.
 #
 #   bash verify-conductor-exit.sh
 set -uo pipefail
@@ -14,12 +14,19 @@ bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 
 CALLS=$(mktemp); export CALLS
+CLOSED_PANES=$(mktemp); export CLOSED_PANES
 # Live panes: the conductor COND and workers p1..p4. The orphan's conductor
-# (GONE) is deliberately absent.
+# (GONE) is deliberately absent. Successful close removes that pane from the
+# next authoritative list, so the postcondition is real.
 herdr() {
   printf '%s\n' "$*" >> "$CALLS"
   case "$1 $2" in
-    "pane list") printf '{"result":{"panes":[{"pane_id":"COND","agent_status":"working","terminal_id":"bC"},{"pane_id":"p1","agent_status":"idle","terminal_id":"b1"},{"pane_id":"p2","agent_status":"idle","terminal_id":"b2"},{"pane_id":"p3","agent_status":"idle","terminal_id":"b3"},{"pane_id":"p4","agent_status":"idle","terminal_id":"b4"}]}}\n' ;;
+    "pane list")
+      closed=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$CLOSED_PANES")
+      jq -nc --argjson closed "$closed" \
+        '{result:{panes:[{pane_id:"COND",agent_status:"working",terminal_id:"bC"},{pane_id:"p1",agent_status:"idle",terminal_id:"b1"},{pane_id:"p2",agent_status:"idle",terminal_id:"b2"},{pane_id:"p3",agent_status:"idle",terminal_id:"b3"},{pane_id:"p4",agent_status:"idle",terminal_id:"b4"}] | map(select(.pane_id as $p | ($closed | index($p) | not)))}}'
+      ;;
+    "pane close") printf '%s\n' "$3" >> "$CLOSED_PANES" ;;
     *) printf '{}\n' ;;
   esac
 }
@@ -32,10 +39,21 @@ gh() {
   [ "${GH_FAIL:-0}" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
   [ "${GH_FAIL_VIEW:-0}" = 1 ] && [ "$1 $2" = "pr view" ] && { echo "gh: stub failure" >&2; return 1; }
   local br="" q="" prev="" num=""
-  [ "$1 $2" = "pr view" ] && num="$3"
+  if [ "$1 $2" = "pr view" ]; then num="${3##*/}"; fi
   for a in "$@"; do
     [ "$prev" = "--head" ] && br="$a"; [ "$prev" = "-q" ] && q="$a"; prev="$a"
   done
+  if [ "$q" = ".headRefOid" ]; then
+    case "$num" in
+      2) proof_label=merged-work ;;
+      4) proof_label=orphan-work ;;
+      *) return 1 ;;
+    esac
+    proof_wt=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+      "SELECT worktree FROM tasks WHERE label='$proof_label' LIMIT 1;") || return 1
+    git -C "$proof_wt" rev-parse HEAD
+    return
+  fi
   local json='[]'
   local all='[{"state":"CLOSED","url":"https://github.com/o/r/pull/1","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/2","mergeCommit":{"oid":"abcdef0123456789abcdef0123456789abcdef01"}},{"state":"OPEN","url":"https://github.com/o/r/pull/3","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/4","mergeCommit":{"oid":"1111111122222222333333334444444455555555"}}]'
   if [ -n "$num" ]; then
@@ -90,28 +108,78 @@ check "merged task still running after dry-run" "$(state t_merged)" "running"
 printf '== --summary: one "<closable> <held>" line ==\n'
 check "summary counts" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "1 2"
 
+printf '== --all: every registered worker, independent of conductor ==\n'
+out=$(bash "$here/conductor-exit.sh" --all 2>&1)
+printf '%s\n' "$out" | grep -q 'ship .*merged-work' && ok "--all includes live conductor's merged worker" || bad "--all omitted merged worker: $out"
+printf '%s\n' "$out" | grep -q 'ship .*orphan-work' && ok "--all includes orphaned merged worker" || bad "--all omitted orphan worker: $out"
+printf '%s\n' "$out" | grep -q 'HOLD .*open-pr-work' && ok "--all still holds open PRs" || bad "--all did not hold open PR: $out"
+check "--all summary counts" "$(bash "$here/conductor-exit.sh" --all --summary)" "2 2"
+
+printf '== --all and --orphans are mutually exclusive ==\n'
+bash "$here/conductor-exit.sh" --all --orphans >/dev/null 2>&1
+check "conflicting scopes refuse" "$?" "2"
+bash "$here/conductor-exit.sh" --all --conductor=COND >/dev/null 2>&1
+check "--all plus explicit conductor refuses" "$?" "2"
+bash "$here/conductor-exit.sh" --conductor=COND --conductor=GONE >/dev/null 2>&1
+check "repeated conductor selectors refuse" "$?" "2"
+
 printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
 out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
 printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*gh lookup failed' && ok "merged-branch task held when gh fails" || bad "not held: $out"
 check "summary with gh failing" "$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
 
-printf '== re-check fails inside close-done-workers -> not closed, and conductor-exit SAYS why ==\n'
+printf '== merged PR head lookup failure -> held before mutation ==\n'
 : > "$CALLS"
 out=$(GH_FAIL_VIEW=1 bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
-check "merged task NOT completed when the re-check cannot run" "$(state t_merged)" "running"
-grep -q 'pane close' "$CALLS" && bad "a pane was closed without a confirmed proof" || ok "nothing closed"
-printf '%s\n' "$out" | grep -q 'close-done-workers: --reason=shipped requires.*could not confirm' \
-  && ok "close-done-workers' refusal reaches the operator" || bad "refusal swallowed: $out"
+check "merged task NOT completed when its PR head cannot be bound" "$(state t_merged)" "running"
+grep -q 'pane close' "$CALLS" && bad "a pane was closed without a bound PR head" || ok "nothing closed"
+printf '%s\n' "$out" | grep -q 'merged PR head lookup failed' \
+  && ok "head lookup failure reaches the operator" || bad "head failure swallowed: $out"
 
 printf '== close-done-workers HOLDs a dirty worktree -> conductor-exit shows the HOLD line (macOS sed) ==\n'
 wt_merged=$(read_task run_t_merged t_merged | jq -r .worktree)
 touch "$wt_merged/uncommitted.txt"
 : > "$CALLS"
 out=$(bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
-rm -f "$wt_merged/uncommitted.txt"
 check "dirty merged task not completed" "$(state t_merged)" "running"
-printf '%s\n' "$out" | grep -q 'close-done-workers: HOLD .*uncommitted' \
-  && ok "HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
+printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*uncommitted' \
+  && ok "dry safety gate's HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
+check "summary does not call dirty merged work closable" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
+rm -f "$wt_merged/uncommitted.txt"
+
+printf '== nonzero safety gate cannot authorize from a close-looking line ==\n'
+bad_gate=$(mktemp)
+cat > "$bad_gate" <<'SH'
+#!/usr/bin/env bash
+echo "close p1 merged-work"
+exit 7
+SH
+chmod +x "$bad_gate"
+out=$(HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$bad_gate" \
+  bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
+printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*safety gate failed (exit 7)' \
+  && ok "nonzero gate output is held despite a close-looking line" || bad "nonzero gate authorized closure: $out"
+check "nonzero gate summary stays fail-closed" \
+  "$(HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$bad_gate" bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
+rm -f "$bad_gate"
+
+printf '== apply failure propagates after a successful dry gate ==\n'
+apply_gate=$(mktemp)
+cat > "$apply_gate" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' --apply '*) echo "HOLD p1 merged-work simulated apply race"; echo "closed 0, held back 1, refused 0, pane-close failed 0"; exit 0 ;;
+  *) echo "close p1 merged-work" ;;
+esac
+SH
+chmod +x "$apply_gate"
+HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$apply_gate" \
+  bash "$here/conductor-exit.sh" --conductor=COND --apply >/tmp/conductor-apply-failure.out 2>&1
+check "apply-time HOLD returns nonzero" "$?" "4"
+grep -q 'apply did not close exactly one task' /tmp/conductor-apply-failure.out \
+  && ok "apply-time HOLD reaches the operator" || bad "apply-time HOLD was hidden"
+check "failed apply leaves task running" "$(state t_merged)" "running"
+rm -f "$apply_gate" /tmp/conductor-apply-failure.out
 
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"
@@ -138,6 +206,14 @@ grep -q 'pane close' "$CALLS" && bad "closed a pane with no pane list" || ok "no
 
 printf '== no conductor at all -> usage error, not "every task" ==\n'
 HERDR_PANE_ID= bash "$here/conductor-exit.sh" >/dev/null 2>&1; check "exit 2 without a conductor" "$?" "2"
+
+printf '== registry query failure never becomes a successful empty summary ==\n'
+bad_state=$(mktemp)
+out=$(HERDR_RUN_STATE_DIR="$bad_state" bash "$here/conductor-exit.sh" --conductor=COND --summary 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "registry query failure returns nonzero" || bad "registry query failure returned success"
+[ "$out" != "0 0" ] && ok "registry failure is not reported as an empty scope" || bad "registry failure became 0 0"
+rm -f "$bad_state"
 
 echo "-----"; echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
