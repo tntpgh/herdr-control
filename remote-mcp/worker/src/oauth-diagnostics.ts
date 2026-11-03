@@ -14,19 +14,30 @@ const reasons = new Set(["method_not_allowed", "repeated_parameter", "grant_type
   "resource_grant_mismatch", "legacy_grant_unbound", "kv_rate_limited", "requested_ttl_too_short",
   "token_missing", "json_malformed", "metadata_invalid", "callback_denied", "payload_too_large",
   "token_not_found", "token_expired", "audience_mismatch", "resolver_rejected", "callback_error"]);
-const object = (v: unknown): Record<string, unknown> =>
-  v !== null && typeof v === "object" ? v as Record<string, unknown> : {};
-const label = (v: unknown, allowed: Set<string>) => typeof v === "string" && allowed.has(v) ? v : "other";
+const ownData = (value: unknown, key: string): unknown => {
+  if (value === null || typeof value !== "object") return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const label = (value: unknown, allowed: Set<string>) =>
+  typeof value === "string" && allowed.has(value) ? value : "other";
 
 export function oauthDiagnostic(event: unknown) {
-  const e = object(event);
-  const internal = object(e.internal);
+  const internal = ownData(event, "internal");
+  const code = ownData(event, "code");
+  const status = ownData(event, "status");
+  const category = ownData(internal, "category");
+  const reason = ownData(internal, "reason");
   return {
     event: "herdr.oauth_error",
-    code: label(e.code, codes),
-    status: typeof e.status === "number" && Number.isInteger(e.status) && e.status >= 400 && e.status <= 599 ? e.status : 0,
-    category: label(internal.category, categories),
-    reason: label(internal.reason, reasons),
+    code: label(code, codes),
+    status: typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599 ? status : 0,
+    category: label(category, categories),
+    reason: label(reason, reasons),
   };
 }
 
