@@ -91,7 +91,7 @@ while IFS= read -r row; do
     }
   # --orphans: only tasks whose conductor pane no longer exists.
   if [ "$orphans" = 1 ] && is_live "$cpane"; then continue; fi
-  why=""; proof=""
+  why=""; proof=""; expected_branch=""; expected_head=""
   if [ ! -d "$wt" ]; then
     why="worktree missing"
   else
@@ -102,7 +102,25 @@ while IFS= read -r row; do
     else
       IFS='|' read -r pr_state pr_url pr_oid <<<"$pr"
       case "$pr_state" in
-        MERGED) if [ -n "$pr_oid" ]; then proof="$pr_url ${pr_oid:0:8}"; else why="merged PR reports no merge commit: $pr_url"; fi ;;
+        MERGED)
+          if [ -z "$pr_oid" ]; then
+            why="merged PR reports no merge commit: $pr_url"
+          else
+            local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || why="branch HEAD could not be read"
+            pr_head=""
+            if [ -z "$why" ]; then
+              pr_head=$(gh pr view "$pr_url" -R "$slug" --json headRefOid -q '.headRefOid' 2>/dev/null) \
+                || why="merged PR head lookup failed: $pr_url"
+            fi
+            if [ -z "$why" ] && [ "$pr_head" != "$local_head" ]; then
+              why="branch HEAD is not the merged PR head: $pr_url"
+            elif [ -z "$why" ]; then
+              proof="$pr_url ${pr_oid:0:8}"
+              expected_branch="$br"
+              expected_head="$pr_head"
+            fi
+          fi
+          ;;
         OPEN)   why="PR still open: $pr_url" ;;
         CLOSED) why="PR closed unmerged: $pr_url" ;;
         *)      why="no PR for $slug:$br" ;;
@@ -131,7 +149,8 @@ while IFS= read -r row; do
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
   close_rc=0
-  close_out=$(bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1) || close_rc=$?
+  close_out=$(bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" \
+    --expected-branch="$expected_branch" --expected-head="$expected_head" 2>&1) || close_rc=$?
   printf '%s\n' "$close_out" \
     | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
   if [ "$close_rc" -ne 0 ] || printf '%s\n' "$close_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]' \

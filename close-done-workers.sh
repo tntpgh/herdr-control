@@ -67,7 +67,7 @@ source "$HERE/lib/worktree-archive.sh"
 # shellcheck source=lib/bashlex-preflight.sh
 source "$HERE/lib/bashlex-preflight.sh"
 
-apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; pane_given=0; task_given=0; superseded_by=""
+apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; pane_given=0; task_given=0; superseded_by=""; expected_branch=""; expected_head=""
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
@@ -84,6 +84,8 @@ for a in "$@"; do
     # and the plain "PR is OPEN" hold stands unchanged (item 6).
     --superseded-by=*) superseded_by="${a#--superseded-by=}" ;;
     --proof=*) closure_proof="${a#--proof=}" ;;
+    --expected-branch=*) expected_branch="${a#--expected-branch=}" ;;
+    --expected-head=*) expected_head="${a#--expected-head=}" ;;
     --pane=*) pane_filter="${a#--pane=}"; pane_given=$((pane_given+1)) ;;
     --task=*) task_filter="${a#--task=}"; task_given=$((task_given+1)) ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -98,6 +100,11 @@ if [ "$task_given" -gt 1 ] || { [ "$task_given" = 1 ] && [ -z "${task_filter//[[
 fi
 if [ "$pane_given" -gt 1 ] || { [ "$pane_given" = 1 ] && [ -z "${pane_filter//[[:space:]]/}" ]; }; then
   printf 'close-done-workers: --pane must be supplied once with a non-empty value — refusing\n' >&2
+  exit 1
+fi
+if { [ -n "$expected_branch" ] || [ -n "$expected_head" ]; } \
+  && { [ -z "$expected_branch" ] || [[ ! "$expected_head" =~ ^[0-9a-fA-F]{40}$ ]] || [ "$task_given" != 1 ]; }; then
+  printf 'close-done-workers: expected branch/head require one task and a full commit id — refusing\n' >&2
   exit 1
 fi
 if [ "$apply" = 1 ]; then
@@ -779,6 +786,14 @@ while IFS= read -r row; do
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
       candidate_mode=branch
       br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || reason="branch name could not be read"
+      if [ -z "$reason" ] && [ -n "$expected_branch" ] && [ "$br" != "$expected_branch" ]; then
+        reason="branch changed from shipped proof ($expected_branch -> $br)"
+      fi
+      if [ -z "$reason" ] && [ -n "$expected_head" ]; then
+        current_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || reason="branch HEAD could not be read"
+        [ -n "$reason" ] || [ "$current_head" = "$expected_head" ] \
+          || reason="branch HEAD changed from shipped proof"
+      fi
       if [ -z "$reason" ]; then
         porcelain=$(git -C "$wt" -c status.showUntrackedFiles=all status --porcelain --untracked-files=all 2>/dev/null) || reason="worktree status could not be read"
       fi
@@ -882,6 +897,8 @@ while IFS= read -r row; do
     [ "$include_lost" = 0 ] || recheck_args+=(--include-lost)
     [ -z "$closure_reason" ] || recheck_args+=("--reason=$closure_reason")
     [ -z "$superseded_by" ] || recheck_args+=("--superseded-by=$superseded_by")
+    [ -z "$expected_branch" ] || recheck_args+=("--expected-branch=$expected_branch")
+    [ -z "$expected_head" ] || recheck_args+=("--expected-head=$expected_head")
     recheck_rc=0
     recheck_out=$(bash "$0" "${recheck_args[@]}" 2>&1) || recheck_rc=$?
     recheck_close_count=$(printf '%s\n' "$recheck_out" | grep -Ec '^[[:space:]]*close[[:space:]]')
@@ -890,19 +907,26 @@ while IFS= read -r row; do
       recheck_reason="safety state changed before apply"
     fi
   else
-    refresh_panes
-    fresh_st=$(pane_status "$pane")
-    fresh_birth=$(pane_live_birth "$pane")
-    case "$fresh_st" in
-      absent) ;;
-      idle|done)
-        [ -n "$fresh_birth" ] && [ -n "$pane_birth" ] && [ "$fresh_birth" = "$pane_birth" ] \
-          || recheck_reason="pane identity changed before apply"
-        ;;
-      *) recheck_reason="pane status changed before apply ($fresh_st)" ;;
-    esac
-    [ -n "$recheck_reason" ] || recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+    recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
   fi
+  # The pane identity itself is refreshed after every worktree/evidence path.
+  # An initially live pane disappearing is a HOLD: closing its reusable id
+  # could otherwise terminate a replacement occupant.
+  refresh_panes
+  fresh_st=$(pane_status "$pane")
+  fresh_birth=$(pane_live_birth "$pane")
+  case "$fresh_st" in
+    absent)
+      [ "$st" = absent ] || recheck_reason="pane disappeared before apply"
+      ;;
+    idle|done)
+      [ -n "$fresh_birth" ] && [ -n "$pane_birth" ] && [ "$fresh_birth" = "$pane_birth" ] \
+        || recheck_reason="pane identity changed before apply"
+      ;;
+    *) recheck_reason="pane status changed before apply ($fresh_st)" ;;
+  esac
+  [ -n "$recheck_reason" ] || recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+  st="$fresh_st"
   if [ -n "$recheck_reason" ]; then
     closable=$((closable-1))
     held=$((held+1))

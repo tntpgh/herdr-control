@@ -39,10 +39,21 @@ gh() {
   [ "${GH_FAIL:-0}" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
   [ "${GH_FAIL_VIEW:-0}" = 1 ] && [ "$1 $2" = "pr view" ] && { echo "gh: stub failure" >&2; return 1; }
   local br="" q="" prev="" num=""
-  [ "$1 $2" = "pr view" ] && num="$3"
+  if [ "$1 $2" = "pr view" ]; then num="${3##*/}"; fi
   for a in "$@"; do
     [ "$prev" = "--head" ] && br="$a"; [ "$prev" = "-q" ] && q="$a"; prev="$a"
   done
+  if [ "$q" = ".headRefOid" ]; then
+    case "$num" in
+      2) proof_label=merged-work ;;
+      4) proof_label=orphan-work ;;
+      *) return 1 ;;
+    esac
+    proof_wt=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+      "SELECT worktree FROM tasks WHERE label='$proof_label' LIMIT 1;") || return 1
+    git -C "$proof_wt" rev-parse HEAD
+    return
+  fi
   local json='[]'
   local all='[{"state":"CLOSED","url":"https://github.com/o/r/pull/1","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/2","mergeCommit":{"oid":"abcdef0123456789abcdef0123456789abcdef01"}},{"state":"OPEN","url":"https://github.com/o/r/pull/3","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/4","mergeCommit":{"oid":"1111111122222222333333334444444455555555"}}]'
   if [ -n "$num" ]; then
@@ -117,13 +128,13 @@ out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
 printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*gh lookup failed' && ok "merged-branch task held when gh fails" || bad "not held: $out"
 check "summary with gh failing" "$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
 
-printf '== re-check fails inside close-done-workers -> not closed, and conductor-exit SAYS why ==\n'
+printf '== merged PR head lookup failure -> held before mutation ==\n'
 : > "$CALLS"
 out=$(GH_FAIL_VIEW=1 bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
-check "merged task NOT completed when the re-check cannot run" "$(state t_merged)" "running"
-grep -q 'pane close' "$CALLS" && bad "a pane was closed without a confirmed proof" || ok "nothing closed"
-printf '%s\n' "$out" | grep -q 'close-done-workers: --reason=shipped requires.*could not confirm' \
-  && ok "close-done-workers' refusal reaches the operator" || bad "refusal swallowed: $out"
+check "merged task NOT completed when its PR head cannot be bound" "$(state t_merged)" "running"
+grep -q 'pane close' "$CALLS" && bad "a pane was closed without a bound PR head" || ok "nothing closed"
+printf '%s\n' "$out" | grep -q 'merged PR head lookup failed' \
+  && ok "head lookup failure reaches the operator" || bad "head failure swallowed: $out"
 
 printf '== close-done-workers HOLDs a dirty worktree -> conductor-exit shows the HOLD line (macOS sed) ==\n'
 wt_merged=$(read_task run_t_merged t_merged | jq -r .worktree)
