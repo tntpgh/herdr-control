@@ -55,6 +55,15 @@
 # Exit 6 REFUSED     — the composer changed between two reads ~1s apart right
 #                      before injection — someone looks to be typing into this
 #                      pane RIGHT NOW. Re-send shortly, or use --force.
+# Exit 7 REFUSED     — the pane shows no evidence of a live, identified agent
+#                      (herdr reports no agent for it, and its content
+#                      matches no recognized agent UI — e.g. a bare shell
+#                      prompt left over from a launch that never completed).
+#                      Typing into it could execute the text as shell input
+#                      instead of delivering it to an agent. NOT bypassable
+#                      with --force — forcing past a detected PROMPT is a
+#                      judgment call; forcing text into something that is
+#                      not an agent at all is a different hazard.
 # Exit 2             — bad usage / send or Enter call failed (target/socket).
 #
 # Each retry's `pane read` doubles as the settle delay for the paste debounce
@@ -98,6 +107,34 @@ done
 case "$wait_clear" in
   ''|*[!0-9]*) echo "send-to-agent: --wait-clear requires non-negative seconds" >&2; exit 2 ;;
 esac
+
+# Agent-liveness check (fix/launch-receipt, conductor 2026-10-29): observed
+# live 2026-10-29 — a refused worker launch left a bare zsh prompt in the
+# target pane, and this script typed a task brief into it anyway (nothing
+# below this point checks whether the pane is actually an AGENT, only
+# whether it looks like a PROMPT). herdr's own `agent` field on the pane
+# (set once its agent-shape detector recognizes one — `pane_agent_detected`,
+# lib/herdr_live.py) is the authoritative signal; a pane list miss falls
+# back to a content check for the same box-drawing/prompt markers
+# `_still_in_composer` below already treats as composer anchors (❯ for
+# Claude/Codex, omp's `╭─`/`╰─` box frame), so a brand-new managed spawn
+# whose readiness regex matched a beat before herdr's own classifier caught
+# up is not falsely refused. Unreadable fails closed, same as
+# looks_like_permission_prompt below. Unconditional — see Exit 7 above for
+# why --force does not reach this.
+_pane_looks_agentless() {              # <pane> -> 0 if no live-agent evidence (refuse), 1 if found
+  local pane="$1" rec snap
+  rec="$(herdr pane list 2>/dev/null | jq -r --arg p "$pane" '(.result.panes // .panes)[]? | select(.pane_id==$p) | .agent // empty' 2>/dev/null)"
+  [ -n "$rec" ] && return 1
+  snap="$(herdr pane read "$pane" --source detection --lines 30 2>/dev/null)" || return 0
+  printf '%s' "$snap" | grep -Eq '❯|╭─|╰─' && return 1
+  return 0
+}
+if _pane_looks_agentless "$pane"; then
+  echo "REFUSED: $pane shows no identified agent — herdr reports no agent for this pane, and its content matches no recognized agent UI." >&2
+  echo "REFUSED: this looks like a bare shell or a pane whose launch never completed, not a live agent. Typing into it could run the text as shell input. Not bypassable with --force." >&2
+  exit 7
+fi
 if [ "$submit_only" -eq 1 ]; then
   text=""
 else

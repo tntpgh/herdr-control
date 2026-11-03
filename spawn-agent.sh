@@ -79,7 +79,7 @@ conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
 
 # ---- managed vs literal (same contract as spawn-task.sh) --------------------
 managed=1
-if cli=$(cli_for_agent "$agent" "$(model_for_agent "$agent" implement)" "$posture_req"); then
+if cli=$(cli_for_agent "$agent" "$(model_for_agent "$agent" implement)" "$posture_req" 2>&1); then
   if [ "${#cmd[@]}" -gt 1 ]; then
     for _x in "${cmd[@]:1}"; do
       if managed_flag_rejected "$_x"; then
@@ -91,6 +91,23 @@ if cli=$(cli_for_agent "$agent" "$(model_for_agent "$agent" implement)" "$postur
     done
   fi
 else
+  # Same reasoning as spawn-task.sh (fix/launch-receipt): claude/codex/omp
+  # failing cli_for_agent means the bound-launcher identity check itself
+  # failed (HERDR_OMP_BIN missing or its sha256 no longer matches config.sh's
+  # HERDR_OMP_LAUNCHER_SHA256 pin — lib/agent-profiles.sh:447-450), never a
+  # genuinely-unknown agent name. Falling through as an unmanaged literal
+  # command would type the bare agent name into the pane's shell, resolving
+  # through PATH to whatever binary sits there (possibly unbound), with no
+  # posture flag and — unlike spawn-task.sh — this script has no registry
+  # row to ever mark failed, so the only signal would be a false "spawned"
+  # success line below. Refuse instead of ever printing that line.
+  case "$agent" in
+    claude|codex|omp)
+      echo "spawn-agent: refusing — bound launcher identity check failed for agent '$agent': ${cli:-<no diagnostic>}" >&2
+      echo "spawn-agent: not falling back to an unmanaged literal '$agent' — that would silently run whatever '$agent' resolves to on PATH, unverified. Fix HERDR_OMP_BIN/HERDR_OMP_LAUNCHER_SHA256 in config.sh." >&2
+      exit 1
+      ;;
+  esac
   managed=0
   cli="${cmd[*]}"  # literal command; no model mapping, no posture flag, no rules append
 fi
@@ -211,6 +228,32 @@ stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 \
   || { echo "spawn-agent: failed to run '$cli' in $pane" >&2; exit 1; }
+
+# Launch verification (fix/launch-receipt, conductor 2026-10-29): same
+# startup-failure reconciliation spawn-task.sh does, scoped to what this
+# script actually has. `herdr pane run` returning 0 only means the exec was
+# handed to tmux, not that an agent is alive behind it — a bound-launcher
+# die() or a vanished pane used to leave this script printing "spawned ..."
+# for a pane with nothing live in it. This script keeps no registry row
+# (see its own header), so there is no state to flip to "failed": the
+# contract is simpler — never print the "spawned ..." line (this script's
+# only receipt) until the launch is verified. Managed-only, same reasoning
+# as spawn-task.sh's identical block: an unmanaged literal command has no
+# omp-shaped readiness signal to wait for and must not be held to a
+# 60s omp-shaped timeout it could never satisfy.
+if [ "$managed" = 1 ]; then
+  first_output="$(herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort|^omp-herdr-bound: ' --timeout 60000 2>&1)"
+  wait_rc=$?
+  if printf '%s' "$first_output" | grep -q '^omp-herdr-bound: '; then
+    launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
+    echo "spawn-agent: LAUNCH FAILED — the bound omp launcher rejected this spawn at startup ($launcher_err); pane $pane has nothing live in it" >&2
+    exit 1
+  fi
+  if [ "$wait_rc" != 0 ]; then
+    echo "spawn-agent: LAUNCH FAILED — the worker produced no readiness output within 60s of launch; pane $pane has nothing live in it (process may have exited, or the pane vanished)" >&2
+    exit 1
+  fi
+fi
 
 # Reflect 'active' on the tab immediately (the agent's own status hook takes over later).
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$role" --state working >/dev/null 2>&1 || true

@@ -165,7 +165,7 @@ model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
 # such below rather than dressed up as enforced.
 m=$(model_for "$agent" "$job")
 managed=1
-if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req" "$approval_req"); then
+if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req" "$approval_req" 2>&1); then
   # Extra flags/args after the agent name ride along %q-quoted — EXCEPT
   # flags that would override the approval posture, rule/extension loading,
   # or the system-prompt channel this script composes (managed_flag_rejected,
@@ -182,6 +182,29 @@ if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req" "$approv
     done
   fi
 else
+  # cli_for_agent failed. For a genuinely unrecognized agent name (not
+  # claude/codex/omp/omc) that is the documented UNMANAGED fallback below.
+  # But claude/codex/omp failing here means lib/agent-profiles.sh's own
+  # bound-launcher identity check rejected it (HERDR_OMP_BIN missing, or its
+  # sha256 no longer equals config.sh's HERDR_OMP_LAUNCHER_SHA256 pin,
+  # agent-profiles.sh:447-450) — e.g. a stale checkout whose config.sh still
+  # names a launcher release that was since replaced. That must never fall
+  # through as an "unmanaged literal command": "omp" typed bare into the
+  # pane's shell resolves through PATH to whatever binary sits there
+  # (possibly a DIFFERENT, unbound omp — the exact "unbound worker launch
+  # refused" shape this branch exists to catch), with no posture flag, no
+  # rules append, and no startup verification (that block below is
+  # managed-only) — so the registry would flip straight to "running" on a
+  # launch that was never actually verified. $cli holds cli_for_agent's own
+  # stderr diagnostic (captured via 2>&1 above; empty for a plain-unknown
+  # agent name, which is the one case that legitimately falls through).
+  case "$agent" in
+    claude|codex|omp)
+      echo "spawn-task: refusing — bound launcher identity check failed for agent '$agent': ${cli:-<no diagnostic>}" >&2
+      echo "spawn-task: not falling back to an unmanaged literal '$agent' — that would silently run whatever '$agent' resolves to on PATH, unverified. Fix HERDR_OMP_BIN/HERDR_OMP_LAUNCHER_SHA256 in config.sh." >&2
+      exit 1
+      ;;
+  esac
   managed=0
   cli="${rest[*]}"  # literal command; no model mapping, no posture flag, no rules append
 fi
@@ -1219,17 +1242,55 @@ if [ "$managed" = 1 ]; then
     launcher_err="$(printf '%s' "$first_output" | grep '^omp-herdr-bound: ' | head -1)"
     set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
     append_event "$run_id" "$task_id" "spawn_startup_failed" \
-      "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" '{reason:$r, launcher_error:$e}')" >/dev/null 2>&1 || true
+      "$(jq -nc --arg r "bound launcher refused at startup" --arg e "$launcher_err" \
+         --arg rel "$(printf '%s\n' "${HERDR_OMP_BIN:-}" | sed -n 's#.*/releases/\([^/]*\)/omp$#\1#p')" \
+         --arg sha "${HERDR_OMP_LAUNCHER_SHA256:-}" \
+         '{reason:$r, launcher_error:$e, bound_release_id:$rel, launcher_sha256:$sha}')" >/dev/null 2>&1 || true
     echo "spawn-task: refusing — the bound omp launcher rejected this spawn at startup ($launcher_err); see registry task $task_id" >&2
     exit 1
   fi
   if [ "$wait_rc" != 0 ]; then
     set_task_state "$run_id" "$task_id" failed >/dev/null 2>&1
     append_event "$run_id" "$task_id" "spawn_startup_failed" \
-      '{"reason":"no readiness output within 60s of launch (the process may have exited or the pane vanished)"}' >/dev/null 2>&1 || true
+      "$(jq -nc --arg rel "$(printf '%s\n' "${HERDR_OMP_BIN:-}" | sed -n 's#.*/releases/\([^/]*\)/omp$#\1#p')" \
+         --arg sha "${HERDR_OMP_LAUNCHER_SHA256:-}" \
+         '{reason:"no readiness output within 60s of launch (the process may have exited or the pane vanished)", bound_release_id:$rel, launcher_sha256:$sha}')" >/dev/null 2>&1 || true
     echo "spawn-task: refusing — the worker produced no readiness output within 60s of launch; see registry task $task_id" >&2
     exit 1
   fi
+fi
+# Launch receipt (fix/launch-receipt, conductor 2026-10-29): never report a
+# task "running" without recording the evidence a human can later point at
+# — the incident this fixes was a registry row stuck at "running" with
+# nothing live behind it. For a launch that actually invoked the bound omp
+# binary ($cli's first token is $HERDR_OMP_BIN — true for claude/codex/omp,
+# not omc, which launches its own native binary and is correctly left out,
+# same reasoning as the wait-output block above), that evidence is the
+# release HERDR_OMP_BIN was pinned to (the releases/<id>/ segment of its
+# path), the sha256 config.sh pins it to (already verified equal to the
+# binary's own sha256 by cli_for_agent before $cli was ever built —
+# lib/agent-profiles.sh:447-450), and the first readiness output already
+# captured above. A managed launch that is not bound-launcher-shaped still
+# gets a receipt, honestly empty on the fields that do not apply to it. An
+# UNMANAGED literal command never reaches the omp-shaped wait above (by
+# design — see that block's own comment), so its receipt says so instead
+# of inventing a verification that never ran.
+if [ "$managed" = 1 ]; then
+  receipt_release="" receipt_sha=""
+  if [ -n "${HERDR_OMP_BIN:-}" ]; then
+    case "${cli:-}" in
+      "$HERDR_OMP_BIN"*)
+        receipt_release="$(printf '%s\n' "$HERDR_OMP_BIN" | sed -n 's#.*/releases/\([^/]*\)/omp$#\1#p')"
+        receipt_sha="${HERDR_OMP_LAUNCHER_SHA256:-}"
+        ;;
+    esac
+  fi
+  append_event "$run_id" "$task_id" "launch_receipt" \
+    "$(jq -nc --arg rel "$receipt_release" --arg sha "$receipt_sha" --arg out "${first_output:-}" \
+       '{managed:true, bound_release_id:$rel, launcher_sha256:$sha, first_output:$out}')" >/dev/null 2>&1 || true
+else
+  append_event "$run_id" "$task_id" "launch_receipt" \
+    '{"managed":false,"note":"unmanaged literal command — no bound-launcher verification applies"}' >/dev/null 2>&1 || true
 fi
 set_task_state "$run_id" "$task_id" "running"
 
