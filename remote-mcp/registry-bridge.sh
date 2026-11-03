@@ -181,7 +181,7 @@ case "$cmd" in
         # cancel_stuck alert for a task that was already fully cancelled.
         exit 0
         ;;
-      completed|failed|lost)
+      completed|closed_unverified|failed|lost)
         echo "registry-bridge: cancel $run_id/$task_id -- already terminal ($row_state); refusing before touching any pane" >&2
         exit 1
         ;;

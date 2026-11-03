@@ -102,9 +102,9 @@ else
   ok "shipped with a malformed proof refused"
 fi
 check "state still unchanged after every refusal" "$(read_task run1 task1 | jq -r .state)" "running"
-set_task_state run1 task1 completed "handed_off_to:reviewer" \
+set_task_state run1 task1 closed_unverified "handed_off_to:reviewer" \
   || bad "handed_off_to needs no proof and was refused"
-check "handed_off_to closes without proof" "$(read_task run1 task1 | jq -r .state)" "completed"
+check "handed_off_to closes unverified without proof" "$(read_task run1 task1 | jq -r .state)" "closed_unverified"
 
 printf '== shipped WITH a valid proof: accepted, event carries both ==\n'
 register_task runShip taskShip w c cp cb paneShip birthShip /repo/s /wt/s "ship" \
@@ -282,14 +282,17 @@ set_task_state runOpen taskOpen completed shipped "$pr153 f1579a62" \
 check "merged PR + merge sha completes the task" "$(read_task runOpen taskOpen | jq -r .state)" "completed"
 
 
-# The gap correction 2 named: "nothing stops completed -> running".
+# The gap correction 2 named: "nothing stops completed -> running" --
+# task1 is closed_unverified here (the handed_off_to closure above), which
+# shares _legal_transition's same terminal "nothing leaves this state" arm
+# as completed, so it proves the identical invariant.
 if set_task_state run1 task1 running 2>/dev/null; then
-  bad "illegal completed -> running was ACCEPTED"
+  bad "illegal closed_unverified -> running was ACCEPTED"
 else
-  ok "illegal completed -> running refused"
+  ok "illegal closed_unverified -> running refused"
 fi
-check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "completed"
-set_task_state run1 task1 completed || bad "idempotent re-assert of same state refused"
+check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "closed_unverified"
+set_task_state run1 task1 closed_unverified || bad "idempotent re-assert of same state refused"
 ok "idempotent same-state re-assert allowed"
 
 printf '== set_task_state compare-and-swap under CONCURRENT racing sweeps ==\n'
