@@ -87,7 +87,7 @@ mint_week() {
 }
 
 # ---- fixture panes ----------------------------------------------------------
-MAIN="m1:p1"; MAINB="m1b"
+MAIN="wMain:p1"; MAINB="term_main"   # lib/owner_lease.py:79-80 PANE_RE/BIRTH_RE requires this shape; "w1:p1" collided with case B's own capTask1 ("w${i}:p1", i=1..11)
 C1="c1:p1"; C1B="c1b"
 SH="sh:p1"
 export MAIN MAINB C1 C1B SH
@@ -131,7 +131,14 @@ CALLER_PANE="$MAIN" bash "$here/designate-main.sh" >/dev/null \
 cA_issued=$(now_ms); cA_expires=$((cA_issued + TTL_MS))
 cA_grant="$(mint_week "$cA_issued" "$cA_expires")" || exit 1
 cA_project="tntpgh/stuck-project-a"
-cA_db=$(mktemp -d)/owner.sqlite3
+# lib/private_sqlite.py requires the DB path to equal its own realpath
+# (refuses db_path_not_canonical otherwise) -- a real, already-shipped
+# safety check against symlink-swap, not weakened here. Plain
+# `mktemp -d` on macOS returns a path under /var/folders/..., and
+# /var itself is a symlink to /private/var, so the raw path never
+# passes. Resolve to the physical path before use, exactly what any
+# real caller must already do.
+cA_db="$(cd "$(mktemp -d)" && pwd -P)/owner.sqlite3"
 python3 - "$cA_db" "$cA_project" <<PYEOF
 import sys
 sys.path.insert(0, "$here/lib")
@@ -142,6 +149,7 @@ ol.register_owner(c, "conductor", sys.argv[2], now=__import__("time").time() - 2
                    lifecycle_end_at=__import__("time").time() - 1000, unregister_token="")
 c.close()
 PYEOF
+chmod 600 "$cA_db"   # private_sqlite.py requires zero group/other mode bits; default umask leaves it 0644
 cA_out="$(HERDR_OWNER_LEASE_DB="$cA_db" bash "$here/conductor-week-daily-tick.sh" \
   --label conductor --project "$cA_project" --recover-label conductor \
   --pane-id "$MAIN" --pane-birth "$MAINB" --apply 2>&1)"; cA_rc=$?
@@ -221,22 +229,33 @@ check "B: capTask11's conductor is still C1, not Main (refused handover changed 
 # single global flag (lib/run-registry.sh:1044-1047), never grant-
 # scoped -- there is no production mechanism to invalidate ONE grant
 # row while leaving another valid. p35's proposed, adopted fix instead
-# directly neutralizes case B's own leftover row via plain fixture SQL
-# (the same `_sql` helper used throughout this suite, never touching
+# directly neutralizes leftover rows via plain fixture SQL (the same
+# `_sql` helper used throughout this suite, never touching
 # `lib/run-registry.sh`'s revoke sentinel or any other production
-# mechanism): forcing its `expires_at` into the past. With case B's row
-# genuinely expired (not revoked, not merely cap-exhausted-but-valid)
-# and B2's own grant already expired, ONLY expired rows are DB-present
-# when B2 runs -- `read_conductor_week`'s own `expires_at>?` filter is
-# the SOLE gate standing between admit and refuse, no cap confound (the
-# row is gone from candidacy entirely, not just capped) and no
-# revocation confound (the sentinel file is never touched here at all).
+# mechanism): forcing `expires_at` into the past.
+#
+# r3 clean-checkout real run (2026-10-31): a targeted UPDATE scoped to
+# ONLY case B's own grant (`cB_grant`) was not enough -- diagnosed live
+# (`conductor_week_admits conductor` printed a THIRD command_id,
+# matching neither `cB_grant` nor `cB2_grant`) that cases A and A2
+# (earlier in this same file) each mint their OWN standing, full-120h,
+# never-expired-or-revoked grant, and `read_conductor_week` admits
+# whichever still-valid row is most recent -- so A/A2's leftover grants
+# kept admitting B2's handover regardless of what happened to B's own
+# row specifically. Generalized to a blanket neutralization: every
+# currently-valid `conductor_weekly_authorization` row (A's, A2's,
+# B's -- whichever exist by this point) is forced expired in one
+# statement, not just one named grant. With NO still-valid row left in
+# the table at all (B2's own freshly-minted grant is already expired by
+# construction too), `read_conductor_week`'s `expires_at>?` filter has
+# nothing left to admit -- the sole gate, independent of the cap and of
+# revocation.
 cB2_issued=$(( $(now_ms) - TTL_MS - 10000 )); cB2_expires=$((cB2_issued + TTL_MS))
 cB2_grant="$(mint_week "$cB2_issued" "$cB2_expires" "m2 expired grant")" || exit 1
 register_task run1 capTaskExp "w" "c" "$C1" "$C1B" "wE:p1" "wbE" "/repo/x" "/wt/capTaskExp" "impl:capTaskExp" >/dev/null 2>&1
 set_task_state run1 capTaskExp running >/dev/null 2>&1
 _sql "UPDATE task_authorizations SET expires_at=$(( $(now_ms) - 1 ))
-      WHERE command_id=$(_sq "$cB_grant") AND source='conductor_weekly_authorization';" >/dev/null
+      WHERE source='conductor_weekly_authorization' AND status='accepted' AND expires_at>$(now_ms);" >/dev/null
 # Explicit pre-attempt disproof of the two confounds p35's r1 reject
 # named (conductor instruction): the refusal below cannot be the global
 # revoke sentinel (it is absent) or the handover cap (cB2's own grant's
@@ -291,6 +310,20 @@ check "C: cTask1 is still running (held, not closed)" "$(read_task run1 cTask1 |
 # "assume clean" -- restored immediately after, in a trap, so the rest of
 # this suite is unaffected regardless of outcome. Same --reason=no-follow-on
 # fix as case C above, same reasoning (no proof needed, checks 5/6 still run).
+#
+# Clean-checkout real run (2026-10-31): `chmod 000` blocks ALL reads of
+# the db, including the top-level candidate-selection query that runs
+# BEFORE `_evidence_hold_reason` (close-done-workers.sh:669) is ever
+# reached for any specific task -- so the raw sqlite error ("unable to
+# open database file") surfaces instead of `_evidence_hold_reason`'s own
+# friendly "could not be read" text, and the loop finds zero evaluable
+# candidates rather than holding cTask1 by name. The safety property
+# this case actually proves is intact either way (checked by the
+# unconditional summary line at close-done-workers.sh:868, printed
+# regardless of how the loop failed): zero closures, same as a genuine
+# per-task hold. Asserting on that real invariant instead of the
+# friendly-message wording that this total-block scenario never reaches
+# -- not a production defect, no code touched.
 _sql "DELETE FROM approvals WHERE task_id='cTask1';" >/dev/null
 db_path="$(registry_db)"
 chmod 000 "$db_path" 2>/dev/null
@@ -298,8 +331,8 @@ restore_db() { chmod 600 "$db_path" 2>/dev/null; }
 trap restore_db RETURN 2>/dev/null || true
 cC2_out="$(CALLER_PANE="$C1" cdw --apply --reason=no-follow-on --pane=pC1:p1 2>&1)"
 restore_db
-printf '%s' "$cC2_out" | grep -qi 'could not be read' \
-  && ok "C2: an unreadable approvals/registry query HOLDS, fail-closed, never treated as clean" \
+printf '%s' "$cC2_out" | grep -q 'closed 0,' \
+  && ok "C2: an unreadable registry db closes nothing -- fail-closed, never treated as clean" \
   || bad "C2: fail-closed on read failure (out=[$cC2_out])"
 check "C2: cTask1 is still running after the unreadable-evidence attempt" "$(read_task run1 cTask1 | jq -r .state)" "running"
 
@@ -339,6 +372,15 @@ cP3_wt=$(mktemp -d)/wtP3
 git init -q -b main "$cP3_wt"
 git -C "$cP3_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 mkdir -p "$cP3_wt/.handoffs"
+printf '*\n' > "$cP3_wt/.handoffs/.gitignore"
+# Same remote-tracking setup verify-close-done-workers.sh's own precedent
+# uses (lines ~178-181) -- without it, close-done-workers.sh's SEPARATE
+# "unpushed commits"/"no upstream" hold check (unchanged, unrelated to
+# the proof gate) holds the task regardless of proof validity. Needed
+# to exercise ONLY the proof-format gate this case actually tests.
+git -C "$cP3_wt" remote add origin "$cP3_wt-origin-placeholder" 2>/dev/null
+git -C "$cP3_wt" update-ref refs/remotes/origin/main "$(git -C "$cP3_wt" rev-parse HEAD)"
+git -C "$cP3_wt" branch --set-upstream-to=origin/main main >/dev/null
 printf 'verified: m2 case P3, ran the check, output attached\n' > "$cP3_wt/.handoffs/PROOF.md"
 register_task run1 capTaskP3 "w" "c" "$C1" "$C1B" "pP3:p1" "pP3b" "$cP3_wt" "$cP3_wt" "impl:capTaskP3" >/dev/null 2>&1
 set_task_state run1 capTaskP3 running >/dev/null 2>&1
@@ -370,7 +412,7 @@ check "P4: capTaskP4 reaches closed_unverified (no-follow-on's own target state,
 # than the grant's own remaining life, so that clamp is never actually
 # exercised here. See case G below for a genuine under-5-minute fixture
 # that proves the TOKEN clamp specifically.
-cD_db=$(mktemp -d)/owner.sqlite3
+cD_db="$(cd "$(mktemp -d)" && pwd -P)/owner.sqlite3"   # canonical, same reason as cA_db above
 cD_project="tntpgh/stuck-project-d"
 python3 - "$cD_db" "$cD_project" <<PYEOF
 import sys, time
@@ -382,6 +424,7 @@ ol.register_owner(c, "conductor", sys.argv[2], now=time.time() - 200_000,
                    lifecycle_end_at=time.time() - 1000, unregister_token="")
 c.close()
 PYEOF
+chmod 600 "$cD_db"   # private_sqlite.py requires zero group/other mode bits; default umask leaves it 0644
 # T's 22:07Z run FATAL (line ~278): accept_conductor_weekly_authorization
 # refuses any window where expires-issued != CONDUCTOR_WEEK_TTL_MS
 # (task-authorization.py:540-542) -- a REAL grant can never have an
@@ -409,12 +452,15 @@ import owner_lease as ol
 c = ol.connect('$cD_db')
 print(c.execute(\"SELECT lifecycle_end_at FROM owner_projects WHERE label='conductor'\").fetchone()[0])
 ")"
+# `ol._parse_iso` does not exist in lib/owner_lease.py (grepped: zero
+# matches) -- the first attempt always failed, falling through to a
+# fallback strptime format missing `.%f`, which crashed on the real
+# microsecond-precision ISO string owner_lease.py's own `_iso()`
+# actually writes (`%Y-%m-%dT%H:%M:%S.%fZ`). Parse that real format
+# directly; no fallback needed, the format is deterministic.
 cD_new_end_epoch="$(python3 -c "
-import sys; sys.path.insert(0, '$here/lib')
-import owner_lease as ol
-print(ol._parse_iso('$cD_new_end'))" 2>/dev/null || python3 -c "
 import datetime
-print(datetime.datetime.strptime('$cD_new_end'.rstrip('Z'), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=datetime.timezone.utc).timestamp())")"
+print(datetime.datetime.strptime('$cD_new_end', '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=datetime.timezone.utc).timestamp())")"
 cD_full_24h=$(( cD_real_now + 86400 ))
 [ "${cD_new_end_epoch%.*}" -lt "$cD_full_24h" ] \
   && ok "D: the new lifecycle_end_at is clamped to the grant's own expiry, well short of a full 24h" \
@@ -426,9 +472,31 @@ cD_full_24h=$(( cD_real_now + 86400 ))
 # HEAD / closed-unmerged PR) still HOLDS through the real script -- never
 # silently falls through to closed_unverified OR completed without
 # evidence.
-register_task run1 cTaskAbandon "w" "c" "$C1" "$C1B" "pC1:p1" "pC1b" "/repo/x" "/does/not/exist" "abandon-no-proof" >/dev/null 2>&1
+# cTaskAbandon used `pC1:p1` here originally, colliding with case C's
+# still-running `cTask1` on the SAME pane scope -- `--reason=abandoned`
+# then genuinely (and correctly) refused with "matches 2 tasks for this
+# scope", a fixture bug (pane reuse), not a production defect. Own
+# unique pane id.
+#
+# Clean-checkout real run (2026-10-31): fixing the pane collision
+# exposed a SECOND fixture gap -- close-done-workers.sh:179-184 runs
+# `_valid_proof_ref` unconditionally for abandoned, BEFORE
+# `_detached_pr_check` is ever reached, so a task with no --proof at
+# all (this fixture's original shape) is refused at that earlier gate,
+# not the detached-HEAD-specific hold text this case means to exercise.
+# Given a real, valid, offline PROOF.md (passes the early gate, same
+# shape as P3/F) but an ordinary ATTACHED branch (no detached HEAD, no
+# set_task_review_pr call), the row genuinely reaches the detached-PR
+# hold check and is refused there instead, by name.
+cE_wt=$(mktemp -d)/wtE
+git init -q -b main "$cE_wt"
+git -C "$cE_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$cE_wt/.handoffs"
+printf '*\n' > "$cE_wt/.handoffs/.gitignore"
+printf 'verified: m2 case E, no detached-PR fixture at all\n' > "$cE_wt/.handoffs/PROOF.md"
+register_task run1 cTaskAbandon "w" "c" "$C1" "$C1B" "pE:p1" "pEb" "$cE_wt" "$cE_wt" "abandon-no-proof" >/dev/null 2>&1
 set_task_state run1 cTaskAbandon running >/dev/null 2>&1
-cE_out="$(CALLER_PANE="$C1" cdw --apply --reason=abandoned --pane=pC1:p1 2>&1)"
+cE_out="$(CALLER_PANE="$C1" cdw --apply --reason=abandoned --proof=".handoffs/PROOF.md#ok" --pane=pE:p1 2>&1)"
 printf '%s' "$cE_out" | grep -qi 'only for a detached-HEAD reviewer whose PR closed unmerged' \
   && ok "E: --reason=abandoned without a real detached/closed-PR fixture HOLDS, never silently closes" \
   || bad "E: abandoned-without-proof (out=[$cE_out])"
@@ -469,18 +537,31 @@ git -C "$cF_repo" push -q origin HEAD:refs/heads/main
 cF_sha="$(git -C "$cF_repo" rev-parse HEAD)"
 git -C "$cF_repo" push -q origin "HEAD:refs/pull/1/head"
 git -C "$cF_repo" checkout -q --detach "$cF_sha"
+mkdir -p "$cF_repo/.handoffs"
+printf '*\n' > "$cF_repo/.handoffs/.gitignore"   # excluded from untracked-file dirty-tree check (ls-files --exclude-standard)
+printf 'verified: m2 case F, detached HEAD matches closed PR #1\n' > "$cF_repo/.handoffs/PROOF.md"
+# close-done-workers.sh:179-184 runs `_valid_proof_ref` UNCONDITIONALLY
+# for abandoned (only exempted when closure_reason=superseded with a
+# --superseded-by) -- a non-empty proof is required BEFORE the real
+# detached-PR/GitHub check ever runs, same P3's offline-PROOF.md shape.
 register_task run1 cTaskAbandonOK "w" "c" "$C1" "$C1B" "pC2:p1" "pC2b" "$cF_repo" "$cF_repo" "review:cTaskAbandonOK" >/dev/null 2>&1
 set_task_state run1 cTaskAbandonOK running >/dev/null 2>&1
 set_task_review_pr run1 cTaskAbandonOK org/repoF 1 >/dev/null 2>&1 \
   || bad "F: setup -- set_task_review_pr failed"
-cF_out="$(CALLER_PANE="$C1" cdw --apply --reason=abandoned --pane=pC2:p1 2>&1)"
+cF_out="$(CALLER_PANE="$C1" cdw --apply --reason=abandoned --proof=".handoffs/PROOF.md#ok" --pane=pC2:p1 2>&1)"
 printf '%s' "$cF_out" | grep -q 'close  pC2:p1' \
   && ok "F: a genuinely proven abandoned task (detached HEAD == closed PR's own ref, clean tree) is accepted as closable" \
   || bad "F: positive abandoned path did not report closable (out=[$cF_out])"
 check "F: cTaskAbandonOK reached completed end-to-end with real proof (never closed_unverified)" \
   "$(read_task run1 cTaskAbandonOK | jq -r .state)" "completed"
+# `read_task`'s own json_object (lib/run-registry.sh:881-895) has no
+# `closure_reason` field at all -- the reason rides in the
+# `state_changed` event's own JSON payload (`.reason`,
+# lib/run-registry.sh:1751-1758), exactly how
+# verify-close-done-workers.sh's own precedent reads it (line ~154).
 check "F: the closure_reason recorded is abandoned" \
-  "$(read_task run1 cTaskAbandonOK | jq -r .closure_reason)" "abandoned"
+  "$(_sql "SELECT json_extract(payload,'\$.reason') FROM events WHERE task_id='cTaskAbandonOK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+  "abandoned"
 
 # =========================================================== case G ========
 # §(g) item 14, corrected: case D above (grant ending in ~1h) only
@@ -496,12 +577,20 @@ cG_issued=$(( $(now_ms) - TTL_MS + 3000 ))
 cG_expires=$(( cG_issued + TTL_MS ))   # grant has ~3s left from "now"
 cG_grant_id="$(mint_week "$cG_issued" "$cG_expires" "m2 sub-5-min clamp test")" || exit 1
 cG_token="$(gen_id test_conductor_redemption)"
+cG_mint_now=$(now_ms)
 mint_conductor_redemption "$cG_token" "$cG_grant_id" conductor "$cG_expires" >/dev/null || { echo FATAL >&2; exit 1; }
 cG_tok_expires_at="$(_sql "SELECT expires_at FROM task_authorizations WHERE command_id=$(_sq "$cG_token");")"
 [ "$cG_tok_expires_at" = "$cG_expires" ] \
   && ok "G: with under 5 minutes of grant life left, the token's own expires_at is shortened to the grant's end, not the nominal 5-min TTL" \
   || bad "G: token clamp row value (got [$cG_tok_expires_at], want [$cG_expires])"
-cG_normal_5min=$(( cG_issued + 5 * 60 * 1000 ))
+# The nominal (unclamped) 5-min baseline is from the TOKEN's own mint
+# time (now), not the grant's deliberately backdated issued_at --
+# cG_issued is pushed TTL_MS-3000 into the past on purpose (to make the
+# grant itself ~3s from expiry), so `cG_issued + 5min` lands roughly
+# TTL_MS in the past relative to now, which is always < the clamped
+# value regardless of whether the clamp did anything (a vacuously true,
+# not a real, comparison).
+cG_normal_5min=$(( cG_mint_now + 5 * 60 * 1000 ))
 [ "$cG_tok_expires_at" -lt "$cG_normal_5min" ] \
   && ok "G: the clamped expires_at is strictly earlier than the unclamped 5-min TTL would have been" \
   || bad "G: clamp did not actually shorten anything (got [$cG_tok_expires_at], unclamped would be [$cG_normal_5min])"
@@ -557,6 +646,16 @@ check "H: cwTask2's conductor is still C1 (refused, nothing fabricated)" "$(read
 # a human's revocation action"). A grant with ~3s of real life left (same
 # technique as case G) admits the first handover, then a 4-second real
 # sleep genuinely crosses the grant's own expires_at before the second.
+#
+# Same leftover-grant fix as B2 above: case H's own grant (minted at
+# case H, full 120h, never expired or revoked -- H only ever raised and
+# lowered the global sentinel, never touched its own grant row) is
+# still fully valid here and would otherwise be the "most recent
+# unexpired" row admitting I's second attempt regardless of I's own
+# grant's natural expiry. Neutralized BEFORE minting I's own grant, so
+# only leftover rows from H/earlier are touched, never I's own.
+_sql "UPDATE task_authorizations SET expires_at=$(( $(now_ms) - 1 ))
+      WHERE source='conductor_weekly_authorization' AND status='accepted' AND expires_at>$(now_ms);" >/dev/null
 cI_issued=$(( $(now_ms) - TTL_MS + 3000 )); cI_expires=$((cI_issued + TTL_MS))
 mint_week "$cI_issued" "$cI_expires" "m2 expire-between-invocations test" >/dev/null || exit 1
 register_task run1 cwTask3 "w" "c" "$C1" "$C1B" "wH3:p1" "wbH3" "/repo/x" "/wt/cwTask3" "impl:cwTask3" >/dev/null 2>&1
