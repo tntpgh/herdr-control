@@ -423,7 +423,7 @@ function mapLocalState(t: Pick<TaskRow, "state" | "verified">, livePermission: b
   switch (t.state) {
     case "completed": return t.verified ? "verified" : "finished";
     case "cancelled": return "cancelled";
-    case "failed": case "lost": return "failed";
+    case "failed": case "lost": case "launch_failed": return "failed";
     case "blocked": return livePermission ? "waiting_approval" : "blocked";
     case "starting": return "starting";
     default: return "running";

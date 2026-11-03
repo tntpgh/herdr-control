@@ -60,7 +60,7 @@ EXTENSIONS = ("omp_relay", "1password", "chatgpt")  # must match the Worker's sc
 EXT_STATES = ("enabled", "disabled", "missing", "unknown")
 
 SCHEMA = 1
-TERMINAL = {"completed", "cancelled", "lost", "gone", "error"}
+TERMINAL = {"completed", "cancelled", "lost", "gone", "error", "launch_failed"}
 MESSAGEABLE = {"starting", "running", "blocked", "stalled", "ready_review"}
 KEEP_TERMINAL_DAYS = 14
 RESULT_BUDGET_BYTES = 1_000_000  # the Worker refuses bodies over 2 MB; the rest go next tick

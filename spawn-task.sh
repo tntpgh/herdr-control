@@ -709,7 +709,21 @@ fi
 # The intent stays until this script exits, so an archive run that fences
 # after this check sees it and refuses its remove. A normal spawn never meets
 # a fence; the cost is one `git rev-parse` and two file operations.
-trap archive_fence_leave EXIT
+# C1-a (round 5, b4ef704 review): this trap REPLACES the one at :87 (bash
+# keeps only the last EXIT trap registered) -- every exit from here down
+# to `_spawn_committed=1` (still well before register_task) used to lose
+# HERDR_SPAWN_NO_EFFECT entirely, so lib/escalation.sh's
+# _esc_spawn_successor held those as uncertain instead of trusting the
+# no-effect proof -- a spurious hold, not a wrong bind (fail-safe
+# direction), but still a real regression from the documented contract
+# at :67-85. Chain both: archive_fence_leave's cleanup, then the exact
+# same NO_EFFECT check, `$?` still captured first.
+_spawn_exit_trap() {
+  _spawn_exit_rc=$?
+  archive_fence_leave
+  [ "$_spawn_committed" = 1 ] || [ "$_spawn_exit_rc" = 0 ] || printf "HERDR_SPAWN_NO_EFFECT reason=exited_before_registration\n"
+}
+trap _spawn_exit_trap EXIT
 trap 'exit 130' INT TERM HUP
 if ! archive_fence_enter "$wt"; then
   echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2

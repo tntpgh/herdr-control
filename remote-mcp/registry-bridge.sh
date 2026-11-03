@@ -172,13 +172,26 @@ case "$cmd" in
     # cancelled/lost.)
     row_state=$(printf '%s' "$row" | jq -r '.state // empty')
     case "$row_state" in
-      cancelled)
+      cancelled|launch_failed)
         # R2-2 (round-2 review of F2): cancel is idempotent against a row
         # ALREADY cancelled -- a duplicate/retried cancel (the exact case
         # F6's own retry loop produces) must succeed quietly, not refuse.
         # Refusing here made a second cancel ack 'failed', which ZR1's
         # retry loop re-queued, which eventually raised a false
         # cancel_stuck alert for a task that was already fully cancelled.
+        # round 5 (N4-remote regression, b4ef704 review): `launch_failed`
+        # is now a terminal state too (lib/run-registry.sh's
+        # `_legal_transition`), so the old fallthrough tried to close a
+        # pane and then `set_task_state ... cancelled`, which
+        # `_legal_transition` now refuses from a terminal source -- the
+        # row stayed `launch_failed` forever, cancel always returned
+        # nonzero, and no `cancel_attempt_failed` was ever recorded (the
+        # failure was in the final `set_task_state`, not one of the
+        # close-path branches that calls `_cancel_attempt_failed`). A
+        # launch_failed row never ran a real agent command (every site
+        # that sets it fires before or at the exact point `herdr pane
+        # run` would have), so there is nothing of ours to kill here
+        # either -- same reasoning as the cancelled case above.
         exit 0
         ;;
       completed|failed|lost)

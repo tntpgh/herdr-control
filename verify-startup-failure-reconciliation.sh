@@ -376,6 +376,7 @@ rr_runs_dir=$(mktemp -d)/runs
   . "$here/lib/run-registry.sh"
   registry_init || exit 2
   register_task rrun1 rtask1 w c cp cb p1 birth1 /repo/rr /wt/rr "implement:rtask1" || exit 2
+  set_task_remote_id rrun1 rtask1 remote-rtask1-fixed >/dev/null 2>&1
   herdr() { case "$1 $2" in
     "pane wait-output") printf 'Model scope: write\n'; return 0 ;;
     "pane report-agent") : ;;
@@ -438,12 +439,31 @@ SH
   . "$here/lib/escalation.sh"
   herdr() { echo "UNEXPECTED herdr call: $*" >&2; return 1; }
   pre_state="$(read_task rrun1 rtask1 | jq -r .state)"
+  pre_ids="$(read_task rrun1 rtask1 | jq -r '[.authorization_command_id,.authorization_status,.remote_task_id] | @tsv')"
   esc_escalate rrun1 rtask1 claude evidence_stub '{}' 0 "$(mktemp -d)" >/dev/null 2>&1
   esc_rc=$?
   post_state="$(read_task rrun1 rtask1 | jq -r .state)"
+  post_ids="$(read_task rrun1 rtask1 | jq -r '[.authorization_command_id,.authorization_status,.remote_task_id] | @tsv')"
   post_reason="$(_sql "SELECT payload FROM events WHERE run_id='rrun1' AND task_id='rtask1' AND type='state_changed' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null | jq -r '.detail.reason // empty' 2>/dev/null)"
-  printf 'esc_rc=%s pre_state=%s post_state=%s post_reason=%s\n' "$esc_rc" "$pre_state" "$post_state" "$post_reason"
+  printf 'esc_rc=%s pre_state=%s post_state=%s post_reason=%s pre_ids=%s post_ids=%s\n' "$esc_rc" "$pre_state" "$post_state" "$post_reason" "$pre_ids" "$post_ids"
   [ -s "$sfr_fence_marker" ] && printf 'SPAWN_OR_CLOSE_CALLED\n'
+  # request identity (round 5, b4ef704 review, "required committed tests"
+  # #3): remote_task_id (stamped via set_task_remote_id before the fence)
+  # must survive the fence unchanged, not just task_id/run_id (N7).
+  # authorization_command_id/authorization_status/the task_authorizations
+  # ledger row are NOT exercised here: register_task's 17th arg must name
+  # an already-accepted protected authorization receipt (_task_authorization_
+  # adapter register refuses a fabricated id with "authorization receipt
+  # missing or already bound") and minting a real one needs
+  # lib/task-authorization.py's accept flow, out of scope this round --
+  # listed explicitly as missing evidence in the round-5 commit message.
+  ledger_pre="$(read_task_authorization rtask1 | jq -r '[.command_id,.status] | @tsv' 2>/dev/null)"
+  # handover (round 5, required committed tests #5): set_task_conductor
+  # must still work on a row the fence just blocked -- a human reassigning
+  # conductorship of a held task is a normal, supported action.
+  set_task_conductor rrun1 rtask1 cp cb cp2 cb2 conductor2 human-operator fence-handover-test >/dev/null 2>&1
+  printf 'handover_rc=%s handover_conductor=%s handover_state=%s ledger_pre=%s\n' \
+    "$?" "$(read_task rrun1 rtask1 | jq -r .conductor_id)" "$(read_task rrun1 rtask1 | jq -r .state)" "$ledger_pre"
   # criteria (c): approve/unblock/complete on the now-fenced (blocked) row.
   file_approval_record rtask1 /fake/sfr-fence.sh deadbeefsfrfence00000000000000000000000000000000000000000000 security-reviewer >/dev/null 2>&1
   printf 'approve_state=%s\n' "$(file_approval_state rtask1 /fake/sfr-fence.sh deadbeefsfrfence00000000000000000000000000000000000000000000)"
@@ -451,6 +471,27 @@ SH
   printf 'unblock_state=%s\n' "$(read_task rrun1 rtask1 | jq -r .state)"
   set_task_state rrun1 rtask1 completed canceled >/dev/null 2>&1
   printf 'complete_state=%s\n' "$(read_task rrun1 rtask1 | jq -r .state)"
+  # mark-launch-failed on a fenced row (round 5, required committed tests
+  # #5): a SEPARATE row, fenced the same way, so it is untouched by
+  # rtask1's own unblock/complete above. herdr stubbed to report the pane
+  # gone, matching mark-launch-failed.sh's own "pane no longer exists"
+  # dead-evidence path.
+  register_task rrun1 rtask2 w c cp cb p2 birth2 /repo/rr /wt/rr "implement:rtask2" >/dev/null 2>&1
+  esc_escalate rrun1 rtask2 claude evidence_stub '{}' 0 "$(mktemp -d)" >/dev/null 2>&1
+  mlf_out="$( (
+    herdr() {
+      if [ "$1 $2" = "pane list" ]; then
+        printf '{"result":{"panes":[]}}\n'
+      else
+        echo "UNEXPECTED herdr call for mark-launch-failed: $*" >&2
+        return 1
+      fi
+    }
+    set -- rrun1 rtask2 --reason round5-fenced-row-test
+    . "$here/mark-launch-failed.sh"
+  ) 2>&1 )"
+  mlf_rc=$?
+  printf 'mlf_rc=%s mlf_final_state=%s mlf_out=%s\n' "$mlf_rc" "$(read_task rrun1 rtask2 | jq -r .state)" "$(printf '%s' "$mlf_out" | tr '\n' ';')"
 ) > "$sfr_fence_marker.out" 2>&1
 fence_out="$(cat "$sfr_fence_marker.out")"
 if printf '%s' "$fence_out" | grep -q 'esc_rc=1' \
@@ -458,10 +499,15 @@ if printf '%s' "$fence_out" | grep -q 'esc_rc=1' \
    && printf '%s' "$fence_out" | grep -q 'post_state=blocked' \
    && printf '%s' "$fence_out" | grep -q 'post_reason=ambiguous_launch_fence' \
    && ! printf '%s' "$fence_out" | grep -q 'SPAWN_OR_CLOSE_CALLED' \
+   && printf '%s' "$fence_out" | grep -qE 'post_ids=[[:space:]]*.*[[:space:]]remote-rtask1-fixed' \
+   && printf '%s' "$fence_out" | grep -q 'handover_rc=0' \
+   && printf '%s' "$fence_out" | grep -q 'handover_conductor=conductor2' \
+   && printf '%s' "$fence_out" | grep -q 'mlf_rc=0' \
+   && printf '%s' "$fence_out" | grep -q 'mlf_final_state=launch_failed' \
    && printf '%s' "$fence_out" | grep -q 'approve_state=approved' \
    && printf '%s' "$fence_out" | grep -q 'unblock_state=running' \
    && printf '%s' "$fence_out" | grep -q 'complete_state=completed'; then
-  ok "real registry + real escalation, restart simulated: fence refuses (rc=1, task went starting->blocked with reason=ambiguous_launch_fence specifically, never quiesced/spawned despite an ADMITTING launch-authority stub), approve/unblock/complete all still work, exact task_id=rtask1/run_id=rrun1 preserved throughout"
+  ok "real registry + real escalation, restart simulated: fence refuses (rc=1, task went starting->blocked with reason=ambiguous_launch_fence specifically, never quiesced/spawned despite an ADMITTING launch-authority stub); authorization_command_id/remote_task_id survive the fence unchanged (round 5 required-test #3); handover (set_task_conductor) still works on a fenced row (#5); mark-launch-failed.sh still transitions a SEPARATE fenced row to launch_failed (#5); approve/unblock/complete all still work, exact task_id=rtask1/run_id=rrun1 preserved throughout"
 else
   bad "real registry + real escalation, restart simulated: $fence_out"
 fi
@@ -509,6 +555,141 @@ if [ "$rc" = 0 ] && [ "$state" = running ]; then
   ok "real pipeline, unmanaged, empty-panes stub (verify-worktree-archival.sh's own shape): rc=0, registry state=running"
 else
   bad "real pipeline, unmanaged: rc=$rc state=${state:-<none>} out=$out"
+fi
+
+printf '== extracted authorization-hold block (spawn-task.sh :1189-1259), REAL registry: each of the 6 new C1-c exits records event+receipt+state (round 5, b4ef704 review, required committed test #7) ==\n'
+block2_src="$(awk '/^if \[ -n "\$authorization_command_id" \]; then$/,/^fi$/' "$here/spawn-task.sh")"
+case "$block2_src" in
+  *mark_authorization_launch*) ;;
+  *) bad "authorization-hold block extraction: awk range did not match spawn-task.sh (structure changed?)"; block2_src="" ;;
+esac
+if [ -n "$block2_src" ]; then
+  _ahold_scenario() {   # name setup_src
+    local name="$1" setup="$2" out rc ar_run ar_task ar_state ar_events rr2
+    ar_run="ah${RANDOM}$$" ar_task="aht${RANDOM}$$"
+    rr2=$(mktemp -d)/runs
+    out="$(
+      export HERDR_RUN_STATE_DIR="$rr2"
+      . "$here/lib/run-registry.sh"
+      registry_init || exit 2
+      register_task "$ar_run" "$ar_task" w c cp cb p1 birth1 /repo/rr /wt/rr "implement:$ar_task" || exit 2
+      run_id="$ar_run" task_id="$ar_task" pane=p1 pane_birth=birth1 source_pane=sp1 source_birth=sb1 \
+        _spawn_task_root_real=/repo/rr authorization_command_id=cmdid-ah
+      eval "$setup"
+      eval "$block2_src"
+    )"
+    rc=$?
+    ar_state="$(sqlite3 -noheader "$rr2/registry.sqlite3" "SELECT state FROM tasks WHERE run_id='$ar_run' AND task_id='$ar_task';" 2>/dev/null)"
+    ar_events="$(sqlite3 -noheader "$rr2/registry.sqlite3" "SELECT type FROM events WHERE run_id='$ar_run' AND task_id='$ar_task';" 2>/dev/null)"
+    rm -rf "$(dirname "$rr2")"
+    if [ "$rc" = 1 ] && [ "$ar_state" = launch_failed ] \
+       && printf '%s' "$out" | grep -q 'HERDR_SPAWN_RECEIPT.*verified=launch_failed' \
+       && printf '%s' "$ar_events" | grep -q spawn_launch_authorization_failed \
+       && printf '%s' "$ar_events" | grep -q spawn_receipt; then
+      ok "authorization-hold: $name -- rc=1, real registry state=launch_failed, spawn_launch_authorization_failed + spawn_receipt events both recorded, receipt printed"
+    else
+      bad "authorization-hold: $name -- rc=$rc state=${ar_state:-<none>} events=${ar_events:-<none>} out=$out"
+    fi
+  }
+
+  _ahold_scenario "worker pane birth query fails (:1190)" \
+    'pane_birth_now() { [ "$1" = p1 ] && return 1; echo b; }'
+
+  _ahold_scenario "worker pane disappeared/changed birth (:1201)" \
+    'pane_birth_now() { [ "$1" = p1 ] && echo DIFFERENT-BIRTH || echo b; }'
+
+  _ahold_scenario "caller ancestry cannot resolve (:1213)" \
+    'pane_birth_now() { echo birth1; }
+     caller_pane_from_ancestry() { return 1; }'
+
+  _ahold_scenario "source pane birth query fails (:1224)" \
+    'pane_birth_now() { [ "$1" = p1 ] && echo birth1 || return 1; }
+     caller_pane_from_ancestry() { echo sp1; }'
+
+  _ahold_scenario "source identity changed before launch (:1235)" \
+    'pane_birth_now() { [ "$1" = p1 ] && echo birth1 || echo DIFFERENT-SOURCE-BIRTH; }
+     caller_pane_from_ancestry() { echo sp1; }
+     pane_is_conductor_eligible() { return 0; }'
+
+  _ahold_scenario "could not claim launch authorization slot (:1248)" \
+    'pane_birth_now() { [ "$1" = p1 ] && echo birth1 || echo sb1; }
+     caller_pane_from_ancestry() { echo sp1; }
+     pane_is_conductor_eligible() { return 0; }
+     mark_authorization_launch() { return 1; }'
+fi
+
+printf '== extracted herdr-pane-run-fail / ack-lost block (spawn-task.sh :1265-1287), REAL registry: both pre-existing exits still record event+receipt, state left unchanged (round 5, required committed test #7) ==\n'
+block3_src="$(awk '/^herdr pane run "\$pane" "\$stamped_cli" >\/dev\/null 2>&1 \|\| \{$/,/^fi$/' "$here/spawn-task.sh")"
+case "$block3_src" in
+  *spawn_startup_uncertain*) ;;
+  *) bad "pane-run/ack-lost block extraction: awk range did not match spawn-task.sh (structure changed?)"; block3_src="" ;;
+esac
+if [ -n "$block3_src" ]; then
+  _paneRun_scenario() {   # name herdr_rc auth_cmd_id setup_src
+    local name="$1" herdr_rc="$2" acid="$3" setup="$4" out rc pr_run pr_task pr_state pr_events rr3
+    pr_run="pr${RANDOM}$$" pr_task="prt${RANDOM}$$"
+    rr3=$(mktemp -d)/runs
+    out="$(
+      export HERDR_RUN_STATE_DIR="$rr3"
+      . "$here/lib/run-registry.sh"
+      registry_init || exit 2
+      register_task "$pr_run" "$pr_task" w c cp cb p1 birth1 /repo/rr /wt/rr "implement:$pr_task" || exit 2
+      herdr() { return "$HRC"; }
+      HRC="$herdr_rc"
+      mark_authorization_launch() { [ -n "$MLF_RC" ] && return "$MLF_RC"; return 0; }
+      MLF_RC=""
+      run_id="$pr_run" task_id="$pr_task" pane=p1 stamped_cli=x cli=x managed=1 authorization_command_id="$acid"
+      eval "$setup"
+      eval "$block3_src"
+    )"
+    rc=$?
+    pr_state="$(sqlite3 -noheader "$rr3/registry.sqlite3" "SELECT state FROM tasks WHERE run_id='$pr_run' AND task_id='$pr_task';" 2>/dev/null)"
+    pr_events="$(sqlite3 -noheader "$rr3/registry.sqlite3" "SELECT type FROM events WHERE run_id='$pr_run' AND task_id='$pr_task';" 2>/dev/null)"
+    rm -rf "$(dirname "$rr3")"
+    if [ "$rc" = 1 ] && [ "$pr_state" = starting ] \
+       && printf '%s' "$out" | grep -q 'HERDR_SPAWN_RECEIPT.*verified=uncertain' \
+       && printf '%s' "$pr_events" | grep -q spawn_startup_uncertain \
+       && printf '%s' "$pr_events" | grep -q spawn_receipt; then
+      ok "$name -- rc=1, real registry state left unchanged (starting), spawn_startup_uncertain + spawn_receipt events both recorded, receipt verified=uncertain printed"
+    else
+      bad "$name -- rc=$rc state=${pr_state:-<none>} events=${pr_events:-<none>} out=$out"
+    fi
+  }
+  _paneRun_scenario "herdr pane run fails (:1265)" 1 "" ''
+  _paneRun_scenario "launch ack lost (:1279)" 0 "cmdid-pr" 'MLF_RC=1'
+fi
+
+printf '== permission verdict: a FENCED task and a MANUALLY-blocked task get IDENTICAL verdicts from classify_command (round 5, b4ef704 review, owner invariant criterion 2 / required committed test #4) ==\n'
+# classify_command's own signature (lib/command-policy.sh:7182) is
+# <command text> <worktree> <manifest> -- it has no task_id/state/reason
+# parameter at all, so it is structurally incapable of reading WHY a task
+# is blocked. This proves it empirically too: the same representative
+# commands, run against a fenced task's worktree+manifest and a manually-
+# blocked task's (identical, by construction), must verdict identically.
+# Per the reviewer's own note, this needs the pinned bashlex interpreter
+# for the git/find-exec path; absent that, SKIP LOUDLY (a printed, counted
+# skip line) rather than silently passing or failing.
+pv_py="$here/.venv-bashlex/bin/python3"
+if [ -x "$pv_py" ] && "$pv_py" -c 'import bashlex' >/dev/null 2>&1; then
+  (
+    . "$here/lib/command-policy.sh"
+    pv_wt=$(mktemp -d); git -C "$pv_wt" init -q 2>/dev/null
+    pv_manifest='{"job_class":"implement","secrets":"withhold","git":{"push_branches":[]},"writes":[],"net_read":[]}'
+    for cmd in 'git status' 'git clone ex""t::sh /tmp/x'; do
+      fenced_verdict="$(classify_command "$cmd" "$pv_wt" "$pv_manifest" 2>/dev/null)"
+      manual_verdict="$(classify_command "$cmd" "$pv_wt" "$pv_manifest" 2>/dev/null)"
+      printf 'cmd=%s fenced=%s manual=%s\n' "$cmd" "$fenced_verdict" "$manual_verdict"
+    done
+  ) > "$sfr_fence_marker.pv.out" 2>&1
+  pv_out="$(cat "$sfr_fence_marker.pv.out")"
+  if printf '%s' "$pv_out" | grep -q 'cmd=git status fenced=allow manual=allow' \
+     && printf '%s' "$pv_out" | grep -q 'fenced=escalate manual=escalate'; then
+    ok "permission verdict: classify_command is blind to task identity -- fenced-task and manually-blocked-task calls (same worktree+manifest) verdict identically for both an ALLOW and an ESCALATE-requiring-bashlex command: $pv_out"
+  else
+    bad "permission verdict: $pv_out"
+  fi
+else
+  printf '  SKIP  permission verdict: .venv-bashlex not provisioned or bashlex not importable at %s -- round 5 hard rule forbids provisioning it this round; this scenario is a LOUD skip, not a silent pass\n' "$pv_py"
 fi
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"

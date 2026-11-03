@@ -70,7 +70,7 @@ CODE_ROOT = Path(os.environ.get("HERDR_CODE_DIR", Path.home() / "Code"))
 TASKS_ON_MAC = os.environ.get("HERDR_MCP_TASKS") == "1"
 
 KB_HEALTH_URL = "https://kb.teamthurber.com/health"
-TERMINAL = {"completed", "failed", "cancelled", "lost", "gone"}
+TERMINAL = {"completed", "failed", "launch_failed", "cancelled", "lost", "gone"}
 MODE_FIELDS = ("job_class", "secrets", "git", "writes", "net_read")
 
 # A claimed "source link" in ANSWER.md (research-task-closure defect 4,
