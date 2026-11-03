@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# conductor-exit.sh — a conductor's exit step: close every worker pane it
-# dispatched whose work has SHIPPED, with the merged PR as proof. DRY-RUN BY
-# DEFAULT.
+# conductor-exit.sh — close worker panes whose branches have shipped, with the
+# merged PR as proof. DRY-RUN BY DEFAULT.
 #
 #   conductor-exit.sh                          # this pane's workers ($HERDR_PANE_ID)
 #   conductor-exit.sh --conductor=w19:p7       # a named conductor's workers
+#   conductor-exit.sh --all                    # every registered worker
 #   conductor-exit.sh --orphans                # workers whose conductor pane is gone
 #   conductor-exit.sh --summary                # one line: "<closable> <held>", for hooks
 #   ... --apply                                # actually close
@@ -26,22 +26,30 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
 
-apply=0; summary=0; orphans=0; conductor="${HERDR_PANE_ID:-}"
+apply=0; summary=0; orphans=0; all=0; conductor="${HERDR_PANE_ID:-}"
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
     --summary) summary=1 ;;
+    --all) all=1 ;;
     --orphans) orphans=1 ;;
     --conductor=*) conductor="${a#--conductor=}" ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'conductor-exit: unknown flag %s\n' "$a" >&2; exit 2 ;;
   esac
 done
 
+[ "$all" = 0 ] || [ "$orphans" = 0 ] || {
+  echo "conductor-exit: --all and --orphans are mutually exclusive" >&2
+  exit 2
+}
+
 live_panes=$(herdr pane list 2>/dev/null | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)
 is_live() { printf '%s\n' "$live_panes" | grep -qxF "$1"; }
 
-if [ "$orphans" = 1 ]; then
+if [ "$all" = 1 ]; then
+  scope="1=1"
+elif [ "$orphans" = 1 ]; then
   # An empty pane list (herdr down) would make every conductor look gone.
   [ -n "$live_panes" ] || { echo "conductor-exit: herdr returned no panes; refusing --orphans" >&2; exit 3; }
   scope="conductor_pane_id IS NOT NULL AND conductor_pane_id != ''"
@@ -71,6 +79,16 @@ while IFS='|' read -r task_id pane cpane wt label; do
         CLOSED) why="PR closed unmerged: $pr_url" ;;
         *)      why="no PR for $slug:$br" ;;
       esac
+    fi
+  fi
+  # A merged PR is only a candidate. Run the same dry safety gate that --apply
+  # will re-run so --summary and the stop hook never call dirty, unpushed, or
+  # prompted work "closable".
+  if [ -z "$why" ]; then
+    gate_out=$(bash "$HERE/close-done-workers.sh" --task="$task_id" 2>&1)
+    if ! printf '%s\n' "$gate_out" | grep -Eq '^[[:space:]]*close[[:space:]]'; then
+      why=$(printf '%s\n' "$gate_out" | sed -En 's/^ *(HOLD|REFUSED) +[^ ]+ +[^ ]+ +//p' | sed -n '1p')
+      [ -n "$why" ] || why="close-done-workers safety gate refused"
     fi
   fi
   if [ -n "$why" ]; then

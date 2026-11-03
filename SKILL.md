@@ -297,20 +297,28 @@ external writes, merges, or governance signatures. If the serving shell exits
 after the form is answered but before issue, resume with
 `./grant-conductor-week-v2.sh issue --confirm-form <form-id>`.
 
-**Conductor exit.** Before a conductor stops, meaning it has saved its session
-and handoff and retained its lessons, it closes its shipped workers:
+**Factory cleanup.** One dry-run-first entry point covers the recurring
+cadences without inventing a second closure authority:
 
 ```bash
-./conductor-exit.sh                 # dry run: ship/HOLD per worker this pane conducts
-./conductor-exit.sh --apply         # close only workers whose PR MERGED; proof = PR URL + merge sha
-./conductor-exit.sh --orphans       # workers whose conductor pane is already gone
+./factory-cleanup.sh --cadence=shift             # this conductor's workers
+./factory-cleanup.sh --cadence=shift --apply     # close merged-PR workers only
+./factory-cleanup.sh --cadence=day --apply       # all conductors; same proof gate
+./factory-cleanup.sh --cadence=week --apply      # same closure + fleet debt checklist
 ```
 
-Open-PR and no-PR workers are held and printed; name them in the handoff.
-It reuses `close-done-workers.sh` for the pane safety checks (not working,
-clean tree, nothing unpushed), so it never closes more than that would. The
-omp hook's `session_stop` handler reminds a conductor once, at its first stop,
-whenever `--summary` reports closable workers. It never blocks.
+`shift` requires `HERDR_PANE_ID` or `--conductor=<pane>`. `day` and `week`
+scan every registered worker through `conductor-exit.sh --all`. `--apply`
+still closes only a branch with a merged PR, and `close-done-workers.sh`
+rechecks working state, dirty/unpushed work, approvals, evidence, and the PR
+proof. Open PRs, detached reviews, missing worktrees, dirty branches, and
+ambiguous state remain `HOLD`; the tool never commits, pushes, removes a
+worktree, or guesses a closure.
+
+The shift hook reminds once when either merged/closable **or held** workers
+remain. Daily cleanup also calls for `xd://worktree_debt` and
+`xd://handoff_debt`; weekly adds `xd://fleet_status` and
+`xd://single_copy_scan`. Preserve unique work before closing its pane.
 
 **Conductor handover.** A blocked, stalled or dead conductor pane otherwise
 leaves its workers answerable by nobody but a human — every

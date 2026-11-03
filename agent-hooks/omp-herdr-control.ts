@@ -53,7 +53,7 @@ const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const PRETOOL_REGISTRATION_SH = path.join(ROOT, "lib", "pretool-registration.sh");
 const BASH_WRITE_TARGETS_SH = path.join(ROOT, "lib", "bash-write-targets.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
-const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
+const FACTORY_CLEANUP_SH = path.join(ROOT, "factory-cleanup.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
 const RESOLVE_HUB_PYTHON_SH = path.join(ROOT, "launchd", "resolve-hub-python.sh");
 const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
@@ -2765,36 +2765,34 @@ function onAgentEnd(): undefined {
   return undefined;
 }
 
-// Conductor exit. A conductor that saves its session and lessons then stops
-// used to leave every finished worker's pane open and its registry row
-// `running` (2026-09-24: a closed conductor tab left four workers whose PRs
-// had merged hours earlier). At the FIRST stop, if this pane conducts workers
-// whose PRs have merged, tell it once to run conductor-exit.sh. Advisory,
-// never a block: closing panes is cheap to do by hand later, and a stop that
-// fails for another reason must not be turned into two problems. A pane with
-// no HERDR_PANE_ID, or no closable workers, costs one short subprocess and
-// says nothing.
+// Shift cleanup. A conductor that saves its session and lessons then stops
+// used to leave every worker's pane open and its registry row `running`
+// (2026-09-24: a closed conductor tab left four merged workers; 2026-11-03:
+// dozens more stayed open because they had WIP, open PRs, or missing review
+// metadata). At the FIRST stop, report both merged/closable and held workers.
+// Advisory, never a block: the cleanup tool can auto-close only merged-PR
+// workers; held work still requires evidence-backed recovery.
 let exitNudged = false;
 function onSessionStop(): { continue: true; additionalContext: string } | undefined {
   try {
     if (exitNudged) return undefined;
     const pane = process.env.HERDR_PANE_ID?.trim();
-    if (!pane || !safeExists(CONDUCTOR_EXIT_SH)) return undefined;
-    const r = spawnSync("bash", [CONDUCTOR_EXIT_SH, `--conductor=${pane}`, "--summary"], {
+    if (!pane || !safeExists(FACTORY_CLEANUP_SH)) return undefined;
+    const r = spawnSync("bash", [FACTORY_CLEANUP_SH, "--cadence=shift", `--conductor=${pane}`, "--summary"], {
       encoding: "utf8",
       timeout: 20_000,
     });
     const [closable, held] = (r.stdout ?? "").trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
-    if (!(closable > 0)) return undefined;
+    if (!(closable > 0 || held > 0)) return undefined;
     exitNudged = true;
     return {
       continue: true,
       additionalContext:
-        `<system-reminder>\nBefore finishing: this pane (${pane}) conducts ${closable} worker(s) whose PR has merged` +
-        `${held > 0 ? ` and ${held} still open or unshipped` : ""}. Close the shipped ones through the gate:\n\n` +
-        `  bash ${CONDUCTOR_EXIT_SH}            # dry run: shows ship/HOLD per worker\n` +
-        `  bash ${CONDUCTOR_EXIT_SH} --apply    # closes only merged-PR workers, proof = PR URL + merge sha\n\n` +
-        `Held workers stay open; name them in your handoff. This reminder fires once.\n</system-reminder>`,
+        `<system-reminder>\nBefore finishing: this pane (${pane}) conducts ${closable || 0} merged/closable worker(s)` +
+        ` and ${held || 0} held worker(s). Run the shift cleanup:\n\n` +
+        `  bash ${FACTORY_CLEANUP_SH} --cadence=shift --conductor=${pane}          # dry run\n` +
+        `  bash ${FACTORY_CLEANUP_SH} --cadence=shift --conductor=${pane} --apply  # closes merged-PR workers only\n\n` +
+        `Held workers are never auto-closed: preserve dirty/unpushed work, link exact PR reviews, or record the blocker and handoff. This reminder fires once.\n</system-reminder>`,
     };
   } catch {
     return undefined; // see onToolResult(): a hook must never throw into the session.

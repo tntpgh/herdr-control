@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # verify-conductor-exit.sh — conductor-exit.sh closes ONLY workers whose PR
 # merged (as `shipped`, with the PR URL + merge sha as proof), holds the rest,
-# scopes to one conductor, and --orphans picks only workers whose conductor
-# pane is gone. herdr and gh are stubbed functions; the registry is a
-# throwaway HERDR_RUN_STATE_DIR. Nothing live is touched.
+# scopes to one conductor, --all covers every worker, and --orphans picks only
+# workers whose conductor pane is gone. herdr and gh are stubbed functions; the
+# registry is a throwaway HERDR_RUN_STATE_DIR. Nothing live is touched.
 #
 #   bash verify-conductor-exit.sh
 set -uo pipefail
@@ -90,6 +90,17 @@ check "merged task still running after dry-run" "$(state t_merged)" "running"
 printf '== --summary: one "<closable> <held>" line ==\n'
 check "summary counts" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "1 2"
 
+printf '== --all: every registered worker, independent of conductor ==\n'
+out=$(bash "$here/conductor-exit.sh" --all 2>&1)
+printf '%s\n' "$out" | grep -q 'ship .*merged-work' && ok "--all includes live conductor's merged worker" || bad "--all omitted merged worker: $out"
+printf '%s\n' "$out" | grep -q 'ship .*orphan-work' && ok "--all includes orphaned merged worker" || bad "--all omitted orphan worker: $out"
+printf '%s\n' "$out" | grep -q 'HOLD .*open-pr-work' && ok "--all still holds open PRs" || bad "--all did not hold open PR: $out"
+check "--all summary counts" "$(bash "$here/conductor-exit.sh" --all --summary)" "2 2"
+
+printf '== --all and --orphans are mutually exclusive ==\n'
+bash "$here/conductor-exit.sh" --all --orphans >/dev/null 2>&1
+check "conflicting scopes refuse" "$?" "2"
+
 printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
 out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
 printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*gh lookup failed' && ok "merged-branch task held when gh fails" || bad "not held: $out"
@@ -108,10 +119,11 @@ wt_merged=$(read_task run_t_merged t_merged | jq -r .worktree)
 touch "$wt_merged/uncommitted.txt"
 : > "$CALLS"
 out=$(bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
-rm -f "$wt_merged/uncommitted.txt"
 check "dirty merged task not completed" "$(state t_merged)" "running"
-printf '%s\n' "$out" | grep -q 'close-done-workers: HOLD .*uncommitted' \
-  && ok "HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
+printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*uncommitted' \
+  && ok "dry safety gate's HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
+check "summary does not call dirty merged work closable" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
+rm -f "$wt_merged/uncommitted.txt"
 
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"
