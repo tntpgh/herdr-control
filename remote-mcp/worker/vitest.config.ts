@@ -37,7 +37,7 @@ const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
 export default defineConfig({
   test: {
     projects: [
-      { plugins: [worker("true")], test: { name: "messaging", include: ["test/flow.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "messaging", include: ["test/flow.test.ts", "test/oauth-diagnostics.test.ts"] } },
       { plugins: [worker("true", "true")], test: { name: "tasks", include: ["test/tasks.test.ts"] } },
       { plugins: [worker("false")], test: { name: "read-only", include: ["test/readonly.test.ts"] } },
       { plugins: [worker("true", "false", "true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },

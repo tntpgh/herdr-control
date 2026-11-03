@@ -9,6 +9,7 @@
 import OAuthProvider, { AuthorizationError, CimdFetchError, OAuthError } from "@cloudflare/workers-oauth-provider";
 import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed, verifyAccess } from "./access";
+import { logOAuthError } from "./oauth-diagnostics";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
 import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, serverInfo } from "./policy";
@@ -264,6 +265,9 @@ export function makeProvider(publicUrl: string, scopes: string[]): OAuthProvider
       authorization_servers: [publicUrl],
       resource_name: "herdr-mcp (Team Thurber agent fleet status)",
     },
+    // Observe only sanitized enums; return nothing so OAuth response semantics stay unchanged.
+    // Worker observability supplies timestamp/deployment metadata. Do not log raw errors.
+    onError: (event) => { logOAuthError(event); },
     accessTokenTTL: 3600,
     refreshTokenTTL: 30 * 86_400,
     refreshTokenIdleTTL: 7 * 86_400,

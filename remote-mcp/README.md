@@ -27,7 +27,7 @@ stays loopback-only.
 
 | Surface | Mechanism |
 |---|---|
-| MCP client → `/mcp` | OAuth 2.1 authorization code + PKCE (S256) bearer token, audience-bound to `https://herdr-mcp.teamthurber.com/mcp` (RFC 8707 `resource`). Clients register by DCR (`/oauth/register`) or CIMD. RFC 9207 `iss` in every authorization response. Discovery: `/.well-known/oauth-protected-resource/mcp` (RFC 9728), `/.well-known/oauth-authorization-server` (RFC 8414). Access token 1 h; refresh 30 days, idles out after 7. |
+| MCP client → `/mcp` | OAuth 2.1 authorization code + PKCE (S256) bearer token, audience-bound to `https://herdr-mcp.teamthurber.com/mcp` (RFC 8707 `resource`). Clients register by DCR (`/oauth/register`) or CIMD. RFC 9207 `iss` in every authorization response. Discovery: `/.well-known/oauth-protected-resource/mcp` (RFC 9728), `/.well-known/oauth-authorization-server` (RFC 8414). Access token 1 h; a new refresh grant starts with 30 days, then each successful refresh resets expiry to 7 days from that refresh. |
 | Human consent → `/authorize` | Path-scoped Cloudflare Access app `herdr-mcp-authorize` (Google Workspace IdP pinned, policy = `ALLOWED_EMAILS`). The Worker **also** verifies the `Cf-Access-Jwt-Assertion` (RS256 against the team JWKS, issuer- and AUD-pinned, email allowlisted), so a removed or widened Access app fails closed. Consent is CSRF-bound to the browser by the provider's `__Host-` cookie + handle. |
 | Mac → `/ingest/sync` | HMAC-SHA256 over `ts.nonce.sha256(body)` with `INGEST_KEY`; ±300 s skew; nonces single-use. Never an OAuth token. |
 
@@ -632,8 +632,14 @@ ChatGPT ([OpenAI: connect and test](https://developers.openai.com/plugins/deploy
    In a new chat, add the connection and ask for the fleet status; it should
    call `get_status` and report `connection.state`.
 
-The grant then works unattended until the refresh token idles out (7 days
-unused, 30 days at most) or the email leaves the allowlist.
+The grant can work unattended while refresh succeeds: the initial lifetime is
+30 days, and each successful refresh resets expiry to 7 days from that refresh.
+There is no 30-day absolute cap in the configured provider. Explicit revocation,
+allowlist removal, client-registration loss, or idle expiry still stops access.
+The browser Access session is separate and protects `/authorize`, not token renewal.
+OAuth failures emit `herdr.oauth_error` with allowlisted code/status/category/reason
+only; unknown labels become `other`. Worker logs supply time/deployment metadata.
+Never include request bodies, headers, tokens or raw error details in diagnostics.
 
 Any other MCP client: point it at the same URL with OAuth discovery; it finds
 everything from the 401's `WWW-Authenticate: Bearer resource_metadata=…`.
