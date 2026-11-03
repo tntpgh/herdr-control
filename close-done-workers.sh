@@ -866,6 +866,10 @@ while IFS= read -r row; do
       fi
     fi
   fi
+  if [ -z "$reason" ] && { [ -n "$expected_branch" ] || [ -n "$expected_head" ]; } \
+    && [ "$candidate_mode" != branch ]; then
+    reason="shipped proof expected an exact branch, but the worktree is no longer on that branch"
+  fi
 
   # §(i) checks 5/6: evidence of outstanding authority — unconsumed
   # approval or unresolved prompt — HOLDS the same way checks 1-4 already
@@ -906,10 +910,9 @@ while IFS= read -r row; do
       || printf '%s\n' "$recheck_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]'; then
       recheck_reason="safety state changed before apply"
     fi
-  else
-    recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
   fi
-  # The pane identity itself is refreshed after every worktree/evidence path.
+  [ -n "$recheck_reason" ] || recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+  # The pane identity itself is refreshed after every other recheck.
   # An initially live pane disappearing is a HOLD: closing its reusable id
   # could otherwise terminate a replacement occupant.
   refresh_panes
@@ -925,7 +928,7 @@ while IFS= read -r row; do
       ;;
     *) recheck_reason="pane status changed before apply ($fresh_st)" ;;
   esac
-  [ -n "$recheck_reason" ] || recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+  # No authority/evidence lookup occurs after this final pane snapshot.
   st="$fresh_st"
   if [ -n "$recheck_reason" ]; then
     closable=$((closable-1))
