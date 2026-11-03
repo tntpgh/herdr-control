@@ -443,14 +443,27 @@ _footer_clipped_trusted_content() {
   t_prompt_id="$(prompt_id "$pane" 2>/dev/null)"
   [ -n "$t_prompt_id" ] || return 0
   t_occ_py="$(_registry_python 2>/dev/null)" || return 0
-  # No --tool: proposal_check already requires the occurrence's OWN
-  # registered tool to be write/edit (PROPOSAL_TOOLS) -- this is exactly
-  # "whatever write/edit content is pending for this pane," not a guess at
-  # which tool is on screen, which is the ambiguity this detector exists
-  # to resolve in the first place.
+  # REVIEW-PARSER-1d00122 (HIGH): --tool write is REQUIRED, not optional.
+  # prompt-occurrence.py's proposal body is the raw, newline-preserving
+  # Content string ONLY for tool=="write" (lib/prompt-occurrence.py:1249);
+  # for edit (old_string/new_string/path) and bash/shell (command, when
+  # HERDR_BOUND_BASH=1 widens PROPOSAL_TOOLS) it is a json.dumps() of the
+  # whole input instead, which escapes an embedded newline as the two
+  # literal characters `\n` rather than a real line break -- a forged
+  # "Approve"/"Deny" row inside an edit's new_string or a bash command
+  # never appears as an isolated line in that JSON dump, so the line-scan
+  # cross-check below cannot see it no matter how blatant the forgery.
+  # The comment that used to live here ("proposal_check already requires
+  # ... write/edit") was wrong: proposal_check's tool-equality check only
+  # fires when --tool is actually supplied (lib/prompt-occurrence.py:1194)
+  # -- omitting it, as this call used to, left edit/bash/shell occurrences
+  # resolving through a cross-check that was comparing the window against
+  # a textual representation that cannot possibly match it. write is the
+  # only tool whose payload this detector can verify at all; every other
+  # tool must refuse (trusted_ok stays 0), never guess.
   t_payload="$("$t_occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
     --run "$t_run" --task "$t_task" --pane "$pane" --birth "$t_birth" \
-    --prompt-id "$t_prompt_id" --worktree "$t_worktree" 2>/dev/null)"
+    --prompt-id "$t_prompt_id" --worktree "$t_worktree" --tool write 2>/dev/null)"
   [ "$(printf '%s' "$t_payload" | jq -r '.ok == true' 2>/dev/null)" = true ] || return 0
   _FC_TRUSTED_OK=1
   _FC_TRUSTED_CONTENT="$(printf '%s' "$t_payload" | jq -r '.body // empty' 2>/dev/null)"

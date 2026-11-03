@@ -1884,21 +1884,22 @@ EOF_WIN
     esac
   done
   [ "$approve_n" = 1 ] && [ "$deny_n" = 1 ] || return 1
-  # TRUSTED-CONTENT CROSS-CHECK (REVIEW-PARSER-a1f9feb, Attack 1/2): if the
-  # occurrence's own recorded Content can itself produce a line reading
-  # exactly "Approve" or "Deny" once stripped the same way, the window's
-  # candidate pair cannot be trusted to be omp's chrome rather than
-  # Content's own text -- refuse outright, no matter how the window looks.
+  # TRUSTED-CONTENT CROSS-CHECK (REVIEW-PARSER-a1f9feb Attack 1/2, widened
+  # by REVIEW-PARSER-1d00122 MEDIUM): a per-LINE exact match missed a
+  # wrap-reflow case -- a single long Content line with no embedded
+  # newline, if omp's own box-rendering wraps it to display width such
+  # that the final wrapped segment happens to read exactly "Approve"/
+  # "Deny", never appears as an isolated LINE in the raw (unwrapped)
+  # trusted content, even though the literal word is right there. Search
+  # the whole trusted content for the word ANYWHERE (word-bounded so
+  # "Disapprove"/"Denying" do not false-positive), not just a line that
+  # already happens to match exactly -- this still catches Attack 1/2 (the
+  # word WAS already isolated on its own line there too) and additionally
+  # catches any wrap boundary that could isolate it on screen, without
+  # having to know or reproduce omp's actual render width.
   if [ -n "$trusted" ]; then
-    local tline tstripped
-    while IFS= read -r tline || [ -n "$tline" ]; do
-      tstripped="$(printf '%s' "$tline" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//')"
-      case "$tstripped" in
-        Approve | Deny) return 1 ;;
-      esac
-    done <<EOF_TRUSTED
-$trusted
-EOF_TRUSTED
+    printf '%s' "$trusted" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+      | grep -qE '(^|[^A-Za-z])(Approve|Deny)([^A-Za-z]|$)' && return 1
   fi
   case "$mode" in
     options)
