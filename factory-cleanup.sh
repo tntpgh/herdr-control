@@ -30,12 +30,13 @@ apply=0
 summary=0
 conductor="${HERDR_PANE_ID:-}"
 conductor_explicit=0
+cadence_explicit=0
 for arg in "$@"; do
   case "$arg" in
-    --cadence=*) cadence=${arg#--cadence=} ;;
-    --shift) cadence=shift ;;
-    --day) cadence=day ;;
-    --week) cadence=week ;;
+    --cadence=*) cadence=${arg#--cadence=}; cadence_explicit=$((cadence_explicit+1)) ;;
+    --shift) cadence=shift; cadence_explicit=$((cadence_explicit+1)) ;;
+    --day) cadence=day; cadence_explicit=$((cadence_explicit+1)) ;;
+    --week) cadence=week; cadence_explicit=$((cadence_explicit+1)) ;;
     --apply) apply=1 ;;
     --summary) summary=1 ;;
     --conductor=*) conductor=${arg#--conductor=}; conductor_explicit=1 ;;
@@ -43,6 +44,11 @@ for arg in "$@"; do
     *) printf 'factory-cleanup: unknown flag %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
+[ "$cadence_explicit" -le 1 ] || {
+  echo "factory-cleanup: cadence selectors are mutually exclusive" >&2
+  exit 2
+}
+
 
 case "$cadence" in
   shift)

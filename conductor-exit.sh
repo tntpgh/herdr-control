@@ -66,7 +66,14 @@ else
   scope="conductor_pane_id=$(_sq "$conductor")"
 fi
 
-closable=0; held=0
+query="SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
+       FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;"
+rows=$(_sql "$query") || {
+  echo "conductor-exit: registry query failed" >&2
+  exit 3
+}
+
+closable=0; held=0; apply_failed=0
 while IFS='|' read -r task_id pane cpane wt label; do
   [ -n "$task_id" ] || continue
   # --orphans: only tasks whose conductor pane no longer exists.
@@ -110,15 +117,21 @@ while IFS='|' read -r task_id pane cpane wt label; do
   [ "$summary" = 1 ] && continue
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
-  bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
+  close_rc=0
+  close_out=$(bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1) || close_rc=$?
+  printf '%s\n' "$close_out" \
     | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
-done < <(_sql "SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
-               FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;")
+  if [ "$close_rc" -ne 0 ]; then
+    apply_failed=$((apply_failed+1))
+    printf '    close-done-workers: failed with exit %d\n' "$close_rc" >&2
+  fi
+done <<<"$rows"
 
 if [ "$summary" = 1 ]; then printf '%d %d\n' "$closable" "$held"; exit 0; fi
 echo
 if [ "$apply" = 1 ]; then
-  printf '%d shipped task(s) sent to close-done-workers, %d held\n' "$closable" "$held"
+  printf '%d shipped task(s) sent to close-done-workers, %d held, %d failed\n' "$closable" "$held" "$apply_failed"
+  [ "$apply_failed" -eq 0 ] || exit 4
 else
   printf '%d shipped (closable), %d held — DRY RUN, nothing changed. Re-run with --apply\n' "$closable" "$held"
 fi

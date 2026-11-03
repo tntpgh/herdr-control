@@ -143,6 +143,24 @@ check "nonzero gate summary stays fail-closed" \
   "$(HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$bad_gate" bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
 rm -f "$bad_gate"
 
+printf '== apply failure propagates after a successful dry gate ==\n'
+apply_gate=$(mktemp)
+cat > "$apply_gate" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' --apply '*) echo "REFUSED p1 merged-work simulated apply race"; exit 7 ;;
+  *) echo "close p1 merged-work" ;;
+esac
+SH
+chmod +x "$apply_gate"
+HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$apply_gate" \
+  bash "$here/conductor-exit.sh" --conductor=COND --apply >/tmp/conductor-apply-failure.out 2>&1
+check "apply-time close failure returns nonzero" "$?" "4"
+grep -q 'failed with exit 7' /tmp/conductor-apply-failure.out \
+  && ok "apply-time failure reaches the operator" || bad "apply-time failure was hidden"
+check "failed apply leaves task running" "$(state t_merged)" "running"
+rm -f "$apply_gate" /tmp/conductor-apply-failure.out
+
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"
 bash "$here/conductor-exit.sh" --conductor=COND --apply >/dev/null 2>&1
@@ -168,6 +186,14 @@ grep -q 'pane close' "$CALLS" && bad "closed a pane with no pane list" || ok "no
 
 printf '== no conductor at all -> usage error, not "every task" ==\n'
 HERDR_PANE_ID= bash "$here/conductor-exit.sh" >/dev/null 2>&1; check "exit 2 without a conductor" "$?" "2"
+
+printf '== registry query failure never becomes a successful empty summary ==\n'
+bad_state=$(mktemp)
+out=$(HERDR_RUN_STATE_DIR="$bad_state" bash "$here/conductor-exit.sh" --conductor=COND --summary 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "registry query failure returns nonzero" || bad "registry query failure returned success"
+[ "$out" != "0 0" ] && ok "registry failure is not reported as an empty scope" || bad "registry failure became 0 0"
+rm -f "$bad_state"
 
 echo "-----"; echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
