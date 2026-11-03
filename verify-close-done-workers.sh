@@ -19,12 +19,17 @@ bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 
 CALLS=$(mktemp)
-export CALLS
+CLOSED_PANES=$(mktemp)
+export CALLS CLOSED_PANES
 herdr() {
   printf '%s\n' "$1 $2" >> "$CALLS"
   case "$1 $2" in
-    "pane list")  printf '{"result":{"panes":[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"}]}}\n' ;;
-    "pane close") : ;;
+    "pane list")
+      closed=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$CLOSED_PANES")
+      jq -nc --argjson closed "$closed" \
+        '{result:{panes:[{pane_id:"pX",agent_status:"idle",terminal_id:"birthX"},{pane_id:"pY",agent_status:"idle",terminal_id:"birthY"},{pane_id:"pZ",agent_status:"idle",terminal_id:"birthZ"},{pane_id:"pR",agent_status:"idle",terminal_id:"birthR-live"}] | map(select(.pane_id as $p | ($closed | index($p) | not)))}}'
+      ;;
+    "pane close") printf '%s\n' "$3" >> "$CLOSED_PANES" ;;
     *) printf '{}\n' ;;
   esac
 }
@@ -77,7 +82,7 @@ else
 fi
 check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
 check "task1 untouched by the refused empty --task=" "$(read_task run1 task1 | jq -r .state)" "running"
-grep -q 'given but empty' /tmp/cdw-out1b-$$.log && ok "refusal names the empty --task" || bad "refusal text: $(cat /tmp/cdw-out1b-$$.log)"
+grep -q 'supplied once with a non-empty value' /tmp/cdw-out1b-$$.log && ok "refusal names the empty --task" || bad "refusal text: $(cat /tmp/cdw-out1b-$$.log)"
 
 printf '== --task="   " (whitespace-only) is refused the same way ==\n'
 : > "$CALLS"
@@ -97,6 +102,14 @@ else
   ok "dry-run with --task= (empty) refused"
 fi
 check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+
+printf '== empty or repeated --pane never widens to batch mode ==\n'
+: > "$CALLS"
+bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --pane= >/tmp/cdw-pane-empty-$$.log 2>&1
+check "empty --pane refuses" "$?" "1"
+bash "$here/close-done-workers.sh" --pane=pX --pane=pY >/tmp/cdw-pane-repeat-$$.log 2>&1
+check "repeated --pane refuses" "$?" "1"
+check "invalid pane filters make no herdr call" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
 
 printf '== --apply --reason=shipped with no --proof: refused before any herdr call ==\n'
 : > "$CALLS"
@@ -347,6 +360,7 @@ printf '== --task=<id> whose registered pane_birth does NOT match the LIVE occup
 # reissued to a brand-new, unrelated live occupant (pX, terminal_id
 # "birthX" per the herdr stub above) was treated as closable/idle just
 # because that OTHER occupant happens to report idle right now.
+: > "$CLOSED_PANES"  # pane ids are reusable; F1 models a new pX occupant.
 register_task runRec taskRecycled w c cp cb pX birthX-OLD /repo/rec /does/not/exist "recycled-via-task" \
   || bad "register taskRecycled failed"
 set_task_state runRec taskRecycled running || bad "taskRecycled -> running failed (setup)"
@@ -596,7 +610,7 @@ printf '%s' "$out" | grep -q '^  close  pV7' && ok "V7: wt=repo row is not held 
 printf -- '-- G1: git status failure -> HOLD, never assumed clean --\n'
 export FAIL_GIT_WT="$wtV6"
 git() {
-  if [ "$1" = -C ] && [ "$2" = "$FAIL_GIT_WT" ] && [ "$3" = status ]; then return 9; fi
+  if [ "$1" = -C ] && [ "$2" = "$FAIL_GIT_WT" ] && [ "${5:-}" = status ]; then return 9; fi
   command git "$@"
 }
 export -f git
@@ -621,6 +635,57 @@ export -f herdr
 unset -f make_fake_bashlex_venv _v_mk_root _v_wt _v_reg
 
 printf '\n== failed authoritative inputs never become successful empty/clean scans ==\n'
+register_task runMalformed taskMalformed w c cp cb pMalformed birthMalformed /repo/malformed /does/not/exist "malformed-pane" || bad "register taskMalformed"
+set_task_state runMalformed taskMalformed running || bad "taskMalformed -> running"
+herdr() {
+  case "$1 $2" in
+    "pane list") printf '{"result":{"panes":[{"pane_id":"pMalformed","agent_status":"idle"}]}}\n' ;;
+    *) return 0 ;;
+  esac
+}
+export -f herdr
+out=$(bash "$here/close-done-workers.sh" --task=taskMalformed 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*pane identity is incomplete' \
+  && ok "live pane without terminal identity HOLDs" || bad "malformed live pane authorized: $out"
+
+register_task runRace taskRace w c cp cb pRace birthRace /repo/race /does/not/exist "race-close" || bad "register taskRace"
+set_task_state runRace taskRace running || bad "taskRace -> running"
+RACE_COUNT=$(mktemp); printf '0\n' > "$RACE_COUNT"; export RACE_COUNT
+herdr() {
+  case "$1 $2" in
+    "pane list")
+      n=$(cat "$RACE_COUNT"); n=$((n+1)); printf '%s\n' "$n" > "$RACE_COUNT"
+      if [ "$n" -eq 1 ]; then status=idle; else status=working; fi
+      printf '{"result":{"panes":[{"pane_id":"pRace","agent_status":"%s","terminal_id":"birthRace"}]}}\n' "$status"
+      ;;
+    *) return 0 ;;
+  esac
+}
+export -f herdr
+out=$(bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task=taskRace 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "fresh pre-apply recheck refuses a pane that became working" || bad "working race returned success"
+check "working race leaves task running" "$(read_task runRace taskRace | jq -r .state)" "running"
+printf '%s' "$out" | grep -q 'safety state changed before apply' \
+  && ok "working race is explicit" || bad "working race output: $out"
+rm -f "$RACE_COUNT"
+
+register_task runNoop taskNoop w c cp cb pNoop birthNoop /repo/noop /does/not/exist "noop-close" || bad "register taskNoop"
+set_task_state runNoop taskNoop running || bad "taskNoop -> running"
+herdr() {
+  case "$1 $2" in
+    "pane list") printf '{"result":{"panes":[{"pane_id":"pNoop","agent_status":"idle","terminal_id":"birthNoop"}]}}\n' ;;
+    "pane close") return 0 ;;
+    *) return 0 ;;
+  esac
+}
+export -f herdr
+out=$(bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task=taskNoop 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "exit-zero pane-close no-op returns failure" || bad "pane-close no-op reported success"
+printf '%s' "$out" | grep -q 'same pane remains live after close' \
+  && ok "pane-close no-op is explicit" || bad "pane-close no-op output: $out"
+
 register_task runFail taskFail w c cp cb pFail birthFail /repo/fail /does/not/exist "fail-inputs" || bad "register taskFail"
 set_task_state runFail taskFail running || bad "taskFail -> running"
 herdr() {
