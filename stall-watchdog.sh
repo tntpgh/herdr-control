@@ -311,7 +311,7 @@ _sw_escalate() {                        # task_id run_id signal label pane condu
   alert_claim "$alert_pane" "$key" || return 0   # already posted for this (task,signal) within the TTL
   local art_note=""
   [ -n "$artifact" ] && art_note=" ($artifact)"
-  local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. ${reason}. Nothing answers prompts or acts on the worker's behalf here — a human looks. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+  local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. ${reason}. Nothing answers prompts or acts on the worker's behalf here — a human looks. Ack once handled: $here/stall-ack.sh ${task_id} ${signal} — Fix it (hand it to the owning lane): $here/fix-it.sh ${task_id} ${signal}"
   local rc=0
   if [ -n "$conductor" ]; then
     bash "$SW_NOTIFY" --pane "$conductor" --class stall-watchdog "$msg" >/dev/null 2>&1 || rc=$?
@@ -440,7 +440,7 @@ cmd_wake() {
           local art_note="" harvest_note
           [ -n "$artifact" ] && art_note=" ($artifact)"
           harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
-          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
+          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal} — Fix it (hand it to the owning lane): $here/fix-it.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
           _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
       fi
@@ -477,7 +477,7 @@ cmd_wake() {
     local art_note="" harvest_note
     [ -n "$artifact" ] && art_note=" ($artifact)"
     harvest_note="$(_sw_successor_note "$task_id" "$signal" "$conductor")"
-    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
+    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal} — Fix it (hand it to the owning lane): $here/fix-it.sh ${task_id} ${signal}${harvest_note:+ $harvest_note}"
     _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
 }

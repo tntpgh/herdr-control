@@ -284,6 +284,7 @@ legend{font:600 12px system-ui;letter-spacing:.12em;text-transform:uppercase;col
 pre{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Menlo,monospace;background:var(--ground);border:1px solid var(--line);border-radius:5px;padding:10px 12px}
 .bar{position:fixed;left:0;right:0;bottom:0;padding:14px 24px;background:var(--surface);border-top:1px solid var(--line);display:flex;gap:12px;justify-content:flex-end;align-items:center}
 button{font:600 14px system-ui;padding:10px 20px;border-radius:5px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:var(--ground)}
+button.secondary{background:var(--accent-soft);color:var(--accent);border-color:var(--line)}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 </style></head>
 <body><main>
@@ -295,16 +296,21 @@ button{font:600 14px system-ui;padding:10px 20px;border-radius:5px;cursor:pointe
 <fieldset><legend>Look at it</legend><pre>herdr pane read $(_attn_esc "$pane") --source visible --lines 30</pre></fieldset>
 </form>
 </main>
-<div class=bar><button type=submit form=f>Acknowledge</button></div>
+<div class=bar>
+<button type=button class=secondary id=fixit>Fix it</button>
+<button type=submit form=f>Acknowledge</button>
+</div>
 <script>document.getElementById("f").addEventListener("submit",function(e){e.preventDefault();
-window.submitAnswers({acknowledged:true,pane:"$(_attn_esc "$pane")",task_id:"$(_attn_esc "$task_id")"})});</script>
+window.submitAnswers({acknowledged:true,pane:"$(_attn_esc "$pane")",task_id:"$(_attn_esc "$task_id")"})});
+document.getElementById("fixit").addEventListener("click",function(){
+window.submitAnswers({fix_it:true,pane:"$(_attn_esc "$pane")",task_id:"$(_attn_esc "$task_id")"})});</script>
 </body></html>
 HTML
   local formserve="${HERDR_ATTENTION_FORMSERVE:-$here/formserve.py}"
   local python="${HERDR_ATTENTION_PYTHON:-python3}"
   local title="Attention needed: ${label:-$task_id} ($pane)"
   local log="$f.serve.log"
-  ( "$python" "$formserve" "$f" --timeout 86400 --no-open --title "$title" </dev/null >"$log" 2>&1
+  ( out="$("$python" "$formserve" "$f" --timeout 86400 --no-open --title "$title" </dev/null 2>"$log")"
     rc=$?
     # >=2: formserve itself refused to start (config error -- e.g. a shape
     # unanswerable_reasons() rejects). 1 is a normal expiry, not a refusal;
@@ -315,6 +321,12 @@ HTML
         "$(jq -nc --arg p "$pane" --arg f "$f" --arg err "$(tail -c 2000 "$log" 2>/dev/null)" \
            '{pane:$p, form_path:$f, stderr:$err}')" \
         "attnformref_$(basename "$f")" >/dev/null 2>&1 || true
+    elif [ "$rc" -eq 0 ] && printf '%s' "$out" | jq -e '.fix_it == true' >/dev/null 2>&1; then
+      # The "Fix it" button, answered: hand this exact alert to the task's
+      # own conductor pane as a concrete next step. fix-it.sh owns its own
+      # idempotency (claim_once) and audit trail — safe even if this
+      # subshell somehow ran twice for the same alert.
+      bash "$here/fix-it.sh" "$task_id" attention >/dev/null 2>&1 || true
     fi
     rm -f "$log" 2>/dev/null
   ) >/dev/null 2>&1 & disown

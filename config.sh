@@ -292,6 +292,10 @@ unset _herdr_main_db _herdr_main_row
 # 2x the detect threshold, the same ladder shape as HERDR_WAKE_RESPONSE_S.
 : "${HERDR_STALL_WATCHDOG_ESCALATE_S:=}"
 
+# Kill switch for fix-it.sh (the "Fix it" action beside Ack on an alert):
+# 1 refuses outright and explains why, rather than silently doing nothing.
+: "${HERDR_FIX_IT_DISABLE:=0}"
+
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
@@ -302,5 +306,5 @@ export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES HERDR_
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_SLACK_LEVEL HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
-export HERDR_STALL_WATCHDOG_THRESHOLD_S HERDR_STALL_WATCHDOG_ESCALATE_S
+export HERDR_STALL_WATCHDOG_THRESHOLD_S HERDR_STALL_WATCHDOG_ESCALATE_S HERDR_FIX_IT_DISABLE
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
