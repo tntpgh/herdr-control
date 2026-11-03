@@ -14,14 +14,22 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-CONDUCTOR_EXIT_SH=${HERDR_CONDUCTOR_EXIT_SH:-$HERE/conductor-exit.sh}
-CLOSE_DONE_SH=${HERDR_CLOSE_DONE_SH:-$HERE/close-done-workers.sh}
+CONDUCTOR_EXIT_SH=$HERE/conductor-exit.sh
+CLOSE_DONE_SH=$HERE/close-done-workers.sh
 HUB_URL=${HERDR_HUB_URL:-http://127.0.0.1:8600}
+if [ "${HERDR_FACTORY_CLEANUP_TEST_MODE:-0}" = 1 ]; then
+  CONDUCTOR_EXIT_SH=${HERDR_CONDUCTOR_EXIT_SH:-$CONDUCTOR_EXIT_SH}
+  CLOSE_DONE_SH=${HERDR_CLOSE_DONE_SH:-$CLOSE_DONE_SH}
+elif [ -n "${HERDR_CONDUCTOR_EXIT_SH:-}${HERDR_CLOSE_DONE_SH:-}" ]; then
+  echo "factory-cleanup: dependency overrides require HERDR_FACTORY_CLEANUP_TEST_MODE=1" >&2
+  exit 3
+fi
 
 cadence=shift
 apply=0
 summary=0
 conductor="${HERDR_PANE_ID:-}"
+conductor_explicit=0
 for arg in "$@"; do
   case "$arg" in
     --cadence=*) cadence=${arg#--cadence=} ;;
@@ -30,7 +38,7 @@ for arg in "$@"; do
     --week) cadence=week ;;
     --apply) apply=1 ;;
     --summary) summary=1 ;;
-    --conductor=*) conductor=${arg#--conductor=} ;;
+    --conductor=*) conductor=${arg#--conductor=}; conductor_explicit=1 ;;
     -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'factory-cleanup: unknown flag %s\n' "$arg" >&2; exit 2 ;;
   esac
@@ -42,9 +50,19 @@ case "$cadence" in
       echo "factory-cleanup: shift cleanup needs HERDR_PANE_ID or --conductor=<pane>" >&2
       exit 2
     }
+    [[ "$conductor" =~ ^w[[:alnum:]]+:p[[:alnum:]]+$ ]] || {
+      echo "factory-cleanup: invalid conductor pane '$conductor'" >&2
+      exit 2
+    }
     scope_args=("--conductor=$conductor")
     ;;
-  day|week) scope_args=(--all) ;;
+  day|week)
+    [ "$conductor_explicit" = 0 ] || {
+      echo "factory-cleanup: --conductor is valid only for shift cleanup" >&2
+      exit 2
+    }
+    scope_args=(--all)
+    ;;
   *) echo "factory-cleanup: --cadence must be shift, day, or week" >&2; exit 2 ;;
 esac
 
@@ -70,8 +88,11 @@ bash "$CLOSE_DONE_SH" || {
 printf '\n== hub ==\n'
 if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   if hub=$(curl -fsS "$HUB_URL/api/summary" 2>/dev/null); then
-    printf '%s\n' "$hub" | jq -r '
+    if ! printf '%s\n' "$hub" | jq -er '
       "attention=\(.attention // "?") tasks=\(.attention_tasks // "?") registry=\(.registry_attention // "?") handoff_debt=\(.handoff_debt // "?") decisions=\(.open_decisions // "?")"'
+    then
+      echo "hub returned invalid summary data (cleanup stayed fail-closed)"
+    fi
   else
     echo "hub unavailable at $HUB_URL (cleanup stayed fail-closed)"
   fi

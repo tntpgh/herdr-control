@@ -2777,21 +2777,24 @@ function onSessionStop(): { continue: true; additionalContext: string } | undefi
   try {
     if (exitNudged) return undefined;
     const pane = process.env.HERDR_PANE_ID?.trim();
-    if (!pane || !safeExists(FACTORY_CLEANUP_SH)) return undefined;
+    if (!pane || !/^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/.test(pane) || !safeExists(FACTORY_CLEANUP_SH)) return undefined;
     const r = spawnSync("bash", [FACTORY_CLEANUP_SH, "--cadence=shift", `--conductor=${pane}`, "--summary"], {
       encoding: "utf8",
       timeout: 20_000,
     });
-    const [closable, held] = (r.stdout ?? "").trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
+    const summary = (r.stdout ?? "").match(/^(\d+)\s+(\d+)\s*$/);
+    if (r.status !== 0 || r.error || r.signal || !summary) return undefined;
+    const closable = Number.parseInt(summary[1], 10);
+    const held = Number.parseInt(summary[2], 10);
     if (!(closable > 0 || held > 0)) return undefined;
     exitNudged = true;
     return {
       continue: true,
       additionalContext:
-        `<system-reminder>\nBefore finishing: this pane (${pane}) conducts ${closable || 0} merged/closable worker(s)` +
-        ` and ${held || 0} held worker(s). Run the shift cleanup:\n\n` +
-        `  bash ${FACTORY_CLEANUP_SH} --cadence=shift --conductor=${pane}          # dry run\n` +
-        `  bash ${FACTORY_CLEANUP_SH} --cadence=shift --conductor=${pane} --apply  # closes merged-PR workers only\n\n` +
+        `<system-reminder>\nBefore finishing: this pane (${pane}) conducts ${closable} merged/closable worker(s)` +
+        ` and ${held} held worker(s). Run the shift cleanup:\n\n` +
+        `  bash ${JSON.stringify(FACTORY_CLEANUP_SH)} --cadence=shift --conductor=${JSON.stringify(pane)}          # dry run\n` +
+        `  bash ${JSON.stringify(FACTORY_CLEANUP_SH)} --cadence=shift --conductor=${JSON.stringify(pane)} --apply  # closes merged-PR workers only\n\n` +
         `Held workers are never auto-closed: preserve dirty/unpushed work, link exact PR reviews, or record the blocker and handoff. This reminder fires once.\n</system-reminder>`,
     };
   } catch {

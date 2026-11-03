@@ -100,6 +100,8 @@ check "--all summary counts" "$(bash "$here/conductor-exit.sh" --all --summary)"
 printf '== --all and --orphans are mutually exclusive ==\n'
 bash "$here/conductor-exit.sh" --all --orphans >/dev/null 2>&1
 check "conflicting scopes refuse" "$?" "2"
+bash "$here/conductor-exit.sh" --all --conductor=COND >/dev/null 2>&1
+check "--all plus explicit conductor refuses" "$?" "2"
 
 printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
 out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
@@ -124,6 +126,22 @@ printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*uncommitted' \
   && ok "dry safety gate's HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
 check "summary does not call dirty merged work closable" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
 rm -f "$wt_merged/uncommitted.txt"
+
+printf '== nonzero safety gate cannot authorize from a close-looking line ==\n'
+bad_gate=$(mktemp)
+cat > "$bad_gate" <<'SH'
+#!/usr/bin/env bash
+echo "close p1 merged-work"
+exit 7
+SH
+chmod +x "$bad_gate"
+out=$(HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$bad_gate" \
+  bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
+printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*safety gate failed (exit 7)' \
+  && ok "nonzero gate output is held despite a close-looking line" || bad "nonzero gate authorized closure: $out"
+check "nonzero gate summary stays fail-closed" \
+  "$(HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$bad_gate" bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
+rm -f "$bad_gate"
 
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"

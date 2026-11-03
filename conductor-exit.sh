@@ -25,22 +25,30 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
+CLOSE_DONE_SH=$HERE/close-done-workers.sh
+if [ "${HERDR_CONDUCTOR_EXIT_TEST_MODE:-0}" = 1 ]; then
+  CLOSE_DONE_SH=${HERDR_CLOSE_DONE_SH:-$CLOSE_DONE_SH}
+elif [ -n "${HERDR_CLOSE_DONE_SH:-}" ]; then
+  echo "conductor-exit: dependency overrides require HERDR_CONDUCTOR_EXIT_TEST_MODE=1" >&2
+  exit 3
+fi
 
-apply=0; summary=0; orphans=0; all=0; conductor="${HERDR_PANE_ID:-}"
+apply=0; summary=0; orphans=0; all=0; conductor="${HERDR_PANE_ID:-}"; conductor_explicit=0
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
     --summary) summary=1 ;;
     --all) all=1 ;;
     --orphans) orphans=1 ;;
-    --conductor=*) conductor="${a#--conductor=}" ;;
+    --conductor=*) conductor="${a#--conductor=}"; conductor_explicit=1 ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'conductor-exit: unknown flag %s\n' "$a" >&2; exit 2 ;;
   esac
 done
 
-[ "$all" = 0 ] || [ "$orphans" = 0 ] || {
-  echo "conductor-exit: --all and --orphans are mutually exclusive" >&2
+scope_count=$((all + orphans + conductor_explicit))
+[ "$scope_count" -le 1 ] || {
+  echo "conductor-exit: --all, --orphans, and --conductor are mutually exclusive" >&2
   exit 2
 }
 
@@ -85,10 +93,12 @@ while IFS='|' read -r task_id pane cpane wt label; do
   # will re-run so --summary and the stop hook never call dirty, unpushed, or
   # prompted work "closable".
   if [ -z "$why" ]; then
-    gate_out=$(bash "$HERE/close-done-workers.sh" --task="$task_id" 2>&1)
-    if ! printf '%s\n' "$gate_out" | grep -Eq '^[[:space:]]*close[[:space:]]'; then
+    gate_rc=0
+    gate_out=$(bash "$CLOSE_DONE_SH" --task="$task_id" 2>&1) || gate_rc=$?
+    close_count=$(printf '%s\n' "$gate_out" | grep -Ec '^[[:space:]]*close[[:space:]]')
+    if [ "$gate_rc" -ne 0 ] || [ "$close_count" -ne 1 ] || printf '%s\n' "$gate_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]'; then
       why=$(printf '%s\n' "$gate_out" | sed -En 's/^ *(HOLD|REFUSED) +[^ ]+ +[^ ]+ +//p' | sed -n '1p')
-      [ -n "$why" ] || why="close-done-workers safety gate refused"
+      [ -n "$why" ] || why="close-done-workers safety gate failed (exit $gate_rc)"
     fi
   fi
   if [ -n "$why" ]; then
@@ -100,7 +110,7 @@ while IFS='|' read -r task_id pane cpane wt label; do
   [ "$summary" = 1 ] && continue
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
-  bash "$HERE/close-done-workers.sh" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
+  bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
     | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
 done < <(_sql "SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
                FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;")
