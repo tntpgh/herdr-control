@@ -89,7 +89,7 @@ PYEOF
 
 _renew() {
   _outside_herdr_or_die "renew"
-  local reason="" html out err created_ms pid form_id="" hub_url rc=0 i
+  local reason="" tmp_root tmpdir html out err created_ms pid form_id="" hub_url rc=0 i
   while [ $# -gt 0 ]; do
     case "$1" in
       --reason) reason="${2:-}"; shift 2 ;;
@@ -98,9 +98,11 @@ _renew() {
     esac
   done
   [ -n "$reason" ] || { echo "grant-conductor-week-v2: renew requires --reason" >&2; return 2; }
-  html="$(mktemp "${TMPDIR:-/tmp}/herdr-factory-week-key.XXXXXX.html")" || return 1
-  out="${html%.html}.out"
-  err="${html%.html}.err"
+  tmp_root="${TMPDIR:-/tmp}"
+  tmpdir="$(mktemp -d "${tmp_root%/}/herdr-factory-week-key.XXXXXX")" || return 1
+  html="$tmpdir/form.html"
+  out="$tmpdir/form.out"
+  err="$tmpdir/form.err"
   created_ms="$(( $(date +%s) * 1000 ))"
   _CONDUCTOR_WEEK_MINTING_PANE="" _CONDUCTOR_WEEK_MINTING_PANE_BIRTH="" \
     _py build-form --reason "$reason" --out "$html" || return $?
