@@ -718,8 +718,9 @@ _closure_target_state() {   # closure_reason -> completed | closed_unverified
 }
 
 
-scan_query="SELECT run_id || '|' || task_id || '|' || pane_id || '|' || pane_birth || '|' || worktree || '|' || label || '|' || trunk
-            || '|' || repo || '|' || review_pr_repo || '|' || review_pr_number
+scan_query="SELECT json_object('run_id',run_id,'task_id',task_id,'pane',pane_id,'pane_birth',pane_birth,
+            'worktree',worktree,'label',label,'trunk',trunk,'repo',repo,
+            'review_pr_repo',review_pr_repo,'review_pr_number',review_pr_number)
             FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;"
 scan_rows=$(_sql "$scan_query") || {
   echo "close-done-workers: registry scan failed — refusing" >&2
@@ -727,8 +728,21 @@ scan_rows=$(_sql "$scan_query") || {
 }
 
 closable=0; held=0; refused=0; pane_close_failed=0
-while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
-  [ -n "$pane" ] || continue
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  run_id=$(printf '%s' "$row" | jq -er '.run_id | strings') \
+    && task_id=$(printf '%s' "$row" | jq -er '.task_id | strings') \
+    && pane=$(printf '%s' "$row" | jq -er '.pane | strings') \
+    && pane_birth=$(printf '%s' "$row" | jq -r '.pane_birth // ""') \
+    && wt=$(printf '%s' "$row" | jq -er '.worktree | strings') \
+    && label=$(printf '%s' "$row" | jq -er '.label | strings') \
+    && trunk=$(printf '%s' "$row" | jq -r '.trunk // ""') \
+    && repo=$(printf '%s' "$row" | jq -er '.repo | strings') \
+    && review_pr_repo=$(printf '%s' "$row" | jq -r '.review_pr_repo // ""') \
+    && review_pr_number=$(printf '%s' "$row" | jq -r '.review_pr_number // ""') || {
+      echo "close-done-workers: malformed registry row — refusing" >&2
+      exit 1
+    }
   dpr_tuple=""; dpr_detail=""; _DPR_VIA=""
   if [ "$panes_ok" != 1 ]; then
     reason="herdr pane list is unavailable or unparseable; status cannot be verified"
@@ -854,21 +868,42 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
   [ "$apply" = 1 ] || continue
 
-  # Re-run every safety check from a fresh pane/git snapshot immediately
-  # before the irreversible transition. This closes the dry→apply window and
-  # catches work that became active or dirty while an earlier row was scanned.
-  recheck_args=("--task=$task_id")
-  [ "$include_lost" = 0 ] || recheck_args+=(--include-lost)
-  [ -z "$closure_reason" ] || recheck_args+=("--reason=$closure_reason")
-  [ -z "$superseded_by" ] || recheck_args+=("--superseded-by=$superseded_by")
-  recheck_rc=0
-  recheck_out=$(bash "$0" "${recheck_args[@]}" 2>&1) || recheck_rc=$?
-  recheck_close_count=$(printf '%s\n' "$recheck_out" | grep -Ec '^[[:space:]]*close[[:space:]]')
-  if [ "$recheck_rc" -ne 0 ] || [ "$recheck_close_count" -ne 1 ] \
-    || printf '%s\n' "$recheck_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]'; then
+  # Branch worktrees get a complete fresh dry check immediately before the
+  # irreversible transition. Detached checks may archive ignored artifacts
+  # during apply, so rerunning their pre-archive dry path would reject the
+  # archive it just created; refresh pane identity and authority evidence
+  # directly instead.
+  recheck_reason=""
+  if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    recheck_args=("--task=$task_id")
+    [ "$include_lost" = 0 ] || recheck_args+=(--include-lost)
+    [ -z "$closure_reason" ] || recheck_args+=("--reason=$closure_reason")
+    [ -z "$superseded_by" ] || recheck_args+=("--superseded-by=$superseded_by")
+    recheck_rc=0
+    recheck_out=$(bash "$0" "${recheck_args[@]}" 2>&1) || recheck_rc=$?
+    recheck_close_count=$(printf '%s\n' "$recheck_out" | grep -Ec '^[[:space:]]*close[[:space:]]')
+    if [ "$recheck_rc" -ne 0 ] || [ "$recheck_close_count" -ne 1 ] \
+      || printf '%s\n' "$recheck_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]'; then
+      recheck_reason="safety state changed before apply"
+    fi
+  else
+    refresh_panes
+    fresh_st=$(pane_status "$pane")
+    fresh_birth=$(pane_live_birth "$pane")
+    case "$fresh_st" in
+      absent) ;;
+      idle|done)
+        [ -n "$fresh_birth" ] && [ -n "$pane_birth" ] && [ "$fresh_birth" = "$pane_birth" ] \
+          || recheck_reason="pane identity changed before apply"
+        ;;
+      *) recheck_reason="pane status changed before apply ($fresh_st)" ;;
+    esac
+    [ -n "$recheck_reason" ] || recheck_reason="$(_evidence_hold_reason "$task_id" "$run_id")"
+  fi
+  if [ -n "$recheck_reason" ]; then
     closable=$((closable-1))
     held=$((held+1))
-    printf '  HOLD   %-8s %-46s safety state changed before apply; left running\n' "$pane" "$label"
+    printf '  HOLD   %-8s %-46s %s; left running\n' "$pane" "$label" "$recheck_reason"
     continue
   fi
 

@@ -71,7 +71,7 @@ else
   scope="conductor_pane_id=$(_sq "$conductor")"
 fi
 
-query="SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
+query="SELECT json_object('task_id',task_id,'pane',pane_id,'conductor',conductor_pane_id,'worktree',worktree,'label',label)
        FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;"
 rows=$(_sql "$query") || {
   echo "conductor-exit: registry query failed" >&2
@@ -79,8 +79,16 @@ rows=$(_sql "$query") || {
 }
 
 closable=0; held=0; apply_failed=0
-while IFS='|' read -r task_id pane cpane wt label; do
-  [ -n "$task_id" ] || continue
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  task_id=$(printf '%s' "$row" | jq -er '.task_id | strings') \
+    && pane=$(printf '%s' "$row" | jq -er '.pane | strings') \
+    && cpane=$(printf '%s' "$row" | jq -r '.conductor // ""') \
+    && wt=$(printf '%s' "$row" | jq -er '.worktree | strings') \
+    && label=$(printf '%s' "$row" | jq -er '.label | strings') || {
+      echo "conductor-exit: malformed registry row — refusing" >&2
+      exit 3
+    }
   # --orphans: only tasks whose conductor pane no longer exists.
   if [ "$orphans" = 1 ] && is_live "$cpane"; then continue; fi
   why=""; proof=""

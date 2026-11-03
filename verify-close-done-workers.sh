@@ -469,7 +469,7 @@ _v_reg() {
 # (terminal_id "birth<pane_id>", matching the pane_birth passed to
 # register_task above) -- restored to the plain stub at the end of this
 # section, same save/override/restore pattern as F2 above.
-V_PANES=(pV1 pV1b pV2 pV2b pV2c pV2d pV3a pV3b pV4 pV5 pV5b pV5c pV6 pV7)
+V_PANES=(pV1 pV1b pV2 pV2b pV2c pV2d pV3a pV3b pV4 pV5 pV5b pV5c pV6 pV7 pVPipe)
 V_PANES_JSON=$(printf '%s\n' "${V_PANES[@]}" | jq -R '{pane_id: ., agent_status: "idle", terminal_id: ("birth" + .)}' | jq -s .)
 V_BASE_PANES_JSON='[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"}]'
 V_ALL_PANES_JSON=$(jq -c -n --argjson a "$V_BASE_PANES_JSON" --argjson b "$V_PANES_JSON" '{result:{panes: ($a+$b)}}')
@@ -607,6 +607,18 @@ _v_reg runV7 taskV7 pV7 "$V_SHARED" "$V_SHARED" "V7"
 out=$(bash "$here/close-done-workers.sh" --task=taskV7 2>&1)
 printf '%s' "$out" | grep -q '^  close  pV7' && ok "V7: wt=repo row is not held for its own real-directory venv" || bad "V7 output: $out"
 
+printf -- '-- J1: JSON registry rows preserve delimiter characters in paths and labels --\n'
+wtVPipe="$V_TMP/wt|pipe"
+git -C "$V_SHARED" worktree add -q -b case-pipe "$wtVPipe" main >/dev/null
+git -C "$wtVPipe" branch --set-upstream-to=origin/main case-pipe >/dev/null
+mkdir -p "$wtVPipe/.handoffs"
+printf '*\n' > "$wtVPipe/.handoffs/.gitignore"
+printf 'unique\n' > "$wtVPipe/dirty|file.txt"
+_v_reg runVPipe taskVPipe pVPipe "$V_SHARED" "$wtVPipe" "pipe|label"
+out=$(bash "$here/close-done-workers.sh" --task=taskVPipe 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*pipe|label.*1 uncommitted file(s)' \
+  && ok "J1: delimiter path checks the registered dirty worktree" || bad "J1 output: $out"
+
 printf -- '-- G1: git status failure -> HOLD, never assumed clean --\n'
 export FAIL_GIT_WT="$wtV6"
 git() {
@@ -666,7 +678,7 @@ out=$(bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task=ta
 rc=$?
 [ "$rc" -ne 0 ] && ok "fresh pre-apply recheck refuses a pane that became working" || bad "working race returned success"
 check "working race leaves task running" "$(read_task runRace taskRace | jq -r .state)" "running"
-printf '%s' "$out" | grep -q 'safety state changed before apply' \
+printf '%s' "$out" | grep -q 'pane status changed before apply' \
   && ok "working race is explicit" || bad "working race output: $out"
 rm -f "$RACE_COUNT"
 

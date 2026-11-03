@@ -14,12 +14,19 @@ bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 
 CALLS=$(mktemp); export CALLS
+CLOSED_PANES=$(mktemp); export CLOSED_PANES
 # Live panes: the conductor COND and workers p1..p4. The orphan's conductor
-# (GONE) is deliberately absent.
+# (GONE) is deliberately absent. Successful close removes that pane from the
+# next authoritative list, so the postcondition is real.
 herdr() {
   printf '%s\n' "$*" >> "$CALLS"
   case "$1 $2" in
-    "pane list") printf '{"result":{"panes":[{"pane_id":"COND","agent_status":"working","terminal_id":"bC"},{"pane_id":"p1","agent_status":"idle","terminal_id":"b1"},{"pane_id":"p2","agent_status":"idle","terminal_id":"b2"},{"pane_id":"p3","agent_status":"idle","terminal_id":"b3"},{"pane_id":"p4","agent_status":"idle","terminal_id":"b4"}]}}\n' ;;
+    "pane list")
+      closed=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$CLOSED_PANES")
+      jq -nc --argjson closed "$closed" \
+        '{result:{panes:[{pane_id:"COND",agent_status:"working",terminal_id:"bC"},{pane_id:"p1",agent_status:"idle",terminal_id:"b1"},{pane_id:"p2",agent_status:"idle",terminal_id:"b2"},{pane_id:"p3",agent_status:"idle",terminal_id:"b3"},{pane_id:"p4",agent_status:"idle",terminal_id:"b4"}] | map(select(.pane_id as $p | ($closed | index($p) | not)))}}'
+      ;;
+    "pane close") printf '%s\n' "$3" >> "$CLOSED_PANES" ;;
     *) printf '{}\n' ;;
   esac
 }
