@@ -46,6 +46,8 @@ HERDR_PANE_ID='not a pane' bash "$here/factory-cleanup.sh" --shift >/dev/null 2>
 [ "$?" = 2 ] && ok 'invalid pane identity refuses' || bad 'invalid pane identity accepted'
 bash "$here/factory-cleanup.sh" --day --conductor=w1:p2 >/dev/null 2>&1
 [ "$?" = 2 ] && ok 'day plus explicit conductor refuses' || bad 'day silently broadened explicit conductor'
+bash "$here/factory-cleanup.sh" --shift --conductor=w1:p2 --conductor=w2:p3 >/dev/null 2>&1
+[ "$?" = 2 ] && ok 'repeated conductor selectors refuse' || bad 'last conductor selector silently won'
 : > "$calls"
 bash "$here/factory-cleanup.sh" --shift --day --apply >/dev/null 2>&1
 [ "$?" = 2 ] && ok 'multiple cadence selectors refuse' || bad 'last cadence selector widened apply scope'

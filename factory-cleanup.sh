@@ -39,7 +39,7 @@ for arg in "$@"; do
     --week) cadence=week; cadence_explicit=$((cadence_explicit+1)) ;;
     --apply) apply=1 ;;
     --summary) summary=1 ;;
-    --conductor=*) conductor=${arg#--conductor=}; conductor_explicit=1 ;;
+    --conductor=*) conductor=${arg#--conductor=}; conductor_explicit=$((conductor_explicit+1)) ;;
     -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'factory-cleanup: unknown flag %s\n' "$arg" >&2; exit 2 ;;
   esac
@@ -48,6 +48,11 @@ done
   echo "factory-cleanup: cadence selectors are mutually exclusive" >&2
   exit 2
 }
+[ "$conductor_explicit" -le 1 ] || {
+  echo "factory-cleanup: conductor selectors are mutually exclusive" >&2
+  exit 2
+}
+
 
 
 case "$cadence" in

@@ -40,7 +40,7 @@ for a in "$@"; do
     --summary) summary=1 ;;
     --all) all=1 ;;
     --orphans) orphans=1 ;;
-    --conductor=*) conductor="${a#--conductor=}"; conductor_explicit=1 ;;
+    --conductor=*) conductor="${a#--conductor=}"; conductor_explicit=$((conductor_explicit+1)) ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'conductor-exit: unknown flag %s\n' "$a" >&2; exit 2 ;;
   esac
@@ -52,7 +52,12 @@ scope_count=$((all + orphans + conductor_explicit))
   exit 2
 }
 
-live_panes=$(herdr pane list 2>/dev/null | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)
+pane_list_rc=0
+pane_list_json=$(herdr pane list 2>/dev/null) || pane_list_rc=$?
+live_panes=""
+if [ "$pane_list_rc" -eq 0 ]; then
+  live_panes=$(printf '%s' "$pane_list_json" | jq -er '(.result.panes // .panes) | if type == "array" then .[]?.pane_id else error("panes is not an array") end' 2>/dev/null) || live_panes=""
+fi
 is_live() { printf '%s\n' "$live_panes" | grep -qxF "$1"; }
 
 if [ "$all" = 1 ]; then
@@ -121,9 +126,10 @@ while IFS='|' read -r task_id pane cpane wt label; do
   close_out=$(bash "$CLOSE_DONE_SH" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1) || close_rc=$?
   printf '%s\n' "$close_out" \
     | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
-  if [ "$close_rc" -ne 0 ]; then
+  if [ "$close_rc" -ne 0 ] || printf '%s\n' "$close_out" | grep -Eq '^[[:space:]]*(HOLD|REFUSED)[[:space:]]' \
+    || ! printf '%s\n' "$close_out" | grep -q '^closed 1, held back 0, refused 0, pane-close failed 0$'; then
     apply_failed=$((apply_failed+1))
-    printf '    close-done-workers: failed with exit %d\n' "$close_rc" >&2
+    printf '    close-done-workers: apply did not close exactly one task (exit %d)\n' "$close_rc" >&2
   fi
 done <<<"$rows"
 

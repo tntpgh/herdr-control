@@ -102,6 +102,8 @@ bash "$here/conductor-exit.sh" --all --orphans >/dev/null 2>&1
 check "conflicting scopes refuse" "$?" "2"
 bash "$here/conductor-exit.sh" --all --conductor=COND >/dev/null 2>&1
 check "--all plus explicit conductor refuses" "$?" "2"
+bash "$here/conductor-exit.sh" --conductor=COND --conductor=GONE >/dev/null 2>&1
+check "repeated conductor selectors refuse" "$?" "2"
 
 printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
 out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
@@ -148,16 +150,16 @@ apply_gate=$(mktemp)
 cat > "$apply_gate" <<'SH'
 #!/usr/bin/env bash
 case " $* " in
-  *' --apply '*) echo "REFUSED p1 merged-work simulated apply race"; exit 7 ;;
+  *' --apply '*) echo "HOLD p1 merged-work simulated apply race"; echo "closed 0, held back 1, refused 0, pane-close failed 0"; exit 0 ;;
   *) echo "close p1 merged-work" ;;
 esac
 SH
 chmod +x "$apply_gate"
 HERDR_CONDUCTOR_EXIT_TEST_MODE=1 HERDR_CLOSE_DONE_SH="$apply_gate" \
   bash "$here/conductor-exit.sh" --conductor=COND --apply >/tmp/conductor-apply-failure.out 2>&1
-check "apply-time close failure returns nonzero" "$?" "4"
-grep -q 'failed with exit 7' /tmp/conductor-apply-failure.out \
-  && ok "apply-time failure reaches the operator" || bad "apply-time failure was hidden"
+check "apply-time HOLD returns nonzero" "$?" "4"
+grep -q 'apply did not close exactly one task' /tmp/conductor-apply-failure.out \
+  && ok "apply-time HOLD reaches the operator" || bad "apply-time HOLD was hidden"
 check "failed apply leaves task running" "$(state t_merged)" "running"
 rm -f "$apply_gate" /tmp/conductor-apply-failure.out
 

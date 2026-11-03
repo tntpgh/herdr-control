@@ -593,9 +593,54 @@ _v_reg runV7 taskV7 pV7 "$V_SHARED" "$V_SHARED" "V7"
 out=$(bash "$here/close-done-workers.sh" --task=taskV7 2>&1)
 printf '%s' "$out" | grep -q '^  close  pV7' && ok "V7: wt=repo row is not held for its own real-directory venv" || bad "V7 output: $out"
 
+printf -- '-- G1: git status failure -> HOLD, never assumed clean --\n'
+export FAIL_GIT_WT="$wtV6"
+git() {
+  if [ "$1" = -C ] && [ "$2" = "$FAIL_GIT_WT" ] && [ "$3" = status ]; then return 9; fi
+  command git "$@"
+}
+export -f git
+out=$(bash "$here/close-done-workers.sh" --task=taskV6 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*worktree status could not be read' \
+  && ok "G1: failed git status HOLDs" || bad "G1 output: $out"
+
+printf -- '-- G2: upstream rev-list failure -> HOLD, never assumed pushed --\n'
+git() {
+  if [ "$1" = -C ] && [ "$2" = "$FAIL_GIT_WT" ] && [ "$3" = rev-list ]; then return 9; fi
+  command git "$@"
+}
+export -f git
+out=$(bash "$here/close-done-workers.sh" --task=taskV6 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*unpushed commits.*could not be checked' \
+  && ok "G2: failed upstream rev-list HOLDs" || bad "G2 output: $out"
+unset -f git
+unset FAIL_GIT_WT
+
 eval "$old_herdr_fn_v"
 export -f herdr
 unset -f make_fake_bashlex_venv _v_mk_root _v_wt _v_reg
+
+printf '\n== failed authoritative inputs never become successful empty/clean scans ==\n'
+register_task runFail taskFail w c cp cb pFail birthFail /repo/fail /does/not/exist "fail-inputs" || bad "register taskFail"
+set_task_state runFail taskFail running || bad "taskFail -> running"
+herdr() {
+  case "$1 $2" in
+    "pane list") printf '{"result":{"panes":[{"pane_id":"pFail","agent_status":"idle","terminal_id":"birthFail"}]}}\n'; return 7 ;;
+    *) return 7 ;;
+  esac
+}
+export -f herdr
+out=$(bash "$here/close-done-workers.sh" --task=taskFail 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*pane list is unavailable' \
+  && ok "parseable stdout from failed pane query HOLDs" || bad "failed pane query authorized: $out"
+
+bad_state=$(mktemp)
+out=$(HERDR_RUN_STATE_DIR="$bad_state" bash "$here/close-done-workers.sh" --task=taskFail 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "registry scan failure returns nonzero" || bad "registry scan failure returned success"
+printf '%s' "$out" | grep -Eq 'registry (scan|scope query) failed' \
+  && ok "registry failure is explicit" || bad "registry failure output: $out"
+rm -f "$bad_state"
 
 
 printf '\n%s\n' "-----"

@@ -152,12 +152,20 @@ if [ "$apply" = 1 ] && case "$closure_reason" in shipped|abandoned|superseded) t
   # get applied while the main scan processes a DIFFERENT row first —
   # refuse outright rather than guess which one the proof is actually
   # evidence for.
-  match_count=$(_sql "SELECT count(*) FROM tasks WHERE state IN ($states)$states_filter;" 2>/dev/null)
-  if [ "${match_count:-0}" -gt 1 ]; then
-    printf 'close-done-workers: --reason=%s matches %s tasks for this scope — refusing (one proof cannot cover more than one task; use --task=<id> to disambiguate)\n' "$closure_reason" "$match_count" >&2
+  match_count=$(_sql "SELECT count(*) FROM tasks WHERE state IN ($states)$states_filter;" 2>/dev/null) || {
+    echo "close-done-workers: registry scope query failed — refusing" >&2
     exit 1
-  fi
-  proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
+  }
+  case "$match_count" in
+    1) ;;
+    0) printf 'close-done-workers: --reason=%s matches no task for this scope — refusing\n' "$closure_reason" >&2; exit 1 ;;
+    *[!0-9]*|'') echo "close-done-workers: registry scope count is invalid — refusing" >&2; exit 1 ;;
+    *) printf 'close-done-workers: --reason=%s matches %s tasks for this scope — refusing (one proof cannot cover more than one task; use --task=<id> to disambiguate)\n' "$closure_reason" "$match_count" >&2; exit 1 ;;
+  esac
+  proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null) || {
+    echo "close-done-workers: registry proof-worktree query failed — refusing" >&2
+    exit 1
+  }
   # `superseded`'s proof requirement depends on which of its two paths
   # this one scoped row actually takes. With no --superseded-by at all,
   # ONLY the older, CLOSED-unmerged `superseded` disposition is even
@@ -184,16 +192,15 @@ if [ "$apply" = 1 ] && case "$closure_reason" in shipped|abandoned|superseded) t
   fi
 fi
 
-panes_json=$(herdr pane list 2>/dev/null)
-# F2 (security review round 2, 2026-10-04): `herdr pane list` failing (empty
-# output, or any shape jq cannot walk) used to make every status query
-# return "" from jq's own stderr-only failure, which matched none of the
-# case arms below and fell through to CLOSABLE -- the exact opposite of
-# "fail closed" for a check that exists to gate on whether a pane is still
-# being used. Validate the shape ONCE, and every row holds, not passes,
-# when it cannot be verified at all.
+panes_rc=0
+panes_json=$(herdr pane list 2>/dev/null) || panes_rc=$?
+# F2 (security review round 2, 2026-10-04): command failure, empty output,
+# or any shape jq cannot walk holds every row. Parseable partial stdout from
+# a failed command is not authoritative.
 panes_ok=0
-printf '%s' "$panes_json" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1 && panes_ok=1
+if [ "$panes_rc" -eq 0 ]; then
+  printf '%s' "$panes_json" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1 && panes_ok=1
+fi
 pane_status() {
   [ "$panes_ok" = 1 ] || { printf 'unknown'; return; }
   printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'
@@ -711,6 +718,14 @@ _closure_target_state() {   # closure_reason -> completed | closed_unverified
 }
 
 
+scan_query="SELECT run_id || '|' || task_id || '|' || pane_id || '|' || pane_birth || '|' || worktree || '|' || label || '|' || trunk
+            || '|' || repo || '|' || review_pr_repo || '|' || review_pr_number
+            FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;"
+scan_rows=$(_sql "$scan_query") || {
+  echo "close-done-workers: registry scan failed — refusing" >&2
+  exit 1
+}
+
 closable=0; held=0; refused=0; pane_close_failed=0
 while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
   [ -n "$pane" ] || continue
@@ -745,31 +760,27 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   fi
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
-      br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
-      porcelain=$(git -C "$wt" status --porcelain 2>/dev/null)
-      if [ "$wt" != "$repo" ]; then
+      br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || reason="branch name could not be read"
+      if [ -z "$reason" ]; then
+        porcelain=$(git -C "$wt" status --porcelain 2>/dev/null) || reason="worktree status could not be read"
+      fi
+      if [ -z "$reason" ] && [ "$wt" != "$repo" ]; then
         venv_state=$(worktree_bashlex_venv_state "$wt" "$repo")
         case "$venv_state" in
           provisioned) porcelain=$(printf '%s\n' "$porcelain" | grep -vxF '?? .venv-bashlex') ;;
           foreign:*) reason=".venv-bashlex is not the spawn-provisioned link (${venv_state#foreign:})" ;;
         esac
       fi
-      dirty=$(printf '%s\n' "$porcelain" | grep -c .)
-      up=$(git -C "$wt" for-each-ref --format='%(upstream:short)' "refs/heads/$br" 2>/dev/null)
+      if [ -z "$reason" ]; then
+        dirty=$(printf '%s\n' "$porcelain" | grep -c .)
+        up=$(git -C "$wt" for-each-ref --format='%(upstream:short)' "refs/heads/$br" 2>/dev/null) \
+          || reason="branch upstream could not be read"
+      fi
       [ -z "$reason" ] && [ "${dirty:-0}" != 0 ] && reason="$dirty uncommitted file(s)"
       if [ -z "$reason" ]; then
         if [ -z "$up" ]; then
-          # No upstream is only a risk when the branch holds commits no remote
-          # has. A review/probe branch created on an already-pushed commit has
-          # none — holding it made the conductor close such panes by hand, and
-          # every one landed in the registry as `lost` (2026-09-28). A
-          # research task's branch (git: none) is never pushed at all, so
-          # `--remotes` alone is the wrong bar for it: also exclude whatever
-          # the task's own recorded trunk resolves to (local or
-          # remote-tracking) -- a branch still sitting on its base has
-          # nothing any remote could lose, pushed or not. Without this, every
-          # finished research task held forever since none ever push
-          # (2026-10-02, caught by remote-mcp/verify-tasks-e2e.py).
+          # With no upstream, exclude every remote plus the task's recorded
+          # trunk. A branch on its base is recoverable; a unique commit HOLDS.
           excl=(--remotes)
           if [ -n "$trunk" ]; then
             if git -C "$wt" show-ref --verify -q "refs/remotes/origin/$trunk"; then
@@ -778,15 +789,25 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
               excl+=("refs/heads/$trunk")
             fi
           fi
-          only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not "${excl[@]}" 2>/dev/null)
-          case "$only_here" in
-            0) ;;
-            ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
-            *) reason="branch $br has no upstream ($only_here commit(s) exist only here)" ;;
-          esac
+          only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not "${excl[@]}" 2>/dev/null) \
+            || reason="branch $br has no upstream and its commits cannot be checked against the remotes"
+          if [ -z "$reason" ]; then
+            case "$only_here" in
+              0) ;;
+              ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
+              *) reason="branch $br has no upstream ($only_here commit(s) exist only here)" ;;
+            esac
+          fi
         else
-          un=$(git -C "$wt" rev-list --count "$up..$br" 2>/dev/null)
-          [ "${un:-0}" != 0 ] && reason="$un unpushed commit(s) on $br"
+          un=$(git -C "$wt" rev-list --count "$up..$br" 2>/dev/null) \
+            || reason="unpushed commits on $br could not be checked"
+          if [ -z "$reason" ]; then
+            case "$un" in
+              0) ;;
+              ''|*[!0-9]*) reason="unpushed commits on $br could not be checked" ;;
+              *) reason="$un unpushed commit(s) on $br" ;;
+            esac
+          fi
         fi
       fi
     else
@@ -874,9 +895,7 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
       printf '  WARN   %-8s %-46s registry settled completed, but herdr pane close FAILED — pane may still be live; close it by hand\n' "$pane" "$label"
     fi
   fi
-done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || pane_birth || '|' || worktree || '|' || label || '|' || trunk
-               || '|' || repo || '|' || review_pr_repo || '|' || review_pr_number
-               FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
+done <<<"$scan_rows"
 
 echo
 if [ "$apply" = 1 ]; then
