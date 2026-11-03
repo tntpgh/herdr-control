@@ -121,9 +121,9 @@ bash "$here/close-done-workers.sh" --apply --reason=no-follow-on >/tmp/cdw-out4-
 rc=$?
 [ "$rc" -eq 0 ] && ok "apply with a valid reason exits 0" || bad "exit $rc: $(cat /tmp/cdw-out4-$$.log)"
 grep -q "^pane close$" "$CALLS" && ok "herdr pane close was called" || bad "no pane close RPC: $(cat "$CALLS")"
-check "task marked completed" "$(read_task run1 task1 | jq -r .state)" "completed"
-check "reason recorded on the state_changed event" \
-  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.reason') FROM events WHERE task_id='task1' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+check "task marked closed_unverified (no-follow-on is an unverified closure, not completed)" "$(read_task run1 task1 | jq -r .state)" "closed_unverified"
+check "reason recorded on the session_closed event" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.reason') FROM events WHERE task_id='task1' AND type='session_closed';")" \
   "no-follow-on"
 
 printf '== --reason=shipped with NO --pane/--task: refused (one proof cannot cover a whole batch) ==\n'
