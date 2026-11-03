@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -78,7 +79,10 @@ def read_confirmation(form_id: str, label: str, new_lifecycle_end_at: float,
     if answers.get("label") != label:
         return "form_label_mismatch"
     try:
-        if abs(float(answers.get("new_lifecycle_end_at")) - new_lifecycle_end_at) > 1.0:
+        approved_bound = float(answers.get("new_lifecycle_end_at"))
+        if (not math.isfinite(approved_bound)
+                or not math.isfinite(new_lifecycle_end_at)
+                or abs(approved_bound - new_lifecycle_end_at) > 1.0):
             return "form_bound_mismatch"
     except (TypeError, ValueError):
         return "form_bound_mismatch"
