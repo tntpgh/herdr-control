@@ -498,12 +498,17 @@ check "policy verdict retained" "$(q policy_verdict)" "allow"
 printf '== prune only touches OLD terminal tasks ==\n'
 register_task run2 taskOld w c cp cb paneOld birthOld /repo/o /wt/o "old" || bad "register taskOld failed"
 set_task_state run2 taskOld failed || bad "-> failed refused"
-# Backdate it past the retention window.
-sqlite3 "$(registry_db)" "UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE task_id='taskOld';"
+register_task run2 taskOldUnverified w c cp cb paneOldU birthOldU /repo/ou /wt/ou "old-unverified" \
+  || bad "register taskOldUnverified failed"
+set_task_state run2 taskOldUnverified closed_unverified no-follow-on \
+  || bad "-> closed_unverified refused"
+# Backdate both terminal states past the retention window.
+sqlite3 "$(registry_db)" "UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE task_id IN ('taskOld','taskOldUnverified');"
 prune_completed_tasks 14 || bad "prune returned non-zero"
-check "old terminal task pruned"      "$(read_task run2 taskOld)" ""
-check "recent completed task KEPT"    "$(read_task run1 task1 | jq -r .task_id)" "task1"
-check "non-terminal task KEPT"        "$(read_task run1 taskEvil | jq -r .state)" "starting"
+check "old verified terminal task pruned"   "$(read_task run2 taskOld)" ""
+check "old unverified terminal task pruned" "$(read_task run2 taskOldUnverified)" ""
+check "recent terminal task KEPT"           "$(read_task run1 task1 | jq -r .task_id)" "task1"
+check "non-terminal task KEPT"              "$(read_task run1 taskEvil | jq -r .state)" "starting"
 if prune_completed_tasks abc 2>/dev/null; then bad "prune accepted a non-integer"; else ok "prune rejects a non-integer day count"; fi
 
 printf '== #3b ownership grant: branch/trunk stored and read back; empty by default ==\n'

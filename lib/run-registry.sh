@@ -2380,12 +2380,12 @@ all_tasks_json() {
 # belong to them. Nothing else prunes, so this is the only thing keeping the
 # registry from growing forever on a long-lived host.
 #
-# Deliberately narrow, unchanged from the file-layout version: only the true
-# TERMINAL states (completed/failed/cancelled/lost) are eligible —
-# starting/running/blocked are left alone, and `blocked` in particular can
-# still resolve, it is not a dead end. Date arithmetic is SQLite's own
-# (julianday), which removes the BSD-vs-GNU `date -v`/`date -d` fallback pair
-# the old implementation needed.
+# Deliberately narrow: only terminal states are eligible. `closed_unverified`
+# is terminal even though it is not completion evidence; retaining it forever
+# would leak every no-follow-on/session-closed row. starting/running/blocked
+# are left alone, and `blocked` in particular can still resolve.
+# Date arithmetic is SQLite's own (julianday), avoiding BSD/GNU `date`
+# differences.
 prune_completed_tasks() {               # max_age_days
   local days="$1"
   registry_init || return 1
@@ -2393,10 +2393,10 @@ prune_completed_tasks() {               # max_age_days
   _sql "BEGIN IMMEDIATE;
     DELETE FROM events WHERE task_id IN (
       SELECT task_id FROM tasks
-       WHERE state IN ('completed','failed','cancelled','lost')
+       WHERE state IN ('completed','closed_unverified','failed','cancelled','lost')
          AND julianday(updated_at) < julianday('now', '-${days} days'));
     DELETE FROM tasks
-     WHERE state IN ('completed','failed','cancelled','lost')
+     WHERE state IN ('completed','closed_unverified','failed','cancelled','lost')
        AND julianday(updated_at) < julianday('now', '-${days} days');
     COMMIT;" >/dev/null 2>&1
 }

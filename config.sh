@@ -11,7 +11,7 @@
 # smart-name.sh's SMART_NAME_BACKEND default.
 : "${HERDR_DEFAULT_AGENT:=omp}"
 HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-11-03-s4-v27d/omp"
-HERDR_OMP_LAUNCHER_SHA256="8e201dc0ad3a510a799c55ddf859603841fe2e1cf787ebd0ed4c4876125ea242"
+HERDR_OMP_LAUNCHER_SHA256="3b4765d505e5a33b20980d17cdf8a8eeaf9e0c35228a1ab2875f436ec623b36b"
 # The deployed app directory the bound omp launcher above trusts as its own
 # control tree (every release's wrapper hardcodes this as `$control`, and
 # literal-compares every --config argument against `$control/agent-hooks/
