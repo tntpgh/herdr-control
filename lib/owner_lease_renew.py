@@ -95,7 +95,9 @@ def renew_due(conn, label: str, registry_identity: tuple[str, str, str] | None, 
     cur = ol._live(conn, label, now)
     if not cur:
         return "no_live_lease"
-    lease_id, pane, birth, gen, _renewed, expires_at, sess = cur
+    lease_id, pane, birth, gen, _renewed, expires_at, sess, mode = cur
+    if mode == "assignment":
+        return "not_timed"  # a durable assignment has no TTL to renew; never touched here
     row = conn.execute("SELECT lifecycle_end_at FROM owner_projects WHERE label=?", (label,)).fetchone()
     end_iso = row[0] if row else None
     if end_iso is None:

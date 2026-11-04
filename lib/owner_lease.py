@@ -52,6 +52,27 @@ Migration / rollback (design; NOT applied to the live registry by this file)
   here ever drops a table. Applying v1 live is a separate approval with a
   registry backup first.
 
+
+Durable assignments (Plan 018 PR A, inert)
+  v6 adds a SECOND authority_mode ('assignment') to owner_leases, sharing
+  the same table, the same one-unreleased-row-per-label partial unique
+  index, and the same label-local-monotonic generation as 'timed' leases.
+  An assignment's expires_at is always NULL and is NEVER read by any TTL
+  check: _live()'s own query treats it as live regardless of `now`. Only
+  assign_initial(), assign_replace(), assign_revoke() and assign_settle()
+  ever create, replace, release or settle one -- acquire()/claim_initial()/
+  claim_successor() (the timed-only legacy path) refuse outright rather
+  than implicitly converting or taking over an active assignment.
+  release() and unregister_owner() refuse an active assignment too
+  (AssignmentActive): it ends only via assign_revoke()/assign_replace().
+  Re-assignment after a revoke is a separate explicit operation
+  (assign_replace(after_revoke=True), fresh decision_ref); a plain replace
+  never resurrects a revoked label. holder_tuple() -- the shared holder
+  boundary used by dispatch, grant issuance, result submit/accept, publisher
+  and factory-status -- is timed-only by default, so those consumers read an
+  assignment as no holder (fail closed, before any grant is consumed) until
+  PR B routes them by authority_mode via holder_tuple(modes=AUTHORITY_MODES).
+
 Policy
   An owner's queue bound is its registered max_open (1..MAX_OPEN_LIMIT); a
   caller can never pass a larger one. Pane ids, births, request ids and TTLs
@@ -72,7 +93,7 @@ from datetime import datetime, timezone
 
 import private_sqlite
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_MAX_OPEN = 5
 MAX_OPEN_LIMIT = 50
 MAX_TTL_S = 86_400
@@ -141,6 +162,13 @@ class Unauthorized(Exception):
     label's current live lease (R13-BOUNDS.md)."""
 
 
+class AssignmentActive(Exception):
+    """release()/unregister_owner() refused: the label's current authority is
+    a durable assignment. An assignment ends only through the audited
+    assign_revoke()/assign_replace() APIs (decision_ref + reason recorded);
+    the holder pane or an unregister token alone can never drop it."""
+
+
 class AlreadyUnregistered(Exception):
     """register_owner() refused: the (label, project) row already exists
     and is unregistered (unregistered_at set) -- r15/F2: a plain
@@ -161,6 +189,42 @@ class SchemaMigrationRequired(Exception):
     def __init__(self, cur: int, target: int):
         self.cur, self.target = cur, target
         super().__init__(f"schema at v{cur}, need v{target}")
+
+
+class AssignmentConflict(Exception):
+    """assign_initial() refused: the label already has an unreleased
+    authority row (timed or assignment); initial assignment only applies
+    to a managed label with no current holder."""
+
+
+class ReplaceRefused(Exception):
+    """assign_replace() precondition failed. args[0] is a short machine
+    code (stale_expectation | open_requests | same_holder); args[1] is a
+    human-readable detail."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
+class RevokeRefused(Exception):
+    """assign_revoke() precondition failed. args[0] is a short machine
+    code (stale_expectation | not_assignment_mode); args[1] is a
+    human-readable detail."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
+class SettleRefused(Exception):
+    """assign_settle() precondition failed. args[0] is a short machine code
+    (unknown_request | wrong_generation | not_delivering |
+    generation_still_active); args[1] is a human-readable detail."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
 
 
 def _iso(ts: float) -> str:
@@ -273,6 +337,49 @@ MIGRATIONS = {
     5: [
         "ALTER TABLE owner_projects ADD COLUMN lifecycle_end_at TEXT",
         "ALTER TABLE owner_projects ADD COLUMN unregister_token TEXT",
+    ],
+    # v6 (Plan 018 PR A, inert): durable owner ASSIGNMENTS alongside existing
+    # TIMED leases in the SAME table (plan 4.1: "The first compatibility
+    # release may retain the physical table name owner_leases"). Rebuilt by
+    # copy (SQLite cannot relax expires_at's NOT NULL in place, nor ADD a
+    # column with a CHECK that references another column):
+    #   authority_mode  'timed' (unchanged semantics) | 'assignment'
+    #     (durable; expires_at NULL, never read by any TTL/expiry check).
+    #   project         backfilled from owner_projects for every historical
+    #     row -- assignment ops need it without a second join on every call.
+    #   expires_at      now nullable; the CHECK enforces the exact pairing
+    #     (timed -> NOT NULL, assignment -> NULL) at the engine level, not
+    #     by caller discipline.
+    #   decision_ref/reason  '' for every historical (timed) row; an assignment row
+    #     must carry non-empty, bounded evidence (decision_ref <= 200, reason <= 1000
+    #     chars) and a 64-char session digest -- enforced by the engine too (L3), in
+    #     addition to assign_initial()/assign_replace()/assign_revoke().
+    # Every historical row copies authority_mode='timed' byte-for-byte
+    # otherwise -- nothing becomes durable automatically (SPEC: "Keep
+    # compatibility bounded"). The one-live-row partial unique index is
+    # recreated unchanged: it already enforces "one unreleased authority
+    # per label" for BOTH modes, since it only keys on released_at.
+    6: [
+        """CREATE TABLE owner_leases_v6 (
+             lease_id TEXT PRIMARY KEY, label TEXT NOT NULL REFERENCES owner_projects(label),
+             project TEXT NOT NULL, pane_id TEXT NOT NULL, pane_birth TEXT NOT NULL, generation INTEGER NOT NULL,
+             acquired_at TEXT NOT NULL, renewed_at TEXT NOT NULL, expires_at TEXT,
+             released_at TEXT, release_reason TEXT, session_digest TEXT NOT NULL DEFAULT '',
+             authority_mode TEXT NOT NULL CHECK (authority_mode IN ('timed','assignment')),
+             decision_ref TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+             UNIQUE(label, generation),
+             CHECK ((authority_mode='timed' AND expires_at IS NOT NULL) OR (authority_mode='assignment' AND expires_at IS NULL)),
+             CHECK (authority_mode='timed' OR (decision_ref<>'' AND length(decision_ref)<=200
+                    AND reason<>'' AND length(reason)<=1000 AND length(session_digest)=64)))""",
+        """INSERT INTO owner_leases_v6
+           (lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,
+            released_at,release_reason,session_digest,authority_mode,decision_ref,reason)
+           SELECT l.lease_id,l.label,p.project,l.pane_id,l.pane_birth,l.generation,l.acquired_at,l.renewed_at,
+                  l.expires_at,l.released_at,l.release_reason,l.session_digest,'timed','',''
+           FROM owner_leases l LEFT JOIN owner_projects p ON p.label=l.label""",
+        "DROP TABLE owner_leases",
+        "ALTER TABLE owner_leases_v6 RENAME TO owner_leases",
+        "CREATE UNIQUE INDEX owner_leases_one_live ON owner_leases(label) WHERE released_at IS NULL",
     ],
 }
 
@@ -560,6 +667,9 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
     if row[0] is not None:
         return "already_unregistered"
     cur = _live(conn, label, now)
+    if cur and cur[7] == "assignment":
+        raise AssignmentActive(f"{label}: durable assignment is active; revoke or replace it via the audited "
+                               "assignment API first")
     if cur and (cur[3], cur[1], cur[2]) != (generation, pane_id, pane_birth):
         raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
     open_n = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
@@ -580,6 +690,9 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
         if row2[0] is not None:
             return "already_unregistered"
         cur2 = _live(conn, label, now)
+        if cur2 and cur2[7] == "assignment":
+            raise AssignmentActive(f"{label}: durable assignment is active; revoke or replace it via the audited "
+                                   "assignment API first")
         if cur2 and (cur2[3], cur2[1], cur2[2]) != (generation, pane_id, pane_birth):
             raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
         open_n2 = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
@@ -587,7 +700,7 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
         if open_n2:
             raise OpenRequests(f"{label}: {open_n2} open owner_requests")
         if cur2:
-            lease_id, _pane, _birth, gen, _renewed, _expires, _sess = cur2
+            lease_id, _pane, _birth, gen, _renewed, _expires, _sess, _mode = cur2
             conn.execute("UPDATE owner_leases SET released_at=?, release_reason='unregistered' WHERE lease_id=?",
                          (_iso(now), lease_id))
             _event(conn, now, label, "released", lease_id, gen, "unregistered")
@@ -666,10 +779,13 @@ SESSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _live(conn, label, now):
-    """Current live lease (unreleased, unexpired) or None."""
+    """Current live lease (unreleased) for label. A `timed` row is live
+    only while unexpired; a durable `assignment` row (Plan 018 §1.1 #1) is
+    live regardless of `now` -- wall-clock time never ends it."""
     return conn.execute(
-        "SELECT lease_id, pane_id, pane_birth, generation, renewed_at, expires_at, session_digest FROM owner_leases "
-        "WHERE label=? AND released_at IS NULL AND expires_at > ?", (label, _iso(now))).fetchone()
+        "SELECT lease_id, pane_id, pane_birth, generation, renewed_at, expires_at, session_digest, authority_mode "
+        "FROM owner_leases WHERE label=? AND released_at IS NULL AND (authority_mode='assignment' OR expires_at > ?)",
+        (label, _iso(now))).fetchone()
 
 
 def _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_digest) -> int:
@@ -682,10 +798,11 @@ def _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_dige
         conn.execute("UPDATE owner_leases SET released_at=?, release_reason='expired' WHERE lease_id=?", (_iso(now), old_id))
         _event(conn, now, label, "released", old_id, old_gen, "expired")
     gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
+    project = conn.execute("SELECT project FROM owner_projects WHERE label=?", (label,)).fetchone()[0]
     lease_id = f"ol_{uuid.uuid4().hex}"
-    conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
-                 "session_digest) VALUES (?,?,?,?,?,?,?,?,?)",
-                 (lease_id, label, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
+    conn.execute("INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,"
+                 "expires_at,session_digest,authority_mode) VALUES (?,?,?,?,?,?,?,?,?,?,'timed')",
+                 (lease_id, label, project, pane_id, pane_birth, gen, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
     _event(conn, now, label, "acquired", lease_id, gen, f"{pane_id}@{pane_birth}")
     stale = conn.execute(
         f"SELECT request_id, generation FROM owner_requests WHERE label=? AND generation<? AND state IN ({_q(OPEN)})",
@@ -715,13 +832,21 @@ def acquire(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, now: fl
             raise InvalidOwner(f"{label} is not a registered owner")
         cur = _live(conn, label, now)
         if cur:
-            lease_id, pane, birth, gen, _r, _e, sess = cur
+            lease_id, pane, birth, gen, _r, _e, sess, mode = cur
             if (pane, birth, sess) != (pane_id, pane_birth, session_digest):
                 raise LeaseConflict(f"{label} held by {pane}@{birth} gen {gen}")
+            if mode == "assignment":
+                raise LeaseConflict(f"{label}: active authority is a durable assignment; "
+                                    "acquire() is a timed-only renewal, never an implicit conversion")
             conn.execute("UPDATE owner_leases SET renewed_at=?, expires_at=? WHERE lease_id=?",
                          (_iso(now), _iso(now + ttl_s), lease_id))
             _event(conn, now, label, "renewed", lease_id, gen)
             return gen
+        last = conn.execute("SELECT authority_mode, generation FROM owner_leases WHERE label=? "
+                            "ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+        if last and last[0] == "assignment":
+            raise LeaseConflict(f"{label}: generation {last[1]} is a released durable assignment; acquire() is a "
+                                "timed-only path, re-assignment goes through assign_replace()")
         return _successor_insert(conn, label, pane_id, pane_birth, ttl_s, now, session_digest)
 
     return _tx(conn, body)
@@ -748,10 +873,11 @@ def claim_initial(conn, label: str, pane_id: str, pane_birth: str, ttl_s: int, s
             raise LeaseConflict(f"{label} has prior lease history; initial claim only")
         if conn.execute("SELECT 1 FROM owner_requests WHERE label=? LIMIT 1", (label,)).fetchone():
             raise LeaseConflict(f"{label} has request/recovery history; initial claim only")
+        project = conn.execute("SELECT project FROM owner_projects WHERE label=?", (label,)).fetchone()[0]
         lease_id = f"ol_{uuid.uuid4().hex}"
-        conn.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
-                     "session_digest) VALUES (?,?,?,?,1,?,?,?,?)",
-                     (lease_id, label, pane_id, pane_birth, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
+        conn.execute("INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,"
+                     "expires_at,session_digest,authority_mode) VALUES (?,?,?,?,?,1,?,?,?,?,'timed')",
+                     (lease_id, label, project, pane_id, pane_birth, _iso(now), _iso(now), _iso(now + ttl_s), session_digest))
         _event(conn, now, label, "acquired", lease_id, 1, f"{pane_id}@{pane_birth} initial")
         return 1
 
@@ -801,9 +927,13 @@ def claim_successor(conn, label: str, expected_prev_gen: int, expected_prev_pane
             raise SuccessorRefused("live_predecessor",
                                    f"{label}: predecessor lease is live (unexpired); successor claims are expired-only")
         row = conn.execute(
-            "SELECT pane_id, pane_birth, session_digest, generation FROM owner_leases WHERE label=? "
+            "SELECT pane_id, pane_birth, session_digest, generation, authority_mode FROM owner_leases WHERE label=? "
             "ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
-        prev_pane, prev_birth, prev_sess, prev_gen = row if row else (None, None, None, 0)
+        prev_pane, prev_birth, prev_sess, prev_gen, prev_mode = row if row else (None, None, None, 0, None)
+        if prev_mode == "assignment":
+            raise SuccessorRefused("predecessor_was_assignment",
+                                   f"{label}: generation {prev_gen}'s predecessor is a durable assignment; "
+                                   "claim_successor() is a timed-only legacy path, never a cross-mode takeover")
         if prev_gen != expected_prev_gen:
             raise SuccessorRefused("wrong_prev_generation",
                                    f"{label}: predecessor generation {prev_gen} != expected_prev_gen {expected_prev_gen}")
@@ -823,11 +953,22 @@ def claim_successor(conn, label: str, expected_prev_gen: int, expected_prev_pane
     return _tx(conn, body)
 
 
-def holder_tuple(conn, label, now=None):
+AUTHORITY_MODES = ("timed", "assignment")
+
+
+def holder_tuple(conn, label, now=None, modes=("timed",)):
     """(pane_id, pane_birth, session_digest, generation) of the live lease, or
-    None when there is none or it carries no session digest. Read-only."""
+    None when there is none, it carries no session digest, or its
+    authority_mode is not in `modes`. Read-only.
+
+    `modes` defaults to timed only: every consumer of this shared holder
+    boundary (dispatch, grant issuance, result submit/accept, publisher,
+    factory-status) predates durable assignments and reasons about TTLs, so
+    a durable assignment reads as 'no holder' -- they fail closed BEFORE
+    any grant is consumed -- until PR B routes a consumer by authority_mode
+    by passing modes explicitly (AUTHORITY_MODES for both)."""
     cur = _live(conn, label, time.time() if now is None else now)
-    if not cur or not SESSION_DIGEST_RE.match(cur[6] or ""):
+    if not cur or cur[7] not in modes or not SESSION_DIGEST_RE.match(cur[6] or ""):
         return None
     return (cur[1], cur[2], cur[6], cur[3])
 
@@ -841,7 +982,7 @@ def live_expiry(conn, label, now=None) -> float | None:
     _iso() (fixed %Y-%m-%dT%H:%M:%S.%fZ, UTC), so parsing with the exact
     inverse of that format is safe for every row this module itself wrote."""
     cur = _live(conn, label, time.time() if now is None else now)
-    if not cur:
+    if not cur or cur[5] is None:
         return None
     return datetime.strptime(cur[5], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
 
@@ -867,6 +1008,9 @@ def release(conn, label, generation, pane_id, pane_birth, now=None) -> bool:
 
     def body():
         _fence(conn, label, generation, pane_id, pane_birth, now)
+        if _live(conn, label, now)[7] == "assignment":
+            raise AssignmentActive(f"{label}: durable assignment is active; end it with assign_revoke()/"
+                                   "assign_replace(), not release()")
         conn.execute("UPDATE owner_leases SET released_at=?, release_reason='released' "
                      "WHERE label=? AND generation=? AND released_at IS NULL", (_iso(now), label, generation))
         _event(conn, now, label, "released", "", generation, "voluntary")
@@ -926,12 +1070,14 @@ def transition(conn, request_id, to, label, generation, pane_id, pane_birth, det
 
 
 def observe_stale(conn, live_panes: set, now=None) -> list[dict]:
-    """Unreleased leases whose holder is gone from the live pane set or expired,
-    with the exact identity reap() must CAS on."""
+    """Unreleased TIMED leases whose holder is gone from the live pane set or expired,
+    with the exact identity reap() must CAS on. Durable assignments are never observed
+    here: no age/pane-gone reap of an assignment exists (Plan 018 §1.1 #3)."""
     now = time.time() if now is None else now
     out = []
     for lease_id, label, pane, birth, gen, renewed, expires in conn.execute(
-            "SELECT lease_id,label,pane_id,pane_birth,generation,renewed_at,expires_at FROM owner_leases WHERE released_at IS NULL"):
+            "SELECT lease_id,label,pane_id,pane_birth,generation,renewed_at,expires_at FROM owner_leases "
+            "WHERE released_at IS NULL AND authority_mode='timed'"):
         reason = "expired" if expires <= _iso(now) else ("pane-gone" if (pane, birth) not in live_panes else None)
         if reason:
             out.append({"lease_id": lease_id, "label": label, "pane": pane, "birth": birth, "generation": gen,
@@ -1000,3 +1146,360 @@ def export_backup(conn, dest_path: str) -> str:
     finally:
         dst.close()
     return dest_path
+
+
+# --- Durable owner ASSIGNMENTS (Plan 018 PR A, inert) -----------------------
+#
+# An assignment is authoritative until an explicit revoke or exact-generation
+# replacement; wall-clock time never ends it (authority_mode='assignment',
+# expires_at NULL -- see MIGRATIONS[6] and _live()'s mode-aware query). The
+# existing partial unique index (owner_leases(label) WHERE released_at IS
+# NULL) is the SAME "one unreleased authority per label" enforcement both
+# modes share; generation is label-local-monotonic the same way timed
+# generations already are (MAX(generation)+1 over the label's WHOLE
+# history). Nothing here is called by any delivery/dispatch path yet (PR B).
+
+
+MAX_DECISION_REF = 200   # mirrors the v6 CHECK on assignment rows
+MAX_REASON = 1000
+
+
+def _check_evidence(decision_ref, reason):
+    """Decision evidence for every assignment write: non-empty, bounded text (also enforced
+    by the v6 CHECK on assignment rows, so a raw INSERT cannot skip it)."""
+    if not isinstance(decision_ref, str) or not decision_ref:
+        raise ValueError("decision_ref must be non-empty")
+    if len(decision_ref) > MAX_DECISION_REF:
+        raise ValueError(f"decision_ref must be at most {MAX_DECISION_REF} chars")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be non-empty")
+    if len(reason) > MAX_REASON:
+        raise ValueError(f"reason must be at most {MAX_REASON} chars")
+
+
+def _unreleased(conn, label):
+    """The label's current unreleased authority row (any mode), or None.
+    Unlike _live(), this is never filtered by now/expiry -- it is the exact
+    "An active assignment is an unreleased assignment row" read (Plan 018
+    §1.1 #1), and also the row a TIMED label currently holds whether or not
+    it has expired (reap()/the TTL path decide what to do with THAT; this
+    helper only answers "is there a row nobody has released yet")."""
+    return conn.execute(
+        "SELECT lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
+        "session_digest,authority_mode,decision_ref,reason FROM owner_leases WHERE label=? AND released_at IS NULL",
+        (label,)).fetchone()
+
+
+_ASSIGNMENT_KEYS = ("lease_id", "label", "project", "pane_id", "pane_birth", "generation", "acquired_at",
+                   "renewed_at", "expires_at", "session_digest", "authority_mode", "decision_ref", "reason")
+
+
+def current_assignment(conn, label, now=None) -> dict | None:
+    """show/current (Plan 018 §4.4): the label's current unreleased
+    authority row (any mode) as a dict, or None. Read-only, time-
+    independent -- works on a mode=ro connection and never filters by
+    expiry (a durable assignment has none; a timed lease that has expired
+    but not yet been reaped/released is still THE row until something
+    explicit releases it)."""
+    row = _unreleased(conn, label)
+    return dict(zip(_ASSIGNMENT_KEYS, row)) if row else None
+
+
+def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_digest: str, decision_ref: str,
+                   reason: str, now: float | None = None, dry_run: bool = True):
+    """Initial durable assignment (Plan 018 §4.4 `assign`): generation
+    MAX(all historical generations for label)+1, authority_mode='assignment',
+    expires_at=NULL. Refuses (AssignmentConflict) while the label has ANY
+    unreleased authority row, timed or assignment -- this is the bare
+    "managed but unassigned" -> "assigned" transition (§4.2); replacing an
+    ACTIVE row is assign_replace()'s job, never this one's (no implicit
+    takeover of a live timed lease). Also refuses when the label's LATEST
+    generation is a released assignment (revoked or superseded): returning
+    to a revoked label is assign_replace(after_revoke=True)'s fenced,
+    fresh-evidence path, so assign_initial can never bypass it. A label whose
+    history ends in a released TIMED lease is still a valid initial target.
+
+    Idempotent: re-presenting the EXACT same (pane_id, pane_birth,
+    session_digest, decision_ref, reason) against the label's own just-
+    created active assignment returns its generation again without a
+    second write (Plan 018 §4.4: "Re-presenting the exact active assignment
+    is idempotent"). Any other mismatch while active is AssignmentConflict,
+    never a silent overwrite.
+
+    Dry-run by default (this module's convention: a cheap pre-check runs
+    OUTSIDE the transaction and can already refuse; only the write is
+    skipped). Re-checks everything a second time inside _tx()'s BEGIN
+    IMMEDIATE so a concurrent winner's write is never silently clobbered
+    (same TOCTOU-safe shape as unregister_owner())."""
+    now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    if not SESSION_DIGEST_RE.match(session_digest or ""):
+        raise ValueError("session_digest must be 64 lowercase hex")
+    _check_evidence(decision_ref, reason)
+
+    def check():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        active = _unreleased(conn, label)
+        if active:
+            same = (active[10], active[3], active[4], active[9], active[11], active[12]) == \
+                   ("assignment", pane_id, pane_birth, session_digest, decision_ref, reason)
+            if same:
+                return active
+            raise AssignmentConflict(f"{label}: an unreleased {active[10]} authority row already exists (gen {active[5]})")
+        latest = conn.execute("SELECT authority_mode, generation, release_reason FROM owner_leases WHERE label=? "
+                              "ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+        if latest and latest[0] == "assignment":
+            raise AssignmentConflict(f"{label}: latest generation {latest[1]} is a released durable assignment "
+                                     f"({latest[2]}); assign_initial never re-creates one -- use assign_replace("
+                                     "after_revoke=True) with fresh decision evidence")
+        return None
+
+    active = check()
+    if active:
+        return active[5]
+    if dry_run:
+        return "would_assign"
+
+    def body():
+        active2 = check()
+        if active2:
+            return active2[5]
+        gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
+        project = conn.execute("SELECT project FROM owner_projects WHERE label=?", (label,)).fetchone()[0]
+        lease_id = f"ol_{uuid.uuid4().hex}"
+        conn.execute(
+            "INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,"
+            "expires_at,session_digest,authority_mode,decision_ref,reason) VALUES (?,?,?,?,?,?,?,?,NULL,?,'assignment',?,?)",
+            (lease_id, label, project, pane_id, pane_birth, gen, _iso(now), _iso(now), session_digest, decision_ref, reason))
+        _event(conn, now, label, "assigned", lease_id, gen, f"{pane_id}@{pane_birth} {decision_ref}: {reason}")
+        return gen
+
+    return _tx(conn, body)
+
+
+def assign_replace(conn, label: str, expected_generation: int, expected_pane_id: str, expected_pane_birth: str,
+                   expected_session_digest: str, pane_id: str, pane_birth: str, session_digest: str,
+                   decision_ref: str, reason: str, now: float | None = None, dry_run: bool = True,
+                   after_revoke: bool = False):
+    """Exact replacement (Plan 018 §4.4 `replace`). Two DISTINCT operations,
+    selected explicitly by `after_revoke` -- a stale in-flight replace
+    planned against an active assignment can therefore never resurrect
+    authority after a concurrent revoke:
+      * after_revoke=False (active replacement): expected_* names the
+        CURRENT unreleased authority row exactly (any mode); the new holder
+        must DIFFER from it (ReplaceRefused('same_holder') otherwise -- a
+        same-holder "replace" is never implicit renewal of a durable
+        assignment). The predecessor is released 'superseded_by_assignment'.
+        If that row was meanwhile revoked, this refuses stale_expectation.
+      * after_revoke=True (deliberate re-assignment): expected_* names the
+        label's LATEST row exactly, which must already be released
+        'revoked', and the label must have NO unreleased row. The new holder
+        MAY equal the revoked holder, but decision_ref must be NEW:
+        never used by any earlier assignment row or revoke of this label
+        (ReplaceRefused('decision_not_fresh') otherwise).
+    Either way: any mismatch writes nothing (ReplaceRefused('stale_
+    expectation')); zero open owner_requests required (ReplaceRefused
+    ('open_requests') -- replacing a label with unresolved deliveries in
+    flight is refused, never silently staled); new generation =
+    MAX(all historical generations for label)+1.
+
+    Idempotent re-presentation of the label's OWN just-created active
+    assignment (expected==new==active, same decision_ref/reason; only
+    with after_revoke=False) returns its generation without a second write."""
+    now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    _check_holder(expected_pane_id, expected_pane_birth)
+    for sd in (session_digest, expected_session_digest):
+        if not SESSION_DIGEST_RE.match(sd or ""):
+            raise ValueError("session_digest must be 64 lowercase hex")
+    if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
+        raise ValueError("expected_generation must be an int >= 1")
+    _check_evidence(decision_ref, reason)
+
+    def check():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        active = _unreleased(conn, label)
+        if after_revoke:
+            if active:
+                raise ReplaceRefused("stale_expectation", f"{label}: an authority row is unreleased; "
+                                     "re-assignment applies only after revoke")
+            latest = conn.execute(
+                "SELECT pane_id,pane_birth,generation,session_digest,release_reason FROM owner_leases "
+                "WHERE label=? ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+            if not (latest and latest[2] == expected_generation
+                    and (latest[0], latest[1], latest[3]) == (expected_pane_id, expected_pane_birth, expected_session_digest)
+                    and latest[4] == "revoked"):
+                raise ReplaceRefused("stale_expectation", f"{label}: expected revoked gen {expected_generation} "
+                                     f"{expected_pane_id}@{expected_pane_birth} is not the label's latest revoked row")
+            used = conn.execute("SELECT 1 FROM owner_leases WHERE label=? AND decision_ref=?", (label, decision_ref)).fetchone()
+            if not used:
+                prefix = f"{decision_ref}: "
+                used = any(d[0].startswith(prefix) for d in conn.execute(
+                    "SELECT detail FROM owner_events WHERE label=? AND kind='revoked'", (label,)))
+            if used:
+                raise ReplaceRefused("decision_not_fresh", f"{label}: decision_ref {decision_ref!r} was already "
+                                     "used for this label; re-assignment needs new decision evidence")
+            n_open = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                                  (label, *OPEN)).fetchone()[0]
+            if n_open:
+                raise ReplaceRefused("open_requests", f"{label}: {n_open} open owner_requests")
+            return "after_revoke", None
+        if active and (active[5], active[3], active[4], active[9]) == \
+                (expected_generation, expected_pane_id, expected_pane_birth, expected_session_digest):
+            if (active[10], pane_id, pane_birth, session_digest, decision_ref, reason) == \
+                    ("assignment", expected_pane_id, expected_pane_birth, expected_session_digest,
+                     active[11], active[12]):
+                return "idempotent", active
+            if (pane_id, pane_birth, session_digest) == (expected_pane_id, expected_pane_birth, expected_session_digest):
+                raise ReplaceRefused("same_holder", f"{label}: new holder equals the active predecessor; "
+                                     "replace requires a different live holder")
+            n_open = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                                  (label, *OPEN)).fetchone()[0]
+            if n_open:
+                raise ReplaceRefused("open_requests", f"{label}: {n_open} open owner_requests")
+            return "active", active
+        raise ReplaceRefused("stale_expectation", f"{label}: expected gen {expected_generation} "
+                             f"{expected_pane_id}@{expected_pane_birth} does not match current state")
+
+    branch, row = check()
+    if branch == "idempotent":
+        return row[5]
+    if dry_run:
+        return "would_replace"
+
+    def body():
+        branch2, row2 = check()
+        if branch2 == "idempotent":
+            return row2[5]
+        if branch2 == "active":
+            conn.execute("UPDATE owner_leases SET released_at=?, release_reason='superseded_by_assignment' "
+                        "WHERE lease_id=?", (_iso(now), row2[0]))
+            _event(conn, now, label, "released", row2[0], row2[5], "superseded_by_assignment")
+        gen = conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM owner_leases WHERE label=?", (label,)).fetchone()[0]
+        project = conn.execute("SELECT project FROM owner_projects WHERE label=?", (label,)).fetchone()[0]
+        new_id = f"ol_{uuid.uuid4().hex}"
+        conn.execute(
+            "INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,"
+            "expires_at,session_digest,authority_mode,decision_ref,reason) VALUES (?,?,?,?,?,?,?,?,NULL,?,'assignment',?,?)",
+            (new_id, label, project, pane_id, pane_birth, gen, _iso(now), _iso(now), session_digest, decision_ref, reason))
+        _event(conn, now, label, "assigned", new_id, gen, f"{pane_id}@{pane_birth} {decision_ref}: {reason} ({branch2})")
+        return gen
+
+    return _tx(conn, body)
+
+
+def assign_revoke(conn, label: str, expected_generation: int, expected_pane_id: str, expected_pane_birth: str,
+                  expected_session_digest: str, decision_ref: str, reason: str, now: float | None = None,
+                  dry_run: bool = True):
+    """Revoke (Plan 018 §4.4): fences on the EXACT active assignment tuple,
+    then immediately releases it (release_reason='revoked') -- this alone
+    blocks new admission: _live()/_fence() (so enqueue()/transition()/
+    release()) only ever see an UNRELEASED row, and after this commits
+    there is none, so every normal fenced call refuses FencedOut exactly
+    as it would for any other released label. Queued/held/blocked
+    owner_requests for the revoked generation become 'cancelled' in the
+    SAME transaction; a 'delivering' request is deliberately left alone --
+    it may not start a second send, but its terminal outcome against this
+    EXACT released generation is assign_settle()'s job, not this one's
+    (Plan 018 §4.4: "an already-delivering request may record its
+    terminal outcome ... but may not start a second send").
+
+    Refuses (RevokeRefused('not_assignment_mode')) against a TIMED active
+    lease -- revoke is a durable-assignment-only operation; the timed
+    label's own release()/unregister_owner() are unchanged by this PR."""
+    now = time.time() if now is None else now
+    _check_holder(expected_pane_id, expected_pane_birth)
+    if not SESSION_DIGEST_RE.match(expected_session_digest or ""):
+        raise ValueError("expected_session_digest must be 64 lowercase hex")
+    if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
+        raise ValueError("expected_generation must be an int >= 1")
+    _check_evidence(decision_ref, reason)
+
+    def check():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        active = _unreleased(conn, label)
+        if not active:
+            raise RevokeRefused("stale_expectation", f"{label}: no unreleased authority row")
+        if active[10] != "assignment":
+            raise RevokeRefused("not_assignment_mode", f"{label}: active authority is {active[10]}, not a durable assignment")
+        if (active[5], active[3], active[4], active[9]) != (expected_generation, expected_pane_id, expected_pane_birth, expected_session_digest):
+            raise RevokeRefused("stale_expectation", f"{label}: expected gen {expected_generation} "
+                                f"{expected_pane_id}@{expected_pane_birth} does not match live gen {active[5]} "
+                                f"{active[3]}@{active[4]}")
+        return active
+
+    check()
+    if dry_run:
+        return "would_revoke"
+
+    def body():
+        active = check()
+        lease_id, gen = active[0], active[5]
+        conn.execute("UPDATE owner_leases SET released_at=?, release_reason='revoked' WHERE lease_id=?", (_iso(now), lease_id))
+        _event(conn, now, label, "revoked", lease_id, gen, f"{decision_ref}: {reason}")
+        cancelled = [r[0] for r in conn.execute(
+            "SELECT request_id FROM owner_requests WHERE label=? AND generation=? AND state IN ('queued','held','blocked')",
+            (label, gen)).fetchall()]
+        for rid in cancelled:
+            conn.execute("UPDATE owner_requests SET state='cancelled', updated_at=? WHERE request_id=?", (_iso(now), rid))
+            _event(conn, now, label, "request:cancelled", rid, gen, "revoked")
+        return {"generation": gen, "cancelled": cancelled}
+
+    return _tx(conn, body)
+
+
+def assign_settle(conn, label: str, request_id: str, expected_generation: int, to: str, detail: str = "",
+                  now: float | None = None, dry_run: bool = True):
+    """Terminal settlement of an already-'delivering' request after its
+    generation's durable assignment was REVOKED (Plan 018 §4.4's revoke
+    note): the request must currently be 'delivering', belong to EXACTLY
+    (label, expected_generation), and that generation's owner_leases row
+    must be an authority_mode='assignment' row released 'revoked' --
+    SettleRefused('generation_still_active') while it is unreleased (use the
+    normal fenced transition()), SettleRefused('not_revoked_assignment')
+    for a timed, reaped, expired or superseded generation (those have their
+    own paths; this never authenticates a live holder). `to` is restricted
+    to the two real terminal outcomes (replied, timeout) -- it can never
+    re-admit to 'delivering' or any other state, so this can never start a
+    second send."""
+    now = time.time() if now is None else now
+    _check(REQUEST_RE, request_id, "request id")
+    if to not in ("replied", "timeout"):
+        raise InvalidTransition(f"settlement target must be 'replied' or 'timeout', got {to!r}")
+    if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
+        raise ValueError("expected_generation must be an int >= 1")
+
+    def check():
+        row = conn.execute("SELECT label, generation, state FROM owner_requests WHERE request_id=?", (request_id,)).fetchone()
+        if not row:
+            raise SettleRefused("unknown_request", f"unknown request {request_id}")
+        if row[:2] != (label, expected_generation):
+            raise SettleRefused("wrong_generation", f"{request_id} belongs to {row[0]} gen {row[1]}, "
+                                f"expected {label} gen {expected_generation}")
+        if row[2] != "delivering":
+            raise SettleRefused("not_delivering", f"{request_id} is {row[2]!r}, not delivering")
+        lease_row = conn.execute("SELECT released_at, authority_mode, release_reason FROM owner_leases "
+                                 "WHERE label=? AND generation=?", (label, expected_generation)).fetchone()
+        if not lease_row or lease_row[0] is None:
+            raise SettleRefused("generation_still_active", f"{label} generation {expected_generation} is not "
+                                "released; use transition(), not settlement")
+        if (lease_row[1], lease_row[2]) != ("assignment", "revoked"):
+            raise SettleRefused("not_revoked_assignment", f"{label} generation {expected_generation} is "
+                                f"{lease_row[1]}/{lease_row[2]}, not a revoked durable assignment")
+        return row
+
+    check()
+    if dry_run:
+        return "would_settle"
+
+    def body():
+        check()
+        conn.execute("UPDATE owner_requests SET state=?, updated_at=?, detail=? WHERE request_id=? AND state='delivering'",
+                    (to, _iso(now), detail, request_id))
+        _event(conn, now, label, f"request:{to}", request_id, expected_generation, f"settled-after-revoke: {detail}")
+        return to
+
+    return _tx(conn, body)

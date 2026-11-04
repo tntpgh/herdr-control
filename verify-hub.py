@@ -2719,6 +2719,33 @@ class OwnersView(unittest.TestCase):
         self.assertTrue(row["expires_at"].endswith(".500000Z"), row["expires_at"])
         self.assertEqual(row["state"], "live")
 
+    def test_durable_assignment_row_does_not_break_owner_surfaces(self):
+        """Security review M4: an assignment row has expires_at=NULL; owner_lease_data(),
+        owners_data() and render_owners() must stay up (no TypeError), reporting it live
+        with no expiry and no fencing tuple, while a timed row's behavior is unchanged."""
+        reg = self._registry_with_owner()
+        lease_db = self.tmp / "owner_lease_assignment.sqlite3"
+        lconn = ol.connect(str(lease_db))
+        ol.migrate(lconn)
+        ol.register_owner(lconn, "herdr-control", "tntpgh/herdr-control", now=time.time())
+        ol.assign_initial(lconn, "herdr-control", "w9:p1", "term_xyz", "a" * 64, "dec-1", "fixture",
+                          now=time.time(), dry_run=False)
+        lconn.close()
+        with patch.object(hub, "REGISTRY", reg), \
+                patch.dict(os.environ, {"HERDR_OWNER_LEASE_DB": str(lease_db)}):
+            raw = hub.owner_lease_data()
+            out = hub.owners_data()
+        self.assertEqual(raw["status"], "ok")
+        row = raw["live"]["herdr-control"]
+        self.assertEqual((row["state"], row["expires_at"], row["authority_mode"]), ("live", None, "assignment"))
+        lease = {o["label"]: o for o in out["owners"]}["herdr-control"]["lease"]
+        self.assertEqual((lease["state"], lease["expires_at"], lease["authority_mode"]), ("live", None, "assignment"))
+        self.assertNotIn("term_xyz", json.dumps(out))
+        with patch.dict(hub.CACHES, {"owners": Mock(get=lambda: out)}):
+            rendered = hub.render_owners()
+        self.assertIn("durable assignment", rendered)
+        self.assertNotIn("term_xyz", rendered)
+
     def test_html_distinguishes_partial_unavailable_from_both_other_cases(self):
         """SPEC item 1 (pr361-r2 LOW follow-up): zero rows with SOME sources
         readable and others down must not read as either the all-down

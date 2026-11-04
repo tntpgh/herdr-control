@@ -18,7 +18,7 @@ torn down; with no live lease there is nothing to fence against and the
 token alone is the authorization.
 
 Dry-run by default: every refusal check still runs (InvalidOwner,
-Unauthorized, OpenRequests), only the final mutation is skipped — a
+Unauthorized, OpenRequests, AssignmentActive), only the final mutation is skipped — a
 dry-run of a refused call reports the SAME refusal a real run would, never
 a fake preview. --apply performs the mutation: releases the label's
 current live lease (if any) and sets owner_projects.unregistered_at
@@ -109,6 +109,9 @@ def main(argv=None) -> int:
         except ol.OpenRequests as exc:
             print(f"refused:open_requests:{exc}")
             return 2
+        except ol.AssignmentActive as exc:
+            print(f"refused:assignment_active:{exc}")
+            return 2
         finally:
             conn.close()
         print(f"dry-run:{result}:{a.label}")
@@ -134,6 +137,9 @@ def main(argv=None) -> int:
         return 2
     except ol.OpenRequests as exc:
         print(f"refused:open_requests:{exc}")
+        return 2
+    except ol.AssignmentActive as exc:
+        print(f"refused:assignment_active:{exc}")
         return 2
     finally:
         conn.close()

@@ -3370,9 +3370,14 @@ def owner_lease_data() -> dict:
             live = {}
             for r in conn.execute(
                     "SELECT label, pane_id, pane_birth, generation, expires_at FROM owner_leases WHERE released_at IS NULL"):
+                # expires_at is NULL exactly for a durable assignment (v6 CHECK pairs mode<->expiry); wall
+                # clock never ends it, so it is live and has no expiry to compare. Keyed off NULL, not the
+                # authority_mode column, so a pre-v6 store (no such column) still reads.
+                durable = r["expires_at"] is None
                 live[r["label"]] = {
                     "pane_id": r["pane_id"], "pane_birth": r["pane_birth"], "generation": r["generation"],
-                    "expires_at": r["expires_at"], "state": "live" if r["expires_at"] > now_iso else "expired",
+                    "expires_at": r["expires_at"], "authority_mode": "assignment" if durable else "timed",
+                    "state": "live" if durable or r["expires_at"] > now_iso else "expired",
                 }
             return {"status": "ok", "projects": projects, "live": live}
         finally:
@@ -3537,7 +3542,8 @@ def owners_data() -> dict:
         # does NOT also require session_digest (pr361-r2-REVIEW.md LOW
         # finding 2). Nothing writes this store yet, but this view must not
         # pre-publish that proof to every unauthenticated loopback reader.
-        live_public = ({"pane_id": live["pane_id"], "expires_at": live["expires_at"], "state": live["state"]}
+        live_public = ({"pane_id": live["pane_id"], "expires_at": live["expires_at"], "state": live["state"],
+                        "authority_mode": live["authority_mode"]}
                        if live else live)
         reg_row = reg["rows"].get(label)
         # pane_birth dropped for the same reason -- it is half of the
@@ -5739,7 +5745,8 @@ def _owner_row(o: dict) -> str:
     elif lease:
         lease_cell = (f"<span class='pill {'ok' if lease['state'] == 'live' else 'bad'}'>{_esc(lease['state'])}</span> "
                       f"{_esc(lease['pane_id'])}<br>"
-                      f"<span class=dim title='{_esc(lease['expires_at'])}'>exp {_age(lease['expires_at'])}</span>")
+                      + ("<span class=dim>durable assignment</span>" if lease.get("expires_at") is None else
+                         f"<span class=dim title='{_esc(lease['expires_at'])}'>exp {_age(lease['expires_at'])}</span>"))
     else:
         lease_cell = "<span class=dim>none</span>"
     ql = o["queue_lane"]

@@ -433,8 +433,39 @@ def main() -> int:
     title_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     consumer_recovery_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    assignment_boundary_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
+
+
+def assignment_boundary_cases(base: Path) -> None:
+    """Security review M3: a durable assignment (Plan 018 PR A, inert) must make
+    the shared holder boundary fail closed BEFORE the single-use grant is
+    consumed -- nothing consumes authority a consumer cannot honour yet."""
+    lc, av, roots, lease_db = env(base)
+    ol.assign_initial(lc, KB, *PANE[KB], SESS[KB], "dec-1", "fixture", T0, False)
+    holder = (*PANE[KB], SESS[KB], 1)
+    case("ASSIGNMENT: holder_tuple default (timed only) reads an assignment as no holder",
+         ol.holder_tuple(lc, KB, T0) is None and ol.holder_tuple(lc, KB, T0, modes=ol.AUTHORITY_MODES) == holder)
+    gate = old.DeliveryGate(lease_db)
+    store = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
+    oda.migrate(store)
+    body, man = b"REQ assign\n", ["result.md"]
+    sha = hashlib.sha256(body).hexdigest()
+    proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+    insert_grant(store, "a_asg", label=KB, project=proj, holder=holder, rid="r_asg", sha=sha, manifest=man,
+                 expires=T0 + 3600)
+    sent = []
+    authorize = lambda l, pj, hd, r, h, m, n: oda.consume(store, "a_asg", label=l, project=pj, holder=hd, request_id=r,
+                                                          body_sha256=h, manifest=m, now=n)
+    d = od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, {KB: (*PANE[KB], SESS[KB])}.get,
+                      lambda: T0, authorize=authorize)
+    res = d.dispatch(KB, "r_asg", body, man, T0)
+    status = store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_asg'").fetchone()[0]
+    case("ASSIGNMENT: Dispatcher holds, sends nothing, and does NOT consume the one-time grant",
+         res.startswith("held:not_dispatched") and not sent and status == "granted"
+         and gate.state("r_asg") is None)
+    store.close(); gate.close(); av.close(); lc.close()
 
 
 def auth_contract_cases(base: Path) -> None:
@@ -908,8 +939,8 @@ def register_pretracking_cases(base: Path) -> None:
     before_dry = snap(db)
     rc, out = run(dry_run=True)
     after_dry = snap(db)
-    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->5",
-         rc == 0 and "schema_pending:3->5" in out)
+    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->6",
+         rc == 0 and "schema_pending:3->6" in out)
     case("R17b: dry-run bytes AND mtime unchanged (truly read-only, never migrates)",
          before_dry == after_dry)
 
@@ -917,22 +948,22 @@ def register_pretracking_cases(base: Path) -> None:
     before_w = snap(db)
     rc, out = run(dry_run=False)
     after_w = snap(db)
-    case("R17b: writer on a v3 store refuses schema_migration_required:3->5, names owner-lease-migrate.py",
-         rc == 4 and f"refused:schema_migration_required:3->5:owner-lease-migrate.py --db {db} --apply" in out)
+    case("R17b: writer on a v3 store refuses schema_migration_required:3->6, names owner-lease-migrate.py",
+         rc == 4 and f"refused:schema_migration_required:3->6:owner-lease-migrate.py --db {db} --apply" in out)
     case("R17b: writer refusal leaves bytes AND mtime unchanged", before_w == after_w)
 
     # --- R17b item 3: owner-lease-migrate.py --apply is the one explicit path ---
     mig_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1")
     mig_rc = subprocess.run([sys.executable, str(HERE / "owner-lease-migrate.py"), "--db", db, "--apply"],
                             capture_output=True, text=True, env=mig_env, timeout=30)
-    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v5",
-         mig_rc.returncode == 0 and "migrated:3->5" in mig_rc.stdout)
+    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v6",
+         mig_rc.returncode == 0 and "migrated:3->6" in mig_rc.stdout)
     post_migrate = raw()
-    case("R17b: migration preserved kb/tos rows and leases, only v4/v5 newly tracked",
+    case("R17b: migration preserved kb/tos rows and leases, only v4/v5/v6 newly tracked",
          [r[:4] for r in projects_full(post_migrate)] == pre_projects
          and all(r[4:] == (None, None, None) for r in projects_full(post_migrate))
          and leases_full(post_migrate) == pre_leases
-         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5])
+         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5, 6])
     post_migrate.close()
 
     # --- now-current store: dry-run reports no schema_pending; real write succeeds ---
@@ -1080,6 +1111,18 @@ def unregister_cases(base: Path) -> None:
     case("UNREGISTER: --apply releases the lease and unregisters",
          rc == 0 and out == f"apply:unregistered:{UL}"
          and ol.holder_tuple(lc, UL, T0 + 3) is None and not gate.registered(UL))
+
+    # --- D1: a durable assignment is refused as a typed business refusal, never a traceback ---
+    AL, AP, AB = "asg-label", "w8:p8", "term_as1"
+    ol.register_owner(lc, AL, "tntpgh/asg-project", now=T0, unregister_token=TOK)
+    ol.assign_initial(lc, AL, AP, AB, hashlib.sha256(b"asg-session").hexdigest(), "dec-1", "fixture", T0, False)
+    asg = dict(label=AL, generation=1, pane_id=AP, pane_birth=AB)
+    rc_d, out_d = run(**asg)
+    rc_a, out_a = run(apply=True, **asg)
+    case("UNREGISTER: an active durable assignment -> refused:assignment_active (exit 2) for dry-run and --apply",
+         rc_d == 2 and out_d.startswith("refused:assignment_active:") and rc_a == 2
+         and out_a.startswith("refused:assignment_active:") and gate.registered(AL)
+         and ol.current_assignment(lc, AL)["authority_mode"] == "assignment")
     case("UNREGISTER: no cross-owner reroute -- KB and DOTS still registered and untouched",
          gate.registered(KB) and gate.registered(DOTS)
          and lc.execute("SELECT unregistered_at FROM owner_projects WHERE label IN (?,?)", (KB, DOTS)).fetchall()

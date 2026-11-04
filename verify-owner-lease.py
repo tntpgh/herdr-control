@@ -79,13 +79,14 @@ def main():
 
     # --- schema / migration ---
     p, c = fresh(label=None)
-    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 5 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 5)
+    case("migrate is versioned and idempotent", ol.migrate(c) == ol.SCHEMA_VERSION == 6 and count(c, "SELECT COUNT(*) FROM owner_schema_version") == 6)
     ol.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0)
     case("events: DELETE rejected by trigger", raises(lambda: c.execute("DELETE FROM owner_events"), sqlite3.IntegrityError))
     case("events: UPDATE rejected by trigger", raises(lambda: c.execute("UPDATE owner_events SET kind='x'"), sqlite3.IntegrityError))
     case("DB itself forbids a second live lease row (partial unique index)",
-         raises(lambda: [c.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at) "
-                                   "VALUES (?,?,?,?,?,?,?,?)", (f"x{i}", "kb", "p", "b", i, "a", "a", "z")) for i in (1, 2)],
+         raises(lambda: [c.execute("INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,"
+                                   "acquired_at,renewed_at,expires_at,authority_mode) VALUES (?,?,?,?,?,?,?,?,?,'timed')",
+                                   (f"x{i}", "kb", "tntpgh/knowledge-base", "p", "b", i, "a", "a", "z")) for i in (1, 2)],
                 sqlite3.IntegrityError))
     c.close()
 
@@ -304,8 +305,9 @@ def main():
          raises(lambda: c.execute("INSERT INTO owner_requests(request_id,label,generation,state,created_at,updated_at) "
                                   "VALUES ('z','kb',99,'queued','t','t')"), sqlite3.IntegrityError))
     case("foreign keys ON: lease for an unregistered label rejected",
-         raises(lambda: c.execute("INSERT INTO owner_leases(lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at) "
-                                  "VALUES ('l','ghost','w1:p1','term_1',1,'a','a','z')"), sqlite3.IntegrityError))
+         raises(lambda: c.execute("INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,"
+                                  "acquired_at,renewed_at,expires_at,authority_mode) VALUES "
+                                  "('l','ghost','tntpgh/ghost','w1:p1','term_1',1,'a','a','z','timed')"), sqlite3.IntegrityError))
 
     # --- reap matches the COMPLETE observed identity ---
     obs = ol.observe_stale(c, set(), T0 + 5)
@@ -371,8 +373,8 @@ def main():
     pre_projects = snap(pre, "owner_projects")
     pre.close()
     u = ol.connect(path)
-    case("v1 -> v5 upgrade applies each version exactly once", ol.migrate(u) == 5 and ol.migrate(u) == 5
-         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2, 3, 4, 5])
+    case("v1 -> v6 upgrade applies each version exactly once", ol.migrate(u) == 6 and ol.migrate(u) == 6
+         and [r[0] for r in u.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [1, 2, 3, 4, 5, 6])
     v1_lease_cols = "lease_id, label, pane_id, pane_birth, generation, acquired_at, renewed_at, expires_at, released_at, release_reason"
     case("upgrade preserves leases, requests and events (incl. seq) verbatim",
          snap(u, "owner_leases", v1_lease_cols) == before["owner_leases"]
