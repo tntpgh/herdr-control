@@ -357,7 +357,9 @@ printf '== spawn-task.sh end-to-end (dry-run against a stubbed herdr) ==\n'
 herdr() { return 1; }
 export -f herdr
 git -C "$fleet/proj" init -q
-spawn_env=(HERDR_CANONICAL_RULES= "HERDR_STATE_DIR=$WORK/state" "HERDR_WT_DIR=$WORK/wt" \
+# -u: this suite must not inherit a withheld parent's HERDR_SECRETS_WITHHELD
+# (spawn-task.sh:96,237 would then report WITHHELD and fail the credential asserts).
+spawn_env=(-u HERDR_SECRETS_WITHHELD HERDR_CANONICAL_RULES= "HERDR_STATE_DIR=$WORK/state" "HERDR_WT_DIR=$WORK/wt" \
            "HERDR_RUN_STATE_DIR=$WORK/registry" HERDR_POSTURE_FLOOR=write HERDR_PANE_ID=)
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --posture strict "$fleet/proj" t1 implement omp 2>&1)
 printf '%s\n' "$out" | grep -q 'posture   : strict' && ok "stricter request honoured and stamped as the child floor" || bad "posture line wrong: $out"
@@ -386,6 +388,15 @@ case "$_pins" in *" sonnet"*) bad "model_for_agent still emits bare sonnet:$_pin
 check "model_for_agent claude implement" "$(model_for_agent claude implement)" "anthropic/claude-sonnet-5-5"
 check "model_for_agent omc review"       "$(model_for_agent omc review)"       "claude-sonnet-5-5:high"
 check "model_for_agent omp implement"    "$(model_for_agent omp implement)"    "anthropic/claude-sonnet-5-5:medium"
+# Sourced WITHOUT config.sh (empty env): standard rows must still be exact, never empty.
+bare() { env -i PATH="$PATH" "$@" bash -c '. "$1/lib/agent-profiles.sh"; model_for_agent "$2" "$3"' _ "$here" "$ba" "$bj"; }
+ba=claude bj=implement; check "agent-profiles sourced without config: claude implement" "$(bare)" "anthropic/claude-sonnet-5-5"
+ba=omc    bj=review;    check "agent-profiles sourced without config: omc review"       "$(bare)" "claude-sonnet-5-5:high"
+ba=omp    bj=docs;      check "agent-profiles sourced without config: omp docs"         "$(bare)" "anthropic/claude-sonnet-5-5:medium"
+ba=omp    bj=implement; check "an env override of the selector is preserved"            "$(bare HERDR_SONNET_OMP=anthropic/other)" "anthropic/other:medium"
+check "source-time defaults equal config.sh's (no drift)" \
+  "$(env -i PATH="$PATH" bash -c '. "$1/lib/agent-profiles.sh"; printf "%s %s" "$HERDR_SONNET_OMP" "$HERDR_SONNET_CLAUDE"' _ "$here")" \
+  "$(env -i PATH="$PATH" HOME="$HOME" bash -c '. "$1/config.sh" 2>/dev/null; printf "%s %s" "$HERDR_SONNET_OMP" "$HERDR_SONNET_CLAUDE"' _ "$here")"
 if out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t2 implement claude --no-rules 2>&1); then
   bad "bypass flag on a managed launch must refuse the spawn"
 else

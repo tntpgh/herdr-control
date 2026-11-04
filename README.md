@@ -170,12 +170,12 @@ overridable as an environment variable per run.
 ./ensure-workspace.sh ~/src/app                 # just print the workspace id
 
 # Task: a worktree opened as a SUB-TAB in the repo's space, at the model the
-# job-class maps to (plan/architect/design→opus/deep, review→sonnet/std HIGH
-# effort, deep-review→opus/deep, implement→sonnet/std, explore→haiku/fast)
-./spawn-task.sh ~/src/app fix-worker implement          # claude sonnet
+# job-class maps to (plan/architect/design→opus/deep, review→Sonnet 5.5/std HIGH
+# effort, deep-review→opus/deep, implement→Sonnet 5.5/std, explore→haiku/fast)
+./spawn-task.sh ~/src/app fix-worker implement          # claude flavor, Sonnet 5.5
 ./spawn-task.sh ~/src/app pr-review review codex        # codex, standard model, high effort
 ./spawn-task.sh ~/src/app arch-review deep-review codex # codex, deep model (auth/secrets/money/deploy/concurrency, or plan/design)
-./spawn-task.sh ~/src/app fix-parser implement omp     # omp, sonnet (verified 2026-07-31)
+./spawn-task.sh ~/src/app fix-parser implement omp     # omp, Sonnet 5.5 (anthropic/claude-sonnet-5-5)
 ./spawn-task.sh ~/src/app fix-worker implement --dry-run # preview, no changes
 # omp tool set follows the job class: explore drops edit/eval/task; every
 # editing class (implement/debug/code/docs/mechanical/quick) drops task and

@@ -180,6 +180,13 @@ offline_mcp_profile_path() {
 	printf '%s\n' "$_ap_dir/offline-mcp-profile.yml"
 }
 
+# Source-time defaults so a caller that sources this library without config.sh
+# still gets an exact Sonnet 5.5 (never an empty `--model `, the 2026-09-04 bug
+# class). MUST equal config.sh's defaults (verify-posture.sh asserts it);
+# an env or config.sh override is kept (`:=` only fills an unset/empty value).
+: "${HERDR_SONNET_OMP:=anthropic/claude-sonnet-5-5}"
+: "${HERDR_SONNET_CLAUDE:=claude-sonnet-5-5}"
+
 model_for_agent() {
   local a="$1" j="$2"
   case "$a:$j" in

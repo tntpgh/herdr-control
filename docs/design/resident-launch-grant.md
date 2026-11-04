@@ -87,10 +87,10 @@ are laid out here so the choice is explicit, not defaulted past him.
 
 | | **A — restricted pilot** | **B — T's requested ladder** |
 |---|---|---|
-| Max tier | `standard` only (haiku→sonnet) | `frontier` (sonnet→opus→codex top tier) |
+| Max tier | `standard` only (haiku→Sonnet 5.5) | `frontier` (Sonnet 5.5→opus→codex top tier) |
 | Tiers admitted | `fast`,`standard` | `fast`,`standard`,`deep`,`frontier` (full ladder — see below) |
 | Blast radius | One model step up, Claude family only | Three model steps, crosses into a second model family (codex) at the top |
-| Unattended spend/runtime | Lowest — one extra sonnet session per loop | Highest — can reach codex's most expensive configured tier unattended |
+| Unattended spend/runtime | Lowest — one extra Sonnet 5.5 session per loop | Highest — can reach codex's most expensive configured tier unattended |
 | Operating experience needed first | None required | None required, but more to watch — recommend running A first even if B is the target end state |
 
 **Option A** is this document's original proposal, unchanged: `max_tier =
@@ -110,19 +110,16 @@ names for any family). `esc_tier_model` (`lib/escalation.sh:218-222`) reads
 the actual model id from the same table `spawn-task.sh` itself uses
 (`lib/agent-profiles.sh`'s `model_for_agent`):
 
-- `standard` → `claude:implement` → harness alias **`sonnet`**
-  (`lib/agent-profiles.sh:188`) — **UNVERIFIED which provider model id this
-  resolves to.** `sonnet`/`opus`/`haiku` are harness-level aliases passed
-  to the `claude`/`omp` CLI, not provider model ids; which exact id an
-  alias resolves to is decided inside the harness at launch time, not
-  stored in any local config this repo can read. Checked and confirmed by
-  the conductor (read-only, `~/.omp/agent/models.db`, 2026 — out of scope
-  for a spawned worker to read directly): the `model_cache` table there
-  holds a broad provider CATALOG (many `claude-opus-*`/`claude-sonnet-*`
-  candidate rows), with **no alias-to-id mapping** — naming one specific id
-  here would be a guess, not a citation, so this document does not name one.
-- `deep` → `claude:plan` → harness alias **`opus`** (`lib/agent-profiles.sh:
-  186`) — same UNVERIFIED caveat as `sonnet` above, same evidence.
+- `standard` → `claude:implement` → **`$HERDR_SONNET_OMP`**, exact id
+  `anthropic/claude-sonnet-5-5` (`config.sh`; `lib/agent-profiles.sh`
+  `model_for_agent`). Pinned since the Sonnet 5.5 cutover: the old bare
+  `sonnet` alias resolved to Sonnet 5 inside the harness, so it is no longer
+  emitted for standard tiers. Id existence: the `anthropic` row of omp's
+  `~/.omp/agent/models.db` `model_cache` lists `claude-sonnet-5-5`. (omc
+  uses `$HERDR_SONNET_CLAUDE` = `claude-sonnet-5-5`; its acceptance by the
+  `claude` CLI is **unverified**.)
+- `deep` → `claude:plan` → harness alias **`opus`** (`lib/agent-profiles.sh`)
+  — still a bare alias the harness resolves at launch; not pinned here.
 - `frontier` → `codex:deep-review` → **`$HERDR_CODEX_DEEP`**
   (`lib/agent-profiles.sh:201`) — this one IS a real provider model id, not
   a harness alias, and IS verifiable from local config, with one added
@@ -138,15 +135,11 @@ the actual model id from the same table `spawn-task.sh` itself uses
     a concept this proposal introduces — both are `config.sh:104` read
     verbatim, no code change here, same as every other tier already does.
 
-**Design option this raises, not proposed here**: because `sonnet`/`opus`
-cannot be pinned to an exact provider id from local config the way the
-Codex tiers can, `lib/agent-profiles.sh` could be changed to pin exact
-provider model ids for the escalation tiers specifically (instead of the
-bare harness aliases `model_for_agent` emits today), giving Option B's
-`standard`/`deep` steps the same verifiability its `frontier` step already
-has. That would be its own change to `lib/agent-profiles.sh`, with its own
-review — not something this document implements or recommends picking an
-id for.
+**Pinning (done for `standard`, not for `deep`)**: `lib/agent-profiles.sh`
+now emits an exact provider id for the Sonnet standard tier, giving Option B's
+`standard` step the same verifiability its `frontier` step has. `deep`
+(`opus`) remains a bare alias; pinning it would be its own change with its
+own review.
 
 The loop threshold — "after 2-3 no-progress loops" — is
 `HERDR_NO_PROGRESS_CYCLES` (`lib/escalation.sh:272`, `${HERDR_NO_PROGRESS_
@@ -233,7 +226,7 @@ asked for, not whether it ever is:
   initial design instead, this is folded into the single mint-time decision
   — Terrence chooses `frontier` once, at mint time, and nothing asks again
   per tier-step after that, which is the material difference from A: A asks
-  "is sonnet enough" once per repo at mint time and never risks more; B asks
+  "is Sonnet 5.5 enough" once per repo at mint time and never risks more; B asks
   "is the full ladder, unattended, acceptable for this repo" once at mint
   time and then genuinely does not ask again before an unattended codex
   spawn.
@@ -281,7 +274,7 @@ pilot starts with.
 - **Models**: unchanged — whatever `esc_tier_model`/`esc_tier_agent`
   (`lib/escalation.sh:206-213`, `esc_tier_model` immediately below it) already
   resolve for the granted tier (fast =
-  haiku, standard = sonnet, deep = opus, frontier = codex's
+  haiku, standard = Sonnet 5.5, deep = opus, frontier = codex's
   `$HERDR_CODEX_DEEP`). The grant authorizes a **tier ceiling**, not a model
   string, so it tracks config changes the same way escalation already does.
 
@@ -317,7 +310,7 @@ pilot starts with.
   above the grant's `max_tier` in the existing ladder order — the old writer
   stays active and the task is marked `blocked`, same shape as a missing
   grant. **Default recommendation: `standard` only** (Option A, haiku→
-  sonnet) — see "Pilot scope: two options" above for the full comparison
+  Sonnet 5.5) — see "Pilot scope: two options" above for the full comparison
   against Terrence's requested wider ladder (Option B, `max_tier =
   frontier`). Reaching `deep`/`frontier` unattended is a materially bigger
   blast radius (opus/codex spend, longer unattended runtime); the mint
