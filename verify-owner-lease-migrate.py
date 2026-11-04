@@ -79,8 +79,9 @@ def main() -> int:
     before = snapshot(db)
     rc, out = run(db, apply=False)
     after = snapshot(db)
-    case("plan: exit 0, reports plan:3->5", rc == 0 and "plan:3->5" in out)
-    case("plan: lists v4/v5 pending statement counts", "v4: 1 statement(s)" in out and "v5: 2 statement(s)" in out)
+    case("plan: exit 0, reports plan:3->6", rc == 0 and "plan:3->6" in out)
+    case("plan: lists v4/v5/v6 pending statement counts",
+         "v4: 1 statement(s)" in out and "v5: 2 statement(s)" in out and "v6: 5 statement(s)" in out)
     case("plan: file bytes AND mtime unchanged (truly read-only)", before == after)
     case("plan: no backup file created", backup_files(base) == [])
 
@@ -101,7 +102,7 @@ def main() -> int:
 
     rc, out = run(db, apply=True, env_extra={"HERDR_OWNER_LEASE_WRITER": "1"})
     case("apply: exit 0, reports backup/backup_sha256/migrated/rollback",
-         rc == 0 and "backup:" in out and "backup_sha256:" in out and "migrated:3->5" in out and "rollback:" in out)
+         rc == 0 and "backup:" in out and "backup_sha256:" in out and "migrated:3->6" in out and "rollback:" in out)
     backups = backup_files(base)
     case("apply: exactly one backup file created", len(backups) == 1)
 
@@ -116,8 +117,11 @@ def main() -> int:
          [r[:4] for r in post_projects] == pre_projects
          and all(r[4:] == (None, None, None) for r in post_projects)
          and post_leases == pre_leases)
-    case("apply: only v4/v5 newly tracked (v1-v3 were inferred, not re-applied)",
-         [r[0] for r in version_rows] == [4, 5])
+    case("apply: only v4/v5/v6 newly tracked (v1-v3 were inferred, not re-applied)",
+         [r[0] for r in version_rows] == [4, 5, 6])
+    case("apply: v6 backfills project/authority_mode/decision_ref/reason for the pre-existing lease",
+         post_conn.execute("SELECT project, authority_mode, decision_ref, reason, expires_at FROM owner_leases "
+                           "WHERE lease_id='L1'").fetchone() == ("tntpgh/knowledge-base", "timed", "", "", pre_leases[0][7]))
     case("apply: NULL lifecycle bound stays fail-closed -- renew_due refuses no_lifecycle_bound",
          olr.renew_due(post_conn, "kb", ("w1:p1", "term_kb", ""), now=time.time()) == "no_lifecycle_bound")
     case("apply: NULL unregister_token stays fail-closed -- unregister_owner raises Unauthorized",
@@ -143,11 +147,11 @@ def main() -> int:
     rc_plan, out_plan = run(db, apply=False)
     rc_apply, out_apply = run(db, apply=True, env_extra={"HERDR_OWNER_LEASE_WRITER": "1"})
     after3 = snapshot(db)
-    case("rerun: plan mode reports current:5", rc_plan == 0 and out_plan == "current:5")
-    case("rerun: --apply on an already-current store reports current:5, no new backup, nothing written",
-         rc_apply == 0 and out_apply == "current:5" and backup_files(base) == backups and before3 == after3)
+    case("rerun: plan mode reports current:6", rc_plan == 0 and out_plan == "current:6")
+    case("rerun: --apply on an already-current store reports current:6, no new backup, nothing written",
+         rc_apply == 0 and out_apply == "current:6" and backup_files(base) == backups and before3 == after3)
 
-    # --- a genuinely fresh (already v5) store: plan/apply both report current ---
+    # --- a genuinely fresh (already v6) store: plan/apply both report current ---
     base2 = Path(os.path.realpath(tempfile.mkdtemp()))
     db2 = base2 / "fresh.sqlite3"
     fconn = ol.connect(str(db2))
@@ -155,7 +159,51 @@ def main() -> int:
     fconn.close()
     os.chmod(db2, 0o600)
     rc, out = run(db2, apply=False)
-    case("fresh v5 store: plan mode reports current:5, no backup", rc == 0 and out == "current:5" and backup_files(base2) == [])
+    case("fresh v6 store: plan mode reports current:6, no backup", rc == 0 and out == "current:6" and backup_files(base2) == [])
+
+    # --- v5 -> v6 preservation: every project/lease/request/event row and FK survive ---
+    base3 = Path(os.path.realpath(tempfile.mkdtemp()))
+    db3 = base3 / "v5.sqlite3"
+    v5 = sqlite3.connect(str(db3), isolation_level=None)
+    for v in (1, 2, 3, 4, 5):
+        for stmt in ol.MIGRATIONS[v]:
+            v5.execute(stmt)
+    v5.execute("CREATE TABLE owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
+    for v in (1, 2, 3, 4, 5):
+        v5.execute("INSERT INTO owner_schema_version VALUES (?, '2026-11-01T00:00:00.000000Z')", (v,))
+    v5.execute("INSERT INTO owner_projects VALUES ('kb','tntpgh/knowledge-base','2026-11-01T00:00:00.000000Z',5,NULL,NULL,NULL)")
+    v5.execute("INSERT INTO owner_leases VALUES ('L5','kb','w1:p1','term_1',1,'2026-11-01T00:00:00.000000Z',"
+              "'2026-11-01T00:00:00.000000Z','2099-01-01T00:00:00.000000Z',NULL,NULL,?)", ("a" * 64,))
+    v5.execute("INSERT INTO owner_requests VALUES ('r5','kb',1,'queued','2026-11-01T00:00:00.000000Z','2026-11-01T00:00:00.000000Z','')")
+    v5.execute("INSERT INTO owner_events (at,label,kind,ref,generation) VALUES ('2026-11-01T00:00:00.000000Z','kb','acquired','L5',1)")
+    v5.close()
+    os.chmod(db3, 0o600)
+    pre3 = sqlite3.connect(str(db3))
+    pre_proj3 = pre3.execute("SELECT * FROM owner_projects ORDER BY label").fetchall()
+    pre_req3 = pre3.execute("SELECT * FROM owner_requests ORDER BY request_id").fetchall()
+    pre_ev3 = pre3.execute("SELECT * FROM owner_events ORDER BY seq").fetchall()
+    pre_lease_cols3 = pre3.execute("SELECT lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,"
+                                   "expires_at,released_at,release_reason,session_digest FROM owner_leases").fetchall()
+    pre3.close()
+    rc3, out3 = run(db3, apply=True, env_extra={"HERDR_OWNER_LEASE_WRITER": "1"})
+    case("v5->v6: apply migrates and reports it", rc3 == 0 and "migrated:5->6" in out3)
+    post3 = sqlite3.connect(str(db3))
+    case("v5->v6: every project/request/event row preserved verbatim",
+         post3.execute("SELECT * FROM owner_projects ORDER BY label").fetchall() == pre_proj3
+         and post3.execute("SELECT * FROM owner_requests ORDER BY request_id").fetchall() == pre_req3
+         and post3.execute("SELECT * FROM owner_events ORDER BY seq").fetchall() == pre_ev3)
+    case("v5->v6: every pre-existing lease column preserved verbatim",
+         post3.execute("SELECT lease_id,label,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
+                       "released_at,release_reason,session_digest FROM owner_leases").fetchall() == pre_lease_cols3)
+    case("v5->v6: project backfilled from owner_projects, new row carries authority_mode='timed'",
+         post3.execute("SELECT project, authority_mode, decision_ref, reason FROM owner_leases "
+                       "WHERE lease_id='L5'").fetchone() == ("tntpgh/knowledge-base", "timed", "", ""))
+    post3.execute("PRAGMA foreign_keys=ON")
+    case("v5->v6: the owner_requests (label,generation) FK onto owner_leases still holds and is clean",
+         post3.execute("PRAGMA foreign_key_check").fetchall() == []
+         and _raises(lambda: post3.execute("INSERT INTO owner_requests VALUES ('rx','kb',99,'queued','t','t','')"),
+                     sqlite3.IntegrityError))
+    post3.close()
 
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     return 1 if FAILS else 0

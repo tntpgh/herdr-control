@@ -908,8 +908,8 @@ def register_pretracking_cases(base: Path) -> None:
     before_dry = snap(db)
     rc, out = run(dry_run=True)
     after_dry = snap(db)
-    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->5",
-         rc == 0 and "schema_pending:3->5" in out)
+    case("R17b: dry-run on a v3 store succeeds, reports schema_pending:3->6",
+         rc == 0 and "schema_pending:3->6" in out)
     case("R17b: dry-run bytes AND mtime unchanged (truly read-only, never migrates)",
          before_dry == after_dry)
 
@@ -917,22 +917,22 @@ def register_pretracking_cases(base: Path) -> None:
     before_w = snap(db)
     rc, out = run(dry_run=False)
     after_w = snap(db)
-    case("R17b: writer on a v3 store refuses schema_migration_required:3->5, names owner-lease-migrate.py",
-         rc == 4 and f"refused:schema_migration_required:3->5:owner-lease-migrate.py --db {db} --apply" in out)
+    case("R17b: writer on a v3 store refuses schema_migration_required:3->6, names owner-lease-migrate.py",
+         rc == 4 and f"refused:schema_migration_required:3->6:owner-lease-migrate.py --db {db} --apply" in out)
     case("R17b: writer refusal leaves bytes AND mtime unchanged", before_w == after_w)
 
     # --- R17b item 3: owner-lease-migrate.py --apply is the one explicit path ---
     mig_env = dict(os.environ, HERDR_OWNER_LEASE_WRITER="1")
     mig_rc = subprocess.run([sys.executable, str(HERE / "owner-lease-migrate.py"), "--db", db, "--apply"],
                             capture_output=True, text=True, env=mig_env, timeout=30)
-    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v5",
-         mig_rc.returncode == 0 and "migrated:3->5" in mig_rc.stdout)
+    case("R17b: owner-lease-migrate.py --apply migrates the v3 fixture to v6",
+         mig_rc.returncode == 0 and "migrated:3->6" in mig_rc.stdout)
     post_migrate = raw()
-    case("R17b: migration preserved kb/tos rows and leases, only v4/v5 newly tracked",
+    case("R17b: migration preserved kb/tos rows and leases, only v4/v5/v6 newly tracked",
          [r[:4] for r in projects_full(post_migrate)] == pre_projects
          and all(r[4:] == (None, None, None) for r in projects_full(post_migrate))
          and leases_full(post_migrate) == pre_leases
-         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5])
+         and [r[0] for r in post_migrate.execute("SELECT version FROM owner_schema_version ORDER BY version")] == [4, 5, 6])
     post_migrate.close()
 
     # --- now-current store: dry-run reports no schema_pending; real write succeeds ---

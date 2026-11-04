@@ -101,7 +101,10 @@ class DeliveryGate:
         self.conn.close()
 
     def _holder(self, label, now):
-        return ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires) | None
+        # fail closed on a durable assignment until PR B routes delivery by authority_mode:
+        # this gate's timed-TTL logic (_ts(expires_at)) cannot evaluate an assignment row.
+        cur = ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires, sess, mode) | None
+        return None if cur and cur[7] == "assignment" else cur
 
     def _enabled(self):
         row = self.conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone()
