@@ -373,7 +373,7 @@ got_sha="$(printf '%s' "$payload" | jq -r '.evidence.window[0].commit_sha // emp
 successor="$(printf '%s' "$payload" | jq -r '.successor_task_id // empty')"
 [ -n "$payload" ] && ok "A: model_escalated recorded after a real 3-tick loop" || bad "A: model_escalated recorded"
 [ "$from_model" = haiku ] && ok "A: exact from_model (claude fast = haiku)" || bad "A: from_model (got $from_model)"
-[ "$to_model" = sonnet ] && ok "A: exact to_model (claude standard = sonnet)" || bad "A: to_model (got $to_model)"
+[ "$to_model" = anthropic/claude-sonnet-5-5 ] && ok "A: exact to_model (claude standard = Sonnet 5.5)" || bad "A: to_model (got $to_model)"
 [ "$got_sha" = "$HEAD_SHA" ] && ok "A: exact commit sha recorded in evidence" || bad "A: commit sha (got $got_sha want $HEAD_SHA)"
 _esc_pane_alive "$PANE" && bad "A: old pane still alive after escalation" || ok "A: old pane verified stopped"
 [ -n "$successor" ] && ok "A: successor task_id recorded" || bad "A: successor task_id recorded"
@@ -760,7 +760,7 @@ esc_n2="$(event_count "$RUN" "$TASK" model_escalated)"
 # invented name); frontier is a deliberate cross-family jump to whatever
 # $HERDR_CODEX_DEEP actually resolves to right now — read live, not
 # hardcoded, so it tracks PR #378 automatically once that merges.
-[ "$(esc_tier_model claude standard)" = sonnet ] && ok "Q: exact standard-tier model (claude = sonnet)" \
+[ "$(esc_tier_model claude standard)" = anthropic/claude-sonnet-5-5 ] && ok "Q: exact standard-tier model (claude = Sonnet 5.5)" \
   || bad "Q: standard model (got $(esc_tier_model claude standard))"
 [ "$(esc_tier_model claude deep)" = opus ] && ok "Q: exact deep-tier model (claude = opus, not an invented 'opus-2')" \
   || bad "Q: deep model (got $(esc_tier_model claude deep))"
@@ -809,7 +809,7 @@ s_to_model="$(printf '%s' "$payload" | jq -r '.to_model // empty')"
 already_standard="$(escalated_payload "$RUN" "$TASK" standard)"
 [ "$s_from_tier" = standard ] && ok "S: a task spawned on implement is read as starting on standard, not fast" \
   || bad "S: from_tier for a pre-standard task (got [$s_from_tier])"
-[ "$s_from_model" = sonnet ] && [ "$s_to_model" = opus ] \
+[ "$s_from_model" = anthropic/claude-sonnet-5-5 ] && [ "$s_to_model" = opus ] \
   && ok "S: escalates standard->deep (sonnet->opus), not a sideways fast->standard" \
   || bad "S: from/to model (got from=[$s_from_model] to=[$s_to_model])"
 [ -z "$already_standard" ] && ok "S: no fast->standard event was ever written for this task" \

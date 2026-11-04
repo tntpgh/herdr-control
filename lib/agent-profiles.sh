@@ -91,8 +91,8 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 #
 # job-class tiers: plan|architect|design|deep-review (deep) ·
 #                  review|implement|debug|code|docs (standard — review runs
-#                  the standard model at HIGH effort: omp sonnet:high, same
-#                  sonnet alias as implement for claude/omc, $HERDR_CODEX_STD
+#                  the standard model at HIGH effort: omp Sonnet 5.5:high, same
+#                  pinned Sonnet 5.5 as implement for claude/omc, $HERDR_CODEX_STD
 #                  for codex) ·
 #                  explore|quick|mechanical (fast)
 # Terrence's decision 2026-10-04 (form 20261004T181727-8798,
@@ -106,9 +106,10 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # killed and respawned. Docs work is judgment work; only explore/quick/
 # mechanical are genuinely fast-tier.
 #
-# Claude and omp both fuzzy-match plain aliases (opus/sonnet/haiku) to a
-# current canonical model, so they share the same tier names. Codex has no
-# such alias scheme, so its model names are set in config.sh instead.
+# Opus/Haiku are plain aliases both omp and Claude fuzzy-match. Sonnet is NOT:
+# bare `sonnet` resolves to Sonnet 5, so standard-tier routes use the exact
+# $HERDR_SONNET_OMP / $HERDR_SONNET_CLAUDE selectors from config.sh. Codex model
+# names are likewise set in config.sh.
 # Credential posture BY JOB CLASS — the safe choice made once, not remembered
 # at every spawn (security review 2026-09-19, SPAWN-OPENV-006).
 #
@@ -184,20 +185,20 @@ model_for_agent() {
   case "$a:$j" in
     claude:deep-review)                                          printf 'opus\n' ;;
     claude:plan|claude:architect|claude:design)                  printf 'opus\n' ;;
-    claude:review)                                               printf 'sonnet:high\n' ;;
-    claude:implement|claude:debug|claude:code|claude:docs)        printf 'sonnet\n' ;;
+    claude:review)                                               printf '%s:high\n' "$HERDR_SONNET_OMP" ;;
+    claude:implement|claude:debug|claude:code|claude:docs)        printf '%s\n' "$HERDR_SONNET_OMP" ;;
     claude:explore|claude:quick|claude:mechanical)               printf 'haiku\n' ;;
-    claude:*)                                                   printf 'sonnet\n' ;;
+    claude:*)                                                   printf '%s\n' "$HERDR_SONNET_OMP" ;;
     # omc launches the real claude binary (cli_for_agent below), so it uses
     # claude's model aliases. These rows were MISSING until 2026-09-04:
     # model_for_agent returned empty for omc, and spawn-task.sh then built
     # `claude --model ` — a broken launch that looked routed but wasn't.
     omc:deep-review)                                             printf 'opus\n' ;;
     omc:plan|omc:architect|omc:design)                           printf 'opus\n' ;;
-    omc:review)                                                   printf 'sonnet:high\n' ;;
-    omc:implement|omc:debug|omc:code|omc:docs)                    printf 'sonnet\n' ;;
+    omc:review)                                                   printf '%s:high\n' "$HERDR_SONNET_CLAUDE" ;;
+    omc:implement|omc:debug|omc:code|omc:docs)                    printf '%s\n' "$HERDR_SONNET_CLAUDE" ;;
     omc:explore|omc:quick|omc:mechanical)                        printf 'haiku\n' ;;
-    omc:*)                                                       printf 'sonnet\n' ;;
+    omc:*)                                                       printf '%s\n' "$HERDR_SONNET_CLAUDE" ;;
     codex:deep-review)                                            printf '%s\n' "$HERDR_CODEX_DEEP" ;;
     codex:plan|codex:architect|codex:design)                      printf '%s\n' "$HERDR_CODEX_DEEP" ;;
     codex:review)                                                  printf '%s:high\n' "${HERDR_CODEX_STD%%:*}" ;;
@@ -206,13 +207,13 @@ model_for_agent() {
     codex:*)                                                      printf '%s\n' "$HERDR_CODEX_STD" ;;
     # omp's reasoning dial is --thinking (off/minimal/low/medium/high/xhigh/max).
     # Verified 2026-07-31 (`omp --help`, live `omp -p` call): `--model <alias>`
-    # fuzzy-matches opus/sonnet/haiku the same as Claude Code.
+    # fuzzy-matches opus/haiku the same as Claude Code; Sonnet is pinned.
     omp:deep-review)                                              printf 'opus:high\n' ;;
     omp:plan|omp:architect|omp:design)                            printf 'opus:high\n' ;;
-    omp:review)                                                   printf 'sonnet:high\n' ;;
-    omp:implement|omp:debug|omp:code|omp:docs)                  printf 'sonnet:medium\n' ;;
+    omp:review)                                                   printf '%s:high\n' "$HERDR_SONNET_OMP" ;;
+    omp:implement|omp:debug|omp:code|omp:docs)                  printf '%s:medium\n' "$HERDR_SONNET_OMP" ;;
     omp:explore|omp:quick|omp:mechanical)                       printf 'haiku:low\n' ;;
-    omp:*)                                                      printf 'sonnet:medium\n' ;;
+    omp:*)                                                      printf '%s:medium\n' "$HERDR_SONNET_OMP" ;;
   esac
 }
 
@@ -293,7 +294,7 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
     codex)
       if   [ "$name" = "${HERDR_CODEX_DEEP%%:*}" ]; then printf 'opus high\n'
       elif [ "$name" = "${HERDR_CODEX_FAST%%:*}" ]; then printf 'haiku low\n'
-      else printf 'sonnet medium\n'
+      else printf '%s medium\n' "$HERDR_SONNET_OMP"
       fi ;;
   esac
 }

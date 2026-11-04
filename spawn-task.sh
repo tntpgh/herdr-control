@@ -11,10 +11,10 @@
 # workspace (a "sub-tab", not a separate space), running the right model at
 # the right job-class tier. This is the orchestrator's per-task hand:
 #
-#   spawn-task.sh ~/Code/myproject fix-parser implement           # claude flavor, sonnet, under omp
+#   spawn-task.sh ~/Code/myproject fix-parser implement           # claude flavor, Sonnet 5.5, under omp
 #   spawn-task.sh ~/Code/myproject pr-review review codex         # codex flavor, standard model high effort, under omp
 #   spawn-task.sh ~/Code/myproject arch-review deep-review codex  # codex flavor, deep model, under omp
-#   spawn-task.sh ~/Code/myproject fix-worker implement omp       # omp, sonnet
+#   spawn-task.sh ~/Code/myproject fix-worker implement omp       # omp, Sonnet 5.5
 #   spawn-task.sh ~/Code/myproject probe quick pwd                # literal cmd (no model)
 #
 # `claude`/`codex` are MODEL FAMILIES, not CLI binaries: both launch under the
@@ -34,10 +34,11 @@
 # job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
 # --effort override):
 #   plan|architect|design|deep-review -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
-#   review                        -> claude sonnet:high · codex $HERDR_CODEX_STD's model at HIGH effort · omp sonnet:high
-#   implement|debug|code|docs     -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
+#   review                        -> claude Sonnet 5.5:high · codex $HERDR_CODEX_STD's model at HIGH effort · omp Sonnet 5.5:high
+#   implement|debug|code|docs     -> claude Sonnet 5.5 · codex $HERDR_CODEX_STD  · omp Sonnet 5.5:medium
 #   explore|quick|mechanical      -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
-# (Claude/omp tiers are model-name aliases omp fuzzy-matches; Codex model
+# (Opus/Haiku are model-name aliases omp fuzzy-matches; Sonnet is pinned to the exact
+# $HERDR_SONNET_OMP / $HERDR_SONNET_CLAUDE ids in config.sh. Codex model
 # names live in config.sh and are launched via omp's `openai-codex/<model>`
 # provider prefix. Known agents live in lib/agent-profiles.sh — add a new one
 # there, not in this file.)
