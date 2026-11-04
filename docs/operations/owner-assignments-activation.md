@@ -70,18 +70,45 @@ After applying live: `python3 owner-assignment.py --db "$HERDR_OWNER_LEASE_DB" s
 
 ```bash
 HERDR_OWNER_ASSIGNMENT_WRITER=1 python3 owner-assignment-activate.py --db "$HERDR_OWNER_LEASE_DB" \
-    --rollback <backup> [--expect-sha256 <sha>]           # dry-run: names backup schema + sha256
+    --rollback <backup>                                   # dry-run: schema, sha256, post-backup authority events
 HERDR_OWNER_ASSIGNMENT_WRITER=1 python3 owner-assignment-activate.py --db "$HERDR_OWNER_LEASE_DB" \
-    --rollback <backup> --apply
+    --rollback <backup> --expect-sha256 <sha> --apply
 ```
 
-`--apply` first snapshots the current store to `<db>.pre-rollback-<ts>.sqlite3`, then restores the backup
-through sqlite's backup API and checks integrity. A rollback discards every row written after the backup
-(requests, events), so stop owner consumers first. To end a single assignment without a full rollback,
-use `owner-assignment.py revoke` (audited, fences every path at once).
+- **Bound to this store:** the backup must be `<db>.pre-assignment-activate-v<N>-<epoch>.sqlite3` or
+  `<db>.pre-rollback-<epoch>.sqlite3` in the same directory as `--db`, contain the owner-lease tables, and
+  `--expect-sha256` is **required** with `--apply` (the activation prints the exact line).
+- **Never erases a revocation:** if the live store holds `revoked`/`assigned` events newer than the backup
+  (a holder revoked, or a new assignment, since activation), the rollback **refuses (exit 2)** and lists
+  them: restoring would re-authorize a revoked holder for the rest of its original TTL. Only
+  `--ack-discard-post-backup-events` overrides, deliberately. Prefer `owner-assignment.py revoke`/`replace`
+  to undo a single assignment; a rollback is for a failed activation.
+- **Never re-enables leasing:** after the restore `owner_state.enabled=0` (kill switch ENGAGED), whatever
+  the backup held. Re-enable on purpose after reviewing the store:
+  `sqlite3 "$HERDR_OWNER_LEASE_DB" "UPDATE owner_state SET enabled=1"`.
+- **Schema:** the restored store has the backup's schema (v5 after an activation rollback). v6 code fails
+  on every read (`no such column: authority_mode`) until `owner-lease-migrate.py` re-migrates it, so either
+  roll the code back too or migrate before re-enabling.
+- `--apply` first snapshots the current store to `<db>.pre-rollback-<epoch>.sqlite3` (`O_EXCL`, 0600 — it
+  never overwrites or follows a pre-existing file or symlink), restores through sqlite's backup API and
+  checks integrity. Rows written after the backup (requests, events) are discarded; stop owner consumers
+  first.
+
+## Registry binding of assignment holders (delivery, reply credit, result submit/accept)
+
+An assignment never lapses and `renew_due` never re-checks it, so a same-pane agent restart (new session)
+would otherwise keep the old holder's authority. Every consumer therefore also requires the owner
+registry's CURRENT `(pane, birth, session digest)` to equal the assignment holder, failing closed when the
+registry is unresolved: dispatch and `ra-sender`/publisher `bound()` (already), the publisher's delivery
+gate (`DeliveryGate(resolve=...)`: `admit`, `begin_notice`, `on_reply`, `record_evidence` →
+`owner_session_mismatch`/`session_mismatch`), and `submit-owner-result.py` / `accept-owner-result.py`
+(`ol.registry_bound_holder`). Timed leases are unchanged (closed by `renew_due`'s identity check).
 
 ## Changelog
 
 - 2026-11-04 — PR B: consumers routed by authority mode; `ol.assign_convert()`, `ol.live_mode()`;
   `owner-assignment-activate.py`; `verify-owner-assignment-activation.py`; `factory-status` assignment
   states; `owner-lease-resume.py` assignment refusal; CI runs the new suites.
+- 2026-11-04 — PR B review fixes (H1/H2/M1/L1): registry/session binding for assignment delivery, reply
+  credit and result submit/accept; rollback refuses post-backup revocations, forces the kill switch on,
+  requires the digest and a same-store backup name, and snapshots/backs up with `ol.export_backup` (`O_EXCL`).

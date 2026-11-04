@@ -1210,7 +1210,7 @@ def owner_lease_gate():
         spec = importlib.util.spec_from_file_location("owner_lease_delivery", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        gate = mod.from_env()
+        gate = mod.from_env(resolve=registry_resolver)
         if gate is None:
             raise RuntimeError("HERDR_OWNER_LEASE_DELIVERY=1 but HERDR_OWNER_LEASE_DB is unset")
         _OWNER_LEASE_GATE = gate

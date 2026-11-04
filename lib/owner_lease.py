@@ -993,6 +993,22 @@ def live_mode(conn, label, now=None) -> str | None:
     return cur[7] if cur else None
 
 
+def registry_bound_holder(conn, label, now, resolve):
+    """holder_tuple(modes=AUTHORITY_MODES), except that a durable ASSIGNMENT
+    holder is returned only while the owner registry's CURRENT
+    (pane, birth, session_digest) for the label is EXACTLY that holder
+    (None otherwise, incl. an unresolved registry). An assignment never
+    lapses and renew_due() never re-checks it ('not_timed'), so a same-pane
+    agent restart (new session) would otherwise keep the old authority
+    forever; a timed lease is closed by renew_due()'s identity check within
+    its TTL and is returned unchanged."""
+    cur = holder_tuple(conn, label, now, modes=AUTHORITY_MODES)
+    if cur is None or live_mode(conn, label, now) != "assignment":
+        return cur
+    reg = resolve(label)
+    return cur if reg is not None and tuple(reg) == cur[:3] else None
+
+
 def live_expiry(conn, label, now=None) -> float | None:
     """Epoch-seconds expires_at of the label's live lease, or None when
     there is none. Read-only. R12/owner-dispatch-issue.py's bind-live-

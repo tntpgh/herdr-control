@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """owner-assignment-activate.py --db PATH --decision-ref REF --reason TEXT
-[--label L ...] [--apply] | --rollback BACKUP [--expect-sha256 SHA] [--apply]
+[--label L ...] [--apply] | --rollback BACKUP --expect-sha256 SHA [--ack-discard-post-backup-events] [--apply]
 
 Plan 018 PR B's ONE activation/deployment entrypoint: migrate an owner-lease
 store to the current schema (v6) and convert every CURRENTLY AUTHORITATIVE
@@ -29,11 +29,20 @@ the backup fails (exit 3) the printed rollback line is the way back; a
 partial conversion is also safe to simply re-run.
 
 --rollback BACKUP: restores the store's content from an activation backup.
-Dry-run by default (prints backup schema version and sha256); --apply first
-snapshots the CURRENT store to `<db>.pre-rollback-<ts>.sqlite3`, then
-restores through sqlite's backup API. --expect-sha256 pins the backup file.
-NOTE: a rollback discards every row written after the backup (including
-owner_events and any requests); stop owner consumers first.
+The backup must be one this tool made for --db (<db>.pre-assignment-activate-
+v<N>-<epoch>.sqlite3 or <db>.pre-rollback-<epoch>.sqlite3 beside it), an
+owner-lease store (owner_projects/owner_leases/owner_events/owner_state), and
+--expect-sha256 is REQUIRED with --apply. Dry-run by default (prints schema,
+sha256 and any post-backup authority events). It REFUSES (exit 2) when the live
+store holds `revoked`/`assigned` events newer than the backup -- a restore would
+erase audited revocations and re-authorize revoked holders -- unless
+--ack-discard-post-backup-events is given. --apply first snapshots the CURRENT
+store to `<db>.pre-rollback-<ts>.sqlite3` (O_EXCL, 0600), restores through
+sqlite's backup API, then ENGAGES the kill switch (owner_state.enabled=0): a
+rollback never re-enables leasing; the operator does that on purpose. The
+restored store has the BACKUP's schema (v5 after an activation rollback), so v6
+code fails until owner-lease-migrate.py runs. Rows written after the backup are
+discarded; stop owner consumers first.
 
 Exit: 0 ok (incl. clean dry-run, nothing-to-do); 2 refused (drift /
 unresolved registry / kill switch / assign_convert refusal); 4 refused
@@ -42,6 +51,7 @@ unresolved registry / kill switch / assign_convert refusal); 4 refused
 from __future__ import annotations
 
 import argparse
+import re
 import hashlib
 import os
 import sqlite3
@@ -115,25 +125,51 @@ def build_plan(conn, cur_version: int, now: float, resolve, only: set[str]) -> t
 
 
 def _backup(src, db: str, tag: str) -> tuple[str, str]:
+    """ol.export_backup: O_CREAT|O_EXCL 0600 -- never overwrites or follows a pre-planted file/symlink."""
     path = f"{db}.{tag}-{int(time.time())}.sqlite3"
-    dst = sqlite3.connect(path)
-    try:
-        src.backup(dst)
-    finally:
-        dst.close()
-    os.chmod(path, 0o600)
+    ol.export_backup(src, path)
     return path, _sha(path)
 
 
-def _rollback_line(backup: str, db: str) -> str:
-    return (f"rollback: python3 {Path(__file__).name} --db {db} --rollback {backup} --apply   # restores the "
-            f"pre-activation content (rows written after the backup are discarded); or: cp {backup} {db}")
+def _rollback_line(backup: str, db: str, sha: str) -> str:
+    return (f"rollback: python3 {Path(__file__).name} --db {db} --rollback {backup} --expect-sha256 {sha} --apply"
+            "   # restores pre-activation content, leaves the kill switch ENGAGED; refuses if revocations/"
+            "assignments were made since (see --ack-discard-post-backup-events)")
+
+
+REQUIRED_TABLES = ("owner_projects", "owner_leases", "owner_events", "owner_state")
+# Events that are audited authority decisions made AFTER a backup: a restore would silently erase them.
+AUTHORITY_EVENT_KINDS = ("revoked", "assigned")
+
+
+def _backup_name_ok(backup: str, db: str) -> bool:
+    """Bound to THIS store by name: only what _backup() itself produced for --db (activation backup or
+    a pre-rollback snapshot), never an arbitrary file."""
+    pat = re.escape(Path(db).name) + r"\.(pre-assignment-activate-v\d+|pre-rollback)-\d+\.sqlite3"
+    return re.fullmatch(pat, Path(backup).name) is not None and Path(backup).parent.resolve() == Path(db).resolve().parent
+
+
+def _post_backup_events(live, backup_conn) -> tuple[list[tuple], str | None]:
+    """([(seq, label, kind, generation)], refusal). Authority events in `live` newer than anything the backup
+    holds. A backup whose newest event is AHEAD of the live store is not a backup of it (refusal)."""
+    bmax = backup_conn.execute("SELECT COALESCE(MAX(seq),0) FROM owner_events").fetchone()[0]
+    lmax = live.execute("SELECT COALESCE(MAX(seq),0) FROM owner_events").fetchone()[0]
+    if bmax > lmax:
+        return [], "backup_newer_than_store"
+    marks = ",".join("?" * len(AUTHORITY_EVENT_KINDS))
+    rows = live.execute(f"SELECT seq, label, kind, generation FROM owner_events WHERE seq>? AND kind IN ({marks}) "
+                        "ORDER BY seq", (bmax, *AUTHORITY_EVENT_KINDS)).fetchall()
+    return [tuple(r) for r in rows], None
 
 
 def cmd_rollback(a) -> int:
     backup = a.rollback
     if not Path(backup).is_file():
         print("refused:backup_missing")
+        return 4
+    if not _backup_name_ok(backup, a.db):
+        print("refused:backup_not_from_this_store (expected <db>.pre-assignment-activate-v<N>-<epoch>.sqlite3 "
+              "or <db>.pre-rollback-<epoch>.sqlite3 beside --db)")
         return 4
     sha = _sha(backup)
     if a.expect_sha256 and a.expect_sha256 != sha:
@@ -144,6 +180,7 @@ def cmd_rollback(a) -> int:
         try:
             bver = ol.current_version(b)
             ok = b.execute("PRAGMA integrity_check").fetchone()[0]
+            have = {r[0] for r in b.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             b.close()
     except sqlite3.Error as exc:
@@ -152,10 +189,42 @@ def cmd_rollback(a) -> int:
     if ok != "ok":
         print("refused:backup_integrity")
         return 4
+    if not set(REQUIRED_TABLES) <= have:
+        print("refused:backup_not_an_owner_lease_store")
+        return 4
+    try:
+        probe = ol.open_ro(a.db, require_table="owner_projects")
+    except ValueError as exc:
+        print(f"refused:lease_{exc}")
+        return 4
+    try:
+        b = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+        try:
+            events, why = _post_backup_events(probe, b)
+        finally:
+            b.close()
+    except sqlite3.Error as exc:
+        print(f"refused:live_events_unreadable:{type(exc).__name__}")
+        return 4
+    finally:
+        probe.close()
+    if why:
+        print(f"refused:{why}")
+        return 4
     print(f"rollback_plan:restore {backup} (schema v{bver}, sha256 {sha}) over {a.db}")
+    for seq, label, kind, gen in events:
+        print(f"post_backup_authority_event:seq={seq} label={label} kind={kind} gen={gen} (a restore ERASES this decision)")
+    if events and not a.ack_discard:
+        print("refused:post_backup_authority_events (revocations/assignments made after the backup would be undone, "
+              "re-authorizing revoked holders; re-run with --ack-discard-post-backup-events only if that is intended)")
+        return 2
+    print("note:the restored store is left owner_state.enabled=0 (kill switch ENGAGED); re-enable it deliberately")
     if not a.apply:
-        print("dry-run: nothing written (pass --apply to restore)")
+        print("dry-run: nothing written (pass --apply with --expect-sha256 to restore)")
         return 0
+    if not a.expect_sha256:
+        print(f"refused:expect_sha256_required (pass --expect-sha256 {sha})")
+        return 4
     if os.environ.get(ASSIGN_WRITER) != "1":
         print("refused:flags_off")
         return 4
@@ -174,9 +243,11 @@ def cmd_rollback(a) -> int:
             src.backup(live)
         finally:
             src.close()
+        ol.disable(live)  # a rollback never re-enables leasing: the operator does that on purpose
         chk = live.execute("PRAGMA integrity_check").fetchone()[0]
-        print(f"restored:{backup}:schema_v{ol.current_version(live)}:integrity={chk}")
-        return 0 if chk == "ok" else 3
+        en = live.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone()[0]
+        print(f"restored:{backup}:schema_v{ol.current_version(live)}:integrity={chk}:owner_state.enabled={en}")
+        return 0 if chk == "ok" and en == 0 else 3
     except BaseException as exc:  # noqa: BLE001
         print(f"error:{type(exc).__name__}:{exc}")
         return 3
@@ -193,6 +264,7 @@ def main(argv=None, resolve=None, clock=time.time) -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--rollback")
     ap.add_argument("--expect-sha256", dest="expect_sha256")
+    ap.add_argument("--ack-discard-post-backup-events", dest="ack_discard", action="store_true")
     a = ap.parse_args(argv)
     if a.rollback:
         return cmd_rollback(a)
@@ -263,7 +335,7 @@ def main(argv=None, resolve=None, clock=time.time) -> int:
         backup, sha = _backup(conn, a.db, f"pre-assignment-activate-v{cur}")
         print(f"backup:{backup}")
         print(f"backup_sha256:{sha}")
-        print(_rollback_line(backup, a.db))
+        print(_rollback_line(backup, a.db, sha))
         if cur < target:
             print(f"migrated:{cur}->{ol.migrate(conn)}")
         for _, label, r in converts:
@@ -285,7 +357,7 @@ def main(argv=None, resolve=None, clock=time.time) -> int:
     except BaseException as exc:  # noqa: BLE001
         print(f"error:{type(exc).__name__}:{exc}")
         if backup:
-            print(_rollback_line(backup, a.db))
+            print(_rollback_line(backup, a.db, sha))
         return 3
     finally:
         conn.close()

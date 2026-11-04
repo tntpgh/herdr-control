@@ -212,24 +212,102 @@ def part1():
     case("re-run with DIFFERENT evidence never rewrites an existing assignment",
          rc == 0 and "nothing_to_do" in out and db.read_bytes() == after)
 
-    # rollback
+    # rollback: bound to THIS store's backup (M1), refuses to erase post-backup revocations (H2), never re-enables (H2b)
+    bsha = hashlib.sha256(bk[0].read_bytes()).hexdigest()
     rc, out = run_cli(base, db, "--rollback", str(bk[0]), registry=registry)
-    case("ROLLBACK dry-run names the backup (schema v5 + sha256) and writes nothing",
-         rc == 0 and "schema v5" in out and "dry-run" in out and db.read_bytes() == after)
+    case("ROLLBACK dry-run names the backup (schema v5 + sha256), warns the kill switch stays engaged, writes nothing",
+         rc == 0 and "schema v5" in out and "dry-run" in out and "enabled=0" in out and db.read_bytes() == after)
     rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--expect-sha256", "0" * 64, "--apply", flags=W, registry=registry)
     case("ROLLBACK with a wrong --expect-sha256 is refused", rc == 4 and "backup_sha256_mismatch" in out and db.read_bytes() == after)
-    rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--apply", registry=registry)
-    case("ROLLBACK --apply without the writer flag: refused:flags_off", rc == 4 and out.endswith("refused:flags_off"))
     rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--apply", flags=W, registry=registry)
+    case("M1: ROLLBACK --apply WITHOUT --expect-sha256 is refused (digest binding required)",
+         rc == 4 and "expect_sha256_required" in out and db.read_bytes() == after)
+    rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--expect-sha256", bsha, "--apply", registry=registry)
+    case("ROLLBACK --apply without the writer flag: refused:flags_off", rc == 4 and out.endswith("refused:flags_off"))
+    junk = db.parent / f"{db.name}.pre-rollback-1.sqlite3"
+    jc = sqlite3.connect(str(junk))
+    jc.execute("CREATE TABLE keep (x)")
+    jc.commit(); jc.close()
+    rc, out = run_cli(base, db, "--rollback", str(junk), "--expect-sha256", hashlib.sha256(junk.read_bytes()).hexdigest(),
+                      "--apply", flags=W, registry=registry)
+    case("M1: an arbitrary sqlite file that is not an owner-lease store is refused, live store untouched",
+         rc == 4 and "backup_not_an_owner_lease_store" in out and db.read_bytes() == after)
+    junk.unlink()
+    stray = base / "stray.sqlite3"
+    stray.write_bytes(bk[0].read_bytes())
+    rc, out = run_cli(base, db, "--rollback", str(stray), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
+    case("M1: a genuine backup under a foreign name is refused (not this store's backup)",
+         rc == 4 and "backup_not_from_this_store" in out and db.read_bytes() == after)
+    other = tmpdir()
+    foreign = other / bk[0].name
+    foreign.write_bytes(bk[0].read_bytes())
+    rc, out = run_cli(base, db, "--rollback", str(foreign), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
+    case("M1: a same-named backup from another directory (another store) is refused",
+         rc == 4 and "backup_not_from_this_store" in out and db.read_bytes() == after)
+    # L1: the snapshot name is pre-planted as a symlink -> O_EXCL refuses, victim untouched, store not restored
+    victim = base / "victim.txt"
+    victim.write_text("keep me")
+    plant = Path(f"{db}.pre-rollback-{int(time.time())}.sqlite3")
+    plant2 = Path(f"{db}.pre-rollback-{int(time.time()) + 1}.sqlite3")
+    for p in (plant, plant2):
+        p.symlink_to(victim)
+    rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
+    case("L1: a pre-planted symlink at the snapshot name is never followed/overwritten (O_EXCL); store NOT restored",
+         rc == 3 and "FileExistsError" in out and victim.read_text() == "keep me" and db.read_bytes() == after)
+    plant.unlink(); plant2.unlink()
+
+    # H2: a revocation made AFTER the backup must not be silently erased
+    base_r = tmpdir()
+    db_r = base_r / db.name
+    db_r.write_bytes(after)
+    os.chmod(db_r, 0o600)
+    bk_r = base_r / bk[0].name
+    bk_r.write_bytes(bk[0].read_bytes())
+    rcn = ol.connect(str(db_r))
+    ol.assign_revoke(rcn, "kb", 1, "w1:p1", "term_kb", digest("kb", "sess-kb"), "dec-rev-1", "compromised pane",
+                     now + 5, dry_run=False)
+    rcn.close()
+    revoked_bytes = db_r.read_bytes()
+    rc, out = run_cli(base_r, db_r, "--rollback", str(bk_r), registry=registry)
+    case("H2: ROLLBACK dry-run lists the post-backup revocation and refuses (exit 2)",
+         rc == 2 and "post_backup_authority_event:" in out and "label=kb kind=revoked" in out
+         and "refused:post_backup_authority_events" in out and db_r.read_bytes() == revoked_bytes)
+    rc, out = run_cli(base_r, db_r, "--rollback", str(bk_r), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
+    case("H2: ROLLBACK --apply is refused too; the revoked holder is NOT re-authorized, nothing written, no snapshot",
+         rc == 2 and "refused:post_backup_authority_events" in out and db_r.read_bytes() == revoked_bytes
+         and not backups(db_r, "pre-rollback")
+         and rows_of(db_r, "SELECT release_reason FROM owner_leases WHERE label='kb'") == [("revoked",)])
+    rc, out = run_cli(base_r, db_r, "--rollback", str(bk_r), "--expect-sha256", bsha, "--ack-discard-post-backup-events",
+                      "--apply", flags=W, registry=registry)
+    case("H2: only with the explicit --ack-discard-post-backup-events does it restore (and the discard is reported)",
+         rc == 0 and "post_backup_authority_event:" in out and "restored:" in out and len(backups(db_r, "pre-rollback")) == 1)
+    case("H2b: even after an acknowledged restore the kill switch is ENGAGED (enabled=0), schema is the backup's v5",
+         rows_of(db_r, "SELECT enabled FROM owner_state") == [(0,)]
+         and rows_of(db_r, "SELECT MAX(version) FROM owner_schema_version") == [(5,)])
+
+    # H2b: an engaged kill switch is not re-enabled by a rollback (the backup itself has enabled=1)
+    live_c = sqlite3.connect(str(db))
+    live_c.execute("UPDATE owner_state SET enabled=0")
+    live_c.commit(); live_c.close()
+    rc, out = run_cli(base, db, "--rollback", str(bk[0]), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
     snaps = backups(db, "pre-rollback")
-    case("ROLLBACK --apply: pre-rollback snapshot taken, store restored to the v5 content",
-         rc == 0 and len(snaps) == 1 and "restored:" in out and "integrity=ok" in out
+    case("ROLLBACK --apply: pre-rollback snapshot taken, store restored to the v5 content, kill switch stays engaged",
+         rc == 0 and len(snaps) == 1 and "restored:" in out and "integrity=ok" in out and "owner_state.enabled=0" in out
          and rows_of(db, "SELECT MAX(version) FROM owner_schema_version") == [(5,)]
+         and rows_of(db, "SELECT enabled FROM owner_state") == [(0,)]
          and rows_of(db, "SELECT lease_id, expires_at FROM owner_leases ORDER BY lease_id")
          == [("Lkb", ol._iso(now + 3600)), ("Lold", ol._iso(now - 600)), ("Ltos", ol._iso(now + 3600))]
-         and rows_of(snaps[0], "SELECT authority_mode FROM owner_leases WHERE label='kb'") == [("assignment",)])
+         and rows_of(snaps[0], "SELECT authority_mode FROM owner_leases WHERE label='kb'") == [("assignment",)]
+         and (snaps[0].stat().st_mode & 0o777) == 0o600)
     rc, out = run_cli(base, db, *EV, "--apply", flags=W, registry=registry)
-    case("after a rollback the activation can be applied again", rc == 0 and "converted:kb:gen=1" in out)
+    case("after a rollback leasing stays OFF: activation refuses until the operator re-enables on purpose",
+         rc == 2 and "owner_leasing_disabled" in out)
+    en = sqlite3.connect(str(db))
+    en.execute("UPDATE owner_state SET enabled=1")
+    en.commit(); en.close()
+    time.sleep(1.1)  # backup names carry epoch seconds and are O_EXCL: never reuse the first activation's name
+    rc, out = run_cli(base, db, *EV, "--apply", flags=W, registry=registry)
+    case("after the deliberate re-enable the activation can be applied again", rc == 0 and "converted:kb:gen=1" in out)
 
     # --label restriction + kill switch
     base2 = tmpdir()
@@ -357,17 +435,49 @@ def part2():
     (roots[KB] / "r1" / "result.md").write_text("done r1\n")
     sha1 = hashlib.sha256(b"done r1\n").hexdigest()
 
+    reg = {KB: HOLDER1}
+
     def submit(rid, pane):
-        return capture(sub.main, ["--rid", rid], caller_pane_resolver=lambda: pane, waker=lambda *a: "wake:skipped", environ=cfg)
+        return capture(sub.main, ["--rid", rid], caller_pane_resolver=lambda: pane, waker=lambda *a: "wake:skipped",
+                       environ=cfg, resolve=reg.get)
 
     def accept(receipt, sha):
-        return capture(acc.main, ["--receipt-id", receipt, "--by", "reviewer", "--pin", f"result.md={sha}"], environ=cfg)
+        return capture(acc.main, ["--receipt-id", receipt, "--by", "reviewer", "--pin", f"result.md={sha}"], environ=cfg,
+                       resolve=reg.get)
 
     rc, out = submit("r1", PANE[KB][0])
     receipt1 = out.split(":")[1] if out.startswith("submitted:") else ""
     case("RESULT SUBMIT by the assigned holder pane -> receipt", rc == 0 and receipt1.startswith("recv_"))
     rc, out = submit("r1", "w1:pZ")
     case("RESULT SUBMIT from a pane that is not the holder -> refused", rc == 2 and "bindings_did_not_match" in out)
+
+    # H1: the registry's session for the label changes (same pane id + birth, agent restarted) -> an assignment
+    # holder must stop being honoured by EVERY consumer, even though the assignment itself never lapses.
+    drift = (*PANE[KB], hashlib.sha256(b"restarted-agent-session").hexdigest())
+    reg[KB] = drift
+    rc, out = submit("r1", PANE[KB][0])
+    case("H1 RESULT SUBMIT with registry session drift (same pane+birth) -> refused", rc == 2 and "bindings_did_not_match" in out)
+    rc, out = accept(receipt1, sha1)
+    case("H1 RESULT ACCEPT with registry session drift -> refused", rc == 2 and "bindings_did_not_match" in out)
+    rc, out = capture(acc.main, ["--receipt-id", receipt1, "--by", "reviewer", "--pin", f"result.md={sha1}"], environ=cfg,
+                      resolve=lambda label: None)
+    case("H1 RESULT ACCEPT with an UNRESOLVED registry label -> refused (fail closed)", rc == 2 and "bindings_did_not_match" in out)
+    dg = old.DeliveryGate(lease_db, resolve=reg.get)
+    case("H1 DELIVERY admit with registry session drift: blocked owner_session_mismatch, nothing queued",
+         dg.admit(KB, *PANE[KB], "r_drift", T1 + 1).reason == "owner_session_mismatch" and dg.state("r_drift") is None)
+    case("H1 DELIVERY begin_notice with drift: owner_session_mismatch (not delivering)",
+         dg.begin_notice(KB, *PANE[KB], 1, "r1", T1 + 1) == "owner_session_mismatch")
+    case("H1 DELIVERY reply crediting with drift: session_mismatch, the delivering request is NOT credited",
+         dg.on_reply(KB, "r1", now=T1 + 1) == "session_mismatch" and dg.state("r1") == "delivering")
+    case("H1 DELIVERY record_evidence with drift: FencedOut",
+         raises(lambda: dg.record_evidence(KB, "r1", "ev-x", now=T1 + 1), ol.FencedOut))
+    reg[KB] = None
+    case("H1 DELIVERY with an unresolved registry: admit blocked owner_session_mismatch (fail closed)",
+         dg.admit(KB, *PANE[KB], "r_unres", T1 + 1).reason == "owner_session_mismatch")
+    reg[KB] = HOLDER1
+    case("H1 control: registry restored to the exact holder -> admit ok again",
+         dg.admit(KB, *PANE[KB], "r_ok", T1 + 1).ok and dg.state("r_ok") == "queued")
+    dg.close()
     rc, out = accept(receipt1, sha1)
     case("RESULT ACCEPT by an independent reviewer -> accepted", rc == 0 and out == "accepted" and "accepted" in av.stages("r1"))
 
@@ -430,6 +540,7 @@ def part2():
     gen2 = ol.assign_replace(lc, KB, 1, *HOLDER1, *HOLDER2, "dec-new", "new owner", T2 + 10, False, True)
     case("audited replacement -> generation 2 for the NEW holder only",
          gen2 == 2 and ol.holder_tuple(lc, KB, T2 + 11, modes=ol.AUTHORITY_MODES) == (*HOLDER2, 2))
+    reg[KB] = HOLDER2                                                     # the registry follows the audited replacement
     res_old, st_old = dispatch("r4", (*HOLDER1, 1), HOLDER1, T2 + 11)
     res_old2, st_old2 = dispatch("r5", (*HOLDER1, 2), HOLDER1, T2 + 11)
     case("old holder still gets nothing: dispatch held, grants not consumed (gen 1 and gen 2 bindings alike)",
@@ -584,6 +695,21 @@ def part4():
         gate = pub.owner_lease_gate()
         case("PUBLISHER deliver_owner: assignment holder admitted, begin_notice has no TTL fence, delivered, gate delivering gen 1",
              res == {"exchange_id": "ex_pub", "outcome": "delivered"} and gate.record("ex_pub")[:3] == (KB, 1, "delivering"))
+        # H1: same pane id + birth, the agent restarted (new session) -> notice delivery and reply credit both stop
+        typed = []
+        real_send = pub._send_owner_notice
+        pub._send_owner_notice = lambda item, label, pane, write=True: typed.append(item["exchange_id"]) or real_send(item, label, pane, write)
+        rows[KB]["agent_session"] = "kb-sess-RESTARTED"
+        res_d = pub.deliver_owner({"exchange_id": "ex_drift", "owner_label": KB, "body": "hello", "sender": "a@b.c"}, local)
+        case("H1 PUBLISHER deliver_owner with same-pane session drift: blocked owner_session_mismatch, nothing typed, nothing queued",
+             res_d == {"exchange_id": "ex_drift", "outcome": "blocked", "reason": "owner_session_mismatch"}
+             and typed == [] and gate.record("ex_drift") is None)
+        case("H1 PUBLISHER credit_owner_reply with session drift: NOT credited, the delivering request stays delivering",
+             pub.credit_owner_reply(gate, KB, "ex_pub", True) is False and gate.state("ex_pub") == "delivering")
+        rows[KB]["agent_session"] = "kb-sess"
+        case("H1 control: registry back to the exact holder -> reply credited",
+             pub.credit_owner_reply(gate, KB, "ex_pub", True) is True and gate.state("ex_pub") == "replied")
+        pub._send_owner_notice = real_send
         ol.assign_revoke(lc, KB, 1, *PANE[KB], digest_kb, "dec-pub-rev", "revoked", now, dry_run=False)
         res2 = pub.deliver_owner({"exchange_id": "ex_pub2", "owner_label": KB, "body": "hello", "sender": "a@b.c"}, local)
         case("PUBLISHER deliver_owner after revoke: blocked owner_no_lease, nothing delivered",
