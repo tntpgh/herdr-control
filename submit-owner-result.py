@@ -131,7 +131,7 @@ def main(argv=None, caller_pane_resolver=caller_pane_from_ancestry, waker=wake_m
             return 4
         lc = ol.connect(lease_db)
         try:
-            holder = lambda label: ol.holder_tuple(lc, label, time.time())  # noqa: E731
+            holder = lambda label: ol.holder_tuple(lc, label, time.time(), modes=ol.AUTHORITY_MODES)  # noqa: E731
             try:
                 receipt_id = avail.submit_owner_result(a.rid, caller_pane, holder)
             except ra.Refused as exc:

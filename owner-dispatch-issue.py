@@ -715,7 +715,7 @@ def build_main(argv, resolve=None, now=None) -> int:
             print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {a.lease_db} --apply")
             return 4
         try:
-            live = ol.holder_tuple(blconn, a.label, clock())
+            live = ol.holder_tuple(blconn, a.label, clock(), modes=ol.AUTHORITY_MODES)
         finally:
             blconn.close()
         if live != (ident[0], ident[1], ident[2], a.bind_live_generation):
@@ -819,7 +819,7 @@ def build_standing_main(argv, resolve=None, now=None) -> int:
         return 4
     try:
         row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (a.label,)).fetchone()
-        live = ol.holder_tuple(lconn, a.label, clock())
+        live = ol.holder_tuple(lconn, a.label, clock(), modes=ol.AUTHORITY_MODES)
     except sqlite3.Error as exc:
         print(f"refused:lease_{type(exc).__name__}")
         return 4
@@ -991,8 +991,8 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
             if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
                              (rec["auth_id"], dec["form_id"])).fetchone():
                 raise Refused("approval_already_used")
-            if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"], h["session_digest"],
-                                                                       rec["expected_generation"]):
+            if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
+                    h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
                 raise Refused("lease_holder_mismatch")                  # floor must ALREADY be live -- never claimed here
             window(dec, clock(), key="standing_window_s")               # revalidation 2: before issue
             same_identity(resolve, rec)
@@ -1214,8 +1214,8 @@ def main(argv=None, resolve=None, now=None) -> int:
                     # the gap between this check and that one is still
                     # caught there (ANSWER-r12.md: "lease expired between
                     # form and issue: refuse, never renew/rebind").
-                    if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"],
-                                                                               h["session_digest"], bind_live_gen):
+                    if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
+                            h["pane_id"], h["pane_birth"], h["session_digest"], bind_live_gen):
                         raise Refused("live_generation_mismatch")
                     gen = bind_live_gen
                 elif prev_gen == 0:
@@ -1244,15 +1244,21 @@ def main(argv=None, resolve=None, now=None) -> int:
                 raise Refused("generation_mismatch")
             window(dec, clock())
             same_identity(resolve, rec)                               # revalidation 2: before issue
-            if ol.holder_tuple(lconn, rec["owner_label"], clock()) != (h["pane_id"], h["pane_birth"], h["session_digest"],
-                                                                       rec["expected_generation"]):
+            if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
+                    h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
                 raise Refused("lease_holder_mismatch")
-            if bind_live_gen is not None:
+            live_mode = ol.live_mode(lconn, rec["owner_label"], clock()) if bind_live_gen is not None else None
+            if bind_live_gen is not None and live_mode not in ("timed", "assignment"):
+                raise Refused("lease_holder_mismatch")
+            if bind_live_gen is not None and live_mode == "timed":
                 # ANSWER-r12.md binding: a bind-live grant's own expiry
-                # must never outlive the lease it is bound to -- checked
+                # must never outlive the TIMED lease it is bound to -- checked
                 # against the REAL, current lease expiry at issue time,
                 # not a stale build-time snapshot (same revalidation
-                # philosophy as same_identity's two calls).
+                # philosophy as same_identity's two calls). A durable
+                # assignment has no expiry to outlive (its grant keeps its
+                # own bounded window); the holder tuple above already
+                # fenced mode+generation, and revocation fences consume.
                 lease_exp = ol.live_expiry(lconn, rec["owner_label"], clock())
                 if lease_exp is None or exp > lease_exp:
                     raise Refused("grant_exceeds_lease_expiry")

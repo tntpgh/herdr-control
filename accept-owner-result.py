@@ -78,7 +78,7 @@ def main(argv=None, post_accept=lambda: None, environ=os.environ) -> int:
             return 4
         lc = ol.connect(lease_db)
         try:
-            holder = lambda label: ol.holder_tuple(lc, label, time.time())  # noqa: E731
+            holder = lambda label: ol.holder_tuple(lc, label, time.time(), modes=ol.AUTHORITY_MODES)  # noqa: E731
             try:
                 ok = avail.accept_receipt(a.receipt_id, pins, holder, a.by)
             except ra.Refused as exc:

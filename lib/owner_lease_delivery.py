@@ -101,10 +101,9 @@ class DeliveryGate:
         self.conn.close()
 
     def _holder(self, label, now):
-        # fail closed on a durable assignment until PR B routes delivery by authority_mode:
-        # this gate's timed-TTL logic (_ts(expires_at)) cannot evaluate an assignment row.
-        cur = ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires, sess, mode) | None
-        return None if cur and cur[7] == "assignment" else cur
+        # Both authority modes are live holders here; only TTL-dependent logic (begin_notice's
+        # lease-remaining margin) is gated on mode == 'timed'. A durable assignment has NULL expires_at.
+        return ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires, sess, mode) | None
 
     def _enabled(self):
         row = self.conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone()
@@ -168,7 +167,7 @@ class DeliveryGate:
             cur = self._holder(label, now)
             if not cur or cur[3] != generation:
                 return "owner_lease_fenced"
-            if _ts(cur[5]) - now < MIN_LEASE_REMAINING_S:
+            if cur[7] == "timed" and _ts(cur[5]) - now < MIN_LEASE_REMAINING_S:
                 return "lease_too_short"
             return ol.transition(self.conn, exchange_id, "delivering", label, generation, pane_id, pane_birth, "", now)
         except ol.Disabled:

@@ -114,7 +114,7 @@ def send_tick() -> dict | None:
     avail = ra.from_env()
 
     def bound(label):
-        cur = ol.holder_tuple(gate.conn, label, time.time())
+        cur = ol.holder_tuple(gate.conn, label, time.time(), modes=ol.AUTHORITY_MODES)
         reg = pub.registry_resolver(label)
         return cur if cur and reg and tuple(reg) == cur[:3] else None
 
