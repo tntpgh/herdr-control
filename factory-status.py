@@ -35,6 +35,7 @@ from xml.parsers.expat import ExpatError
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
+import owner_dispatch_auth as oda  # noqa: E402
 import owner_lease as ol  # noqa: E402
 import queue_supervisor as qs  # noqa: E402
 
@@ -153,6 +154,52 @@ def grant_view(auth_db: str, label: str, standing: bool, next_item: dict | None,
     return {"mode": "single", "auth_id": next_item["auth_id"]}, [f"no_grant:{why}"]
 
 
+def envelope_view(auth_db: str, label: str, next_item: dict | None, now: float) -> tuple[dict, list[str]]:
+    """The weekly envelope the lane's NEXT item names (else the lane's latest):
+    status, expiry, caps used/remaining, and every reason the next dispatch
+    would be refused -- revoked (DB row OR kill marker), expired, day/week cap,
+    budget, or the item failing the policy. Read-only (mode=ro)."""
+    try:
+        ac = sqlite3.connect(f"file:{auth_db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        return {}, [f"auth_store_unreadable:{type(exc).__name__}"]
+    try:
+        aid = next_item["auth_id"] if next_item else None
+        if aid is None:
+            r = ac.execute("SELECT auth_id FROM owner_dispatch_envelope WHERE owner_label=? ORDER BY decided_at DESC",
+                           (label,)).fetchone()
+            aid = r[0] if r else None
+        if aid is None:
+            return {"mode": "envelope", "auth_id": None}, ["no_envelope:none"]
+        u = oda.envelope_usage(ac, aid, now)
+    except sqlite3.Error as exc:
+        return {"mode": "envelope"}, [f"envelope_store_unreadable:{type(exc).__name__}"]
+    finally:
+        ac.close()
+    if u is None:
+        return {"mode": "envelope", "auth_id": aid}, ["no_envelope:missing"]
+    view, why = {"mode": "envelope", **u}, []
+    if u["status"] == "denied" or QSUP.kill_switch.envelope_revoked(aid):
+        why.append("envelope_revoked")
+    if not isinstance(u["expires_at"], (int, float)) or u["expires_at"] <= now:
+        why.append("envelope_expired")
+    if u.get("policy_invalid"):
+        why.append("envelope_policy_invalid")
+        return view, why
+    if u["remaining"]["day"] == 0:
+        why.append("envelope_day_cap")
+    if u["remaining"]["week"] == 0:
+        why.append("envelope_week_cap")
+    if next_item is not None:
+        cost = next_item.get("cost_cents")
+        bad = oda.check_item_policy(u["policy"], next_item["request"].encode(), next_item.get("manifest", []), cost)
+        if bad:
+            why.append(f"next_item_{bad}")
+        elif cost > u["remaining"]["cents"]:
+            why.append("envelope_budget")
+    return view, why
+
+
 def lane_view(env: dict, label: str, now: float) -> dict:
     root = Path(env["HERDR_QUEUE_SUPERVISOR_ROOT"])
     lane = qs.Lane(root, label)
@@ -178,7 +225,11 @@ def lane_view(env: dict, label: str, now: float) -> dict:
         out["blockers"].append("queue_empty")
     out["lease"], b = lease_view(env["HERDR_OWNER_LEASE_DB"], label, now)
     out["blockers"] += b
-    if in_flight is None:
+    if env.get(QSUP.ENVELOPE_ENV_FLAG) == "1":
+        out["grant"], b = envelope_view(env["HERDR_OWNER_DISPATCH_AUTH_DB"], label, nxt, now)
+        if in_flight is None:  # an in-flight lane is RUNNING; its envelope is shown, not judged
+            out["blockers"] += b
+    elif in_flight is None:
         standing = env.get(QSUP.STANDING_ENV_FLAG) == "1"
         out["grant"], b = grant_view(env["HERDR_OWNER_DISPATCH_AUTH_DB"], label, standing, nxt, sha, now)
         out["blockers"] += b
@@ -210,7 +261,7 @@ def status(hub_plist: Path, remote_plist: Path, now: float) -> dict:
         if str(exc) != "FileNotFoundError":  # not installed = renewal off, as before
             shared.append(f"remote_mcp_plist_unreadable:{exc}")
     out = {"shared_blockers": shared, "standing": env.get(QSUP.STANDING_ENV_FLAG) == "1",
-           "lease_renew": renew, "lanes": []}
+           "envelope": env.get(QSUP.ENVELOPE_ENV_FLAG) == "1", "lease_renew": renew, "lanes": []}
     if all(env.get(k) for k in PATHS):
         out["lanes"] = [lane_view(env, lb, now) for lb in lanes]
     for lane in out["lanes"]:
@@ -229,12 +280,23 @@ def main(argv=None, now=None) -> int:
     if a.json:
         print(json.dumps(st, sort_keys=True, default=str))
     else:
-        print(f"factory: standing={'on' if st['standing'] else 'off'} lease_renew={'on' if st['lease_renew'] else 'off'}"
+        print(f"factory: standing={'on' if st['standing'] else 'off'} envelope={'on' if st.get('envelope') else 'off'}"
+              f" lease_renew={'on' if st['lease_renew'] else 'off'}"
               f" shared_blockers={','.join(st['shared_blockers']) or 'none'}")
         for lane in st["lanes"]:
             q = lane["queue"]
             print(f"lane {lane['label']}: {lane['verdict']} {','.join(lane['blockers']) or ''}".rstrip()
                   + f" | queue pending={q['pending']} in_flight={q['in_flight']} lease={lane['lease'].get('state')}")
+            g = lane.get("grant") or {}
+            if g.get("mode") == "envelope" and g.get("auth_id"):
+                if g.get("policy_invalid"):
+                    print(f"  envelope {g['auth_id']}: {g['status']} POLICY INVALID")
+                else:
+                    print(f"  envelope {g['auth_id']}: {g['status']} expires_at={g['expires_at']}"
+                          f" day {g['used_day']}/{g['max_per_day']} week {g['used_week']}/{g['max_per_week']}"
+                          f" spent {g['spent_cents']}/{g['total_cap_cents']}c"
+                          f" remaining day={g['remaining']['day']} week={g['remaining']['week']}"
+                          f" cents={g['remaining']['cents']}")
     blocked = bool(st["shared_blockers"]) or any(lane["verdict"] == "BLOCKED" for lane in st["lanes"])
     return 1 if blocked else 0
 

@@ -111,6 +111,15 @@ MAX_STANDING_WINDOW_S = 86400  # longer than MAX_WINDOW_S: covers a multi-item
 STANDING_KEYS = {"protocol", "owner_label", "project", "expected_holder", "expected_generation",
                  "queue_sha256", "queue_items", "item_cap", "spend_cap_cents", "auth_id", "standing_window_s"}
 
+# A THIRD record kind: the WEEKLY project envelope (owner-dispatch-approval-
+# weekly/1). Binds a POLICY (job templates, caps, expiry) instead of a queue
+# sha, so the queue can be appended to while it is live. Disjoint key set from
+# KEYS/SUCCESSOR_KEYS/STANDING_KEYS: a record of one kind can never satisfy
+# another kind's validator. standing/1 is untouched.
+WEEKLY_PROTOCOL = oda.ENVELOPE_PROTOCOL
+WEEKLY_KEYS = {"protocol", "owner_label", "project", "expected_holder", "expected_generation", "auth_id",
+               "policy", "envelope_window_s"}
+
 
 class Refused(Exception):
     pass
@@ -496,8 +505,7 @@ def insert_grant(store, dec, exp: float) -> None:
     grant, issuance = expected_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
-        if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                         (rec["auth_id"], dec["form_id"])).fetchone():
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
             raise Refused("approval_already_used")
         store.execute(f"INSERT INTO owner_dispatch_auth({','.join(GRANT_COLS)}) VALUES ({','.join('?' * len(GRANT_COLS))})", grant)
         store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
@@ -560,8 +568,7 @@ def insert_standing_grant(store, dec, exp: float) -> None:
     grant, issuance = expected_standing_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
-        if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                         (rec["auth_id"], dec["form_id"])).fetchone():
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
             raise Refused("approval_already_used")
         store.execute(f"INSERT INTO owner_dispatch_auth({','.join(STANDING_GRANT_COLS)}) VALUES ({','.join('?' * len(STANDING_GRANT_COLS))})", grant)
         store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
@@ -593,6 +600,392 @@ def standing_grant_state(auth_db: str, dec, exp: float) -> str:
     if [tuple(r) for r in g] == [want_g] and [tuple(r) for r in i] == [want_i]:
         return "present"
     return "unknown"
+
+
+def validate_weekly_approval(rec) -> dict:
+    if not isinstance(rec, dict) or set(rec) != WEEKLY_KEYS:
+        raise Refused("weekly_approval_schema")
+    if not _valid_holder(rec["expected_holder"]):
+        raise Refused("weekly_approval_holder_schema")
+    if rec["protocol"] != WEEKLY_PROTOCOL:
+        raise Refused("weekly_approval_protocol")
+    for k in ("owner_label", "auth_id"):
+        if not isinstance(rec[k], str) or not SAFE_ID.match(rec[k]):
+            raise Refused(f"weekly_approval_field_{k}")
+    if not isinstance(rec["project"], str) or not rec["project"]:
+        raise Refused("weekly_approval_field_project")
+    if type(rec["expected_generation"]) is not int or rec["expected_generation"] < 1:
+        raise Refused("weekly_approval_field_expected_generation")
+    if type(rec["envelope_window_s"]) is not int or not 60 <= rec["envelope_window_s"] <= oda.MAX_ENVELOPE_WINDOW_S:
+        raise Refused("weekly_approval_field_envelope_window_s")
+    try:
+        oda.validate_policy(rec["policy"])
+    except ValueError as exc:
+        raise Refused(f"weekly_approval_{exc}") from None
+    # The page embeds the record in a <script>; a '<' in a prefix could close
+    # it early and desynchronise what is shown from what is signed.
+    if any("<" in t["request_prefix"] for t in rec["policy"]["templates"]):
+        raise Refused("weekly_approval_policy_markup")
+    return rec
+
+
+def render_weekly_form(rec: dict) -> bytes:
+    """Deterministic decision page for ONE weekly envelope record. It shows the
+    POLICY the human is signing -- every template prefix as an exact JSON string
+    (so trailing spaces/newlines are visible), manifest allow-list and size
+    limit, the per-day / per-week item caps, the per-item and total spend cap
+    and the expiry window -- and states plainly that the QUEUE IS NOT PINNED:
+    any item matching a template may be appended and run. Field lookups are
+    defensive (.get) only so a malformed record still renders some page; the
+    checks are validate_weekly_approval's."""
+    emb = approval_bytes(rec)
+    sha = hashlib.sha256(emb).hexdigest()
+    h = rec.get("expected_holder") if isinstance(rec.get("expected_holder"), dict) else {}
+    pol = rec.get("policy") if isinstance(rec.get("policy"), dict) else {}
+    esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    rows = [("Owner", rec.get("owner_label")), ("Project", rec.get("project")),
+            ("Holder pane", h.get("pane_id")), ("Holder birth", h.get("pane_birth")),
+            ("Holder session sha256", h.get("session_digest")),
+            ("Lease generation (floor)", rec.get("expected_generation")),
+            ("Max items per rolling 24h", pol.get("max_per_day")),
+            ("Max items per envelope (<= 7 days)", pol.get("max_per_week")),
+            ("Per-item spend cap (cents) -- vs QUEUE-DECLARED cost only", pol.get("per_item_cap_cents")),
+            ("Total spend cap (cents) -- vs QUEUE-DECLARED cost only", pol.get("total_cap_cents")), ("Envelope id", rec.get("auth_id")),
+            ("Envelope valid for", f'{rec.get("envelope_window_s")} s after you answer'),
+            ("Approval record sha256", sha)]
+    table = "".join(f"<tr><th>{esc(k)}</th><td><code>{esc(v)}</code></td></tr>" for k, v in rows)
+    tpls = pol.get("templates") if isinstance(pol.get("templates"), list) else []
+    tp_html = "".join(
+        f"<tr><td><code>{esc(t.get('name') if isinstance(t, dict) else t)}</code></td>"
+        f"<td><code>{esc(json.dumps(t.get('request_prefix')) if isinstance(t, dict) else '')}</code></td>"
+        f"<td><code>{esc(', '.join(t.get('manifest_allow', [])) if isinstance(t, dict) and isinstance(t.get('manifest_allow'), list) else '')}</code></td>"
+        f"<td><code>{esc(t.get('max_request_bytes') if isinstance(t, dict) else '')}</code></td></tr>"
+        for t in tpls)
+    heading = (f'Approve a weekly envelope for {esc(rec.get("owner_label"))} ({esc(rec.get("project"))})? '
+               f'Up to {esc(pol.get("max_per_day"))}/day and {esc(pol.get("max_per_week"))} total, spend capped at '
+               f'{esc(pol.get("total_cap_cents"))}c, valid {esc(rec.get("envelope_window_s"))} s after you answer.')
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{heading}'
+            f'</title></head><body>'
+            f'<h1>{heading}</h1>'
+            "<p>Approving authorizes ANY queue item whose request text starts with one of the template prefixes "
+            "below (and passes that template's manifest and size rules) to be dispatched to the currently-live "
+            "holder shown, within the caps. The queue is NOT pinned: items appended later run without another "
+            "approval. The spend caps are checked ONLY against the cost_cents the queue writer declares in the queue "
+            "file; nothing verifies real spend, and an item declaring 0 passes them. Only the item-count caps are hard. "
+            "An item that matches no template is refused. Nothing claims a new lease.</p>"
+            f"<table>{table}</table>"
+            f"<h2>Job templates</h2><table><tr><th>name</th><th>request prefix (exact)</th><th>manifest allow-list</th>"
+            f"<th>max request bytes</th></tr>{tp_html}</table>"
+            f'<script type="application/json" id="owner-dispatch-approval">{emb.decode()}</script>'
+            f'<button onclick="window.submitAnswers({{decision:\'approve\',approval_sha256:\'{sha}\'}})">Approve</button> '
+            "<button onclick=\"window.submitAnswers({decision:'decline'})\">Decline</button>"
+            "</body></html>").encode()
+
+
+def expected_weekly_rows(dec, exp: float) -> tuple[tuple, tuple]:
+    """The complete envelope tuple (oda.POLICY_ROW_COLS + status) and issuance
+    tuple (minus issued_at) this approval produces."""
+    rec, h = dec["rec"], dec["rec"]["expected_holder"]
+    pol = oda.canonical_policy(rec["policy"])
+    decided_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec["answered_at"]))
+    grant = (rec["auth_id"], oda.ENVELOPE_PROTOCOL, rec["owner_label"], rec["project"], h["pane_id"], h["pane_birth"],
+             h["session_digest"], rec["expected_generation"], pol, hashlib.sha256(pol.encode()).hexdigest(),
+             dec["form_id"], dec["form_id"], decided_iso, exp, "granted")
+    issuance = (rec["auth_id"], dec["approval_sha256"], dec["approval_bytes"], dec["form_id"], dec["form_record_sha256"],
+                dec["form_html_sha256"], dec["answered_at"])
+    return grant, issuance
+
+
+WEEKLY_COLS = oda.POLICY_ROW_COLS + ("status",)
+
+
+def _id_used(store, auth_id: str, form_id: str) -> bool:
+    """True when auth_id or approval/form id is already used by ANY issuer: a
+    single/standing grant row or a weekly envelope row. Every issuer calls this
+    (both directions), so an id can never be shared across kinds -- a standing
+    row reusing an envelope's id would otherwise put children under that
+    envelope's parent and spend its caps. The envelope table exists only at
+    schema v3, so its absence (a v1/v2 store) is not an error."""
+    if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
+                     (auth_id, form_id)).fetchone():
+        return True
+    if not store.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_dispatch_envelope'").fetchone():
+        return False
+    return bool(store.execute("SELECT 1 FROM owner_dispatch_envelope WHERE auth_id=? OR approval_id=?",
+                              (auth_id, form_id)).fetchone())
+
+
+def insert_weekly_grant(store, dec, exp: float) -> None:
+    """The only envelope writer: envelope row + immutable issuance record in ONE
+    transaction; refuses any prior use of auth_id/approval_id in EITHER table.
+    The store must already be at schema v3."""
+    rec = dec["rec"]
+    grant, issuance = expected_weekly_rows(dec, exp)
+    store.execute("BEGIN IMMEDIATE")
+    try:
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
+            raise Refused("approval_already_used")
+        store.execute(f"INSERT INTO owner_dispatch_envelope({','.join(WEEKLY_COLS)}) VALUES ({','.join('?' * len(WEEKLY_COLS))})", grant)
+        store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
+                      (*issuance, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        store.execute("COMMIT")
+    finally:
+        if store.in_transaction:
+            store.execute("ROLLBACK")
+
+
+def weekly_grant_state(auth_db: str, dec, exp: float) -> str:
+    """After an error: 'present' only when the COMPLETE expected envelope and
+    issuance tuples are both stored; 'absent' when neither id is used anywhere;
+    otherwise 'unknown'."""
+    want_g, want_i = expected_weekly_rows(dec, exp)
+    try:
+        c = oda.open_store(auth_db)
+        try:
+            g = c.execute(f"SELECT {','.join(WEEKLY_COLS)} FROM owner_dispatch_envelope WHERE auth_id=? OR approval_id=?",
+                          (dec["rec"]["auth_id"], dec["form_id"])).fetchall()
+            i = c.execute(f"SELECT {','.join(ISSUANCE_COLS)} FROM owner_dispatch_issuance WHERE auth_id=? OR form_id=?",
+                          (dec["rec"]["auth_id"], dec["form_id"])).fetchall()
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if not g and not i:
+        return "absent"
+    if [tuple(r) for r in g] == [want_g] and [tuple(r) for r in i] == [want_i]:
+        return "present"
+    return "unknown"
+
+
+def build_weekly_main(argv, resolve=None, now=None) -> int:
+    """OFFLINE: write the deterministic WEEKLY envelope decision page that
+    issue-weekly later requires byte-for-byte (render_weekly_form). Binds: the
+    holder resolved fresh from the registry; the generation of the lease
+    ALREADY live for exactly that identity (read-only --lease-db); the policy
+    -- templates read once from --templates-dir/--templates-name (a JSON list of
+    {name, request_prefix, manifest_allow, max_request_bytes}) plus the four
+    caps and the window. Refused before any page exists (rc 2): invalid
+    policy; owner_projects mismatch; no live lease for the registry identity.
+    No queue is read: the envelope does not pin one.
+    Serves nothing, records nothing, writes only --out (O_EXCL)."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py build-weekly-form")
+    for a in ("--label", "--project", "--templates-dir", "--templates-name", "--auth-id", "--lease-db", "--out"):
+        ap.add_argument(a, required=True)
+    for a in ("--max-per-day", "--max-per-week", "--per-item-cap-cents", "--total-cap-cents"):
+        ap.add_argument(a, type=int, required=True)
+    ap.add_argument("--window-s", type=int, default=oda.MAX_ENVELOPE_WINDOW_S)
+    a = ap.parse_args(argv)
+    clock = (lambda: now) if now is not None else time.time
+    try:
+        templates = json.loads(oda.read_request_once(a.templates_dir, a.templates_name))
+    except (ValueError, OSError):
+        print("refused:templates_unreadable")
+        return 2
+    if resolve is None:
+        import publisher  # noqa: E402
+        resolve = publisher.registry_resolver
+    ident = resolve(a.label)
+    if not ident:
+        print("refused:identity_unresolved")
+        return 2
+    try:
+        lconn = ol.open_ro(a.lease_db, require_table="owner_leases")
+    except (ValueError, sqlite3.Error) as exc:
+        print(f"refused:lease_{exc}")
+        return 4
+    try:
+        row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (a.label,)).fetchone()
+        live = ol.holder_tuple(lconn, a.label, clock(), modes=ol.AUTHORITY_MODES)
+    except sqlite3.Error as exc:
+        print(f"refused:lease_{type(exc).__name__}")
+        return 4
+    finally:
+        lconn.close()
+    if not row or row[0] != a.project:
+        print("refused:owner_project_mismatch")
+        return 2
+    if live is None or live[:3] != (ident[0], ident[1], ident[2]):
+        print("refused:live_generation_unresolved")
+        return 2
+    rec = {"protocol": WEEKLY_PROTOCOL, "owner_label": a.label, "project": a.project,
+           "expected_holder": {"pane_id": ident[0], "pane_birth": ident[1], "session_digest": ident[2]},
+           "expected_generation": live[3], "auth_id": a.auth_id, "envelope_window_s": a.window_s,
+           "policy": {"templates": templates, "max_per_day": a.max_per_day, "max_per_week": a.max_per_week,
+                      "per_item_cap_cents": a.per_item_cap_cents, "total_cap_cents": a.total_cap_cents}}
+    try:
+        validate_weekly_approval(rec)
+    except Refused as exc:
+        print(f"refused:{exc}")
+        return 2
+    os.umask(0o077)
+    html = render_weekly_form(rec)
+    try:
+        fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        print("refused:out_exists")
+        return 2
+    with os.fdopen(fd, "wb") as f:
+        f.write(html)
+    print(f"built:{a.out}:html_sha256={hashlib.sha256(html).hexdigest()}:approval_sha256={hashlib.sha256(approval_bytes(rec)).hexdigest()}")
+    return 0
+
+
+def issue_weekly_main(argv, resolve=None, now=None) -> int:
+    """Weekly-envelope counterpart to issue_standing_main: read_decision bound
+    to validate_weekly_approval/render_weekly_form, the same pinned forms dir,
+    flag gate, both kill switches and identity re-checks; NEVER claims a lease
+    (the floor generation must already be live). Writes ONE row to
+    owner_dispatch_envelope plus the immutable issuance record in ONE
+    transaction, against a store ALREADY at schema v3 (migration is a separate
+    step; refused auth_store_not_migrated otherwise). No queue is read.
+    Exit: 0 issued; 2 refused before any write; 4 config; 6 issue_uncertain."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py issue-weekly")
+    ap.add_argument("--form-id", required=True)
+    a = ap.parse_args(argv)
+    if not all(os.environ.get(f) == "1" for f in ("HERDR_OWNER_DISPATCH_ISSUE", "HERDR_OWNER_LEASE_WRITER",
+                                                   "HERDR_OWNER_LEASE_DELIVERY")):
+        print("refused:flags_off")
+        return 4
+    for sw in (DISPATCH_KILL_SWITCH, MERGE_KILL_SWITCH):
+        if kill_switch.engaged(sw):
+            print(f"refused:kill_switch:{sw}")
+            return 4
+    os.umask(0o077)
+    clock = (lambda: now) if now is not None else time.time
+    try:
+        dec = read_decision(a.form_id, validate=validate_weekly_approval, render=render_weekly_form)
+        rec = dec["rec"]
+        exp = window(dec, clock(), key="envelope_window_s")
+    except Refused as exc:
+        print(f"refused:{exc}")
+        return 2
+    lease_db, auth_db = os.environ.get("HERDR_OWNER_LEASE_DB", ""), os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
+    try:
+        lconn = ol.open_rw_checked(lease_db, require_table="owner_leases")
+    except ValueError as exc:
+        print(f"refused:lease_{exc}")
+        return 4
+    except ol.SchemaMigrationRequired as exc:
+        print(f"refused:schema_migration_required:{exc.cur}->{exc.target}:owner-lease-migrate.py --db {lease_db} --apply")
+        return 4
+    try:
+        store = oda.open_store(auth_db)
+    except ValueError as exc:
+        lconn.close()
+        print(f"refused:auth_{exc}")
+        return 4
+    try:
+        v = store.execute("SELECT COALESCE(MAX(version),0) FROM owner_dispatch_auth_schema_version").fetchone()[0]
+    except sqlite3.OperationalError:
+        v = 0
+    if v < oda.LATEST:
+        lconn.close()
+        store.close()
+        print("refused:auth_store_not_migrated")
+        return 4
+    if resolve is None:
+        import publisher  # noqa: E402
+        resolve = publisher.registry_resolver
+    h = rec["expected_holder"]
+    try:
+        try:
+            same_identity(resolve, rec)                                # revalidation 1: before issue
+            row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
+            if not row or row[0] != rec["project"]:
+                raise Refused("owner_project_mismatch")
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
+                raise Refused("approval_already_used")
+            if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
+                    h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
+                raise Refused("lease_holder_mismatch")                  # floor must ALREADY be live -- never claimed here
+            window(dec, clock(), key="envelope_window_s")               # revalidation 2: before issue
+            same_identity(resolve, rec)
+            insert_weekly_grant(store, dec, exp)
+        except Refused as exc:
+            print(f"refused:{exc}")
+            return 2
+        except Exception as exc:  # noqa: BLE001  after the prior-use/identity checks passed
+            st = weekly_grant_state(auth_db, dec, exp)
+            if st == "present":
+                print(f"issued:{rec['auth_id']} (after error_{type(exc).__name__}; verified in store)")
+                return 0
+            print(f"issue_uncertain:error_{type(exc).__name__}:store_{st}")
+            return 6
+    finally:
+        for c in (lconn, store):
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"issued:{rec['auth_id']}")
+    return 0
+
+
+def revoke_envelope_main(argv, now=None) -> int:
+    """KILL SWITCH for one weekly envelope: stops ALL dispatch under it at once,
+    and records who/why. Needs no feature flag (a kill must never be gated).
+      1. the revocation MARKER (lib/kill_switch.envelope_marker) is created
+         first, O_EXCL, private: dispatch reads it inside the consume
+         transaction, so the stop is immediate and independent of the DB;
+      2. an audit line is appended to owner-dispatch/revoke.jsonl;
+      3. the envelope row is flipped granted -> denied and an operator row
+         written in ONE transaction (oda.revoke_envelope), when
+         HERDR_OWNER_DISPATCH_AUTH_DB is set; a second audit line records
+         that outcome.
+    Idempotent: an existing marker is kept and the DB step still runs.
+    Exit: 0 marker + DB revoked (or already denied); 1 marker written but the
+    DB step did not complete (dispatch IS stopped; re-run once the store is
+    reachable); 2 invalid arguments."""
+    ap = argparse.ArgumentParser(prog="owner-dispatch-issue.py revoke-envelope")
+    ap.add_argument("--auth-id", required=True)
+    ap.add_argument("--operator", required=True)
+    ap.add_argument("--reason", required=True)
+    a = ap.parse_args(argv)
+    marker = kill_switch.envelope_marker(a.auth_id)
+    if marker is None or not a.operator.strip() or not a.reason.strip():
+        print("refused:revoke_invalid")
+        return 2
+    clock = (lambda: now) if now is not None else time.time
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))
+    audit = os.path.join(STATE_ROOT, "owner-dispatch", "revoke.jsonl")
+    os.umask(0o077)
+    created, marker_err = True, None
+    try:
+        os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except FileExistsError:
+        created = False
+    except OSError as exc:
+        # the DB denial is the sticky half: a marker failure must not skip it
+        created, marker_err = False, f"{type(exc).__name__}"
+    audit_err = None
+    try:
+        _append_jsonl(audit, {"action": "marker", "auth_id": a.auth_id, "operator": a.operator, "reason": a.reason,
+                              "marker": marker, "marker_created": created, "marker_error": marker_err,
+                              "timestamp": stamp})
+    except OSError as exc:
+        audit_err = type(exc).__name__
+    auth_db = os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
+    if not auth_db:
+        res = "db_skipped:HERDR_OWNER_DISPATCH_AUTH_DB_unset"
+    else:
+        try:
+            store = oda.open_store(auth_db)
+            try:
+                res = oda.revoke_envelope(store, a.auth_id, operator=a.operator, decision_ref=f"revoke-envelope:{stamp}",
+                                          note=a.reason)
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001
+            res = f"db_error:{type(exc).__name__}"
+    try:
+        _append_jsonl(audit, {"action": "db", "auth_id": a.auth_id, "operator": a.operator, "result": res,
+                              "marker_error": marker_err, "audit_error": audit_err, "timestamp": stamp})
+    except OSError as exc:
+        audit_err = type(exc).__name__
+    mk = "error:" + marker_err if marker_err else ("created" if created else "existed")
+    print(f"revoked:{a.auth_id}:marker={mk}:db={res}" + (f":audit_error={audit_err}" if audit_err else ""))
+    return 0 if res in ("revoked", "revoke_denied") and not marker_err and not audit_err else 1
 
 
 def build_main(argv, resolve=None, now=None) -> int:
@@ -988,8 +1381,7 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
             row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
             if not row or row[0] != rec["project"]:
                 raise Refused("owner_project_mismatch")
-            if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                             (rec["auth_id"], dec["form_id"])).fetchone():
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
                 raise Refused("approval_already_used")
             if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
                     h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
@@ -1118,7 +1510,8 @@ def consume_pending_main(argv, resolve=None, now=None) -> int:
             peek = json.loads(found[0])
         except ValueError:
             continue
-        if not isinstance(peek, dict) or peek.get("protocol") != STANDING_PROTOCOL:
+        proto = peek.get("protocol") if isinstance(peek, dict) else None
+        if proto not in (STANDING_PROTOCOL, WEEKLY_PROTOCOL):
             continue
         label = peek.get("owner_label")
         if not isinstance(label, str) or not SAFE_ID.match(label):
@@ -1126,9 +1519,12 @@ def consume_pending_main(argv, resolve=None, now=None) -> int:
         seen += 1
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = issue_standing_main(
-                ["--form-id", form_id, "--queue-dir", a.queue_root, "--queue-name", f"{label}.queue.json"],
-                resolve=resolve, now=clock())
+            if proto == WEEKLY_PROTOCOL:
+                rc = issue_weekly_main(["--form-id", form_id], resolve=resolve, now=clock())
+            else:
+                rc = issue_standing_main(
+                    ["--form-id", form_id, "--queue-dir", a.queue_root, "--queue-name", f"{label}.queue.json"],
+                    resolve=resolve, now=clock())
         outcome = buf.getvalue().strip()
         print(outcome)
         _append_jsonl(audit_path, {"form_id": form_id, "owner_label": label, "exit_code": rc, "outcome": outcome,
@@ -1148,6 +1544,12 @@ def main(argv=None, resolve=None, now=None) -> int:
         return build_standing_main(argv[1:], resolve=resolve, now=now)
     if argv[:1] == ["issue-standing"]:
         return issue_standing_main(argv[1:], resolve=resolve, now=now)
+    if argv[:1] == ["build-weekly-form"]:
+        return build_weekly_main(argv[1:], resolve=resolve, now=now)
+    if argv[:1] == ["issue-weekly"]:
+        return issue_weekly_main(argv[1:], resolve=resolve, now=now)
+    if argv[:1] == ["revoke-envelope"]:
+        return revoke_envelope_main(argv[1:], now=now)
     if argv[:1] == ["consume-pending"]:
         return consume_pending_main(argv[1:], resolve=resolve, now=now)
     ap = argparse.ArgumentParser()
@@ -1199,8 +1601,7 @@ def main(argv=None, resolve=None, now=None) -> int:
             row = lconn.execute("SELECT project, max_open FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
             if not row or row[0] != rec["project"] or row[1] != rec["max_open"]:
                 raise Refused("owner_project_mismatch")
-            if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                             (rec["auth_id"], dec["form_id"])).fetchone():
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
                 raise Refused("approval_already_used")
             prev_gen = rec.get("expected_prev_generation", 0)
             bind_live_gen = rec.get("bind_live_generation")

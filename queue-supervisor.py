@@ -24,6 +24,12 @@ IDENTICAL, only which grant each dispatch consumes changes -- a single-use
 row (GrantDispatch, oda.consume) or a fresh single-use child minted under a
 standing row (StandingDispatch, oda.consume_standing). Off, this file's
 behavior is byte-for-byte what it was before M9.
+
+HERDR_QUEUE_SUPERVISOR_ENVELOPE=1 (default OFF, mutually exclusive with STANDING)
+selects EnvelopeDispatch: the item's auth_id names a WEEKLY ENVELOPE
+(owner-dispatch-approval-weekly/1) that binds a policy, not a queue sha, so
+appended items run without a new approval while each is validated against the
+policy at dispatch. See docs/operations/weekly-envelope.md.
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 sys.path.insert(0, str(HERE / "remote-mcp"))
+import approval_pending  # noqa: E402
 import kill_switch  # noqa: E402
 import owner_dispatch as od  # noqa: E402
 import owner_dispatch_auth as oda  # noqa: E402
@@ -127,8 +134,70 @@ class StandingDispatch:
                                         queue_sha256=queue_sha256, lease_conn=self.lease_conn,
                                         cost_cents=cost_cents)
 
-        return od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
+        out = od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
             label, rid, request_text, manifest)
+        return defer_if_approval_pending(out, "standing_missing", label, auth_id)
+
+
+ENVELOPE_ENV_FLAG = "HERDR_QUEUE_SUPERVISOR_ENVELOPE"
+
+
+def envelope_enabled(environ=os.environ) -> bool:
+    return environ.get(ENVELOPE_ENV_FLAG) == "1"
+
+
+class EnvelopeDispatch:
+    """qs.Dispatch over one od.Dispatcher using the WEEKLY ENVELOPE named by the
+    item's auth_id (oda.consume_envelope). The envelope binds a POLICY, not a
+    queue sha, so items appended to the queue while it is live dispatch with no
+    new approval -- but each item is validated against the policy HERE, at
+    dispatch, and an item that fails is refused (policy_*, lane frozen and
+    escalated), never run. Each dispatch mints its own single-use child row
+    bound to (item rid, request sha, envelope); the Dispatcher, its fences and
+    its journal are identical to the other two modes.
+
+    root: the queue dir, re-read fresh right before authorization so the
+    item's declared cost_cents comes from the bytes of THIS moment. The spend
+    cap is therefore only as honest as the queue writer's declared cost; the
+    item-count caps are hard regardless (docs/operations/weekly-envelope.md)."""
+
+    def __init__(self, gate, avail, send, resolve, store, lease_conn, root: Path):
+        self.gate, self.avail, self.send, self.resolve, self.store = gate, avail, send, resolve, store
+        self.lease_conn, self.root = lease_conn, root
+
+    def dispatch(self, label, rid, request_text, manifest, auth_id):
+        if not auth_id:
+            return "held:not_dispatched:auth_missing"
+        try:
+            raw = (self.root / f"{label}.queue.json").read_bytes()
+        except FileNotFoundError:
+            raw = b"[]"
+        cost_cents = _item_cost_cents(raw, label, rid)
+
+        def authorize(lb, project, holder, r, sha, man, now):
+            return oda.consume_envelope(self.store, auth_id, label=lb, project=project, holder=holder,
+                                        request_id=r, request_text=request_text, manifest=man, now=now,
+                                        lease_conn=self.lease_conn, cost_cents=cost_cents,
+                                        revoked=kill_switch.envelope_revoked)
+
+        out = od.Dispatcher(self.gate, self.avail, self.send, self.resolve, authorize=authorize).dispatch(
+            label, rid, request_text, manifest)
+        return defer_if_approval_pending(out, "envelope_missing", label, auth_id)
+
+
+# The pinned forms dir (formserve's registry), never read from env; tests
+# rebind this module attribute.
+FORMS_DIR = str(Path.home() / ".local" / "state" / "herdr" / "forms")
+
+
+def defer_if_approval_pending(out: str, missing_reason: str, label: str, auth_id: str) -> str:
+    """The race fix. A dispatch refused because the grant does not exist YET
+    (`held:not_dispatched:<missing_reason>`) while a matching approval is open
+    or answered-but-not-issued becomes the retry-safe `approval_pending`
+    instead of a frozen held_consumed. Every other outcome passes through."""
+    if out == f"held:not_dispatched:{missing_reason}" and approval_pending.pending(FORMS_DIR, label, auth_id, time.time()):
+        return "held:not_dispatched:approval_pending"
+    return out
 
 
 def _item_cost_cents(raw: bytes, label: str, rid: str) -> int | None:
@@ -308,8 +377,15 @@ def main(environ=os.environ, send=None, resolve=None) -> int:
         # `runnable` below; no journal/receipt is touched here.
         blocking_labels = {lb for lb, rids in bad_rids.items() if rids & _queue_rids(qroot, lb)}
         runnable = [lb for lb in lane_labels if lb not in blocking_labels]
-        dispatcher = (StandingDispatch(gate, avail, send, resolve, store, lconn, qroot)
-                     if standing_enabled(environ) else GrantDispatch(gate, avail, send, resolve, store))
+        if standing_enabled(environ) and envelope_enabled(environ):
+            print("refused:standing_and_envelope_both_on")
+            return 4
+        if envelope_enabled(environ):
+            dispatcher = EnvelopeDispatch(gate, avail, send, resolve, store, lconn, qroot)
+        elif standing_enabled(environ):
+            dispatcher = StandingDispatch(gate, avail, send, resolve, store, lconn, qroot)
+        else:
+            dispatcher = GrantDispatch(gate, avail, send, resolve, store)
         out = qs.tick(qroot, runnable, dispatcher, accepted, events, notify, journal, environ=environ)
         for lb in lane_labels:
             if lb not in bad_by_label:

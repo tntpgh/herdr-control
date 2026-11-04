@@ -75,12 +75,28 @@ than M9 has parent=NULL, and SQLite never treats NULLs as a collision) --
 an EXISTING store upgrades with every row preserved, never deleted or
 rewritten. A fresh store reaches the identical end schema by applying both
 versions in order.
+
+Weekly project envelopes (default OFF): owner-dispatch-approval-weekly/1, a
+SEPARATE table (owner_dispatch_envelope, migration v3) because the kind CHECK
+on owner_dispatch_auth cannot be widened by ALTER. An envelope binds a
+POLICY (job templates, per-day / per-envelope item caps, per-item and total
+spend caps, expiry), never a queue sha. consume_envelope() validates ONE item
+against that policy and mints the same pre-consumed single-use CHILD row
+(parent=<envelope auth_id>) consume_standing() mints, so journals, intents,
+unsent()/unresolved() and receipts are unchanged. Every cap is DERIVED from
+the child rows themselves (count / sum), never from a mutable counter, so a
+counter can not drift from the audit trail. The envelope row is immutable
+except granted -> denied (trigger); revoke_envelope() does exactly that and
+records an operator row. standing/1 is not touched.
+
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -89,6 +105,8 @@ import uuid
 import private_sqlite
 
 PROTOCOL = "owner-dispatch-auth/2"
+ENVELOPE_PROTOCOL = "owner-dispatch-approval-weekly/1"
+MAX_ENVELOPE_WINDOW_S = 7 * 86400
 MAX_REQUEST_BYTES = 64 * 1024
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS owner_dispatch_auth (
@@ -150,6 +168,36 @@ ISSUANCE_SCHEMA = (
 OUTCOMES = ("confirmed_delivered", "confirmed_not_delivered", "abandoned_uncertain")
 
 
+POLICY_ROW_COLS = ("auth_id", "protocol", "owner_label", "project", "pane_id", "pane_birth", "session_digest",
+                 "lease_generation", "policy", "policy_sha256", "prompt_id", "approval_id", "decided_at", "expires_at")
+ENVELOPE_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS owner_dispatch_envelope (
+  auth_id          TEXT PRIMARY KEY,
+  protocol         TEXT NOT NULL,
+  owner_label      TEXT NOT NULL,
+  project          TEXT NOT NULL,
+  pane_id          TEXT NOT NULL,
+  pane_birth       TEXT NOT NULL,
+  session_digest   TEXT NOT NULL,
+  lease_generation INTEGER NOT NULL,
+  policy           TEXT NOT NULL,
+  policy_sha256    TEXT NOT NULL CHECK (length(policy_sha256) = 64),
+  prompt_id        TEXT NOT NULL,
+  approval_id      TEXT NOT NULL UNIQUE,
+  decided_at       TEXT NOT NULL,
+  expires_at       REAL NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('granted','denied'))
+)""",
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_envelope_no_delete BEFORE DELETE ON owner_dispatch_envelope"
+    " BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+    # The ONLY legal update is granted -> denied with every other column unchanged.
+    "CREATE TRIGGER IF NOT EXISTS owner_dispatch_envelope_revoke_only BEFORE UPDATE ON owner_dispatch_envelope"
+    " WHEN OLD.status <> 'granted' OR NEW.status <> 'denied' OR "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in POLICY_ROW_COLS)
+    + " BEGIN SELECT RAISE(ABORT, 'immutable'); END",
+)
+
+
 MIGRATIONS = {
     # v1 is the ORIGINAL schema exactly as first shipped (0ac8ba1f, M2).
     # Never edit this entry: a store at v1 exists with exactly these
@@ -169,7 +217,11 @@ MIGRATIONS = {
         "ALTER TABLE owner_dispatch_auth ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0",
         "CREATE UNIQUE INDEX owner_dispatch_auth_parent_request ON owner_dispatch_auth(parent, request_id)",
     ),
+    # v3 (weekly envelopes, default OFF): ONE new table + triggers, additive only.
+    3: ENVELOPE_SCHEMA,
 }
+
+LATEST = max(MIGRATIONS)
 
 
 def migrate(conn: sqlite3.Connection) -> int:
@@ -251,6 +303,31 @@ def consume(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str,
         return f"auth_ambiguous:{type(exc).__name__}"
 
 
+def _holder_fence_ok(lease_conn, label, live, floor) -> bool:
+    """live = the CURRENT (pane, birth, session, generation); floor = the
+    grant's (pane, birth, session, floor generation). True when the holder is
+    the floor's, or is EXACTLY floor+1 under the §8a restart rule (same holder,
+    the floor generation released reason='expired' with zero open requests,
+    verified against lease_conn). Shared by consume_standing and
+    consume_envelope so the two can never drift."""
+    (pane, birth, sess, gen), (g_pane, g_birth, g_sess, floor_gen) = live, floor
+    if (pane, birth, sess) != (g_pane, g_birth, g_sess) or gen < floor_gen:
+        return False
+    if gen == floor_gen:
+        return True
+    if gen != floor_gen + 1 or lease_conn is None:
+        return False
+    prev = lease_conn.execute(
+        "SELECT pane_id, pane_birth, session_digest, release_reason FROM owner_leases"
+        " WHERE label=? AND generation=?", (label, floor_gen)).fetchone()
+    if prev is None or prev[3] != "expired" or (prev[0], prev[1], prev[2]) != (pane, birth, sess):
+        return False
+    n_open = lease_conn.execute(
+        "SELECT COUNT(*) FROM owner_requests WHERE label=? AND generation=? AND state IN"
+        " ('queued','held','blocked','delivering')", (label, floor_gen)).fetchone()[0]
+    return not n_open
+
+
 def consume_standing(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str, holder, request_id: str,
                      body_sha256: str, manifest, now: float, queue_sha256: str,
                      lease_conn: sqlite3.Connection | None = None, cost_cents: int | None = None):
@@ -304,21 +381,8 @@ def consume_standing(conn: sqlite3.Connection, auth_id: str, *, label: str, proj
                 return "standing_mismatch"
             if not isinstance(exp, (int, float)) or now >= exp:
                 return "standing_expired"
-            if (pane, birth, sess) != (g_pane, g_birth, g_sess) or gen < floor_gen:
+            if not _holder_fence_ok(lease_conn, label, (pane, birth, sess, gen), (g_pane, g_birth, g_sess, floor_gen)):
                 return "standing_holder_changed"
-            if gen > floor_gen:
-                if gen != floor_gen + 1 or lease_conn is None:
-                    return "standing_holder_changed"
-                prev = lease_conn.execute(
-                    "SELECT pane_id, pane_birth, session_digest, release_reason FROM owner_leases"
-                    " WHERE label=? AND generation=?", (label, floor_gen)).fetchone()
-                if prev is None or prev[3] != "expired" or (prev[0], prev[1], prev[2]) != (pane, birth, sess):
-                    return "standing_holder_changed"
-                n_open = lease_conn.execute(
-                    "SELECT COUNT(*) FROM owner_requests WHERE label=? AND generation=? AND state IN"
-                    " ('queued','held','blocked','delivering')", (label, floor_gen)).fetchone()[0]
-                if n_open:
-                    return "standing_holder_changed"
             if g_qsha != queue_sha256:
                 return "queue_sha_mismatch"
             if item_cap is not None and used >= item_cap:
@@ -352,6 +416,218 @@ def consume_standing(conn: sqlite3.Connection, auth_id: str, *, label: str, proj
                 conn.execute("ROLLBACK")
     except (sqlite3.Error, TypeError, ValueError) as exc:
         return f"standing_ambiguous:{type(exc).__name__}"
+
+
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
+MIN_PREFIX_CHARS = 8  # a one-character prefix is a catch-all template, not a job template
+
+
+def _is_int(v, lo, hi) -> bool:
+    return type(v) is int and lo <= v <= hi
+
+
+def validate_policy(p) -> dict:
+    """The weekly envelope policy schema, strict, never coerced. Raises
+    ValueError. Shared by the issuer (what a human is shown and signs) and
+    consume_envelope (what is re-validated at every dispatch)."""
+    if not isinstance(p, dict) or set(p) != {"templates", "max_per_day", "max_per_week", "per_item_cap_cents",
+                                              "total_cap_cents"}:
+        raise ValueError("policy_keys")
+    if not (_is_int(p["max_per_day"], 1, 1000) and _is_int(p["max_per_week"], 1, 1000)
+            and _is_int(p["per_item_cap_cents"], 0, 10**9) and _is_int(p["total_cap_cents"], 0, 10**9)):
+        raise ValueError("policy_caps")
+    t = p["templates"]
+    if not isinstance(t, list) or not 1 <= len(t) <= 20:
+        raise ValueError("policy_templates")
+    seen = set()
+    for x in t:
+        if not isinstance(x, dict) or set(x) != {"name", "request_prefix", "manifest_allow", "max_request_bytes"}:
+            raise ValueError("policy_template_keys")
+        if not isinstance(x["name"], str) or not _NAME.match(x["name"]) or x["name"] in seen:
+            raise ValueError("policy_template_name")
+        seen.add(x["name"])
+        pre = x["request_prefix"]
+        if not isinstance(pre, str) or not MIN_PREFIX_CHARS <= len(pre) <= 512:
+            raise ValueError("policy_template_prefix")
+        ma = x["manifest_allow"]
+        if (not isinstance(ma, list) or not 1 <= len(ma) <= 8 or len(set(ma)) != len(ma)
+                or not all(isinstance(m, str) and _NAME.match(m) for m in ma)):
+            raise ValueError("policy_template_manifest")
+        if not _is_int(x["max_request_bytes"], 1, MAX_REQUEST_BYTES):
+            raise ValueError("policy_template_size")
+    return p
+
+
+def canonical_policy(p: dict) -> str:
+    return json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def check_item_policy(policy: dict, request_text: bytes, manifest, cost_cents) -> str | None:
+    """None when the item satisfies one template AND the per-item cap, else the
+    typed policy_* refusal. An unpriced item is never treated as free."""
+    try:
+        text = request_text.decode("utf-8")
+    except UnicodeDecodeError:
+        return "policy_template"
+    hits = [t for t in policy["templates"] if text.startswith(t["request_prefix"])]
+    if not hits:
+        return "policy_template"
+    if not (isinstance(cost_cents, int) and not isinstance(cost_cents, bool) and cost_cents >= 0):
+        return "policy_cost_missing"
+    if cost_cents > policy["per_item_cap_cents"]:
+        return "policy_item_cap"
+    why = "policy_template"
+    for t in hits:
+        if len(request_text) > t["max_request_bytes"]:
+            why = "policy_size"
+        elif not set(manifest) <= set(t["manifest_allow"]):
+            why = "policy_manifest"
+        else:
+            return None
+    return why
+
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def consume_envelope(conn: sqlite3.Connection, auth_id: str, *, label: str, project: str, holder, request_id: str,
+                     request_text: bytes, manifest, now: float, lease_conn: sqlite3.Connection | None,
+                     cost_cents: int | None, revoked: Callable[[str], bool]):
+    """The consumed CHILD envelope (dict, same shape consume() returns) when
+    this call minted a single-use child under the weekly envelope `auth_id`;
+    else a hold reason (str). Never raises. One BEGIN IMMEDIATE: validate,
+    count, insert -- two concurrent callers cannot both take the last slot.
+
+    The ITEM is validated here, at dispatch, against the signed policy
+    (never against a queue sha): template prefix + rules, per-item cost cap.
+    Then the caps, all derived from the existing child rows: per rolling 24h,
+    per envelope lifetime (<= 7 days, so `max_per_week`), total spend.
+    revoked(auth_id) is the out-of-band kill file; it is REQUIRED (no
+    default) so a caller cannot forget it, and is read inside the transaction.
+
+    Hold reasons: envelope_missing | envelope_mismatch | envelope_revoked |
+    envelope_expired | envelope_policy_invalid | envelope_holder_changed |
+    policy_template | policy_cost_missing | policy_item_cap | policy_size |
+    policy_manifest | envelope_consumed | envelope_day_cap | envelope_week_cap
+    | envelope_budget | envelope_ambiguous:<Error>. Nothing is written on any."""
+    pane, birth, sess, gen = holder
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT protocol, owner_label, project, pane_id, pane_birth, session_digest, lease_generation,"
+                " policy, policy_sha256, prompt_id, approval_id, status, expires_at"
+                " FROM owner_dispatch_envelope WHERE auth_id=?", (auth_id,)).fetchone()
+            if row is None:
+                return "envelope_missing"
+            (proto, lb, pj, g_pane, g_birth, g_sess, floor_gen, pol_text, pol_sha, prompt, approval, st, exp) = row
+            if proto != ENVELOPE_PROTOCOL or lb != label or pj != project or not project:
+                return "envelope_mismatch"
+            if st == "denied" or revoked(auth_id):
+                return "envelope_revoked"
+            if st != "granted":
+                return "envelope_mismatch"
+            if not isinstance(exp, (int, float)) or now >= exp:
+                return "envelope_expired"
+            try:
+                if hashlib.sha256(pol_text.encode()).hexdigest() != pol_sha:
+                    return "envelope_policy_invalid"
+                policy = validate_policy(json.loads(pol_text))
+            except ValueError:
+                return "envelope_policy_invalid"
+            if not _holder_fence_ok(lease_conn, label, (pane, birth, sess, gen), (g_pane, g_birth, g_sess, floor_gen)):
+                return "envelope_holder_changed"
+            why = check_item_policy(policy, request_text, manifest, cost_cents)
+            if why:
+                return why
+            if conn.execute("SELECT 1 FROM owner_dispatch_auth WHERE parent=? AND request_id=?",
+                            (auth_id, request_id)).fetchone():
+                return "envelope_consumed"
+            n_day = conn.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE parent=? AND decided_at > ?",
+                                 (auth_id, _utc(now - 86400))).fetchone()[0]
+            n_all, spent = conn.execute("SELECT COUNT(*), COALESCE(SUM(spent_cents),0) FROM owner_dispatch_auth"
+                                        " WHERE parent=?", (auth_id,)).fetchone()
+            if n_day >= policy["max_per_day"]:
+                return "envelope_day_cap"
+            if n_all >= policy["max_per_week"]:
+                return "envelope_week_cap"
+            if spent + cost_cents > policy["total_cap_cents"]:
+                return "envelope_budget"
+            child_id = f"{auth_id}:{uuid.uuid4().hex}"
+            decided = _utc(now)
+            conn.execute(
+                "INSERT INTO owner_dispatch_auth(auth_id,protocol,owner_label,project,pane_id,pane_birth,"
+                "session_digest,lease_generation,request_id,body_sha256,manifest,prompt_id,approval_id,status,"
+                "decided_at,expires_at,consumed_at,kind,parent,spent_cents)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'consumed',?,?,?,'single',?,?)",
+                (child_id, PROTOCOL, label, project, pane, birth, sess, gen, request_id,
+                 hashlib.sha256(request_text).hexdigest(), manifest_key(manifest), prompt, approval, decided, exp,
+                 decided, auth_id, cost_cents))
+            env = _envelope(conn, child_id)
+            conn.execute("COMMIT")
+            return env
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        return f"envelope_ambiguous:{type(exc).__name__}"
+
+
+def revoke_envelope(conn: sqlite3.Connection, auth_id: str, *, operator: str, decision_ref: str, note: str = "") -> str:
+    """'revoked', or why not: revoke_invalid | revoke_missing | revoke_denied |
+    revoke_ambiguous:<Error>. Flips granted -> denied (the one update the
+    table's trigger allows) and appends an operator row keyed by the sha256 of
+    the envelope row, in ONE transaction: no revocation without its audit
+    record. Works on an expired envelope too (a revocation is never refused
+    for being late). Never raises."""
+    if not operator or not decision_ref:
+        return "revoke_invalid"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(f"SELECT {','.join(POLICY_ROW_COLS)}, status FROM owner_dispatch_envelope WHERE auth_id=?",
+                               (auth_id,)).fetchone()
+            if row is None:
+                return "revoke_missing"
+            if row[-1] == "denied":
+                return "revoke_denied"
+            env_sha = envelope_sha256(dict(zip(POLICY_ROW_COLS, row[:-1])))
+            if conn.execute("UPDATE owner_dispatch_envelope SET status='denied' WHERE auth_id=? AND status='granted'",
+                            (auth_id,)).rowcount != 1:
+                return "revoke_denied"
+            _record(conn, auth_id, "revoked", env_sha, operator, decision_ref, "revoked", note, None)
+            conn.execute("COMMIT")
+            return "revoked"
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except sqlite3.Error as exc:
+        return f"revoke_ambiguous:{type(exc).__name__}"
+
+
+def envelope_usage(conn: sqlite3.Connection, auth_id: str, now: float) -> dict | None:
+    """Read-only status of one envelope for factory-status: policy, status,
+    expiry and what the caps have left. None when there is no such envelope.
+    Raises sqlite3.Error on an unreadable/unmigrated store (caller reports it)."""
+    row = conn.execute("SELECT policy, status, expires_at, owner_label, project FROM owner_dispatch_envelope"
+                       " WHERE auth_id=?", (auth_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        pol = validate_policy(json.loads(row[0]))
+    except ValueError:
+        return {"auth_id": auth_id, "status": row[1], "expires_at": row[2], "policy_invalid": True}
+    n_day = conn.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE parent=? AND decided_at > ?",
+                         (auth_id, _utc(now - 86400))).fetchone()[0]
+    n_all, spent = conn.execute("SELECT COUNT(*), COALESCE(SUM(spent_cents),0) FROM owner_dispatch_auth"
+                                " WHERE parent=?", (auth_id,)).fetchone()
+    return {"auth_id": auth_id, "status": row[1], "expires_at": row[2], "templates": [t["name"] for t in pol["templates"]],
+            "used_day": n_day, "max_per_day": pol["max_per_day"], "used_week": n_all, "max_per_week": pol["max_per_week"],
+            "spent_cents": spent, "total_cap_cents": pol["total_cap_cents"],
+            "per_item_cap_cents": pol["per_item_cap_cents"], "policy": pol,
+            "remaining": {"day": max(pol["max_per_day"] - n_day, 0), "week": max(pol["max_per_week"] - n_all, 0),
+                          "cents": max(pol["total_cap_cents"] - spent, 0)}}
 
 
 def _read_intent(journal_root: str, label: str, rid: str) -> dict | None:

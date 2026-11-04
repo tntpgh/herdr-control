@@ -33,6 +33,7 @@ plutil -replace EnvironmentVariables.HERDR_RESULT_AVAILABILITY_ROOTS -string "th
 plutil -replace EnvironmentVariables.HERDR_OWNER_DISPATCH_AUTH_DB -string /x/dispatch-auth.sqlite3 "$LIVE"
 plutil -replace EnvironmentVariables.SOMETHING_ELSE -string keep-out "$LIVE"
 
+plutil -replace EnvironmentVariables.HERDR_QUEUE_SUPERVISOR_ENVELOPE -string 1 "$LIVE"
 printf '== a re-render carries exactly the factory keys the live plist sets ==\n'
 NEW="$WORK/new.plist"; render "$NEW"
 check "precondition: the bare template render has no factory key" '[ -z "$(get HERDR_QUEUE_SUPERVISOR "$NEW")" ]'
@@ -43,6 +44,7 @@ check "HERDR_QUEUE_SUPERVISOR_LANES carried verbatim" '[ "$(get HERDR_QUEUE_SUPE
 check "a value with ':', '=' and a space survives byte-for-byte" \
   '[ "$(get HERDR_RESULT_AVAILABILITY_ROOTS "$NEW")" = "thurber-os=/a/b:kb=/c d/e" ]'
 check "HERDR_OWNER_DISPATCH_AUTH_DB carried verbatim" '[ "$(get HERDR_OWNER_DISPATCH_AUTH_DB "$NEW")" = /x/dispatch-auth.sqlite3 ]'
+check "HERDR_QUEUE_SUPERVISOR_ENVELOPE carried verbatim when the live plist sets it" '[ "$(get HERDR_QUEUE_SUPERVISOR_ENVELOPE "$NEW")" = 1 ]'
 check "a factory key the live plist LACKS is not invented (re-render never turns anything on)" \
   '[ -z "$(get HERDR_QUEUE_SUPERVISOR_STANDING "$NEW")" ] && [ -z "$(get HERDR_OWNER_DISPATCH "$NEW")" ]'
 check "a non-factory key is never carried" '[ -z "$(get SOMETHING_ELSE "$NEW")" ]'
