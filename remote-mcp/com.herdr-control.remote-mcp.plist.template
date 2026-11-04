@@ -108,6 +108,16 @@
 		<string>/Users/thurbs/.local/state/herdr/owner-dispatch/owner-lease.sqlite3</string>
 		<key>HERDR_OWNER_LEASE_RENEW</key>
 		<string>1</string>
+		<!-- owner-lease-resume-sweep.py (same-holder continuity for an
+		     ALREADY-EXPIRED lease) is deliberately NOT wired in here.
+		     HERDR_OWNER_LEASE_RESUME=1 is an explicit, separate operator
+		     decision (review finding F2, 2026-11-04): enabling it here
+		     unconditionally meant it could never succeed without ALSO
+		     setting HERDR_OWNER_LEASE_WRITER=1 for the whole publisher
+		     process (a much bigger grant than this one tick needs), and
+		     every tick in between would have logged a reasonless
+		     refusal every 15s. Add both keys together, deliberately,
+		     only once that tradeoff is a conscious choice. -->
 	</dict>
 	<!-- 15 s: the Worker reports `disconnected` after 90 s without a sync,
 	     so six missed ticks in a row are what it takes to go dark. -->

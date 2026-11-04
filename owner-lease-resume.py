@@ -42,6 +42,17 @@ Preconditions, all refused (rc 2, nothing written) before any write:
     registry-resolved identity for this label -- a holder change belongs
     to owner-dispatch-issue.py's claim_successor path (human-approved
     grant), never this script                            -> different_holder
+  - the label's owner_projects.lifecycle_end_at is NULL (R13-BOUNDS:
+    the weekly-grant-fed absolute bound; resuming with no bound would be
+    a perpetual lease)                                   -> no_lifecycle_bound
+  - `now` is already at or past that bound -- same "fails closed on its
+    own TTL, nothing revives it again" posture as renew_due's identical
+    check (lib/owner_lease_renew.py)                      -> lifecycle_ended
+  - the requested --ttl, clamped to never cross the bound
+    (min(--ttl, bound - now)), falls below the SAME delivery TTL floor
+    the raw --ttl is already checked against above -- never resumes with
+    a clamp so tight it immediately fails begin_notice()'s own margin
+                            -> ttl_below_delivery_floor_after_lifecycle_clamp
 
 CONCURRENT-MUTATION GUARD (best effort, not a true CAS -- see NOTES.md):
 acquire() takes no "expected current generation" parameter the way
@@ -81,6 +92,7 @@ sys.path.insert(0, str(HERE / "remote-mcp"))
 
 import owner_lease as ol  # noqa: E402
 import owner_lease_delivery as oled  # noqa: E402
+import owner_lease_renew as olr  # noqa: E402 -- reuse its _ts() ISO parser, same bound semantics
 
 
 def main(argv=None, resolve=None, now=None) -> int:
@@ -138,8 +150,26 @@ def main(argv=None, resolve=None, now=None) -> int:
                 print(f"schema_pending:{cur_v}->{target_v} (owner-lease-migrate.py --db {db} --apply) -- "
                       f"plan cannot be confirmed until migrated")
                 return 0
-        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (a.label,)).fetchone():
+        proj_row = conn.execute("SELECT lifecycle_end_at, unregistered_at FROM owner_projects WHERE label=?",
+                                 (a.label,)).fetchone()
+        if proj_row is None:
             print("refused:owner_project_unmapped")
+            return 2
+        now_s = clock()
+        end_iso, unregistered_at = proj_row
+        if unregistered_at is not None:
+            print("refused:unregistered_label")
+            return 2
+        if end_iso is None:
+            print("refused:no_lifecycle_bound")
+            return 2
+        end_at = olr._ts(end_iso)  # noqa: SLF001 (same reviewed parser renew_due already uses)
+        if now_s >= end_at:
+            print("refused:lifecycle_ended")
+            return 2
+        effective_ttl = min(a.ttl, int(end_at - now_s))  # never resume past lifecycle_end_at
+        if effective_ttl < oled.CLAIM_TTL_FLOOR_S:
+            print(f"refused:ttl_below_delivery_floor_after_lifecycle_clamp:{oled.CLAIM_TTL_FLOOR_S}")
             return 2
         row = conn.execute(
             "SELECT pane_id, pane_birth, session_digest, generation, expires_at, released_at "
@@ -151,7 +181,6 @@ def main(argv=None, resolve=None, now=None) -> int:
         if prev_gen != a.expect_prev_generation:
             print(f"refused:wrong_prev_generation:observed={prev_gen}:expected={a.expect_prev_generation}")
             return 2
-        now_s = clock()
         # same freshness test as lib/owner_lease.py's own _live(): unreleased AND unexpired
         if prev_released_at is None and ol._iso(now_s) < prev_expires_at:  # noqa: SLF001 (same-module reuse)
             print("refused:live_predecessor")
@@ -161,11 +190,20 @@ def main(argv=None, resolve=None, now=None) -> int:
             return 2
 
         if not a.apply:
-            print(f"plan:resume:{a.label}:from_gen{prev_gen}:pane={pane}:birth={birth}:ttl={a.ttl}"
+            print(f"plan:resume:{a.label}:from_gen{prev_gen}:pane={pane}:birth={birth}:ttl={effective_ttl}"
                   " (dry-run; pass --apply to write)")
             return 0
 
-        new_gen = ol.acquire(conn, a.label, pane, birth, a.ttl, now_s, session_digest=digest)
+        # re-check immediately before the write: narrows (never closes -- acquire() has its
+        # own internal _tx, not composable with this read) the window an operator's
+        # unregister-owner.sh could land in between the precondition read above and here
+        reconfirm = conn.execute("SELECT unregistered_at FROM owner_projects WHERE label=?",
+                                  (a.label,)).fetchone()
+        if reconfirm is None or reconfirm[0] is not None:
+            print("refused:unregistered_label")
+            return 2
+
+        new_gen = ol.acquire(conn, a.label, pane, birth, effective_ttl, now_s, session_digest=digest)
     except (ol.Disabled, ol.InvalidOwner, ValueError) as exc:
         print(f"refused:{type(exc).__name__}")
         return 2

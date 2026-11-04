@@ -1292,6 +1292,45 @@ def owner_lease_renew_tick() -> dict | None:
     return olr.renew_all_due(gate.conn, registry_resolver)
 
 
+def owner_lease_resume_tick() -> dict | None:
+    """OFF BY DEFAULT: None unless HERDR_OWNER_LEASE_RESUME=1 (a NEW,
+    separate flag -- never folded into HERDR_OWNER_LEASE_RENEW=1, whose
+    own module documents "never revives an expired lease" as a
+    security-reviewed invariant, R15/F1). Requires the owner-lease gate
+    too (HERDR_OWNER_LEASE_DELIVERY=1), same posture as the renew tick.
+
+    Runs owner-lease-resume-sweep.py --apply as a subprocess (never
+    in-process: that script owns its own argv/exit-code contract, and a
+    subprocess boundary means a crash in the sweep can never corrupt this
+    tick's own state). The sweep itself only ever resumes a label whose
+    most recent lease is expired-but-unreleased AND whose recorded holder
+    still matches the registry's CURRENT resolution -- see that script's
+    own docstring for the full gap this closes (conductor-week-daily-tick.sh
+    recovering owner_projects.lifecycle_end_at without ever touching the
+    owner_leases row factory-status.py and queue-supervisor actually
+    check). Never a takeover: a holder mismatch is refused by
+    owner-lease-resume.py itself, every time, regardless of who calls it.
+
+    Returns the sweep's own per-label JSON report (parsed), or None when
+    the flag is off, so callers log nothing extra on the common no-op
+    tick -- same shape as owner_lease_renew_tick()."""
+    if os.environ.get("HERDR_OWNER_LEASE_RESUME") != "1":
+        return None
+    if os.environ.get("HERDR_OWNER_LEASE_DELIVERY") != "1":
+        raise RuntimeError("HERDR_OWNER_LEASE_RESUME=1 needs the owner-lease gate (HERDR_OWNER_LEASE_DELIVERY=1)")
+    sweep = REPO / "owner-lease-resume-sweep.py"
+    proc = subprocess.run([sys.executable, str(sweep), "--apply"], capture_output=True, text=True,
+                          timeout=60, env=os.environ.copy())
+    if proc.returncode != 0:
+        raise RuntimeError(f"owner-lease-resume-sweep.py exited {proc.returncode}: "
+                           f"stdout={(proc.stdout or '').strip()!r} stderr={(proc.stderr or '').strip()!r}")
+    try:
+        report = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        raise RuntimeError(f"owner-lease-resume-sweep.py printed non-JSON: {(proc.stdout or '')[:200]!r}")
+    return report or None
+
+
 RESULT_AVAILABILITY_CONDUCTOR = "conductor"
 
 
@@ -2084,6 +2123,13 @@ def main(argv: list[str]) -> int:
             log(f"owner-lease renew: {renew_out}")
     except Exception as exc:  # noqa: BLE001 - never blocks the publisher tick
         log(f"owner-lease renew tick failed (no renewal this tick): {type(exc).__name__}: {exc}")
+
+    try:
+        resume_out = owner_lease_resume_tick()
+        if resume_out:
+            log(f"owner-lease resume: {resume_out}")
+    except Exception as exc:  # noqa: BLE001 - never blocks the publisher tick
+        log(f"owner-lease resume tick failed (no resume this tick): {type(exc).__name__}: {exc}")
 
     try:
         ra_out = result_availability_tick()
