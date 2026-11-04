@@ -139,7 +139,10 @@ def _rollback_line(backup: str, db: str, sha: str) -> str:
 
 REQUIRED_TABLES = ("owner_projects", "owner_leases", "owner_events", "owner_state")
 # Events that are audited authority decisions made AFTER a backup: a restore would silently erase them.
-AUTHORITY_EVENT_KINDS = ("revoked", "assigned")
+# revoked/assigned: assignment decisions. unregistered/released/reaped: an owner (or its lease) was ended on
+# purpose -- restoring the pre-activation rows would bring an unregistered owner / released lease back as live
+# once the operator re-enables leasing (review D1). Event semantics: lib/owner_lease.py _event() callers.
+AUTHORITY_EVENT_KINDS = ("revoked", "assigned", "unregistered", "released", "reaped")
 
 
 def _backup_name_ok(backup: str, db: str) -> bool:

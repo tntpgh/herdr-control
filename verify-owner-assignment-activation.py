@@ -285,6 +285,31 @@ def part1():
          rows_of(db_r, "SELECT enabled FROM owner_state") == [(0,)]
          and rows_of(db_r, "SELECT MAX(version) FROM owner_schema_version") == [(5,)])
 
+    # H2c (review D1): an owner UNREGISTERED after the backup must not be silently restored as registered/live
+    base_u = tmpdir()
+    db_u = base_u / db.name
+    db_u.write_bytes(after)
+    os.chmod(db_u, 0o600)
+    bk_u = base_u / bk[0].name
+    bk_u.write_bytes(bk[0].read_bytes())
+    uc = ol.connect(str(db_u))
+    uc.execute("UPDATE owner_projects SET unregister_token='tok-old' WHERE label='old'")
+    got = ol.unregister_owner(uc, "old", "tok-old", 1, "w3:p1", "term_old", now=now + 5, dry_run=False)
+    uc.close()
+    unreg_bytes = db_u.read_bytes()
+    case("H2c fixture: the post-backup unregistration really happened", got == "unregistered"
+         and rows_of(db_u, "SELECT COUNT(*) FROM owner_events WHERE kind='unregistered'") == [(1,)]
+         and rows_of(db_u, "SELECT unregistered_at IS NOT NULL FROM owner_projects WHERE label='old'") == [(1,)])
+    rc, out = run_cli(base_u, db_u, "--rollback", str(bk_u), "--expect-sha256", bsha, "--apply", flags=W, registry=registry)
+    case("H2c: ROLLBACK refuses a post-backup UNREGISTERED owner (would be restored registered), nothing written",
+         rc == 2 and "label=old kind=unregistered" in out and "refused:post_backup_authority_events" in out
+         and db_u.read_bytes() == unreg_bytes and not backups(db_u, "pre-rollback"))
+    rc, out = run_cli(base_u, db_u, "--rollback", str(bk_u), "--expect-sha256", bsha, "--ack-discard-post-backup-events",
+                      "--apply", flags=W, registry=registry)
+    case("H2c: only with the explicit acknowledgement does it restore, kill switch still engaged",
+         rc == 0 and rows_of(db_u, "SELECT enabled FROM owner_state") == [(0,)]
+         and rows_of(db_u, "SELECT unregistered_at IS NULL FROM owner_projects WHERE label='old'") == [(1,)])
+
     # H2b: an engaged kill switch is not re-enabled by a rollback (the backup itself has enabled=1)
     live_c = sqlite3.connect(str(db))
     live_c.execute("UPDATE owner_state SET enabled=0")

@@ -78,9 +78,11 @@ HERDR_OWNER_ASSIGNMENT_WRITER=1 python3 owner-assignment-activate.py --db "$HERD
 - **Bound to this store:** the backup must be `<db>.pre-assignment-activate-v<N>-<epoch>.sqlite3` or
   `<db>.pre-rollback-<epoch>.sqlite3` in the same directory as `--db`, contain the owner-lease tables, and
   `--expect-sha256` is **required** with `--apply` (the activation prints the exact line).
-- **Never erases a revocation:** if the live store holds `revoked`/`assigned` events newer than the backup
-  (a holder revoked, or a new assignment, since activation), the rollback **refuses (exit 2)** and lists
-  them: restoring would re-authorize a revoked holder for the rest of its original TTL. Only
+- **Never erases a revocation or an unregistration:** if the live store holds `revoked`, `assigned`,
+  `unregistered`, `released` or `reaped` events newer than the backup (a holder revoked, a new assignment, an
+  owner unregistered or a lease released/reaped since activation), the rollback **refuses (exit 2)** and lists
+  them: restoring would re-authorize a revoked holder, or bring an unregistered owner back as live once
+  leasing is re-enabled. Only
   `--ack-discard-post-backup-events` overrides, deliberately. Prefer `owner-assignment.py revoke`/`replace`
   to undo a single assignment; a rollback is for a failed activation.
 - **Never re-enables leasing:** after the restore `owner_state.enabled=0` (kill switch ENGAGED), whatever
