@@ -157,6 +157,20 @@ def consume(aid, lb, rid, text, *, cost=10, man=M, now=None, hold=None, revoked=
                                 revoked=revoked)
 
 
+def refused_with(fn):
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001  a crash is a distinct, non-matching answer, never a pass
+        return str(exc) if isinstance(exc, odi.Refused) else f"crash:{type(exc).__name__}"
+    return None
+
+def standing_rec(lb, aid, window=1800):
+    pane, birth, sess, gen = holder(lb)
+    return {"protocol": odi.STANDING_PROTOCOL, "owner_label": lb, "project": project(lb),
+            "expected_holder": {"pane_id": pane, "pane_birth": birth, "session_digest": sess},
+            "expected_generation": gen, "queue_sha256": "0" * 64, "queue_items": [], "item_cap": 1,
+            "spend_cap_cents": 0, "auth_id": aid, "standing_window_s": window}
+
 def n_children(aid):
     return store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE parent=?", (aid,)).fetchone()[0]
 
@@ -201,6 +215,9 @@ check("BINDING: unknown envelope id -> envelope_missing", consume("env-nope", UL
 lane("proj-unit-other", 1)
 check("BINDING: an envelope for one lane refuses another label -> envelope_mismatch",
       consume(A1, "proj-unit-other", "x2", "WEEKLY-KB: x\n", label="proj-unit-other") == "envelope_mismatch")
+check("ENGAGED: any lstat error but ENOENT reads as engaged (an unreadable dir is never 'off')",
+      kill_switch.engaged(str(base / "not-a-dir-x" / "y" / "z")) is False
+      and kill_switch.engaged(str(base / "ra.db" / "child")) is True)
 check("BINDING: a different live holder (session) than the one approved -> envelope_holder_changed",
       consume(A1, UL, "x3", "WEEKLY-KB: x\n", hold=(*PANE[UL], hashlib.sha256(b"other").hexdigest(), 1))
       == "envelope_holder_changed")
@@ -434,6 +451,56 @@ check("KILL SWITCH (CLI): a path-escaping auth id is refused, no file created",
       rc_bad == 2 and not (base / "evil.revoked").exists())
 odi.STATE_ROOT = ORIG_STATE
 
+# --- F2: a marker that cannot be written must NOT skip the sticky DB denial or the audit line ---
+EF = envelope(UL, "env-unit-f2")
+blocker = base / "not-a-dir"
+blocker.write_text("x")
+ORIG_DIR = kill_switch.ENVELOPE_REVOKE_DIR
+kill_switch.ENVELOPE_REVOKE_DIR = str(blocker / "sub")        # makedirs -> NotADirectoryError
+os.environ["HERDR_OWNER_DISPATCH_AUTH_DB"] = auth_db
+odi.STATE_ROOT = str(state)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    try:
+        rc_f2 = odi.main(["revoke-envelope", "--auth-id", EF, "--operator", "terrence", "--reason", "f2 drill"], now=NOW)
+    except Exception as exc:  # noqa: BLE001
+        rc_f2 = f"crash:{type(exc).__name__}"
+os.environ.pop("HERDR_OWNER_DISPATCH_AUTH_DB")
+kill_switch.ENVELOPE_REVOKE_DIR = ORIG_DIR
+odi.STATE_ROOT = ORIG_STATE
+audit_f2 = [json.loads(x) for x in (state / "owner-dispatch" / "revoke.jsonl").read_text().splitlines()
+            if json.loads(x)["auth_id"] == EF]
+check("KILL SWITCH (marker write fails): the DB row is still denied + operator row written, rc 1, no traceback",
+      rc_f2 == 1 and "marker=error:" in buf.getvalue() and "db=revoked" in buf.getvalue()
+      and store.execute("SELECT status FROM owner_dispatch_envelope WHERE auth_id=?", (EF,)).fetchone()[0] == "denied"
+      and store.execute("SELECT COUNT(*) FROM owner_dispatch_operator WHERE auth_id=? AND kind='revoked'", (EF,)).fetchone() == (1,))
+check("KILL SWITCH (marker write fails): the audit line names the marker error and the dispatch is refused",
+      [a["action"] for a in audit_f2] == ["marker", "db"] and audit_f2[0]["marker_error"] == "NotADirectoryError"
+      and consume(EF, UL, "f2x", "WEEKLY-KB: x\n") == "envelope_revoked")
+
+# --- F4: auth_id / approval_id uniqueness is cross-table in BOTH directions, for every issuer ---
+SD = mk_dec(UL, "env-unit-day", POLICY)                      # an id that is already an ENVELOPE
+SD["rec"] = {**standing_rec(UL, "env-unit-day"), "queue_sha256": "0" * 64, "item_cap": 1}
+check("ID UNIQUENESS: a standing grant reusing an envelope's auth_id is refused (no row, no children hijack)",
+      refused_with(lambda: odi.insert_standing_grant(store, SD, NOW + 600)) == "approval_already_used"
+      and store.execute("SELECT COUNT(*) FROM owner_dispatch_auth WHERE auth_id='env-unit-day'").fetchone() == (0,))
+SD2 = mk_dec(UL, "std-f4", POLICY)
+SD2["rec"] = {**standing_rec(UL, "std-f4"), "queue_sha256": "1" * 64, "item_cap": 1}
+odi.insert_standing_grant(store, SD2, NOW + 600)
+check("ID UNIQUENESS: a weekly envelope reusing a standing grant's auth_id is refused",
+      refused_with(lambda: odi.insert_weekly_grant(store, mk_dec(UL, "std-f4", POLICY), NOW + 600)) == "approval_already_used")
+SD3 = mk_dec(UL, "std-f4-new", POLICY)
+SD3["rec"] = {**standing_rec(UL, "std-f4-new"), "queue_sha256": "2" * 64, "item_cap": 1}
+SD3["form_id"] = store.execute("SELECT approval_id FROM owner_dispatch_envelope WHERE auth_id='env-unit-day'").fetchone()[0]
+check("ID UNIQUENESS: a standing grant reusing an envelope's approval (form) id is refused",
+      refused_with(lambda: odi.insert_standing_grant(store, SD3, NOW + 600)) == "approval_already_used")
+
+# --- F5: project binding on consume_envelope ---
+check("BINDING: a lane whose project differs from the envelope's is refused envelope_mismatch (project, not just label)",
+      oda.consume_envelope(store, A1, label=UL, project="some-other-project", holder=holder(UL), request_id="pj1",
+                           request_text=b"WEEKLY-KB: x\n", manifest=M, now=NOW, lease_conn=lc, cost_cents=10,
+                           revoked=kill_switch.envelope_revoked) == "envelope_mismatch")
+
 # --- B3: expiry and caps hold the item, retry-safe (no freeze) ---
 LX = "proj-wk-exp"
 lane(LX, 12)
@@ -471,13 +538,6 @@ def put_form(fid, rec, kind, status="open", answered_at=None, decision="approve"
     (FORMS / f"{fid}.html").write_bytes(html)
     (FORMS / f"{fid}.json").write_text(json.dumps(row))
 
-
-def standing_rec(lb, aid, window=1800):
-    pane, birth, sess, gen = holder(lb)
-    return {"protocol": odi.STANDING_PROTOCOL, "owner_label": lb, "project": project(lb),
-            "expected_holder": {"pane_id": pane, "pane_birth": birth, "session_digest": sess},
-            "expected_generation": gen, "queue_sha256": "0" * 64, "queue_items": [], "item_cap": 1,
-            "spend_cap_cents": 0, "auth_id": aid, "standing_window_s": window}
 
 
 def weekly_rec(lb, aid, window=WEEK):
@@ -554,6 +614,13 @@ check("RACE NEGATIVE: a DECLINED form does not defer",
       frozen_with(lambda lb, aid: put_form("20261104T120005-9005", standing_rec(lb, aid), "standing", status="answered",
                                            answered_at=int(time.time() * 1000), decision="decline"),
                   "proj-race-d", 25, "standing-rd").startswith("frozen:held_consumed"))
+check("RACE NEGATIVE: a form row whose status is 'declined' does not defer",
+      frozen_with(lambda lb, aid: put_form("20261104T120015-9015", standing_rec(lb, aid), "standing", status="declined"),
+                  "proj-race-dd", 40, "standing-rdd").startswith("frozen:held_consumed"))
+check("RACE NEGATIVE (envelope): an answered-DECLINE weekly form does not defer",
+      frozen_with(lambda lb, aid: put_form("20261104T120016-9016", weekly_rec(lb, aid), "weekly", status="answered",
+                                           answered_at=int(time.time() * 1000), decision="decline"),
+                  "proj-race-de", 41, "env-race-de", env_tick).startswith("frozen:held_consumed"))
 check("RACE NEGATIVE: an approved form whose own window has passed does not defer",
       frozen_with(lambda lb, aid: put_form("20261104T120006-9006", standing_rec(lb, aid, 60), "standing", status="answered",
                                            answered_at=int((time.time() - 3600) * 1000)),
@@ -693,13 +760,6 @@ check("ISSUE NEGATIVE: an unmigrated (v2) store is refused before any write",
       and not count("SELECT name FROM sqlite_master WHERE name='owner_dispatch_envelope'", db=str(old_db)))
 
 # validator negatives: what a human can be shown / sign
-def refused_with(fn):
-    try:
-        fn()
-    except odi.Refused as exc:
-        return str(exc)
-    return None
-
 
 bad_rec = lambda **ov: {**weekly_rec(DL, "env-v"), **ov}  # noqa: E731
 pol_with = lambda **ov: {**POLICY, **ov}  # noqa: E731
@@ -769,6 +829,61 @@ check("STATUS (text): prints envelope id, expiry and remaining caps",
 v_item = FS.envelope_view(auth_db, LC, item(EC, "z1", "totally unrelated request\n"), time.time())
 check("STATUS: the NEXT item failing the policy is reported before the tick refuses it",
       "next_item_policy_template" in v_item[1])
+
+# --- F5: the issuer's SECOND window() recheck (between the in-txn checks and the insert) is a real gate ---
+out2_html = base / "weekly2.html"
+rc, out = run_odi(BUILD + ["--auth-id", "env-issue-w2", "--out", str(out2_html)], flags=False)
+FID2W = "20261104T130009-9109"
+serve(FID2W, out2_html.read_bytes())
+_win, _calls = odi.window, [0]
+
+
+def _second_call_expires(dec, now, key="grant_window_s"):
+    _calls[0] += 1
+    if _calls[0] >= 2:
+        raise odi.Refused("approval_expired")
+    return _win(dec, now, key=key)
+
+
+odi.window = _second_call_expires
+try:
+    rc, out = run_odi(["issue-weekly", "--form-id", FID2W])
+finally:
+    odi.window = _win
+check("ISSUE: the window rechecked right before insert refuses when it has lapsed meanwhile; no row written",
+      rc == 2 and out == "refused:approval_expired" and _calls[0] == 2
+      and count("SELECT COUNT(*) FROM owner_dispatch_envelope WHERE auth_id='env-issue-w2'") == [(0,)])
+rc, out = run_odi(["issue-weekly", "--form-id", FID2W])
+check("ISSUE: the same form issues once the recheck passes (the refusal above burned nothing)",
+      rc == 0 and out == "issued:env-issue-w2")
+
+# --- F5: standing and envelope modes are mutually exclusive in the supervisor ---
+(base / "root-b").mkdir(exist_ok=True)
+(base / "journal-both").mkdir(exist_ok=True)
+env_both = {qs.ENV_FLAG: "1", "HERDR_OWNER_DISPATCH": "1", "HERDR_OWNER_LEASE_DELIVERY": "1",
+            "HERDR_QUEUE_SUPERVISOR_ROOT": str(qroot), "HERDR_QUEUE_SUPERVISOR_LANES": DL,
+            "HERDR_OWNER_LEASE_DB": lease_db, "HERDR_OWNER_DISPATCH_AUTH_DB": auth_db,
+            "HERDR_RESULT_AVAILABILITY": "1", "HERDR_RESULT_AVAILABILITY_DB": str(base / "ra-both.db"),
+            "HERDR_RESULT_AVAILABILITY_JOURNAL": str(base / "journal-both"),
+            "HERDR_RESULT_AVAILABILITY_ROOTS": f"{DL}={base / 'root-b'}",
+            cli.STANDING_ENV_FLAG: "1", cli.ENVELOPE_ENV_FLAG: "1"}
+
+
+def run_main(env):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(environ=env, send=send, resolve=REG.get)
+    return rc, buf.getvalue().strip()
+
+
+_ks = cli.KILL_SWITCH
+cli.KILL_SWITCH = base / "no-such-kill-switch"
+try:
+    rc_both, out_both = run_main(env_both)
+finally:
+    cli.KILL_SWITCH = _ks
+check("FLAGS: standing and envelope both on -> refused:standing_and_envelope_both_on, rc 4, nothing dispatched",
+      (rc_both, out_both) == (4, "refused:standing_and_envelope_both_on"))
 
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

@@ -505,8 +505,7 @@ def insert_grant(store, dec, exp: float) -> None:
     grant, issuance = expected_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
-        if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                         (rec["auth_id"], dec["form_id"])).fetchone():
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
             raise Refused("approval_already_used")
         store.execute(f"INSERT INTO owner_dispatch_auth({','.join(GRANT_COLS)}) VALUES ({','.join('?' * len(GRANT_COLS))})", grant)
         store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
@@ -569,8 +568,7 @@ def insert_standing_grant(store, dec, exp: float) -> None:
     grant, issuance = expected_standing_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
-        if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                         (rec["auth_id"], dec["form_id"])).fetchone():
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
             raise Refused("approval_already_used")
         store.execute(f"INSERT INTO owner_dispatch_auth({','.join(STANDING_GRANT_COLS)}) VALUES ({','.join('?' * len(STANDING_GRANT_COLS))})", grant)
         store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
@@ -651,8 +649,8 @@ def render_weekly_form(rec: dict) -> bytes:
             ("Lease generation (floor)", rec.get("expected_generation")),
             ("Max items per rolling 24h", pol.get("max_per_day")),
             ("Max items per envelope (<= 7 days)", pol.get("max_per_week")),
-            ("Per-item spend cap (cents)", pol.get("per_item_cap_cents")),
-            ("Total spend cap (cents)", pol.get("total_cap_cents")), ("Envelope id", rec.get("auth_id")),
+            ("Per-item spend cap (cents) -- vs QUEUE-DECLARED cost only", pol.get("per_item_cap_cents")),
+            ("Total spend cap (cents) -- vs QUEUE-DECLARED cost only", pol.get("total_cap_cents")), ("Envelope id", rec.get("auth_id")),
             ("Envelope valid for", f'{rec.get("envelope_window_s")} s after you answer'),
             ("Approval record sha256", sha)]
     table = "".join(f"<tr><th>{esc(k)}</th><td><code>{esc(v)}</code></td></tr>" for k, v in rows)
@@ -672,7 +670,9 @@ def render_weekly_form(rec: dict) -> bytes:
             "<p>Approving authorizes ANY queue item whose request text starts with one of the template prefixes "
             "below (and passes that template's manifest and size rules) to be dispatched to the currently-live "
             "holder shown, within the caps. The queue is NOT pinned: items appended later run without another "
-            "approval. An item that matches no template is refused. Nothing claims a new lease.</p>"
+            "approval. The spend caps are checked ONLY against the cost_cents the queue writer declares in the queue "
+            "file; nothing verifies real spend, and an item declaring 0 passes them. Only the item-count caps are hard. "
+            "An item that matches no template is refused. Nothing claims a new lease.</p>"
             f"<table>{table}</table>"
             f"<h2>Job templates</h2><table><tr><th>name</th><th>request prefix (exact)</th><th>manifest allow-list</th>"
             f"<th>max request bytes</th></tr>{tp_html}</table>"
@@ -699,11 +699,20 @@ def expected_weekly_rows(dec, exp: float) -> tuple[tuple, tuple]:
 WEEKLY_COLS = oda.POLICY_ROW_COLS + ("status",)
 
 
-def _weekly_used(store, auth_id: str, form_id: str) -> bool:
-    return bool(store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                              (auth_id, form_id)).fetchone()
-                or store.execute("SELECT 1 FROM owner_dispatch_envelope WHERE auth_id=? OR approval_id=?",
-                                 (auth_id, form_id)).fetchone())
+def _id_used(store, auth_id: str, form_id: str) -> bool:
+    """True when auth_id or approval/form id is already used by ANY issuer: a
+    single/standing grant row or a weekly envelope row. Every issuer calls this
+    (both directions), so an id can never be shared across kinds -- a standing
+    row reusing an envelope's id would otherwise put children under that
+    envelope's parent and spend its caps. The envelope table exists only at
+    schema v3, so its absence (a v1/v2 store) is not an error."""
+    if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
+                     (auth_id, form_id)).fetchone():
+        return True
+    if not store.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_dispatch_envelope'").fetchone():
+        return False
+    return bool(store.execute("SELECT 1 FROM owner_dispatch_envelope WHERE auth_id=? OR approval_id=?",
+                              (auth_id, form_id)).fetchone())
 
 
 def insert_weekly_grant(store, dec, exp: float) -> None:
@@ -714,7 +723,7 @@ def insert_weekly_grant(store, dec, exp: float) -> None:
     grant, issuance = expected_weekly_rows(dec, exp)
     store.execute("BEGIN IMMEDIATE")
     try:
-        if _weekly_used(store, rec["auth_id"], dec["form_id"]):
+        if _id_used(store, rec["auth_id"], dec["form_id"]):
             raise Refused("approval_already_used")
         store.execute(f"INSERT INTO owner_dispatch_envelope({','.join(WEEKLY_COLS)}) VALUES ({','.join('?' * len(WEEKLY_COLS))})", grant)
         store.execute(f"INSERT INTO owner_dispatch_issuance({','.join(ISSUANCE_COLS)},issued_at) VALUES ({','.join('?' * (len(ISSUANCE_COLS) + 1))})",
@@ -884,7 +893,7 @@ def issue_weekly_main(argv, resolve=None, now=None) -> int:
             row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
             if not row or row[0] != rec["project"]:
                 raise Refused("owner_project_mismatch")
-            if _weekly_used(store, rec["auth_id"], dec["form_id"]):
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
                 raise Refused("approval_already_used")
             if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
                     h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
@@ -940,14 +949,22 @@ def revoke_envelope_main(argv, now=None) -> int:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))
     audit = os.path.join(STATE_ROOT, "owner-dispatch", "revoke.jsonl")
     os.umask(0o077)
-    os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
-    created = True
+    created, marker_err = True, None
     try:
+        os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
     except FileExistsError:
         created = False
-    _append_jsonl(audit, {"action": "marker", "auth_id": a.auth_id, "operator": a.operator, "reason": a.reason,
-                          "marker": marker, "marker_created": created, "timestamp": stamp})
+    except OSError as exc:
+        # the DB denial is the sticky half: a marker failure must not skip it
+        created, marker_err = False, f"{type(exc).__name__}"
+    audit_err = None
+    try:
+        _append_jsonl(audit, {"action": "marker", "auth_id": a.auth_id, "operator": a.operator, "reason": a.reason,
+                              "marker": marker, "marker_created": created, "marker_error": marker_err,
+                              "timestamp": stamp})
+    except OSError as exc:
+        audit_err = type(exc).__name__
     auth_db = os.environ.get("HERDR_OWNER_DISPATCH_AUTH_DB", "")
     if not auth_db:
         res = "db_skipped:HERDR_OWNER_DISPATCH_AUTH_DB_unset"
@@ -961,10 +978,14 @@ def revoke_envelope_main(argv, now=None) -> int:
                 store.close()
         except Exception as exc:  # noqa: BLE001
             res = f"db_error:{type(exc).__name__}"
-    _append_jsonl(audit, {"action": "db", "auth_id": a.auth_id, "operator": a.operator, "result": res,
-                          "timestamp": stamp})
-    print(f"revoked:{a.auth_id}:marker={'created' if created else 'existed'}:db={res}")
-    return 0 if res in ("revoked", "revoke_denied") else 1
+    try:
+        _append_jsonl(audit, {"action": "db", "auth_id": a.auth_id, "operator": a.operator, "result": res,
+                              "marker_error": marker_err, "audit_error": audit_err, "timestamp": stamp})
+    except OSError as exc:
+        audit_err = type(exc).__name__
+    mk = "error:" + marker_err if marker_err else ("created" if created else "existed")
+    print(f"revoked:{a.auth_id}:marker={mk}:db={res}" + (f":audit_error={audit_err}" if audit_err else ""))
+    return 0 if res in ("revoked", "revoke_denied") and not marker_err and not audit_err else 1
 
 
 def build_main(argv, resolve=None, now=None) -> int:
@@ -1360,8 +1381,7 @@ def issue_standing_main(argv, resolve=None, now=None) -> int:
             row = lconn.execute("SELECT project FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
             if not row or row[0] != rec["project"]:
                 raise Refused("owner_project_mismatch")
-            if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                             (rec["auth_id"], dec["form_id"])).fetchone():
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
                 raise Refused("approval_already_used")
             if ol.holder_tuple(lconn, rec["owner_label"], clock(), modes=ol.AUTHORITY_MODES) != (
                     h["pane_id"], h["pane_birth"], h["session_digest"], rec["expected_generation"]):
@@ -1581,8 +1601,7 @@ def main(argv=None, resolve=None, now=None) -> int:
             row = lconn.execute("SELECT project, max_open FROM owner_projects WHERE label=?", (rec["owner_label"],)).fetchone()
             if not row or row[0] != rec["project"] or row[1] != rec["max_open"]:
                 raise Refused("owner_project_mismatch")
-            if store.execute("SELECT 1 FROM owner_dispatch_auth WHERE auth_id=? OR approval_id=?",
-                             (rec["auth_id"], dec["form_id"])).fetchone():
+            if _id_used(store, rec["auth_id"], dec["form_id"]):
                 raise Refused("approval_already_used")
             prev_gen = rec.get("expected_prev_generation", 0)
             bind_live_gen = rec.get("bind_live_generation")

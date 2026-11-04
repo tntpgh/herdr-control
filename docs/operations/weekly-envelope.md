@@ -102,3 +102,12 @@ is acceptable. Prefer a per-day cap of what you would be comfortable reviewing t
 
 `python3 verify-weekly-envelope.py` (expiry, daily/weekly/spend caps, off-policy, kill switch + audit, append-while-live,
 race fix, issuer pipeline, factory-status). `tmp/red-mutations.py` is not shipped; its result is in `.handoffs/PROOF.md`.
+
+## Review follow-ups (PR #411 security review)
+
+- The signed page now says, next to both spend-cap rows and in the body, that the caps bind only the `cost_cents` the queue
+  writer declares; only the item-count caps are hard.
+- `revoke-envelope` still flips the DB row to `denied` and writes the operator row and audit line when the marker cannot be
+  written (unwritable state dir); it then exits 1 (`marker=error:<type>`). Dispatch is stopped by the DB denial.
+- `auth_id` / approval id uniqueness is checked across `owner_dispatch_auth` and `owner_dispatch_envelope` by every issuer
+  (single, standing, weekly, in-transaction), so a standing grant can never reuse an envelope's id and spend its caps.

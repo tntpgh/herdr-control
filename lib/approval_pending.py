@@ -27,7 +27,7 @@ import os
 import re
 
 # owner-dispatch-issue.py's STANDING_PROTOCOL (a hyphenated script, not
-# importable); verify-approval-pending.py asserts the two stay equal.
+# importable); verify-weekly-envelope.py ("RACE: the protocol string ...") asserts both stay equal.
 STANDING_PROTOCOL = "owner-dispatch-approval-standing/1"
 WEEKLY_PROTOCOL = "owner-dispatch-approval-weekly/1"
 WINDOW_KEY = {STANDING_PROTOCOL: "standing_window_s", WEEKLY_PROTOCOL: "envelope_window_s"}
