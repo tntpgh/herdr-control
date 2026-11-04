@@ -29,7 +29,7 @@ bounds a wrong approval.
 | `action_requests` (`lib/run-registry.sh` v6) | `request_id, task_id, tool, action_sha256, command, verdict, reason, route, code_path, code_sha256, status, authority, review_category, decision_reason` | Replay input |
 | `events` type `action_decided` (`herdr-action.sh:198`) | `{request_id, action_sha256, decision, authority, reviewer, review_category, reason, form_record, form_outcome}` | Ground truth; audit shape for `authority=judge` (§8) |
 | `lib/pretool-shadow.sh` `pretool_redact`, `_ps_request_command` | Shared secret redaction; stored command shape `(in <cwd>) <cmd>[\n[env] K=V…]`, `[credential withheld]` | Redaction reused, never re-implemented; env values are dropped before the judge |
-| `lib/agent-profiles.sh` | `omp --model sonnet --thinking …`; measured `omp -p --mode json --no-session --thinking off`; `--no-tools` alone still leaves extension tools callable | Judge call adds `--no-extensions --no-skills --no-rules --no-lsp`, an empty `--cwd`, and a `--config` overlay with `memory.backend: off` (§7) |
+| `lib/agent-profiles.sh` | `omp --model anthropic/claude-sonnet-5-5 --thinking …` (`$HERDR_SONNET_OMP`); measured `omp -p --mode json --no-session --thinking off`; `--no-tools` alone still leaves extension tools callable | Judge call adds `--no-extensions --no-skills --no-rules --no-lsp`, an empty `--cwd`, and a `--config` overlay with `memory.backend: off` (§7) |
 
 Why `shadow-compare.sh`'s code is not reused: its whole body is a join of
 `pretool_verdicts` (pretool-shadow.sqlite3) against `approvals` and
@@ -388,7 +388,7 @@ allow-default shape): writes inside rc=0, writes outside refused, curl inside
 
 ## 7. The judge call
 
-`omp -p --mode text --model sonnet --thinking off --no-session --no-tools
+`omp -p --mode text --model anthropic/claude-sonnet-5-5 --thinking off --no-session --no-tools
 --no-extensions --no-skills --no-rules --no-lsp --no-title --config <overlay>
 --max-time 120 --cwd <empty tmpdir> --system-prompt <judge prompt> <input>`,
 with an env of only `PATH HOME USER LANG` (checked: omp still authenticates
@@ -518,7 +518,7 @@ redaction-integrity and NUL refusals). The judge's input changed, so both
 columns need a fresh run; the replay has not been re-run.
 
 Run by Main via `/tmp/judge-shadow-run.sh` (rc 0); logs `tmp/judge-run/`.
-Model `sonnet`, thinking off. Raw logs and per-row detail: `.handoffs/PROOF.md` §run.
+Model bare `sonnet` (the alias at the time of this run, which resolved to Sonnet 5), thinking off. `scripts/judge-shadow.py` now defaults to the exact `anthropic/claude-sonnet-5-5` (`--model` overrides). Raw logs and per-row detail: `.handoffs/PROOF.md` §run.
 
 - **Selection:** 183 candidate rows (bash/shell `escalate` requests decided by
   a conductor or Terrence, one row per `action_sha256`). Skipped:

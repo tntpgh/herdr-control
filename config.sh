@@ -111,7 +111,13 @@ HERDR_OMP_LAUNCHER_SHA256="cabdc6cd5487fdea4de7338e74694fb5f6bfd489d06b45fca7f8d
 : "${HERDR_CANONICAL_RULES:=}"
 
 # ---- spawn-task.sh model routing (job-class -> model) ----------------------
-# Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
+# Opus/Haiku use the standard aliases (opus/haiku) and need no config.
+# Standard-tier Sonnet is PINNED to Sonnet 5.5 (bare `sonnet` resolves to
+# Sonnet 5): the omp selector is provider/id from omp's model cache
+# (`anthropic` row of ~/.omp/agent/models.db, id claude-sonnet-5-5); the
+# claude-binary (omc) selector is the bare Anthropic id.
+: "${HERDR_SONNET_OMP:=anthropic/claude-sonnet-5-5}"   # claude + omp families (launched via omp)
+: "${HERDR_SONNET_CLAUDE:=claude-sonnet-5-5}"          # omc (real claude binary)
 # Codex model names are yours — edit to match your Codex setup.
 # Format: "<model>:<reasoning-effort>".
 : "${HERDR_CODEX_DEEP:=gpt-6-sol:high}"      # plan / architect / design / deep-review
@@ -309,7 +315,7 @@ unset _herdr_main_db _herdr_main_row
 #  End of your config — generic below.
 # ============================================================================
 export HERDR_DEFAULT_AGENT HERDR_OMP_BIN HERDR_OMP_LAUNCHER_SHA256 HERDR_CONTROL_APP_DIR HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
-export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
+export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST HERDR_SONNET_OMP HERDR_SONNET_CLAUDE
 export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES HERDR_BOUND_BASH
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT

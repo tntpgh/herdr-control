@@ -26,7 +26,7 @@
 #      indeterminate), not boolean — herdr being unreachable mid-check
 #      fails the attempt closed (task preserved, nothing closed, nothing
 #      spawned) instead of being silently read as "already gone".
-#   4. The ladder is fast(haiku) -> standard(sonnet) -> deep(opus) ->
+#   4. The ladder is fast(haiku) -> standard(Sonnet 5.5) -> deep(opus) ->
 #      frontier(codex's $HERDR_CODEX_DEEP) — four REAL tiers read from the
 #      one existing model table (lib/agent-profiles.sh's model_for_agent),
 #      never an invented "stronger opus". frontier is a cross-family jump
@@ -115,7 +115,7 @@ esc_spawn_job() {
 # fast/standard/deep (explore|quick|mechanical / implement|debug|code|docs
 # / plan|architect|design) — deliberately NOT a call to model_for_agent
 # itself, because every agent branch there ends in a catch-all default
-# (`claude:*) sonnet`, `codex:*) $HERDR_CODEX_STD`, ...) that would
+# (`claude:*) $HERDR_SONNET_OMP`, `codex:*) $HERDR_CODEX_STD`, ...) that would
 # silently fold an UNRECOGNIZED job-class into "standard"'s model and
 # look like a false match. `review` and `deep-review` are deliberately
 # left unmapped too (they run at a different effort/model than any ladder
@@ -136,8 +136,8 @@ esc_job_tier() {
 # the ladder's weakest tier. Fails (empty, nonzero) when the job-class is
 # missing or unrecognized, so a caller that can't verify where a task
 # started refuses to escalate rather than guessing fast (R4 review D: a
-# worker already on sonnet must never be treated as starting on haiku and
-# "escalated" sideways to the sonnet it is already running).
+# worker already on Sonnet 5.5 must never be treated as starting on haiku and
+# "escalated" sideways to the Sonnet 5.5 it is already running).
 esc_starting_tier() {
   local run_id="$1" task_id="$2" job
   job="$(esc_spawn_job "$run_id" "$task_id")" || return 1

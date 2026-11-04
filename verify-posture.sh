@@ -91,7 +91,7 @@ check "claude opus -> codex deep tier"     "$(omp_cross_family_model claude opus
 check "claude sonnet -> codex std tier"    "$(omp_cross_family_model claude sonnet)" "openai-codex/gpt-5.5 medium"
 check "claude haiku -> codex fast tier"    "$(omp_cross_family_model claude haiku)"  "openai-codex/gpt-5.4-mini low"
 check "codex deep tier -> claude opus"     "$(omp_cross_family_model codex gpt-6-sol)"   "opus high"
-check "codex std tier -> claude sonnet"    "$(omp_cross_family_model codex gpt-5.5)"       "sonnet medium"
+check "codex std tier -> claude sonnet (pinned 5.5)" "$(omp_cross_family_model codex gpt-5.5)" "anthropic/claude-sonnet-5-5 medium"
 check "codex fast tier -> claude haiku"    "$(omp_cross_family_model codex gpt-5.4-mini)"  "haiku low"
 
 printf '== cli_for_agent composes the floor, and cannot be loosened ==\n'
@@ -102,7 +102,7 @@ check "claude at the write floor launches omp, not the claude binary" \
   "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --approval-mode write"
 check "codex at the write floor launches omp, not the codex binary" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex gpt-5.5:medium)" \
-  "omp --model openai-codex/gpt-5.5 --thinking medium --models openai-codex/gpt-5.5,sonnet --approval-mode write"
+  "omp --model openai-codex/gpt-5.5 --thinking medium --models openai-codex/gpt-5.5,anthropic/claude-sonnet-5-5 --approval-mode write"
 check "omp at the write floor" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet:medium)" \
   "omp --model sonnet --thinking medium --approval-mode write"
@@ -201,35 +201,35 @@ for j in plan architect review deep-review design implement debug code explore q
 done
 ok "every agent x job-class yields a model"
 check "claude plan -> opus"         "$(model_for_agent claude plan)"      "opus"
-check "claude implement -> sonnet"  "$(model_for_agent claude implement)" "sonnet"
+check "claude implement -> Sonnet 5.5" "$(model_for_agent claude implement)" "anthropic/claude-sonnet-5-5"
 # `docs` moved fast -> standard on 2026-09-05 (lib/agent-profiles.sh:95): a
 # haiku worker restructuring a governance doc had to be killed and respawned.
 # These two rows kept asserting the pre-change routing and had been failing
 # ever since — a red suite nobody could read is worse than no suite.
-check "claude docs -> sonnet (judgment work, not fast)" \
-                                    "$(model_for_agent claude docs)"      "sonnet"
+check "claude docs -> Sonnet 5.5 (judgment work, not fast)" \
+                                    "$(model_for_agent claude docs)"      "anthropic/claude-sonnet-5-5"
 check "omp plan -> opus:high (unchanged — only review/deep-review moved tiers)" \
                                     "$(model_for_agent omp plan)"         "opus:high"
-check "omp unknown job -> default"  "$(model_for_agent omp weird)"        "sonnet:medium"
+check "omp unknown job -> default"  "$(model_for_agent omp weird)"        "anthropic/claude-sonnet-5-5:medium"
 check "omc plan -> opus (rows were missing; launch built 'claude --model ')" \
                                     "$(model_for_agent omc plan)"         "opus"
-check "omc implement -> sonnet"     "$(model_for_agent omc implement)"    "sonnet"
-check "omc docs -> sonnet"          "$(model_for_agent omc docs)"         "sonnet"
-check "omp docs -> sonnet:medium (the agent we actually run)" \
-                                    "$(model_for_agent omp docs)"         "sonnet:medium"
+check "omc implement -> Sonnet 5.5"  "$(model_for_agent omc implement)"    "claude-sonnet-5-5"
+check "omc docs -> Sonnet 5.5"       "$(model_for_agent omc docs)"         "claude-sonnet-5-5"
+check "omp docs -> Sonnet 5.5:medium (the agent we actually run)" \
+                                    "$(model_for_agent omp docs)"         "anthropic/claude-sonnet-5-5:medium"
 printf '== 2026-10-04 risk-based defaults (Terrence'"'"'s decision, form\n'
 printf '   20261004T181727-8798, models=risk_based_default): review runs the\n'
 printf '   standard model at HIGH effort; deep-review is the old flat-opus\n'
 printf '   mapping, reserved for auth/secrets/money/deploy/concurrency work ==\n'
-check "omp review -> sonnet:high (standard model, high effort — was opus:high on main)" \
-                                    "$(model_for_agent omp review)"      "sonnet:high"
+check "omp review -> Sonnet 5.5:high (standard model, high effort — was opus:high on main)" \
+                                    "$(model_for_agent omp review)"      "anthropic/claude-sonnet-5-5:high"
 check "omp deep-review -> opus:high (new class; old flat review mapping)" \
                                     "$(model_for_agent omp deep-review)" "opus:high"
-check "claude review -> sonnet:high (R1#1: every agent gets HIGH effort, not just omp)" \
-                                    "$(model_for_agent claude review)"   "sonnet:high"
+check "claude review -> Sonnet 5.5:high (R1#1: every agent gets HIGH effort, not just omp)" \
+                                    "$(model_for_agent claude review)"   "anthropic/claude-sonnet-5-5:high"
 check "claude deep-review -> opus" "$(model_for_agent claude deep-review)" "opus"
-check "omc review -> sonnet:high (same fix applies to omc, which launches the real claude binary)" \
-                                    "$(model_for_agent omc review)"      "sonnet:high"
+check "omc review -> Sonnet 5.5:high (same fix applies to omc, which launches the real claude binary)" \
+                                    "$(model_for_agent omc review)"      "claude-sonnet-5-5:high"
 check "omc deep-review -> opus"    "$(model_for_agent omc deep-review)" "opus"
 check "codex review -> \$HERDR_CODEX_STD's model at HIGH effort (R1#1: was \$HERDR_CODEX_STD's own medium effort)" \
                                     "$(model_for_agent codex review)"      "${HERDR_CODEX_STD%%:*}:high"
@@ -239,16 +239,16 @@ printf '== R1#1 end-to-end: HIGH effort for review reaches the LAUNCHED command\
 printf '   line, not just model_for_agent'"'"'s own string (review finding #1) ==\n'
 check "claude review end-to-end: omp launch carries --thinking high" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude "$(model_for_agent claude review)" '' review)" \
-  "omp --model sonnet --thinking high --models sonnet,openai-codex/${HERDR_CODEX_STD%%:*} --approval-mode write"
+  "omp --model anthropic/claude-sonnet-5-5 --thinking high --models anthropic/claude-sonnet-5-5,openai-codex/${HERDR_CODEX_STD%%:*} --approval-mode write"
 check "omc review end-to-end: claude launch carries --effort high" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc "$(model_for_agent omc review)")" \
-  "claude --model sonnet --effort high --permission-mode acceptEdits"
+  "claude --model claude-sonnet-5-5 --effort high --permission-mode acceptEdits"
 check "codex review end-to-end: omp launch carries --thinking high" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex "$(model_for_agent codex review)" '' review)" \
-  "omp --model openai-codex/${HERDR_CODEX_STD%%:*} --thinking high --models openai-codex/${HERDR_CODEX_STD%%:*},sonnet --approval-mode write"
+  "omp --model openai-codex/${HERDR_CODEX_STD%%:*} --thinking high --models openai-codex/${HERDR_CODEX_STD%%:*},anthropic/claude-sonnet-5-5 --approval-mode write"
 check "omp review end-to-end: --thinking high (unchanged — already correct pre-fix)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp "$(model_for_agent omp review)" '' review)" \
-  "omp --model sonnet --thinking high --approval-mode write"
+  "omp --model anthropic/claude-sonnet-5-5 --thinking high --approval-mode write"
 
 # ============================================================================
 # Managed-launch regressions (2026-09-04): argv boundaries, bypass-flag
@@ -357,7 +357,9 @@ printf '== spawn-task.sh end-to-end (dry-run against a stubbed herdr) ==\n'
 herdr() { return 1; }
 export -f herdr
 git -C "$fleet/proj" init -q
-spawn_env=(HERDR_CANONICAL_RULES= "HERDR_STATE_DIR=$WORK/state" "HERDR_WT_DIR=$WORK/wt" \
+# -u: this suite must not inherit a withheld parent's HERDR_SECRETS_WITHHELD
+# (spawn-task.sh:96,237 would then report WITHHELD and fail the credential asserts).
+spawn_env=(-u HERDR_SECRETS_WITHHELD HERDR_CANONICAL_RULES= "HERDR_STATE_DIR=$WORK/state" "HERDR_WT_DIR=$WORK/wt" \
            "HERDR_RUN_STATE_DIR=$WORK/registry" HERDR_POSTURE_FLOOR=write HERDR_PANE_ID=)
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --posture strict "$fleet/proj" t1 implement omp 2>&1)
 printf '%s\n' "$out" | grep -q 'posture   : strict' && ok "stricter request honoured and stamped as the child floor" || bad "posture line wrong: $out"
@@ -370,7 +372,31 @@ printf '%s\n' "$out" | grep -q 'posture   : write' && ok "a yolo request cannot 
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --effort high "$fleet/proj" t1 implement omp 2>&1)
 printf '%s\n' "$out" | grep -q -- '--thinking high' && ok "standalone --effort applies to the job-class model" || bad "standalone --effort dropped: $out"
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t1 implement omc 2>&1)
-printf '%s\n' "$out" | grep -q -- 'claude --model sonnet' && ok "omc launch gets a real model (map rows restored)" || bad "omc launch broken: $out"
+printf '%s\n' "$out" | grep -q -- 'claude --model claude-sonnet-5-5 ' && ok "omc launch gets a real model (map rows restored), pinned to Sonnet 5.5" || bad "omc launch broken: $out"
+printf '%s\n' "$out" | grep -qE -- '--model sonnet( |$)' && bad "omc standard route still uses the fuzzy sonnet alias: $out" || ok "omc dry-run has no plain --model sonnet"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t1 implement claude 2>&1)
+printf '%s\n' "$out" | grep -q -- '--model anthropic/claude-sonnet-5-5 ' && ok "claude-family dry-run launches exact Sonnet 5.5" || bad "claude-family not pinned: $out"
+printf '%s\n' "$out" | grep -qE -- '--model sonnet( |$)' && bad "claude-family standard route still has plain --model sonnet: $out" || ok "claude-family dry-run has no plain --model sonnet"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t1 review omp 2>&1)
+printf '%s\n' "$out" | grep -q -- '--model anthropic/claude-sonnet-5-5 --thinking high' && ok "omp review stays Sonnet 5.5 at high effort" || bad "omp review route wrong: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t1 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q -- '--model anthropic/claude-sonnet-5-5 --thinking medium' && ok "omp implement is Sonnet 5.5 at medium effort" || bad "omp implement route wrong: $out"
+printf '%s\n' "$out" | grep -qE -- '--model sonnet( |$)' && bad "omp standard route still has plain --model sonnet: $out" || ok "omp dry-run has no plain --model sonnet"
+_pins=""
+for _a in claude omc omp; do for _j in implement debug code docs review; do _pins="$_pins $(model_for_agent "$_a" "$_j")"; done; done
+case "$_pins" in *" sonnet"*) bad "model_for_agent still emits bare sonnet:$_pins" ;; *) ok "model_for_agent emits no bare sonnet for claude/omc/omp standard tiers" ;; esac
+check "model_for_agent claude implement" "$(model_for_agent claude implement)" "anthropic/claude-sonnet-5-5"
+check "model_for_agent omc review"       "$(model_for_agent omc review)"       "claude-sonnet-5-5:high"
+check "model_for_agent omp implement"    "$(model_for_agent omp implement)"    "anthropic/claude-sonnet-5-5:medium"
+# Sourced WITHOUT config.sh (empty env): standard rows must still be exact, never empty.
+bare() { env -i PATH="$PATH" "$@" bash -c '. "$1/lib/agent-profiles.sh"; model_for_agent "$2" "$3"' _ "$here" "$ba" "$bj"; }
+ba=claude bj=implement; check "agent-profiles sourced without config: claude implement" "$(bare)" "anthropic/claude-sonnet-5-5"
+ba=omc    bj=review;    check "agent-profiles sourced without config: omc review"       "$(bare)" "claude-sonnet-5-5:high"
+ba=omp    bj=docs;      check "agent-profiles sourced without config: omp docs"         "$(bare)" "anthropic/claude-sonnet-5-5:medium"
+ba=omp    bj=implement; check "an env override of the selector is preserved"            "$(bare HERDR_SONNET_OMP=anthropic/other)" "anthropic/other:medium"
+check "source-time defaults equal config.sh's (no drift)" \
+  "$(env -i PATH="$PATH" bash -c '. "$1/lib/agent-profiles.sh"; printf "%s %s" "$HERDR_SONNET_OMP" "$HERDR_SONNET_CLAUDE"' _ "$here")" \
+  "$(env -i PATH="$PATH" HOME="$HOME" bash -c '. "$1/config.sh" 2>/dev/null; printf "%s %s" "$HERDR_SONNET_OMP" "$HERDR_SONNET_CLAUDE"' _ "$here")"
 if out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t2 implement claude --no-rules 2>&1); then
   bad "bypass flag on a managed launch must refuse the spawn"
 else

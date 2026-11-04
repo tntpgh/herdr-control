@@ -46,6 +46,9 @@ DB = os.path.join(STATE, "registry.sqlite3")
 OUT = os.path.join(STATE, "judge-shadow.jsonl")
 EXPLAINED = os.path.join(STATE, "judge-explained.tsv")
 SQLITE = "/usr/bin/sqlite3"
+# Exact Sonnet 5.5 selector (bare `sonnet` resolves to Sonnet 5); same id as
+# HERDR_SONNET_OMP in config.sh. --model still overrides.
+DEFAULT_MODEL = "anthropic/claude-sonnet-5-5"
 CAP = 20000  # chars of command / script content the judge may see; longer is skipped
 
 CATEGORIES = ("local-read", "local-build", "branch-work", "owned-cleanup")
@@ -879,7 +882,7 @@ def main():
     ap.add_argument("--since", default="1970-01-01T00:00:00Z")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--adversarial", action="store_true")
-    ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--thinking", default="off", choices=("off", "minimal", "low", "medium", "high"))
     ap.add_argument("--score", action="store_true")
     ap.add_argument("--gate", action="store_true")
