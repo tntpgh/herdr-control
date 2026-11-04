@@ -136,6 +136,22 @@ def _race_mix(args):
         c.close()
 
 
+
+def _race_assign_revoke(args):
+    path, kind = args
+    c = ol.connect(path)
+    try:
+        if kind == "revoke":
+            ol.assign_revoke(c, "kb", 1, *A, "dec-rv", "race", T0, False)
+            return "revoke:won"
+        gen = ol.assign_initial(c, "kb", *A, "dec-1", "r", T0, False)
+        return "assign:won2" if gen != 1 else "assign:idem"
+    except (ol.RevokeRefused, ol.AssignmentConflict) as e:
+        return f"{kind}:{getattr(e, 'code', 'conflict')}"
+    finally:
+        c.close()
+
+
 def mutant_module():
     """owner_lease.py with `expires_at > now` re-imposed on assignments."""
     src = (HERE / "lib" / "owner_lease.py").read_text()
@@ -196,15 +212,38 @@ def main():
     # --- schema: engine-level invariants ---
     p, c = fresh()
     case("schema is v6", ol.migrate(c) == 6)
-    row = ("x1", "kb", "tntpgh/knowledge-base", "w1:p1", "term_a", 1, "a", "a")
     ins = ("INSERT INTO owner_leases(lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,"
-           "expires_at,authority_mode) VALUES (?,?,?,?,?,?,?,?,?,?)")
+           "expires_at,released_at,session_digest,authority_mode,decision_ref,reason) VALUES (?,?,?,?,?,?,?,?,?,'rel',?,?,?,?)")
+    _n = [0]
+
+    def raw(expires, mode, dec="d", rsn="r", sd="a" * 64):
+        _n[0] += 1       # unique lease_id/generation: a rejection can only come from the CHECK under test
+        return c.execute(ins, (f"x{_n[0]}", "kb", "tntpgh/knowledge-base", "w1:p1", "term_a", _n[0], "a", "a",
+                               expires, sd, mode, dec, rsn))
+    case("CHECK: a well-formed assignment row (no expiry, evidence, 64-char digest) is accepted",
+         raw(None, "assignment") is not None)
     case("CHECK: assignment row with an expires_at is rejected",
-         raises(lambda: c.execute(ins, (*row, "z", "assignment")), sqlite3.IntegrityError))
+         raises(lambda: raw("z", "assignment"), sqlite3.IntegrityError))
     case("CHECK: timed row without expires_at is rejected",
-         raises(lambda: c.execute(ins, (*row, None, "timed")), sqlite3.IntegrityError))
+         raises(lambda: raw(None, "timed", dec="", rsn="", sd=""), sqlite3.IntegrityError))
     case("CHECK: unknown authority_mode is rejected",
-         raises(lambda: c.execute(ins, (*row, None, "forever")), sqlite3.IntegrityError))
+         raises(lambda: raw(None, "forever"), sqlite3.IntegrityError))
+    case("L3 CHECK: assignment row with empty decision_ref / empty reason / short digest is rejected by the engine",
+         raises(lambda: raw(None, "assignment", dec=""), sqlite3.IntegrityError)
+         and raises(lambda: raw(None, "assignment", rsn=""), sqlite3.IntegrityError)
+         and raises(lambda: raw(None, "assignment", sd=""), sqlite3.IntegrityError)
+         and raises(lambda: raw(None, "assignment", sd="a" * 63), sqlite3.IntegrityError))
+    case("L3 CHECK: assignment evidence is bounded (decision_ref <= 200, reason <= 1000); the limits themselves pass",
+         raises(lambda: raw(None, "assignment", dec="d" * 201), sqlite3.IntegrityError)
+         and raises(lambda: raw(None, "assignment", rsn="r" * 1001), sqlite3.IntegrityError)
+         and raw(None, "assignment", dec="d" * 200, rsn="r" * 1000) is not None)
+    case("L3 CHECK: a historical TIMED row keeps empty evidence (migration compatibility)",
+         raw("2099-01-01T00:00:00.000000Z", "timed", dec="", rsn="", sd="") is not None)
+    case("L3: the library bounds decision_ref/reason before touching the db (ValueError), every writer",
+         raises(lambda: ol.assign_initial(c, "kb", *A, "d" * 201, "r", T0, True), ValueError)
+         and raises(lambda: ol.assign_initial(c, "kb", *A, "d", "r" * 1001, T0, True), ValueError)
+         and raises(lambda: ol.assign_replace(c, "kb", 1, *A, *B, "d" * 201, "r", T0, True), ValueError)
+         and raises(lambda: ol.assign_revoke(c, "kb", 1, *A, "d", "r" * 1001, T0, True), ValueError))
     c.close()
 
     # --- initial assignment ---
@@ -518,6 +557,40 @@ def main():
          code_of(lambda: ol.assign_settle(c, "kb", "tdel", g, "replied", "x", T0 + 2, False), ol.SettleRefused)
          == "not_revoked_assignment" and snap(c) == before)
     c.close()
+
+    # --- delta review R1: assign_initial cannot bypass the fenced re-assignment path ---
+    p, c = fresh()
+    assign(c, A)
+    revoke(c, 1, A, dec="dec-rev")
+    after_rev = snap(c)
+    case("R1: assign -> revoke -> byte-identical assign (same holder, original decision_ref) is refused",
+         raises(lambda: assign(c, A), ol.AssignmentConflict) and snap(c) == after_rev
+         and ol.current_assignment(c, "kb") is None)
+    case("R1: ... also with a different holder or a fresh decision_ref (only replace --after-revoke may re-assign)",
+         raises(lambda: assign(c, B, dec="dec-9"), ol.AssignmentConflict)
+         and raises(lambda: assign(c, A, dec="dec-9"), ol.AssignmentConflict) and snap(c) == after_rev)
+    case("R1: the fenced path still works afterwards, with fresh evidence",
+         replace(c, 1, A, A, dec="dec-9", after_revoke=True) == 2)
+    c.close()
+    p, c = fresh()
+    g = ol.acquire(c, "kb", A[0], A[1], TTL, T0, session_digest=A[2])
+    c.execute("UPDATE owner_leases SET released_at=?, release_reason='expired' WHERE generation=?", (ol._iso(T0 + TTL + 1), g))
+    case("R1: released-TIMED history is still a valid initial-assignment (cutover) target",
+         assign(c, B, now=T0 + TTL + 2) == g + 1)
+    c.close()
+    mix_ok = True
+    for _ in range(6):
+        p, c = fresh()
+        assign(c, A)
+        c.close()
+        with ctx.Pool(4) as pool:
+            res = pool.map(_race_assign_revoke, [(p, "revoke"), (p, "assign"), (p, "assign"), (p, "revoke")])
+        c = ol.connect(p)
+        rows = c.execute("SELECT generation, release_reason, released_at FROM owner_leases ORDER BY generation").fetchall()
+        mix_ok = mix_ok and [r[0] for r in rows] == [1] and sum(1 for r in res if r == "revoke:won") == 1 \
+            and not any(r == "assign:won2" for r in res)
+        c.close()
+    case("R1: assign-vs-revoke race (4 processes x 6 rounds): exactly one revoke wins, no gen 2 is ever created", mix_ok)
 
     # --- disabled store fails closed ---
     p, c = fresh()

@@ -350,8 +350,10 @@ MIGRATIONS = {
     #   expires_at      now nullable; the CHECK enforces the exact pairing
     #     (timed -> NOT NULL, assignment -> NULL) at the engine level, not
     #     by caller discipline.
-    #   decision_ref/reason  '' for every historical (timed) row; required
-    #     non-empty by assign_initial()/assign_replace()/assign_revoke().
+    #   decision_ref/reason  '' for every historical (timed) row; an assignment row
+    #     must carry non-empty, bounded evidence (decision_ref <= 200, reason <= 1000
+    #     chars) and a 64-char session digest -- enforced by the engine too (L3), in
+    #     addition to assign_initial()/assign_replace()/assign_revoke().
     # Every historical row copies authority_mode='timed' byte-for-byte
     # otherwise -- nothing becomes durable automatically (SPEC: "Keep
     # compatibility bounded"). The one-live-row partial unique index is
@@ -366,7 +368,9 @@ MIGRATIONS = {
              authority_mode TEXT NOT NULL CHECK (authority_mode IN ('timed','assignment')),
              decision_ref TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
              UNIQUE(label, generation),
-             CHECK ((authority_mode='timed' AND expires_at IS NOT NULL) OR (authority_mode='assignment' AND expires_at IS NULL)))""",
+             CHECK ((authority_mode='timed' AND expires_at IS NOT NULL) OR (authority_mode='assignment' AND expires_at IS NULL)),
+             CHECK (authority_mode='timed' OR (decision_ref<>'' AND length(decision_ref)<=200
+                    AND reason<>'' AND length(reason)<=1000 AND length(session_digest)=64)))""",
         """INSERT INTO owner_leases_v6
            (lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,
             released_at,release_reason,session_digest,authority_mode,decision_ref,reason)
@@ -1156,6 +1160,23 @@ def export_backup(conn, dest_path: str) -> str:
 # history). Nothing here is called by any delivery/dispatch path yet (PR B).
 
 
+MAX_DECISION_REF = 200   # mirrors the v6 CHECK on assignment rows
+MAX_REASON = 1000
+
+
+def _check_evidence(decision_ref, reason):
+    """Decision evidence for every assignment write: non-empty, bounded text (also enforced
+    by the v6 CHECK on assignment rows, so a raw INSERT cannot skip it)."""
+    if not isinstance(decision_ref, str) or not decision_ref:
+        raise ValueError("decision_ref must be non-empty")
+    if len(decision_ref) > MAX_DECISION_REF:
+        raise ValueError(f"decision_ref must be at most {MAX_DECISION_REF} chars")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be non-empty")
+    if len(reason) > MAX_REASON:
+        raise ValueError(f"reason must be at most {MAX_REASON} chars")
+
+
 def _unreleased(conn, label):
     """The label's current unreleased authority row (any mode), or None.
     Unlike _live(), this is never filtered by now/expiry -- it is the exact
@@ -1192,7 +1213,11 @@ def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_dige
     unreleased authority row, timed or assignment -- this is the bare
     "managed but unassigned" -> "assigned" transition (§4.2); replacing an
     ACTIVE row is assign_replace()'s job, never this one's (no implicit
-    takeover of a live timed lease).
+    takeover of a live timed lease). Also refuses when the label's LATEST
+    generation is a released assignment (revoked or superseded): returning
+    to a revoked label is assign_replace(after_revoke=True)'s fenced,
+    fresh-evidence path, so assign_initial can never bypass it. A label whose
+    history ends in a released TIMED lease is still a valid initial target.
 
     Idempotent: re-presenting the EXACT same (pane_id, pane_birth,
     session_digest, decision_ref, reason) against the label's own just-
@@ -1210,10 +1235,7 @@ def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_dige
     _check_holder(pane_id, pane_birth)
     if not SESSION_DIGEST_RE.match(session_digest or ""):
         raise ValueError("session_digest must be 64 lowercase hex")
-    if not decision_ref:
-        raise ValueError("decision_ref must be non-empty")
-    if not reason:
-        raise ValueError("reason must be non-empty")
+    _check_evidence(decision_ref, reason)
 
     def check():
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
@@ -1225,6 +1247,12 @@ def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_dige
             if same:
                 return active
             raise AssignmentConflict(f"{label}: an unreleased {active[10]} authority row already exists (gen {active[5]})")
+        latest = conn.execute("SELECT authority_mode, generation, release_reason FROM owner_leases WHERE label=? "
+                              "ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+        if latest and latest[0] == "assignment":
+            raise AssignmentConflict(f"{label}: latest generation {latest[1]} is a released durable assignment "
+                                     f"({latest[2]}); assign_initial never re-creates one -- use assign_replace("
+                                     "after_revoke=True) with fresh decision evidence")
         return None
 
     active = check()
@@ -1287,10 +1315,7 @@ def assign_replace(conn, label: str, expected_generation: int, expected_pane_id:
             raise ValueError("session_digest must be 64 lowercase hex")
     if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
         raise ValueError("expected_generation must be an int >= 1")
-    if not decision_ref:
-        raise ValueError("decision_ref must be non-empty")
-    if not reason:
-        raise ValueError("reason must be non-empty")
+    _check_evidence(decision_ref, reason)
 
     def check():
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
@@ -1390,10 +1415,7 @@ def assign_revoke(conn, label: str, expected_generation: int, expected_pane_id: 
         raise ValueError("expected_session_digest must be 64 lowercase hex")
     if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
         raise ValueError("expected_generation must be an int >= 1")
-    if not decision_ref:
-        raise ValueError("decision_ref must be non-empty")
-    if not reason:
-        raise ValueError("reason must be non-empty")
+    _check_evidence(decision_ref, reason)
 
     def check():
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():

@@ -1111,6 +1111,18 @@ def unregister_cases(base: Path) -> None:
     case("UNREGISTER: --apply releases the lease and unregisters",
          rc == 0 and out == f"apply:unregistered:{UL}"
          and ol.holder_tuple(lc, UL, T0 + 3) is None and not gate.registered(UL))
+
+    # --- D1: a durable assignment is refused as a typed business refusal, never a traceback ---
+    AL, AP, AB = "asg-label", "w8:p8", "term_as1"
+    ol.register_owner(lc, AL, "tntpgh/asg-project", now=T0, unregister_token=TOK)
+    ol.assign_initial(lc, AL, AP, AB, hashlib.sha256(b"asg-session").hexdigest(), "dec-1", "fixture", T0, False)
+    asg = dict(label=AL, generation=1, pane_id=AP, pane_birth=AB)
+    rc_d, out_d = run(**asg)
+    rc_a, out_a = run(apply=True, **asg)
+    case("UNREGISTER: an active durable assignment -> refused:assignment_active (exit 2) for dry-run and --apply",
+         rc_d == 2 and out_d.startswith("refused:assignment_active:") and rc_a == 2
+         and out_a.startswith("refused:assignment_active:") and gate.registered(AL)
+         and ol.current_assignment(lc, AL)["authority_mode"] == "assignment")
     case("UNREGISTER: no cross-owner reroute -- KB and DOTS still registered and untouched",
          gate.registered(KB) and gate.registered(DOTS)
          and lc.execute("SELECT unregistered_at FROM owner_projects WHERE label IN (?,?)", (KB, DOTS)).fetchall()
