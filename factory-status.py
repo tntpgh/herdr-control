@@ -92,15 +92,22 @@ def lease_view(lease_db: str, label: str, now: float) -> tuple[dict, list[str]]:
     except (ValueError, sqlite3.Error) as exc:
         return {}, [f"lease_store_unreadable:{exc}"]
     try:
-        live = ol.holder_tuple(lc, label, now)
-        last = lc.execute("SELECT generation, expires_at FROM owner_leases WHERE label=?"
-                          " ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+        live = ol.holder_tuple(lc, label, now, modes=ol.AUTHORITY_MODES)
+        mode = ol.live_mode(lc, label, now)
+        last = lc.execute("SELECT generation, expires_at, authority_mode, released_at, release_reason FROM owner_leases"
+                          " WHERE label=? ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
     except sqlite3.Error as exc:
         return {}, [f"lease_store_unreadable:{type(exc).__name__}"]
     finally:
         lc.close()
     if live:
-        return {"state": "live", "generation": live[3]}, []
+        out = {"state": "live", "generation": live[3], "authority_mode": mode}
+        if mode == "assignment":
+            out["expires_at"] = None  # durable: no TTL
+        return out, []
+    if last and last[2] == "assignment":
+        return ({"state": "ended", "generation": last[0], "authority_mode": "assignment", "release_reason": last[4]},
+                [f"assignment_ended:gen{last[0]}:{last[4] or 'unreleased_unreadable'}"])
     if last:
         return {"state": "expired", "generation": last[0], "expires_at": last[1]}, [f"lease_expired:gen{last[0]}"]
     return {"state": "none"}, ["lease_none"]

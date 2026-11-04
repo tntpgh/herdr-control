@@ -142,14 +142,19 @@ def main(argv=None, resolve=None, now=None) -> int:
             print("refused:owner_project_unmapped")
             return 2
         row = conn.execute(
-            "SELECT pane_id, pane_birth, session_digest, generation, expires_at, released_at "
+            "SELECT pane_id, pane_birth, session_digest, generation, expires_at, released_at, authority_mode "
             "FROM owner_leases WHERE label=? ORDER BY generation DESC LIMIT 1", (a.label,)).fetchone()
         if not row:
             print("refused:no_predecessor")
             return 2
-        prev_pane, prev_birth, prev_digest, prev_gen, prev_expires_at, prev_released_at = row
+        prev_pane, prev_birth, prev_digest, prev_gen, prev_expires_at, prev_released_at, prev_mode = row
         if prev_gen != a.expect_prev_generation:
             print(f"refused:wrong_prev_generation:observed={prev_gen}:expected={a.expect_prev_generation}")
+            return 2
+        if prev_mode == "assignment":
+            # a durable assignment never "expires" and is never resumed: an active one is live, a released one
+            # (revoked/superseded) re-enters only via assign_replace(after_revoke=True) with fresh evidence.
+            print("refused:predecessor_is_assignment")
             return 2
         now_s = clock()
         # same freshness test as lib/owner_lease.py's own _live(): unreleased AND unexpired

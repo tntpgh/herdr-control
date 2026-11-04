@@ -53,25 +53,28 @@ Migration / rollback (design; NOT applied to the live registry by this file)
   registry backup first.
 
 
-Durable assignments (Plan 018 PR A, inert)
+Durable assignments (Plan 018 PR A core + PR B activation)
   v6 adds a SECOND authority_mode ('assignment') to owner_leases, sharing
   the same table, the same one-unreleased-row-per-label partial unique
   index, and the same label-local-monotonic generation as 'timed' leases.
   An assignment's expires_at is always NULL and is NEVER read by any TTL
   check: _live()'s own query treats it as live regardless of `now`. Only
-  assign_initial(), assign_replace(), assign_revoke() and assign_settle()
-  ever create, replace, release or settle one -- acquire()/claim_initial()/
+  assign_initial(), assign_replace(), assign_revoke(), assign_settle() and
+  the activation-only assign_convert() ever create, replace, release or settle one -- acquire()/claim_initial()/
   claim_successor() (the timed-only legacy path) refuse outright rather
   than implicitly converting or taking over an active assignment.
   release() and unregister_owner() refuse an active assignment too
   (AssignmentActive): it ends only via assign_revoke()/assign_replace().
   Re-assignment after a revoke is a separate explicit operation
   (assign_replace(after_revoke=True), fresh decision_ref); a plain replace
-  never resurrects a revoked label. holder_tuple() -- the shared holder
-  boundary used by dispatch, grant issuance, result submit/accept, publisher
-  and factory-status -- is timed-only by default, so those consumers read an
-  assignment as no holder (fail closed, before any grant is consumed) until
-  PR B routes them by authority_mode via holder_tuple(modes=AUTHORITY_MODES).
+  never resurrects a revoked label. holder_tuple() is timed-only by default;
+  every live owner consumer (dispatch, delivery gate, publisher/ra-sender,
+  result submit/accept, bind-live grant issuance, factory-status) passes
+  modes=AUTHORITY_MODES deliberately and treats an assignment's NULL expiry
+  as "no TTL" (delivery's lease-remaining margin does not apply).
+  assign_convert() is the one-time in-place timed->assignment cutover used
+  by owner-assignment-activate.py (same generation, so open requests and
+  generation-bound standing grants keep their binding).
 
 Policy
   An owner's queue bound is its registered max_open (1..MAX_OPEN_LIMIT); a
@@ -211,6 +214,15 @@ class RevokeRefused(Exception):
     """assign_revoke() precondition failed. args[0] is a short machine
     code (stale_expectation | not_assignment_mode); args[1] is a
     human-readable detail."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
+class ConvertRefused(Exception):
+    """assign_convert() precondition failed. args[0] is a short machine
+    code (stale_expectation); args[1] is a human-readable detail."""
 
     def __init__(self, code: str, detail: str):
         super().__init__(f"{code}: {detail}")
@@ -961,16 +973,40 @@ def holder_tuple(conn, label, now=None, modes=("timed",)):
     None when there is none, it carries no session digest, or its
     authority_mode is not in `modes`. Read-only.
 
-    `modes` defaults to timed only: every consumer of this shared holder
-    boundary (dispatch, grant issuance, result submit/accept, publisher,
-    factory-status) predates durable assignments and reasons about TTLs, so
-    a durable assignment reads as 'no holder' -- they fail closed BEFORE
-    any grant is consumed -- until PR B routes a consumer by authority_mode
-    by passing modes explicitly (AUTHORITY_MODES for both)."""
+    `modes` defaults to timed only (legacy/timed-only callers: claim paths that
+    just wrote a timed lease, test fixtures). Every live owner consumer
+    (dispatch, delivery, publisher/ra-sender, result submit/accept, grant
+    issuance bind-live, factory-status) routes by authority mode on
+    purpose and passes modes=AUTHORITY_MODES; a durable assignment is
+    otherwise read as 'no holder' (fail closed before any grant is
+    consumed)."""
     cur = _live(conn, label, time.time() if now is None else now)
     if not cur or cur[7] not in modes or not SESSION_DIGEST_RE.match(cur[6] or ""):
         return None
     return (cur[1], cur[2], cur[6], cur[3])
+
+
+def live_mode(conn, label, now=None) -> str | None:
+    """authority_mode ('timed'|'assignment') of the label's live lease, or
+    None when there is none. Read-only."""
+    cur = _live(conn, label, time.time() if now is None else now)
+    return cur[7] if cur else None
+
+
+def registry_bound_holder(conn, label, now, resolve):
+    """holder_tuple(modes=AUTHORITY_MODES), except that a durable ASSIGNMENT
+    holder is returned only while the owner registry's CURRENT
+    (pane, birth, session_digest) for the label is EXACTLY that holder
+    (None otherwise, incl. an unresolved registry). An assignment never
+    lapses and renew_due() never re-checks it ('not_timed'), so a same-pane
+    agent restart (new session) would otherwise keep the old authority
+    forever; a timed lease is closed by renew_due()'s identity check within
+    its TTL and is returned unchanged."""
+    cur = holder_tuple(conn, label, now, modes=AUTHORITY_MODES)
+    if cur is None or live_mode(conn, label, now) != "assignment":
+        return cur
+    reg = resolve(label)
+    return cur if reg is not None and tuple(reg) == cur[:3] else None
 
 
 def live_expiry(conn, label, now=None) -> float | None:
@@ -1274,6 +1310,66 @@ def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_dige
             (lease_id, label, project, pane_id, pane_birth, gen, _iso(now), _iso(now), session_digest, decision_ref, reason))
         _event(conn, now, label, "assigned", lease_id, gen, f"{pane_id}@{pane_birth} {decision_ref}: {reason}")
         return gen
+
+    return _tx(conn, body)
+
+
+def assign_convert(conn, label: str, expected_generation: int, pane_id: str, pane_birth: str, session_digest: str,
+                   decision_ref: str, reason: str, now: float | None = None, dry_run: bool = True):
+    """Activation-only (Plan 018 PR B): convert the label's CURRENTLY
+    AUTHORITATIVE timed lease (unreleased AND unexpired at `now`) to a durable
+    assignment IN PLACE -- same lease_id, same generation, same holder --
+    so owner_requests, queued/delivering exchanges and generation-bound
+    standing dispatch grants keep their binding across the cutover. Exact
+    fence: (generation, pane, birth, session) must equal the live timed row.
+    ConvertRefused('stale_expectation') on any mismatch, an expired or
+    released lease, or an assignment already active with different
+    evidence; this never resurrects an expired/revoked row (that is
+    assign_replace(after_revoke=True)'s fresh-evidence path) and never
+    changes the holder. Idempotent only for the exact assignment it already
+    made (same decision_ref/reason). Audited by a 'converted' event."""
+    now = time.time() if now is None else now
+    _check_holder(pane_id, pane_birth)
+    if not SESSION_DIGEST_RE.match(session_digest or ""):
+        raise ValueError("session_digest must be 64 lowercase hex")
+    if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or expected_generation < 1:
+        raise ValueError("expected_generation must be an int >= 1")
+    _check_evidence(decision_ref, reason)
+
+    def check():
+        if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
+            raise InvalidOwner(f"{label} is not a registered owner")
+        active = _unreleased(conn, label)
+        if not active or (active[5], active[3], active[4], active[9]) != (expected_generation, pane_id, pane_birth, session_digest):
+            raise ConvertRefused("stale_expectation", f"{label}: no unreleased authority row for gen {expected_generation} "
+                                 f"{pane_id}@{pane_birth} with that session")
+        if active[10] == "assignment":
+            if (active[11], active[12]) == (decision_ref, reason):
+                return "idempotent", active
+            raise ConvertRefused("stale_expectation", f"{label}: gen {expected_generation} is already a durable assignment")
+        if active[8] is None or active[8] <= _iso(now):
+            raise ConvertRefused("stale_expectation", f"{label}: gen {expected_generation} timed lease is expired; "
+                                 "only a currently authoritative lease converts")
+        return "timed", active
+
+    branch, row = check()
+    if branch == "idempotent":
+        return row[5]
+    if dry_run:
+        return "would_convert"
+
+    def body():
+        branch2, row2 = check()
+        if branch2 == "idempotent":
+            return row2[5]
+        cur = conn.execute(
+            "UPDATE owner_leases SET authority_mode='assignment', expires_at=NULL, decision_ref=?, reason=? "
+            "WHERE lease_id=? AND released_at IS NULL AND authority_mode='timed' AND expires_at > ?",
+            (decision_ref, reason, row2[0], _iso(now)))
+        if cur.rowcount != 1:
+            raise ConvertRefused("stale_expectation", f"{label}: lost a race converting gen {expected_generation}")
+        _event(conn, now, label, "converted", row2[0], row2[5], f"{pane_id}@{pane_birth} {decision_ref}: {reason}")
+        return row2[5]
 
     return _tx(conn, body)
 

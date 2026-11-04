@@ -78,14 +78,19 @@ class Admission:
     generation: int | None = None
 
 
-def from_env(environ=os.environ) -> "DeliveryGate | None":
+def from_env(environ=os.environ, resolve=None) -> "DeliveryGate | None":
     if environ.get(FLAG) != "1" or not environ.get(DB_ENV):
         return None
-    return DeliveryGate(environ[DB_ENV])
+    return DeliveryGate(environ[DB_ENV], resolve=resolve)
 
 
 class DeliveryGate:
-    def __init__(self, db_path: str, conn=None):
+    def __init__(self, db_path: str, conn=None, resolve=None):
+        # resolve: label -> the owner registry's CURRENT (pane_id, pane_birth, session_digest) or None.
+        # When set, a durable ASSIGNMENT holder is admitted/credited only while it equals that tuple
+        # (an assignment never lapses and is never renewed, so nothing else would notice a same-pane
+        # agent restart). The publisher always sets it; Dispatcher/ra-sender bind the registry themselves.
+        self.resolve = resolve
         # Never creates or migrates: a missing/unmigrated DB fails closed.
         # conn: an already-verified connection (lib/private_sqlite.open_private).
         if conn is not None:
@@ -101,10 +106,15 @@ class DeliveryGate:
         self.conn.close()
 
     def _holder(self, label, now):
-        # fail closed on a durable assignment until PR B routes delivery by authority_mode:
-        # this gate's timed-TTL logic (_ts(expires_at)) cannot evaluate an assignment row.
-        cur = ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires, sess, mode) | None
-        return None if cur and cur[7] == "assignment" else cur
+        # Both authority modes are live holders here; only TTL-dependent logic (begin_notice's
+        # lease-remaining margin) is gated on mode == 'timed'. A durable assignment has NULL expires_at.
+        return ol._live(self.conn, label, now)  # (lease_id, pane, birth, gen, renewed, expires, sess, mode) | None
+
+    def _session_bound(self, label, cur) -> bool:
+        if cur[7] != "assignment" or self.resolve is None:
+            return True
+        reg = self.resolve(label)
+        return reg is not None and tuple(reg) == (cur[1], cur[2], cur[6])
 
     def _enabled(self):
         row = self.conn.execute("SELECT enabled FROM owner_state WHERE id=1").fetchone()
@@ -134,6 +144,8 @@ class DeliveryGate:
             cur = self._holder(label, now)
             if not cur:
                 return Admission(False, "owner_no_lease")
+            if not self._session_bound(label, cur):
+                return Admission(False, "owner_session_mismatch")
             gen = cur[3]
             # enqueue()'s own fence rejects a caller that is not the live holder.
             res = ol.enqueue(self.conn, label, gen, pane_id, pane_birth, exchange_id, now)
@@ -168,7 +180,9 @@ class DeliveryGate:
             cur = self._holder(label, now)
             if not cur or cur[3] != generation:
                 return "owner_lease_fenced"
-            if _ts(cur[5]) - now < MIN_LEASE_REMAINING_S:
+            if not self._session_bound(label, cur):
+                return "owner_session_mismatch"
+            if cur[7] == "timed" and _ts(cur[5]) - now < MIN_LEASE_REMAINING_S:
                 return "lease_too_short"
             return ol.transition(self.conn, exchange_id, "delivering", label, generation, pane_id, pane_birth, "", now)
         except ol.Disabled:
@@ -203,6 +217,8 @@ class DeliveryGate:
         cur = self._holder(label, now)
         if not cur:
             return "no_lease"
+        if not self._session_bound(label, cur):
+            return "session_mismatch"
         try:  # transition()'s fence rejects a request of a superseded generation
             return ol.transition(self.conn, exchange_id, "replied", label, row[1], cur[1], cur[2], "", now)
         except ol.Disabled:
@@ -230,4 +246,6 @@ class DeliveryGate:
         cur = self._holder(label, now)
         if not row or not cur or cur[3] != row[0]:
             raise ol.FencedOut(f"{exchange_id}: no live lease for its generation")
+        if not self._session_bound(label, cur):
+            raise ol.FencedOut(f"{exchange_id}: holder session is not the registry's current session")
         return ol.transition(self.conn, exchange_id, "evidence", label, row[0], cur[1], cur[2], evidence_ref[:200], now)

@@ -120,7 +120,7 @@ class Dispatcher:
     def _bound(self, label, now):
         """The lease holder, only when the registry names exactly that
         (pane, birth, session); else None."""
-        holder = ol.holder_tuple(self.gate.conn, label, now)
+        holder = ol.holder_tuple(self.gate.conn, label, now, modes=ol.AUTHORITY_MODES)
         try:
             reg = self.resolve(label)
         except Exception:

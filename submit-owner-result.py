@@ -107,7 +107,15 @@ def wake_main(rid: str, receipt_id: str, caller_pane: str) -> str:
     return "wake:sent" if p.returncode == 0 else f"wake:failed:rc{p.returncode}"
 
 
-def main(argv=None, caller_pane_resolver=caller_pane_from_ancestry, waker=wake_main, environ=os.environ) -> int:
+def registry_resolve(label):
+    """Read-only (pane, birth, session_digest) from the owner registry (the publisher's own resolver)."""
+    sys.path.insert(0, str(HERE / "remote-mcp"))
+    import publisher  # noqa: E402
+    return publisher.registry_resolver(label)
+
+
+def main(argv=None, caller_pane_resolver=caller_pane_from_ancestry, waker=wake_main, environ=os.environ,
+         resolve=registry_resolve) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rid", required=True)
     a = ap.parse_args(argv)
@@ -131,7 +139,9 @@ def main(argv=None, caller_pane_resolver=caller_pane_from_ancestry, waker=wake_m
             return 4
         lc = ol.connect(lease_db)
         try:
-            holder = lambda label: ol.holder_tuple(lc, label, time.time())  # noqa: E731
+            # A durable assignment never lapses, so its holder must ALSO be the registry's current
+            # (pane, birth, session): a same-pane restart (new session) cannot submit under the old one.
+            holder = lambda label: ol.registry_bound_holder(lc, label, time.time(), resolve)  # noqa: E731
             try:
                 receipt_id = avail.submit_owner_result(a.rid, caller_pane, holder)
             except ra.Refused as exc:

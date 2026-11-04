@@ -2,8 +2,9 @@
 """owner-assignment.py --db PATH <show|assign|replace|revoke|settle> ... —
 Plan 018 PR A's permanent CLI around lib/owner_lease.py's durable-assignment
 operations (current_assignment/assign_initial/assign_replace/assign_revoke/
-assign_settle). PR A is INERT: nothing calls this script, no live label is
-migrated by it, and it never touches delivery/dispatch (that is PR B).
+assign_settle). Operator CLI only: it never touches delivery/dispatch itself (the
+consumers route assignments by authority mode, PR B) and never converts a timed
+lease; cutover from timed leases is owner-assignment-activate.py.
 
 Dry-run by default (owner-lease-migrate.py's own convention): every
 subcommand opens read-only (ol.open_ro(), sqlite mode=ro) and reports what

@@ -291,9 +291,9 @@ def main() -> int:
     calls = {"n": 0}
     real = ol.holder_tuple
 
-    def flaky(conn, label, now=None):
+    def flaky(conn, label, now=None, modes=("timed",)):
         calls["n"] += 1
-        return real(conn, label, now) if calls["n"] == 1 else None
+        return real(conn, label, now, modes=modes) if calls["n"] == 1 else None
     od.ol.holder_tuple = flaky
     try:
         s3 = Sender()
@@ -439,13 +439,13 @@ def main() -> int:
 
 
 def assignment_boundary_cases(base: Path) -> None:
-    """Security review M3: a durable assignment (Plan 018 PR A, inert) must make
-    the shared holder boundary fail closed BEFORE the single-use grant is
-    consumed -- nothing consumes authority a consumer cannot honour yet."""
+    """PR B: dispatch routes a durable assignment as a live holder. The one-time grant
+    is consumed exactly once, the exchange is delivered under the assignment's
+    generation, and an old (pre-assignment) timed-mode default still reads no holder."""
     lc, av, roots, lease_db = env(base)
     ol.assign_initial(lc, KB, *PANE[KB], SESS[KB], "dec-1", "fixture", T0, False)
     holder = (*PANE[KB], SESS[KB], 1)
-    case("ASSIGNMENT: holder_tuple default (timed only) reads an assignment as no holder",
+    case("ASSIGNMENT: holder_tuple default (timed only) reads an assignment as no holder; AUTHORITY_MODES reads it",
          ol.holder_tuple(lc, KB, T0) is None and ol.holder_tuple(lc, KB, T0, modes=ol.AUTHORITY_MODES) == holder)
     gate = old.DeliveryGate(lease_db)
     store = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
@@ -462,9 +462,8 @@ def assignment_boundary_cases(base: Path) -> None:
                       lambda: T0, authorize=authorize)
     res = d.dispatch(KB, "r_asg", body, man, T0)
     status = store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_asg'").fetchone()[0]
-    case("ASSIGNMENT: Dispatcher holds, sends nothing, and does NOT consume the one-time grant",
-         res.startswith("held:not_dispatched") and not sent and status == "granted"
-         and gate.state("r_asg") is None)
+    case("ASSIGNMENT: Dispatcher dispatches under the assignment generation and consumes the one-time grant",
+         res == "dispatched" and len(sent) == 1 and status == "consumed" and gate.state("r_asg") == "delivering")
     store.close(); gate.close(); av.close(); lc.close()
 
 

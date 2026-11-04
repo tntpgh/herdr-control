@@ -43,7 +43,14 @@ import owner_lease as ol  # noqa: E402
 import result_availability as ra  # noqa: E402
 
 
-def main(argv=None, post_accept=lambda: None, environ=os.environ) -> int:
+def registry_resolve(label):
+    """Read-only (pane, birth, session_digest) from the owner registry (the publisher's own resolver)."""
+    sys.path.insert(0, str(HERE / "remote-mcp"))
+    import publisher  # noqa: E402
+    return publisher.registry_resolver(label)
+
+
+def main(argv=None, post_accept=lambda: None, environ=os.environ, resolve=registry_resolve) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--receipt-id", required=True)
     ap.add_argument("--by", required=True, help="the independent reviewer's own identity")
@@ -78,7 +85,8 @@ def main(argv=None, post_accept=lambda: None, environ=os.environ) -> int:
             return 4
         lc = ol.connect(lease_db)
         try:
-            holder = lambda label: ol.holder_tuple(lc, label, time.time())  # noqa: E731
+            # Assignment holders must also be the registry's CURRENT (pane, birth, session) -- see submit-owner-result.py.
+            holder = lambda label: ol.registry_bound_holder(lc, label, time.time(), resolve)  # noqa: E731
             try:
                 ok = avail.accept_receipt(a.receipt_id, pins, holder, a.by)
             except ra.Refused as exc:

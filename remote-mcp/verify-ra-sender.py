@@ -240,6 +240,22 @@ def main() -> int:
         case("BUDGET: the deferred row is sent on the very next run, nothing lost",
              out2["r_budget_b"] == "notified" and len(typed.read_text().splitlines()) == before + 2)
 
+        # PR B: the conductor lease is pushed inside the delivery margin (a timed lease would park the
+        # notice as lease_too_short), then converted in place to a durable assignment: ra-sender's bound()
+        # and the gate must treat it as a live holder with no TTL.
+        cgen = lc.execute("SELECT generation FROM owner_leases WHERE label=? AND released_at IS NULL", (COND,)).fetchone()[0]
+        lc.execute("UPDATE owner_leases SET expires_at=? WHERE label=? AND released_at IS NULL", (ol._iso(time.time() + 30), COND))
+        t5 = stage_rid("r_send5")
+        lines5 = len(typed.read_text().splitlines())
+        held = rs.send_tick()
+        case("ASSIGNMENT: a timed conductor lease inside the delivery margin parks the notice (lease_too_short), nothing typed",
+             held.get("r_send5") == "held:not_dispatched:lease_too_short" and len(typed.read_text().splitlines()) == lines5)
+        ol.assign_convert(lc, COND, cgen, *PANE[COND], cond_digest, "dec-ra-sender", "cutover", time.time(), dry_run=False)
+        out5 = rs.send_tick()
+        case("ASSIGNMENT: after in-place conversion the same notice is sent through the gate (no TTL fence), exactly one new line",
+             out5.get("r_send5") == "notified" and len(typed.read_text().splitlines()) == lines5 + 1
+             and typed.read_text().splitlines()[-1] == f"{PANE[COND][0]}|{t5}")
+
         live_after = _snapshot(live_alerts)
         case("LIVE STATE: the real ~/.local/state/herdr/remote-mcp/ra-sender-alerts.jsonl is byte-for-byte untouched "
              "(this suite forced HERDR_RA_SENDER_ALERTS to a disposable tmp path and generated real ALERT rows)",
