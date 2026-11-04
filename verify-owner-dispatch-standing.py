@@ -184,7 +184,7 @@ before = {r[0]: r for r in old_store.execute(f"SELECT {','.join(OLD_COLS)} FROM 
 check("UPGRADE: three pre-M9 rows present before migrate()", len(before) == 3)
 
 version_after = oda.migrate(old_store)
-check("UPGRADE: migrate() reaches schema version 2", version_after == 2)
+check("UPGRADE: migrate() reaches the latest schema version", version_after == oda.LATEST)
 
 after = {r[0]: r for r in old_store.execute(f"SELECT {','.join(OLD_COLS)} FROM owner_dispatch_auth ORDER BY auth_id")}
 check("UPGRADE: every pre-existing row's ORIGINAL 17 columns are byte-identical after the upgrade (no DELETE, no rewrite)",
@@ -198,8 +198,8 @@ check("UPGRADE: the new M9 columns land on every pre-existing row with the docum
                   ("old_denied", "single", None, None, None, None, 0, 0),
                   ("old_granted", "single", None, None, None, None, 0, 0)])
 
-check("UPGRADE: re-running migrate() on an already-v2 store is a no-op (version gate, no duplicate ALTER)",
-      oda.migrate(old_store) == 2)
+check("UPGRADE: re-running migrate() on an already-current store is a no-op (version gate, no duplicate ALTER)",
+      oda.migrate(old_store) == oda.LATEST)
 
 # the upgraded store is FUNCTIONAL, not just structurally present: a FRESH
 # standing grant can be signed and consumed on it, through the SAME
@@ -258,8 +258,8 @@ cols_after = sorted(r[1] for r in atomic_store.execute("PRAGMA table_info(owner_
 check("ATOMICITY: the 3 v2 columns that succeeded before the injected failure are GONE too -- "
      "one transaction, nothing half-applied", cols_after == cols_before)
 
-check("ATOMICITY: the real (unpatched) migrate() still reaches v2 cleanly on the SAME store afterward",
-      oda.migrate(atomic_store) == 2)
+check("ATOMICITY: the real (unpatched) migrate() still reaches the latest version cleanly on the SAME store afterward",
+      oda.migrate(atomic_store) == oda.LATEST)
 atomic_store.close()
 print(f"{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

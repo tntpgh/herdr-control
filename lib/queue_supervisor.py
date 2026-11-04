@@ -60,8 +60,18 @@ ENV_FLAG = "HERDR_QUEUE_SUPERVISOR"
 _SENT = {"dispatched", "registered"}
 # owner_dispatch.Dispatcher._dispatch raises these BEFORE self.authorize()
 # consumes the grant and before any journal file exists (owner_dispatch.py:141-163).
+# The weekly-envelope reasons are returned by oda.consume_envelope, which
+# writes NOTHING on any hold: expiry, revocation and the three caps clear by
+# time or by an operator action on the envelope, never by retrying the same
+# bytes, so the item stays PENDING (one deduped escalation) rather than
+# freezing the lane. approval_pending: a matching approval form is open or
+# answered-but-not-yet-issued (the 2026-11-01 race: held_consumed would have
+# burned the item permanently for a grant that was about to exist).
+# Off-policy (policy_*), envelope_missing/mismatch/holder_changed are NOT
+# listed: they are refused AND frozen, fail closed.
 RETRY_SAFE = frozenset({"label_has_no_root", "bad_request", "bad_manifest", "owner_project_unmapped",
-                        "registry_lease_mismatch", "auth_missing"})
+                        "registry_lease_mismatch", "auth_missing", "approval_pending", "envelope_expired",
+                        "envelope_revoked", "envelope_day_cap", "envelope_week_cap", "envelope_budget"})
 TERMINAL = {"done", "cancelled"}
 FREEZING = {"blocked", "uncertain", "held_consumed"}
 MAX_LANES = 5  # operator-requested 1-5 canonical lanes
