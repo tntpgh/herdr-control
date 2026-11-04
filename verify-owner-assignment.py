@@ -75,8 +75,8 @@ def assign(c, h, dec="dec-1", reason="r", now=T0, label="kb", dry_run=False):
     return ol.assign_initial(c, label, *h, dec, reason, now, dry_run)
 
 
-def replace(c, exp_gen, exp, new, dec="dec-2", reason="r", now=T0, dry_run=False):
-    return ol.assign_replace(c, "kb", exp_gen, *exp, *new, dec, reason, now, dry_run)
+def replace(c, exp_gen, exp, new, dec="dec-2", reason="r", now=T0, dry_run=False, after_revoke=False):
+    return ol.assign_replace(c, "kb", exp_gen, *exp, *new, dec, reason, now, dry_run, after_revoke)
 
 
 def revoke(c, gen, exp, dec="dec-r", reason="r", now=T0, dry_run=False):
@@ -121,6 +121,21 @@ def _race_replace(args):
         c.close()
 
 
+def _race_mix(args):
+    path, kind = args
+    c = ol.connect(path)
+    try:
+        if kind == "revoke":
+            ol.assign_revoke(c, "kb", 1, *A, "dec-rv", "race", T0, False)
+        else:
+            ol.assign_replace(c, "kb", 1, *A, *B, "dec-rp", "race", T0, False)
+        return f"{kind}:won"
+    except (ol.RevokeRefused, ol.ReplaceRefused) as e:
+        return f"{kind}:{e.code}"
+    finally:
+        c.close()
+
+
 def mutant_module():
     """owner_lease.py with `expires_at > now` re-imposed on assignments."""
     src = (HERE / "lib" / "owner_lease.py").read_text()
@@ -141,7 +156,7 @@ def time_independent(mod):
     mod.migrate(c)
     mod.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0)
     mod.assign_initial(c, "kb", *A, "dec-1", "r", T0, False)
-    ok = mod.holder_tuple(c, "kb", TEN_Y) == (*A, 1)
+    ok = mod.holder_tuple(c, "kb", TEN_Y, modes=mod.AUTHORITY_MODES) == (*A, 1)
     c.close()
     return ok
 
@@ -223,7 +238,7 @@ def main():
     p, c = fresh()
     assign(c, A)
     case("assignment is current ten years later (holder_tuple, current_assignment)",
-         ol.holder_tuple(c, "kb", TEN_Y) == (*A, 1) and ol.current_assignment(c, "kb", TEN_Y)["generation"] == 1)
+         ol.holder_tuple(c, "kb", TEN_Y, modes=ol.AUTHORITY_MODES) == (*A, 1) and ol.current_assignment(c, "kb", TEN_Y)["generation"] == 1)
     case("assignment has no expiry to report", ol.live_expiry(c, "kb", TEN_Y) is None)
     case("fenced enqueue still admitted ten years later",
          ol.enqueue(c, "kb", 1, A[0], A[1], "late", now=TEN_Y)["authority"] is True)
@@ -256,7 +271,7 @@ def main():
     case("replace to a different holder: generation 2, predecessor released superseded_by_assignment",
          replace(c, 1, A, B) == 2
          and c.execute("SELECT release_reason FROM owner_leases WHERE generation=1").fetchone()[0] == "superseded_by_assignment"
-         and ol.holder_tuple(c, "kb", T0) == (*B, 2)
+         and ol.holder_tuple(c, "kb", T0, modes=ol.AUTHORITY_MODES) == (*B, 2)
          and count(c, "SELECT COUNT(*) FROM owner_leases WHERE released_at IS NULL") == 1)
     s2 = snap(c)
     case("IDEMPOTENT: re-presenting the exact replacement returns gen 2, writes nothing",
@@ -339,7 +354,7 @@ def main():
     case("settle dry-run default writes nothing",
          ol.assign_settle(c, "kb", "d1", 1, "replied", "x", T0) == "would_settle" and snap(c) == s_rev)
     case("re-assign refused open_requests while a delivering request is unsettled",
-         code_of(lambda: replace(c, 1, A, A, dec="dec-3"), ol.ReplaceRefused) == "open_requests")
+         code_of(lambda: replace(c, 1, A, A, dec="dec-3", after_revoke=True), ol.ReplaceRefused) == "open_requests")
     case("settle records the terminal outcome against the exact released generation",
          ol.assign_settle(c, "kb", "d1", 1, "timeout", "late reply", T0 + 5, False) == "timeout"
          and c.execute("SELECT state, detail FROM owner_requests WHERE request_id='d1'").fetchone() == ("timeout", "late reply"))
@@ -361,19 +376,20 @@ def main():
     revoke(c, 1, A)
     before = snap(c)
     case("re-assign after revoke: stale generation / holder refused, nothing written",
-         code_of(lambda: replace(c, 2, A, A, dec="dec-3"), ol.ReplaceRefused) == "stale_expectation"
-         and code_of(lambda: replace(c, 1, B, A, dec="dec-3"), ol.ReplaceRefused) == "stale_expectation"
+         code_of(lambda: replace(c, 2, A, A, dec="dec-3", after_revoke=True), ol.ReplaceRefused) == "stale_expectation"
+         and code_of(lambda: replace(c, 1, B, A, dec="dec-3", after_revoke=True), ol.ReplaceRefused) == "stale_expectation"
          and snap(c) == before)
     case("re-assign after revoke may name the SAME holder from the exact revoked generation: gen 2",
-         replace(c, 1, A, A, dec="dec-3") == 2 and ol.holder_tuple(c, "kb", T0) == (*A, 2)
+         replace(c, 1, A, A, dec="dec-3", after_revoke=True) == 2
+         and ol.holder_tuple(c, "kb", T0, modes=ol.AUTHORITY_MODES) == (*A, 2)
          and ol.current_assignment(c, "kb")["decision_ref"] == "dec-3")
     case("generation stays label-local monotonic (1, 2) with one unreleased row",
          [r[0] for r in c.execute("SELECT generation FROM owner_leases ORDER BY generation")] == [1, 2]
          and count(c, "SELECT COUNT(*) FROM owner_leases WHERE released_at IS NULL") == 1)
     revoke(c, 2, A, dec="dec-r2")
     case("re-assign is only from the LATEST revoked generation (gen 1 is no longer valid)",
-         code_of(lambda: replace(c, 1, A, B, dec="dec-4"), ol.ReplaceRefused) == "stale_expectation"
-         and replace(c, 2, A, B, dec="dec-4") == 3)
+         code_of(lambda: replace(c, 1, A, B, dec="dec-4", after_revoke=True), ol.ReplaceRefused) == "stale_expectation"
+         and replace(c, 2, A, B, dec="dec-4", after_revoke=True) == 3)
     case("a superseded (not revoked) predecessor is not a re-assign base",
          replace(c, 3, B, C, dec="dec-5") == 4
          and code_of(lambda: replace(c, 3, B, B, dec="dec-6"), ol.ReplaceRefused) == "stale_expectation"
@@ -418,6 +434,89 @@ def main():
     case("an explicit replace may supersede an expired timed lease row only by exact tuple",
          replace(c, g, A, B, dec="cutover", now=T0 + TTL + 5) == 2
          and c.execute("SELECT release_reason FROM owner_leases WHERE generation=1").fetchone()[0] == "superseded_by_assignment")
+    c.close()
+
+    # --- security review: M1 stale replace vs revoke, fresh evidence ---
+    p, c = fresh()
+    assign(c, A)
+    revoke(c, 1, A, dec="dec-rev")
+    after_rev = snap(c)
+    case("M1: a replace planned against the ACTIVE assignment cannot resurrect authority after a revoke",
+         code_of(lambda: replace(c, 1, A, B, dec="dec-2"), ol.ReplaceRefused) == "stale_expectation"
+         and snap(c) == after_rev and ol.current_assignment(c, "kb") is None)
+    case("M1: re-assignment refuses the ORIGINAL assignment's decision_ref (needs new evidence)",
+         code_of(lambda: replace(c, 1, A, B, dec="dec-1", after_revoke=True), ol.ReplaceRefused) == "decision_not_fresh"
+         and snap(c) == after_rev)
+    case("M1: re-assignment refuses the REVOKE's own decision_ref",
+         code_of(lambda: replace(c, 1, A, B, dec="dec-rev", after_revoke=True), ol.ReplaceRefused) == "decision_not_fresh"
+         and snap(c) == after_rev)
+    case("M1: re-assignment with distinct fresh evidence succeeds",
+         replace(c, 1, A, B, dec="dec-new", after_revoke=True) == 2)
+    case("M1: after_revoke never applies while an authority row is unreleased",
+         code_of(lambda: replace(c, 2, B, C, dec="dec-x", after_revoke=True), ol.ReplaceRefused) == "stale_expectation")
+    case("M1: a revoked decision_ref cannot be replayed on a later re-assignment either",
+         revoke(c, 2, B, dec="dec-rev2")["generation"] == 2
+         and code_of(lambda: replace(c, 2, B, C, dec="dec-rev2", after_revoke=True), ol.ReplaceRefused) == "decision_not_fresh"
+         and code_of(lambda: replace(c, 2, B, C, dec="dec-new", after_revoke=True), ol.ReplaceRefused) == "decision_not_fresh")
+    c.close()
+    mix_ok = True
+    for _ in range(6):
+        p, c = fresh()
+        assign(c, A)
+        c.close()
+        with ctx.Pool(4) as pool:
+            res = pool.map(_race_mix, [(p, "revoke"), (p, "replace"), (p, "replace"), (p, "revoke")])
+        c = ol.connect(p)
+        rows = c.execute("SELECT generation, release_reason, released_at FROM owner_leases ORDER BY generation").fetchall()
+        # exactly one of revoke/replace may win; a revoke that wins must never be followed by a live gen 2
+        wins = [r for r in res if r.endswith(":won")]
+        resurrected = len(rows) > 1 and rows[0][1] == "revoked"
+        mix_ok = mix_ok and len(wins) == 1 and not resurrected \
+            and sum(1 for r in rows if r[2] is None) <= 1
+        c.close()
+    case("M1: replace-vs-revoke race (4 processes x 6 rounds): one winner, a revoke is never resurrected", mix_ok)
+
+    # --- security review: M2 release()/unregister_owner cannot drop an assignment ---
+    p, c = fresh(label=None)
+    ol.register_owner(c, "kb", "tntpgh/knowledge-base", now=T0, unregister_token="tok")
+    assign(c, A)
+    before = snap(c)
+    case("M2: release() by the holder pane cannot end an assignment (even ten years on)",
+         raises(lambda: ol.release(c, "kb", 1, A[0], A[1], now=TEN_Y), ol.AssignmentActive) and snap(c) == before)
+    case("M2: unregister_owner (dry-run and apply) refuses an ACTIVE assignment; row and registration untouched",
+         raises(lambda: ol.unregister_owner(c, "kb", "tok", 1, A[0], A[1], now=T0, dry_run=True), ol.AssignmentActive)
+         and raises(lambda: ol.unregister_owner(c, "kb", "tok", 1, A[0], A[1], now=T0, dry_run=False), ol.AssignmentActive)
+         and snap(c) == before
+         and c.execute("SELECT unregistered_at FROM owner_projects WHERE label='kb'").fetchone()[0] is None)
+    case("M2: a wrong token still learns nothing about the assignment (Unauthorized, not AssignmentActive)",
+         raises(lambda: ol.unregister_owner(c, "kb", "bad", 1, A[0], A[1], now=T0, dry_run=False), ol.Unauthorized))
+    revoke(c, 1, A)
+    case("M2: after an audited revoke, unregister_owner proceeds as before",
+         ol.unregister_owner(c, "kb", "tok", 1, A[0], A[1], now=T0, dry_run=False) == "unregistered")
+    c.close()
+
+    # --- security review: M3 shared holder boundary ---
+    p, c = fresh()
+    assign(c, A)
+    case("M3: holder_tuple defaults to timed-only: an assignment is NO holder for every legacy consumer",
+         ol.holder_tuple(c, "kb", T0) is None and ol.holder_tuple(c, "kb", TEN_Y) is None
+         and ol.holder_tuple(c, "kb", T0, modes=("timed",)) is None
+         and ol.holder_tuple(c, "kb", T0, modes=ol.AUTHORITY_MODES) == (*A, 1))
+    c.close()
+    p, c = fresh()
+    ol.acquire(c, "kb", A[0], A[1], TTL, T0, session_digest=A[2])
+    case("M3: timed lease callers are unaffected by the modes default", ol.holder_tuple(c, "kb", T0 + 1) == (*A, 1))
+    c.close()
+
+    # --- security review: L2 settle is for revoked assignments only ---
+    p, c = fresh()
+    g = ol.acquire(c, "kb", A[0], A[1], TTL, T0, session_digest=A[2])
+    deliver(c, g, A, "tdel")
+    c.execute("UPDATE owner_leases SET released_at=?, release_reason='released' WHERE generation=?", (ol._iso(T0 + 1), g))
+    before = snap(c)
+    case("L2: assign_settle refuses a TIMED released generation (not_revoked_assignment), nothing written",
+         code_of(lambda: ol.assign_settle(c, "kb", "tdel", g, "replied", "x", T0 + 2, False), ol.SettleRefused)
+         == "not_revoked_assignment" and snap(c) == before)
     c.close()
 
     # --- disabled store fails closed ---

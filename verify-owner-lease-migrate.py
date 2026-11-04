@@ -205,6 +205,32 @@ def main() -> int:
                      sqlite3.IntegrityError))
     post3.close()
 
+    # --- L1: a lease whose label has no owner_projects row must never be silently dropped ---
+    base4 = Path(os.path.realpath(tempfile.mkdtemp()))
+    db4 = base4 / "orphan.sqlite3"
+    v5o = sqlite3.connect(str(db4), isolation_level=None)
+    for v in (1, 2, 3, 4, 5):
+        for stmt in ol.MIGRATIONS[v]:
+            v5o.execute(stmt)
+    v5o.execute("CREATE TABLE owner_schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL)")
+    for v in (1, 2, 3, 4, 5):
+        v5o.execute("INSERT INTO owner_schema_version VALUES (?, '2026-11-01T00:00:00.000000Z')", (v,))
+    v5o.execute("INSERT INTO owner_projects VALUES ('kb','tntpgh/knowledge-base','2026-11-01T00:00:00.000000Z',5,NULL,NULL,NULL)")
+    for lid, lab in (("L1", "kb"), ("LG", "ghost")):   # FKs are off on this connection: 'ghost' has no project row
+        v5o.execute("INSERT INTO owner_leases VALUES (?,?,'w1:p1','term_1',1,'2026-11-01T00:00:00.000000Z',"
+                    "'2026-11-01T00:00:00.000000Z','2099-01-01T00:00:00.000000Z',NULL,NULL,?)", (lid, lab, "a" * 64))
+    v5o.close()
+    os.chmod(db4, 0o600)
+    rc4, out4 = run(db4, apply=True, env_extra={"HERDR_OWNER_LEASE_WRITER": "1"})
+    chk = sqlite3.connect(str(db4))
+    case("L1: v5->v6 with an orphan-label lease fails loudly instead of silently dropping it",
+         rc4 != 0 and "migrated:5->6" not in out4)
+    case("L1: the failed migration rolled back fully: both leases kept, still v5, no half-built v6 table",
+         chk.execute("SELECT COUNT(*) FROM owner_leases").fetchone()[0] == 2
+         and chk.execute("SELECT MAX(version) FROM owner_schema_version").fetchone()[0] == 5
+         and chk.execute("SELECT 1 FROM sqlite_master WHERE name='owner_leases_v6'").fetchone() is None)
+    chk.close()
+
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
 

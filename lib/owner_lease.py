@@ -62,8 +62,16 @@ Durable assignments (Plan 018 PR A, inert)
   assign_initial(), assign_replace(), assign_revoke() and assign_settle()
   ever create, replace, release or settle one -- acquire()/claim_initial()/
   claim_successor() (the timed-only legacy path) refuse outright rather
-  than implicitly converting or taking over an active assignment. Nothing
-  outside this module reads authority_mode yet (PR B is the runtime gate).
+  than implicitly converting or taking over an active assignment.
+  release() and unregister_owner() refuse an active assignment too
+  (AssignmentActive): it ends only via assign_revoke()/assign_replace().
+  Re-assignment after a revoke is a separate explicit operation
+  (assign_replace(after_revoke=True), fresh decision_ref); a plain replace
+  never resurrects a revoked label. holder_tuple() -- the shared holder
+  boundary used by dispatch, grant issuance, result submit/accept, publisher
+  and factory-status -- is timed-only by default, so those consumers read an
+  assignment as no holder (fail closed, before any grant is consumed) until
+  PR B routes them by authority_mode via holder_tuple(modes=AUTHORITY_MODES).
 
 Policy
   An owner's queue bound is its registered max_open (1..MAX_OPEN_LIMIT); a
@@ -152,6 +160,13 @@ class Unauthorized(Exception):
     """unregister_owner() refused: missing/mismatched unregister_token, or
     the caller's (generation, pane_id, pane_birth) does not match the
     label's current live lease (R13-BOUNDS.md)."""
+
+
+class AssignmentActive(Exception):
+    """release()/unregister_owner() refused: the label's current authority is
+    a durable assignment. An assignment ends only through the audited
+    assign_revoke()/assign_replace() APIs (decision_ref + reason recorded);
+    the holder pane or an unregister token alone can never drop it."""
 
 
 class AlreadyUnregistered(Exception):
@@ -357,7 +372,7 @@ MIGRATIONS = {
             released_at,release_reason,session_digest,authority_mode,decision_ref,reason)
            SELECT l.lease_id,l.label,p.project,l.pane_id,l.pane_birth,l.generation,l.acquired_at,l.renewed_at,
                   l.expires_at,l.released_at,l.release_reason,l.session_digest,'timed','',''
-           FROM owner_leases l JOIN owner_projects p ON p.label=l.label""",
+           FROM owner_leases l LEFT JOIN owner_projects p ON p.label=l.label""",
         "DROP TABLE owner_leases",
         "ALTER TABLE owner_leases_v6 RENAME TO owner_leases",
         "CREATE UNIQUE INDEX owner_leases_one_live ON owner_leases(label) WHERE released_at IS NULL",
@@ -648,6 +663,9 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
     if row[0] is not None:
         return "already_unregistered"
     cur = _live(conn, label, now)
+    if cur and cur[7] == "assignment":
+        raise AssignmentActive(f"{label}: durable assignment is active; revoke or replace it via the audited "
+                               "assignment API first")
     if cur and (cur[3], cur[1], cur[2]) != (generation, pane_id, pane_birth):
         raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
     open_n = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
@@ -668,6 +686,9 @@ def unregister_owner(conn, label: str, token: str, generation: int = 0, pane_id:
         if row2[0] is not None:
             return "already_unregistered"
         cur2 = _live(conn, label, now)
+        if cur2 and cur2[7] == "assignment":
+            raise AssignmentActive(f"{label}: durable assignment is active; revoke or replace it via the audited "
+                                   "assignment API first")
         if cur2 and (cur2[3], cur2[1], cur2[2]) != (generation, pane_id, pane_birth):
             raise Unauthorized(f"{label}: generation/pane/birth does not match the live lease")
         open_n2 = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
@@ -928,11 +949,22 @@ def claim_successor(conn, label: str, expected_prev_gen: int, expected_prev_pane
     return _tx(conn, body)
 
 
-def holder_tuple(conn, label, now=None):
+AUTHORITY_MODES = ("timed", "assignment")
+
+
+def holder_tuple(conn, label, now=None, modes=("timed",)):
     """(pane_id, pane_birth, session_digest, generation) of the live lease, or
-    None when there is none or it carries no session digest. Read-only."""
+    None when there is none, it carries no session digest, or its
+    authority_mode is not in `modes`. Read-only.
+
+    `modes` defaults to timed only: every consumer of this shared holder
+    boundary (dispatch, grant issuance, result submit/accept, publisher,
+    factory-status) predates durable assignments and reasons about TTLs, so
+    a durable assignment reads as 'no holder' -- they fail closed BEFORE
+    any grant is consumed -- until PR B routes a consumer by authority_mode
+    by passing modes explicitly (AUTHORITY_MODES for both)."""
     cur = _live(conn, label, time.time() if now is None else now)
-    if not cur or not SESSION_DIGEST_RE.match(cur[6] or ""):
+    if not cur or cur[7] not in modes or not SESSION_DIGEST_RE.match(cur[6] or ""):
         return None
     return (cur[1], cur[2], cur[6], cur[3])
 
@@ -972,6 +1004,9 @@ def release(conn, label, generation, pane_id, pane_birth, now=None) -> bool:
 
     def body():
         _fence(conn, label, generation, pane_id, pane_birth, now)
+        if _live(conn, label, now)[7] == "assignment":
+            raise AssignmentActive(f"{label}: durable assignment is active; end it with assign_revoke()/"
+                                   "assign_replace(), not release()")
         conn.execute("UPDATE owner_leases SET released_at=?, release_reason='released' "
                      "WHERE label=? AND generation=? AND released_at IS NULL", (_iso(now), label, generation))
         _event(conn, now, label, "released", "", generation, "voluntary")
@@ -1217,18 +1252,24 @@ def assign_initial(conn, label: str, pane_id: str, pane_birth: str, session_dige
 
 def assign_replace(conn, label: str, expected_generation: int, expected_pane_id: str, expected_pane_birth: str,
                    expected_session_digest: str, pane_id: str, pane_birth: str, session_digest: str,
-                   decision_ref: str, reason: str, now: float | None = None, dry_run: bool = True):
-    """Exact replacement (Plan 018 §4.4 `replace`), covering BOTH named
-    cases from the same transaction shape:
-      * active replacement: expected_* names the CURRENT unreleased
-        authority row exactly (any mode); the new holder must DIFFER from
-        it (ReplaceRefused('same_holder') otherwise -- a same-holder
-        "replace" is never implicit renewal of a durable assignment).
-        The predecessor is released 'superseded_by_assignment'.
-      * re-assignment after revoke: expected_* names the label's LATEST
-        row exactly, which must already be released 'revoked'. The new
-        holder MAY equal the revoked holder (Plan 018 §4.4), but only from
-        that EXACT revoked generation and with a fresh decision_ref.
+                   decision_ref: str, reason: str, now: float | None = None, dry_run: bool = True,
+                   after_revoke: bool = False):
+    """Exact replacement (Plan 018 §4.4 `replace`). Two DISTINCT operations,
+    selected explicitly by `after_revoke` -- a stale in-flight replace
+    planned against an active assignment can therefore never resurrect
+    authority after a concurrent revoke:
+      * after_revoke=False (active replacement): expected_* names the
+        CURRENT unreleased authority row exactly (any mode); the new holder
+        must DIFFER from it (ReplaceRefused('same_holder') otherwise -- a
+        same-holder "replace" is never implicit renewal of a durable
+        assignment). The predecessor is released 'superseded_by_assignment'.
+        If that row was meanwhile revoked, this refuses stale_expectation.
+      * after_revoke=True (deliberate re-assignment): expected_* names the
+        label's LATEST row exactly, which must already be released
+        'revoked', and the label must have NO unreleased row. The new holder
+        MAY equal the revoked holder, but decision_ref must be NEW:
+        never used by any earlier assignment row or revoke of this label
+        (ReplaceRefused('decision_not_fresh') otherwise).
     Either way: any mismatch writes nothing (ReplaceRefused('stale_
     expectation')); zero open owner_requests required (ReplaceRefused
     ('open_requests') -- replacing a label with unresolved deliveries in
@@ -1236,8 +1277,8 @@ def assign_replace(conn, label: str, expected_generation: int, expected_pane_id:
     MAX(all historical generations for label)+1.
 
     Idempotent re-presentation of the label's OWN just-created active
-    assignment (same shape as assign_initial()) returns its generation
-    without a second write."""
+    assignment (expected==new==active, same decision_ref/reason; only
+    with after_revoke=False) returns its generation without a second write."""
     now = time.time() if now is None else now
     _check_holder(pane_id, pane_birth)
     _check_holder(expected_pane_id, expected_pane_birth)
@@ -1255,6 +1296,31 @@ def assign_replace(conn, label: str, expected_generation: int, expected_pane_id:
         if not conn.execute("SELECT 1 FROM owner_projects WHERE label=?", (label,)).fetchone():
             raise InvalidOwner(f"{label} is not a registered owner")
         active = _unreleased(conn, label)
+        if after_revoke:
+            if active:
+                raise ReplaceRefused("stale_expectation", f"{label}: an authority row is unreleased; "
+                                     "re-assignment applies only after revoke")
+            latest = conn.execute(
+                "SELECT pane_id,pane_birth,generation,session_digest,release_reason FROM owner_leases "
+                "WHERE label=? ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
+            if not (latest and latest[2] == expected_generation
+                    and (latest[0], latest[1], latest[3]) == (expected_pane_id, expected_pane_birth, expected_session_digest)
+                    and latest[4] == "revoked"):
+                raise ReplaceRefused("stale_expectation", f"{label}: expected revoked gen {expected_generation} "
+                                     f"{expected_pane_id}@{expected_pane_birth} is not the label's latest revoked row")
+            used = conn.execute("SELECT 1 FROM owner_leases WHERE label=? AND decision_ref=?", (label, decision_ref)).fetchone()
+            if not used:
+                prefix = f"{decision_ref}: "
+                used = any(d[0].startswith(prefix) for d in conn.execute(
+                    "SELECT detail FROM owner_events WHERE label=? AND kind='revoked'", (label,)))
+            if used:
+                raise ReplaceRefused("decision_not_fresh", f"{label}: decision_ref {decision_ref!r} was already "
+                                     "used for this label; re-assignment needs new decision evidence")
+            n_open = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
+                                  (label, *OPEN)).fetchone()[0]
+            if n_open:
+                raise ReplaceRefused("open_requests", f"{label}: {n_open} open owner_requests")
+            return "after_revoke", None
         if active and (active[5], active[3], active[4], active[9]) == \
                 (expected_generation, expected_pane_id, expected_pane_birth, expected_session_digest):
             if (active[10], pane_id, pane_birth, session_digest, decision_ref, reason) == \
@@ -1269,17 +1335,6 @@ def assign_replace(conn, label: str, expected_generation: int, expected_pane_id:
             if n_open:
                 raise ReplaceRefused("open_requests", f"{label}: {n_open} open owner_requests")
             return "active", active
-        latest = conn.execute(
-            "SELECT lease_id,label,project,pane_id,pane_birth,generation,acquired_at,renewed_at,expires_at,"
-            "session_digest,authority_mode,decision_ref,reason,released_at,release_reason FROM owner_leases "
-            "WHERE label=? ORDER BY generation DESC LIMIT 1", (label,)).fetchone()
-        if latest and latest[5] == expected_generation and (latest[3], latest[4], latest[9]) == \
-                (expected_pane_id, expected_pane_birth, expected_session_digest) and latest[14] == "revoked":
-            n_open = conn.execute(f"SELECT COUNT(*) FROM owner_requests WHERE label=? AND state IN ({_q(OPEN)})",
-                                  (label, *OPEN)).fetchone()[0]
-            if n_open:
-                raise ReplaceRefused("open_requests", f"{label}: {n_open} open owner_requests")
-            return "after_revoke", latest
         raise ReplaceRefused("stale_expectation", f"{label}: expected gen {expected_generation} "
                              f"{expected_pane_id}@{expected_pane_birth} does not match current state")
 
@@ -1377,16 +1432,17 @@ def assign_revoke(conn, label: str, expected_generation: int, expected_pane_id: 
 def assign_settle(conn, label: str, request_id: str, expected_generation: int, to: str, detail: str = "",
                   now: float | None = None, dry_run: bool = True):
     """Terminal settlement of an already-'delivering' request after its
-    generation's authority has been released (Plan 018 §4.4's revoke note):
-    the request must currently be 'delivering', belong to EXACTLY (label,
-    expected_generation), and that generation's owner_leases row must
-    already be released (any reason -- revoked, superseded, or expired) --
-    SettleRefused('generation_still_active') otherwise, directing the
-    caller to the normal fenced transition() instead (this function never
-    authenticates a live holder; it exists ONLY for the generation that no
-    longer has one). `to` is restricted to the two real terminal outcomes
-    (replied, timeout) -- it can never re-admit to 'delivering' or any
-    other state, so this can never start a second send."""
+    generation's durable assignment was REVOKED (Plan 018 §4.4's revoke
+    note): the request must currently be 'delivering', belong to EXACTLY
+    (label, expected_generation), and that generation's owner_leases row
+    must be an authority_mode='assignment' row released 'revoked' --
+    SettleRefused('generation_still_active') while it is unreleased (use the
+    normal fenced transition()), SettleRefused('not_revoked_assignment')
+    for a timed, reaped, expired or superseded generation (those have their
+    own paths; this never authenticates a live holder). `to` is restricted
+    to the two real terminal outcomes (replied, timeout) -- it can never
+    re-admit to 'delivering' or any other state, so this can never start a
+    second send."""
     now = time.time() if now is None else now
     _check(REQUEST_RE, request_id, "request id")
     if to not in ("replied", "timeout"):
@@ -1403,11 +1459,14 @@ def assign_settle(conn, label: str, request_id: str, expected_generation: int, t
                                 f"expected {label} gen {expected_generation}")
         if row[2] != "delivering":
             raise SettleRefused("not_delivering", f"{request_id} is {row[2]!r}, not delivering")
-        lease_row = conn.execute("SELECT released_at FROM owner_leases WHERE label=? AND generation=?",
-                                 (label, expected_generation)).fetchone()
+        lease_row = conn.execute("SELECT released_at, authority_mode, release_reason FROM owner_leases "
+                                 "WHERE label=? AND generation=?", (label, expected_generation)).fetchone()
         if not lease_row or lease_row[0] is None:
             raise SettleRefused("generation_still_active", f"{label} generation {expected_generation} is not "
                                 "released; use transition(), not settlement")
+        if (lease_row[1], lease_row[2]) != ("assignment", "revoked"):
+            raise SettleRefused("not_revoked_assignment", f"{label} generation {expected_generation} is "
+                                f"{lease_row[1]}/{lease_row[2]}, not a revoked durable assignment")
         return row
 
     check()

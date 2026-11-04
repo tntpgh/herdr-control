@@ -433,8 +433,39 @@ def main() -> int:
     title_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     standing_issue_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     consumer_recovery_cases(Path(os.path.realpath(tempfile.mkdtemp())))
+    assignment_boundary_cases(Path(os.path.realpath(tempfile.mkdtemp())))
     print(f"{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failing")
     return 1 if FAILS else 0
+
+
+def assignment_boundary_cases(base: Path) -> None:
+    """Security review M3: a durable assignment (Plan 018 PR A, inert) must make
+    the shared holder boundary fail closed BEFORE the single-use grant is
+    consumed -- nothing consumes authority a consumer cannot honour yet."""
+    lc, av, roots, lease_db = env(base)
+    ol.assign_initial(lc, KB, *PANE[KB], SESS[KB], "dec-1", "fixture", T0, False)
+    holder = (*PANE[KB], SESS[KB], 1)
+    case("ASSIGNMENT: holder_tuple default (timed only) reads an assignment as no holder",
+         ol.holder_tuple(lc, KB, T0) is None and ol.holder_tuple(lc, KB, T0, modes=ol.AUTHORITY_MODES) == holder)
+    gate = old.DeliveryGate(lease_db)
+    store = sqlite3.connect(str(base / "auth.db"), isolation_level=None)
+    oda.migrate(store)
+    body, man = b"REQ assign\n", ["result.md"]
+    sha = hashlib.sha256(body).hexdigest()
+    proj = lc.execute("SELECT project FROM owner_projects WHERE label=?", (KB,)).fetchone()[0]
+    insert_grant(store, "a_asg", label=KB, project=proj, holder=holder, rid="r_asg", sha=sha, manifest=man,
+                 expires=T0 + 3600)
+    sent = []
+    authorize = lambda l, pj, hd, r, h, m, n: oda.consume(store, "a_asg", label=l, project=pj, holder=hd, request_id=r,
+                                                          body_sha256=h, manifest=m, now=n)
+    d = od.Dispatcher(gate, av, lambda l, h, t: sent.append(t) or True, {KB: (*PANE[KB], SESS[KB])}.get,
+                      lambda: T0, authorize=authorize)
+    res = d.dispatch(KB, "r_asg", body, man, T0)
+    status = store.execute("SELECT status FROM owner_dispatch_auth WHERE auth_id='a_asg'").fetchone()[0]
+    case("ASSIGNMENT: Dispatcher holds, sends nothing, and does NOT consume the one-time grant",
+         res.startswith("held:not_dispatched") and not sent and status == "granted"
+         and gate.state("r_asg") is None)
+    store.close(); gate.close(); av.close(); lc.close()
 
 
 def auth_contract_cases(base: Path) -> None:

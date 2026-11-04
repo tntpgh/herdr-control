@@ -1,5 +1,5 @@
 name: owner-lease
-# INERT owner-lease contract (lib/owner_lease.py): nothing at runtime calls it.
+# INERT owner-lease contract (lib/owner_lease.py): no production path creates a durable assignment.
 # These offline checks keep its CAS/fencing/queue/reap/rollback/upgrade proofs green,
 # plus the inert result-availability primitive (lib/result_availability.py).
 on:

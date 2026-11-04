@@ -106,7 +106,7 @@ def cmd_replace(a, conn) -> int:
     try:
         res = ol.assign_replace(conn, a.label, a.expected_generation, a.expected_pane_id, a.expected_pane_birth,
                                 a.expected_session_digest, a.pane_id, a.pane_birth, a.session_digest,
-                                a.decision_ref, a.reason, dry_run=not a.apply)
+                                a.decision_ref, a.reason, dry_run=not a.apply, after_revoke=a.after_revoke)
     except BUSINESS_REFUSALS as exc:
         print(f"refused:{type(exc).__name__}:{getattr(exc, 'code', exc)}")
         return 2
@@ -176,6 +176,10 @@ def main(argv=None) -> int:
     p_replace.add_argument("--session-digest", dest="session_digest", required=True)
     p_replace.add_argument("--decision-ref", dest="decision_ref", required=True)
     p_replace.add_argument("--reason", required=True)
+    p_replace.add_argument("--after-revoke", dest="after_revoke", action="store_true",
+                           help="deliberate re-assignment from the latest REVOKED generation "
+                                "(needs a decision-ref never used for this label); without it only an "
+                                "ACTIVE assignment can be replaced")
     p_replace.add_argument("--apply", action="store_true")
     p_replace.set_defaults(fn=cmd_replace)
 
