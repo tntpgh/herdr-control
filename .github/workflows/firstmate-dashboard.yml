@@ -1,0 +1,19 @@
+name: firstmate-dashboard
+# Renders the dashboard against fixtures: every open decision shown, hostile
+# text escaped, Bebop theme loads, answer-path guards hold.
+on:
+  pull_request:
+    paths: ["firstmate-dashboard/**", "lib/hub_ui/**", ".github/workflows/firstmate-dashboard.yml"]
+  push:
+    branches: [main]
+    paths: ["firstmate-dashboard/**", "lib/hub_ui/**", ".github/workflows/firstmate-dashboard.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python3 firstmate-dashboard/check.py

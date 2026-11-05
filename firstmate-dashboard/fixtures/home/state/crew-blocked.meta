@@ -1,0 +1,7 @@
+window=default:wT1:p2
+endpoint_task_id=crew-blocked
+worktree=/tmp/fixture-worktree/crew-blocked
+kind=ship
+mode=direct-PR
+branch=fm/crew-blocked
+herdr_pane_id=wT1:p2

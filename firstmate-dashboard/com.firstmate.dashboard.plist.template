@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by firstmate-dashboard/launchd.sh; do not edit the rendered copy.
+     __PYTHON__ is the pinned interpreter from launchd/resolve-hub-python.sh,
+     never `env python3` (launchd has no shell PATH to resolve it with). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.firstmate.dashboard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__SERVER__</string>
+		<string>--home</string>
+		<string>__FM_HOME__</string>
+		<string>--port</string>
+		<string>__PORT__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- The Firstmate CLIs are bash and call jq, tasks-axi and friends. -->
+		<key>PATH</key>
+		<string>__PATH__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>

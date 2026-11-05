@@ -1,0 +1,10 @@
+count: 6
+tasks[6]{id,state,kind,repo,title,held,hold_kind,hold_reason,closed,created}:
+  crew-blocked,in_flight,ship,demo-repo,"Fix the <b>feed</b>, then report",no,-,-,-,2026-11-04
+  crew-working,in_flight,scout,demo-repo,Scout the photo gap,no,-,-,-,2026-11-04
+  cap-xss,queued,captain,demo-repo,"Pick <script>alert(\"t\")</script> & go",yes,captain,"Two calls (data/cap-xss/report.md): <img src=x onerror=alert(1)>\nline two",-,2026-11-04
+  cap-long,queued,captain,other-repo,"A captain call whose title is long enough that the list view cuts it off right \n... (truncated, 120 chars total - use show cap-long --full to see complete text)",yes,captain,"Approve the backfill, yes or no",-,2026-11-03
+  wait-dep,queued,ship,demo-repo,Wait for upstream,yes,dependency,waiting on crew-blocked,-,2026-11-04
+  old-done,done,ship,demo-repo,Shipped thing,no,-,-,2026-11-02,2026-11-01
+help[1]:
+  - Run `tasks-axi show <id>` for full notes on a task

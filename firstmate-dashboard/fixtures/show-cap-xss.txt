@@ -1,0 +1,18 @@
+task:
+  id: cap-xss
+  title: "Pick <script>alert(\"t\")</script> & go"
+  state: queued
+  blocked: no
+  blocked_by: none
+  held: yes
+  hold_reason: "Two calls (data/cap-xss/report.md): <img src=x onerror=alert(1)>\nline two"
+  hold_kind: captain
+  hold_until: "-"
+  kind: captain
+  repo: demo-repo
+  priority: "-"
+  created: 2026-11-04
+  closed: "-"
+  deps: none
+  links: none
+  body: "Captain hold set: 2026-11-04T23:56:55Z\nCaptain hold origin: crew-blocked\n\nOrigin: crew-blocked"

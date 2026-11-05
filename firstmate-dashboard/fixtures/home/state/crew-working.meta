@@ -1,0 +1,5 @@
+window=default:wT2:p2
+endpoint_task_id=crew-working
+worktree=/tmp/fixture-worktree/crew-working
+kind=scout
+herdr_pane_id=wT2:p2

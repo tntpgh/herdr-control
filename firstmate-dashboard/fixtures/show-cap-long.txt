@@ -1,0 +1,18 @@
+task:
+  id: cap-long
+  title: "A captain call whose title is long enough that the list view cuts it off right here at the end"
+  state: queued
+  blocked: no
+  blocked_by: none
+  held: yes
+  hold_reason: "Approve the backfill, yes or no"
+  hold_kind: captain
+  hold_until: "-"
+  kind: captain
+  repo: other-repo
+  priority: "-"
+  created: 2026-11-03
+  closed: "-"
+  deps: none
+  links: none
+  body: ""
