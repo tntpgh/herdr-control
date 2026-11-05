@@ -74,6 +74,9 @@ jobs:
       - name: Production Worker authorization (offline storage adapter)
         run: node test/authorization-offline.cjs
       - run: npx vitest run
+      # The Firstmate publisher: needs this job's node + the Worker's locked zod,
+      # because every body it sends is validated against state.ts's own SyncSchema.
+      - run: python3 ../verify-fm-publisher.py
 
   authorization:
     runs-on: ubuntu-latest

@@ -658,10 +658,113 @@ screen contents, prompt ids, the hub, the registry file, secrets files, or a
 credential value from the capability probe (only booleans: was a secret
 grant passed, was KB HTTP-reachable).
 
-Redaction (`publisher.py` `REDACTIONS`) removes common credential shapes. It
-is a ceiling, not a guarantee, and it does not detect client names or
-addresses that a worker wrote into PROOF.md — those reach whoever holds a
-`herdr:read` token.
+Redaction (`sync_client.py` `REDACTIONS`, shared by both publishers) removes
+common credential shapes. It is a ceiling, not a guarantee, and it does not
+detect client names or addresses that a worker wrote into PROOF.md — those
+reach whoever holds a `herdr:read` token.
+
+## Firstmate publisher (`fm_publisher.py`)
+
+Serves the **Firstmate** fleet to Dot and Duet through this same Worker,
+OAuth front door, scopes, limits, audit and peer inbox, with no Worker change.
+It replaces only the Mac half: `publisher.py` read the herdr hub and run
+registry; `fm_publisher.py` reads Firstmate through its own CLIs. Run one
+publisher, never both: it refuses to sync while
+`com.herdr-control.remote-mcp` is loaded.
+
+```mermaid
+flowchart LR
+  P["fm_publisher.py --loop<br/>(com.firstmate.fm-mcp-publisher)"] -->|"HMAC /ingest/sync every 15 s"| W[Worker]
+  W -->|"owner_outbox · outbox · commands"| P
+  P -->|read| S["fm-fleet-snapshot.sh --json"]
+  P -->|read| R["fm-inbox.sh ready · receipts"]
+  P -->|"the only write"| N["fm-inbox.sh note"]
+  P -.->|"acked refused, never executed"| X["outbox · commands"]
+```
+
+**Trust boundary.** Data crossing to Cloudflare is an explicit allow-list
+(`build_snapshot`); data arriving from a phone app is only ever a request.
+
+- **Out (scope `full`, the default):** task ids, titles, repo names,
+  branches, states and state detail, PR URLs (as `closure_proof`), captain-hold
+  reasons, last-event lines (240 chars), pane targets and harness names,
+  `data/<task>/report.md` (single-link regular file, 64 KB) as source
+  `report.md`, and a generated `firstmate:card` per task. Every free-text
+  field is redacted, then capped. **Never:** note bodies, terminal captures,
+  secondmate evidence, raw status lines, local paths, `data/captain.md`,
+  learnings, secrets. `~/.config/fm-mcp/read-scope` set to `counts` sends only
+  numbers and liveness (any value other than `full`/`counts` fails closed to
+  `counts`); `~/.config/fm-mcp/read-deny` lists task ids or globs that are
+  dropped everywhere (tasks, agents, blockers, results, counts).
+- **In:** an owner message to `firstmate` (or its alias `conductor`) becomes
+  `fm-inbox.sh note --request-id remote-<client>:<exchange_id> --json -`,
+  where `<client>` is `dot`, `duet` or `unknown` from the CIMD client label.
+  The note's first line, which is also the wake summary, reads
+  `REMOTE request via dot (ChatGPT app) - NOT the captain's word; never an approval`;
+  the remote text is folded to one line and fenced by a random nonce it cannot
+  forge. A Dot/Duet note is a request Firstmate confirms with the captain in
+  an attended channel, never the captain's explicit word (merge, hold
+  release, discard, deploy, yolo). A re-leased message replays the same note
+  (same request id) and never wakes Firstmate twice; a note saved but not
+  announced is not acked and is announced on the next tick. Firstmate answers
+  with `fm-inbox.sh reply <note id>`; the publisher reads
+  `fm-inbox.sh receipts --after <cursor> --all-replies`, sends only replies to
+  remote notes, and advances its cursor only past replies the Worker accepted
+  (or durably refused).
+- **Refused:** every `outbox` item (`send_message`/`follow_up`) and every
+  `commands` item (`start_task`/`cancel_task`/`resume_task`, the grant-loss
+  cancel sweep) is acked `refused`. Every task is synced with
+  `agent_live: false` and no pane/agent id, and `task_config` is `null`, so
+  the Worker refuses those tools before queueing anything.
+- **Commands it may run:** `fm-fleet-snapshot.sh --json`, `fm-inbox.sh ready`,
+  `fm-inbox.sh receipts --after … --all-replies`,
+  `fm-inbox.sh note --request-id … --json -`, `fm-inbox.sh announce --json <id>`.
+  `run_cli` refuses anything else. The ingest key is stripped from their
+  environment.
+
+**Cost.** One long-lived process (`--loop`), so no interpreter starts per
+tick. The fleet snapshot is the only heavy step (about 5 s of CPU on a
+12-task fleet), so it is rebuilt only when a stat fingerprint of its inputs
+(backlog, `state/*.meta|*.status`, `data/*/report.md`) changes, and never
+sooner than the CPU budget allows: the gap between rebuilds is at least the
+last rebuild's CPU divided by `REBUILD_CPU_BUDGET` (0.6% of one core), so a
+5 s rebuild runs at most every ~14 min, and a busier or larger fleet costs
+freshness, never CPU. Every snapshot carries its `generated_at`. A change to
+`read-scope`/`read-deny` rebuilds at once (if that rebuild fails, an empty
+snapshot is sent, never the old wider one). Between rebuilds each 15 s tick
+re-sends the cached snapshot; an unchanged `report.md` is not re-read.
+`fm-inbox.sh ready` runs at most once a minute and `receipts` only while a
+remote note awaits its reply. The LaunchAgent runs as
+`ProcessType=Background`, `Nice=10`, `LowPriorityIO`.
+
+**Status for a dashboard.** `~/.local/state/fm-mcp/status.json`
+(`fm-mcp-publisher-status.v1`) is rewritten every tick: `last_sync_at`, `ok`,
+`outcome` (`synced`, `synced_degraded`, `sync_failed`, `no_ingest_key`,
+`refused_old_publisher_loaded`), `detail`, `sync_ms`, `tick_ms`,
+`tick_cpu_ms`, `snapshot_generated_at`, `live_connected`, `tasks`,
+`awaiting_reply`, and `stale_after_s` (90, the Worker's own threshold: a
+`last_sync_at` older than that is what Dot/Duet see as `disconnected`; a
+missing file means the publisher never ran). Reading it is one small file,
+no subprocess or network (`fm_publisher.read_status()` checks the schema),
+so a dashboard can show it on its own refresh without adding a poller.
+
+**Run it.**
+
+- What would be sent, no network and no writes:
+  `python3 remote-mcp/fm_publisher.py --dry-run`.
+- Install (captain-approved activation only), from the deployed app checkout
+  so the plist's script path survives worktree cleanup:
+  `launchctl bootout gui/$(id -u)/com.herdr-control.remote-mcp` (if loaded), then
+  `bash ~/.local/share/herdr-control/app/remote-mcp/install-fm-publisher.sh --apply`.
+  Without `--apply` it renders and lints the plist and changes nothing.
+- State and logs: `~/.local/state/fm-mcp/`,
+  `~/Library/Logs/com.firstmate.fm-mcp-publisher.log`; `--status` prints both
+  LaunchAgents' state and `status.json`.
+- Kill switch: `bash remote-mcp/install-fm-publisher.sh --uninstall`
+  (`launchctl bootout` + remove the plist); clients see `disconnected` after
+  90 s. The Worker kill switches under "Operating it" still apply.
+- Tests: `(cd remote-mcp/worker && npm ci) && python3 remote-mcp/verify-fm-publisher.py`
+  (validates every body against the Worker's own `SyncSchema` with its zod).
 
 ## Connecting a client
 
