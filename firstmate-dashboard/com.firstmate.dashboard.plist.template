@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Rendered by firstmate-dashboard/launchd.sh; do not edit the rendered copy.
      __PYTHON__ is the pinned interpreter from launchd/resolve-hub-python.sh,
-     never `env python3` (launchd has no shell PATH to resolve it with). -->
+     never `env python3` (launchd has no shell PATH to resolve it with).
+     The TAILNET_ARGS placeholder line below becomes one <string> per optional
+     tailnet flag (none by default: loopback only). -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -15,6 +17,7 @@
 		<string>__FM_HOME__</string>
 		<string>--port</string>
 		<string>__PORT__</string>
+		__TAILNET_ARGS__
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
