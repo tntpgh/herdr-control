@@ -5,6 +5,11 @@ Everything here is a read: `fm-tasks-axi.sh list|show`, `fm-crew-state.sh`,
 one write the dashboard makes (an inbox note) lives in server.py, behind the
 same CLI the captain would type.
 
+Evolution-loop signals are the one read that leaves the machine: the alert
+issues named in `state/evolution-loop.seen` are looked up with `gh issue view`
+at most once per SIGNAL_REFRESH_S, so a closed alert drops off the bounty
+board instead of staying "open" forever.
+
 Output of the CLIs is TOON-style text (`tasks[N]{a,b}:` tables, `key: value`
 records). The parsers are header-driven so a field added upstream is ignored
 rather than misread.
@@ -17,7 +22,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 CMD_TIMEOUT_S = 15
@@ -29,6 +37,26 @@ REPORT_REF = re.compile(r"(?<![\w/.-])data/[A-Za-z0-9._/-]+\.(?:md|txt|json|log)
 _TABLE_HEAD = re.compile(r"^(\w+)\[(\d+)\]\{([^}]*)\}:\s*$")
 _CELL = re.compile(r'\s*("(?:[^"\\]|\\.)*"|[^,]*?)\s*(,|$)')
 _TRUNC = re.compile(r"\n\.\.\. \(truncated.*$", re.S)
+# tasks-axi `links`: `pr:<url>` / `report:<data path>`, space/comma separated.
+_LINK = re.compile(r"(?:^|[\s,;])(pr|report):(\S+?)(?=$|[\s,;])")
+# The evolution loop's seen-set (state/evolution-loop.seen, written by its
+# custom check): `issue:<repo>:<number>:<updatedAt>` per alert-issue update.
+SIGNALS_SEEN = "evolution-loop.seen"
+_SIGNAL_ISSUE = re.compile(r"^issue:([A-Za-z0-9._-]+):(\d+):(\S+)$")
+_GH_SLUG = re.compile(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
+SIGNAL_REFRESH_S = 600
+SIGNAL_MAX = 12
+# Bounty statuses, in board order (prototype/board/fixtures/bounties.json).
+BOUNTY_STATUSES = ("open", "in_progress", "awaiting_evidence", "verified")
+# What closes a backlog item, by Firstmate task kind.
+EVIDENCE = {
+    "ship": "A merged PR recorded on the backlog row.",
+    "scout": "A report recorded on the backlog row (data/<id>/report.md).",
+    "captain": "Your resolution recorded on the backlog row.",
+    "review": "A review report or merged PR recorded on the backlog row.",
+    "secondmate": "The secondmate's landed work recorded on the backlog row.",
+}
+EVIDENCE_DEFAULT = "A merged PR or report recorded on the backlog row."
 
 
 class CommandError(RuntimeError):
@@ -91,6 +119,20 @@ def untruncate(title: str) -> tuple[str, bool]:
     return cut, cut != title
 
 
+def parse_links(value: str) -> dict:
+    """tasks-axi `links` -> {"pr": [...], "report": [...]}."""
+    out: dict[str, list[str]] = {"pr": [], "report": []}
+    for kind, ref in _LINK.findall(value or ""):
+        if ref not in out[kind]:
+            out[kind].append(ref)
+    return out
+
+
+def github_slug(remote_url: str) -> str:
+    m = _GH_SLUG.search((remote_url or "").strip())
+    return m.group(1) if m else ""
+
+
 def parse_meta(path: Path) -> dict:
     meta = {}
     try:
@@ -129,11 +171,18 @@ class Home:
     """One Firstmate home. `root` holds bin/ (the code), `home` holds state/
     and data/ (FM_HOME); they are the same directory in the usual layout."""
 
-    def __init__(self, home: Path, root: Path | None = None):
+    def __init__(self, home: Path, root: Path | None = None, gh: str | None = None):
         self.home = Path(home).resolve()
         self.root = Path(root).resolve() if root else self.home
         self.state = self.home / "state"
         self.data = self.home / "data"
+        self.gh = gh if gh is not None else (shutil.which("gh") or "")
+        # Done rows never change title, and a repo's GitHub remote rarely
+        # does: read each once instead of on every 10s refresh.
+        self._done_titles: dict[str, str] = {}
+        self._slugs: dict[str, str] = {}
+        self._issues: dict[tuple[str, str], dict] = {}
+        self._lock = threading.Lock()
 
     def env(self) -> dict:
         env = dict(os.environ)
@@ -156,7 +205,7 @@ class Home:
 
     # ── individual reads ──────────────────────────────────────────────────
     def tasks(self) -> list[dict]:
-        out = self.run("fm-tasks-axi.sh", "list", "--fields", "held,hold_kind,hold_reason,closed,created")
+        out = self.run("fm-tasks-axi.sh", "list", "--fields", "held,hold_kind,hold_reason,closed,created,links,blocked_by")
         return parse_table(out)
 
     def show(self, task_id: str) -> dict:
@@ -169,6 +218,74 @@ class Home:
 
     def receipts(self) -> dict:
         return json.loads(self.run("fm-inbox.sh", "receipts") or "{}")
+
+    def repo_slug(self, repo: str) -> str:
+        """`owner/name` of projects/<repo>'s GitHub origin, or "" if none."""
+        with self._lock:
+            if repo in self._slugs:
+                return self._slugs[repo]
+        slug, path = "", self.home / "projects" / repo
+        if repo and path.is_dir():
+            try:
+                p = subprocess.run(["git", "-C", str(path), "remote", "get-url", "origin"],
+                                   capture_output=True, text=True, timeout=5)
+                slug = github_slug(p.stdout) if p.returncode == 0 else ""
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        with self._lock:
+            self._slugs[repo] = slug
+        return slug
+
+    def signal_keys(self) -> list[tuple[str, str, str]]:
+        """(repo, issue number, latest updatedAt) per alert issue in the
+        evolution loop's seen-set, most recently updated first."""
+        try:
+            text = (self.state / SIGNALS_SEEN).read_text(errors="replace")
+        except OSError:
+            return []
+        latest: dict[tuple[str, str], str] = {}
+        for ln in text.splitlines():
+            m = _SIGNAL_ISSUE.match(ln.strip())
+            if m and m.group(3) > latest.get((m.group(1), m.group(2)), ""):
+                latest[(m.group(1), m.group(2))] = m.group(3)
+        keys = sorted(latest, key=lambda k: latest[k], reverse=True)[:SIGNAL_MAX]
+        return [(repo, n, latest[(repo, n)]) for repo, n in keys]
+
+    def issue(self, repo: str, number: str, updated: str) -> dict:
+        """One alert issue's state, from cache unless it is older than
+        SIGNAL_REFRESH_S or the loop saw a newer update. A failed lookup is
+        cached too, so a missing `gh` is not retried every refresh."""
+        now = time.time()
+        with self._lock:
+            hit = self._issues.get((repo, number))
+        if hit and hit["updated"] == updated and now - hit["checked"] < SIGNAL_REFRESH_S:
+            return hit
+        rec = {"repo": repo, "number": number, "updated": updated, "checked": now,
+               "state": "unknown", "title": "", "url": "", "error": ""}
+        slug = self.repo_slug(repo)
+        if slug:
+            rec["url"] = f"https://github.com/{slug}/issues/{number}"
+        if not slug:
+            rec["error"] = f"no projects/{repo} checkout with a GitHub origin"
+        elif not self.gh:
+            rec["error"] = "gh is not installed"
+        else:
+            try:
+                p = subprocess.run([self.gh, "issue", "view", number, "-R", slug, "--json", "state,title,url"],
+                                   capture_output=True, text=True, timeout=CMD_TIMEOUT_S)
+                if p.returncode == 0:
+                    d = json.loads(p.stdout)
+                    rec["state"] = str(d.get("state") or "unknown").lower()
+                    rec["title"] = str(d.get("title") or "")
+                    if str(d.get("url") or "").startswith("https://"):
+                        rec["url"] = d["url"]
+                else:
+                    rec["error"] = f"gh issue view: exit {p.returncode}: {(p.stderr or '').strip()[:160]}"
+            except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+                rec["error"] = f"gh issue view: {type(e).__name__}"
+        with self._lock:
+            self._issues[(repo, number)] = rec
+        return rec
 
     def status_tail(self, task_id: str) -> tuple[str, float | None, list[str]]:
         """(last event line, its mtime, PR URLs newest first) from state/<id>.status."""
@@ -211,11 +328,14 @@ class Home:
         except CommandError as e:
             return {"ok": False, "errors": [str(e)], "generated": _iso(dt.datetime.now().timestamp()),
                     "home": str(self.home), "decisions": [], "in_flight": [], "queued": [], "done": [],
-                    "counts": {}, "fingerprint": ""}
+                    "bounties": [], "counts": {}, "fingerprint": ""}
         for r in rows:
             r["title"], r["title_truncated"] = untruncate(r.get("title", ""))
-            for k in ("hold_reason", "hold_kind", "closed", "created", "held"):
+            for k in ("hold_reason", "hold_kind", "closed", "created", "held", "blocked_by"):
                 r[k] = _blank(r.get(k, ""))
+            r["links"] = parse_links(r.get("links", ""))
+            if r.get("state") == "done" and r["id"] in self._done_titles:
+                r["title"], r["title_truncated"] = self._done_titles[r["id"]], False
 
         holds = [r for r in rows if r.get("held") == "yes" and r.get("hold_kind") == "captain" and r.get("state") != "done"]
         hold_ids = {r["id"] for r in holds}
@@ -223,9 +343,10 @@ class Home:
         metas = {r["id"]: parse_meta(self.state / f"{r['id']}.meta") for r in live}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             shows = {r["id"]: pool.submit(self.show, r["id"])
-                     for r in rows if r["id"] in hold_ids or (r["title_truncated"] and r.get("state") != "done")}
+                     for r in rows if r["id"] in hold_ids or r["title_truncated"]}
             states = {r["id"]: pool.submit(self.crew_state, r["id"]) for r in live if metas[r["id"]]}
             receipts_f = pool.submit(self.receipts)
+            issues_f = [pool.submit(self.issue, *k) for k in self.signal_keys()]
 
         full = {}
         for tid, f in shows.items():
@@ -236,6 +357,8 @@ class Home:
         for r in rows:
             if r["id"] in full and full[r["id"]].get("title"):
                 r["title"], r["title_truncated"] = full[r["id"]]["title"], False
+                if r.get("state") == "done":
+                    self._done_titles[r["id"]] = r["title"]
 
         try:
             receipts = receipts_f.result()
@@ -280,20 +403,115 @@ class Home:
 
         queued = [{"id": r["id"], "title": r["title"], "repo": _blank(r.get("repo", "")), "kind": r.get("kind", ""),
                    "held": r.get("held") == "yes", "hold_kind": r.get("hold_kind", ""), "hold_reason": r.get("hold_reason", ""),
-                   "created": r.get("created", "")}
+                   "blocked_by": r.get("blocked_by", ""), "created": r.get("created", "")}
                   for r in rows if r.get("state") == "queued" and r["id"] not in hold_ids]
         done = sorted(({"id": r["id"], "title": r["title"], "repo": _blank(r.get("repo", "")), "kind": r.get("kind", ""),
-                        "closed": r.get("closed", ""), "prs": self.status_tail(r["id"])[2]}
+                        "closed": r.get("closed", ""), "links": r["links"],
+                        "report_files": [p for p in r["links"]["report"] if self.report_file(p)]}
                        for r in rows if r.get("state") == "done"), key=lambda d: d["closed"], reverse=True)
+        issues = [f.result() for f in issues_f]
+        board = bounties(decisions, queued, in_flight, done, issues)
 
         counts = {"open_decisions": len(decisions), "attention_tasks": sum(1 for t in in_flight if t["attention"]),
                   "in_flight": len(in_flight), "queued": len(queued), "done_recent": len(done)}
         fp_src = json.dumps([[d["id"], d["digest"], len(d["answers"])] for d in decisions]
                             + [[t["id"], t["crew"]["state"], t["last_event"]] for t in in_flight]
-                            + [[q["id"]] for q in queued] + [[d["id"]] for d in done])
+                            + [[q["id"]] for q in queued] + [[d["id"]] for d in done]
+                            + [[b["id"], b["status"]] for b in board])
         return {"ok": True, "errors": errors, "generated": _iso(dt.datetime.now().timestamp()), "home": str(self.home),
-                "decisions": decisions, "in_flight": in_flight, "queued": queued, "done": done, "counts": counts,
-                "fingerprint": hashlib.sha256(fp_src.encode()).hexdigest()[:16]}
+                "decisions": decisions, "in_flight": in_flight, "queued": queued, "done": done, "bounties": board,
+                "counts": counts, "fingerprint": hashlib.sha256(fp_src.encode()).hexdigest()[:16]}
+
+
+def _mentions(text: str, url: str, repo: str, number: str) -> bool:
+    """`text` names this issue by URL or `repo#n` (not `repo#n0`)."""
+    refs = [re.escape(url)] if url else []
+    refs.append(re.escape(f"{repo}#{number}"))
+    return re.search(f"(?:{'|'.join(refs)})(?!\\d)", text) is not None
+
+
+def bounties(decisions: list[dict], queued: list[dict], in_flight: list[dict], done: list[dict],
+             issues: list[dict]) -> list[dict]:
+    """Big Shot's board: Firstmate work outside the crew rooms, and the
+    evidence that closes it. A card reads `verified` only when the backlog
+    row records a merged PR (`pr:` link, written at landing cleanup) or a
+    report file that exists; nothing else, however done it looks, counts.
+
+    Sources: captain holds, queued backlog rows, crews that report done
+    before Firstmate records a delivery, closed rows (captain-kind rows are
+    answered calls, not deliveries, so they are left out, as Firstmate's
+    own Recently Landed does), and the evolution loop's alert issues."""
+    out: list[dict] = []
+
+    def add(bid, source, objective, owner, kind, status, note, evidence, proof=None, href=""):
+        out.append({"id": bid, "source": source, "objective": objective, "owner": owner or "(no repo)",
+                    "kind": kind, "status": status, "note": note, "evidence": evidence, "proof": proof, "href": href})
+
+    for d in decisions:
+        if d["answers"]:
+            picked = any(a["acknowledged"] for a in d["answers"])
+            status, note = "in_progress", ("Your answer reached Firstmate; it records the resolution next."
+                                           if picked else "Your answer is in Firstmate's inbox, not yet picked up.")
+        else:
+            status, note = "open", "Held for the captain; nothing moves until it is answered."
+        add(d["id"], "captain hold", d["title"], d["repo"], d["kind"], status, note,
+            "The resolution recorded on the backlog row.", href=f"#d-{d['id']}")
+    for q in queued:
+        if q["held"]:
+            note = f"Held ({q['hold_kind'] or 'hold'}): {q['hold_reason']}"
+        elif q["blocked_by"]:
+            note = f"Starts after {q['blocked_by']}."
+        else:
+            note = "Ready; no crew on it yet."
+        add(q["id"], "backlog", q["title"], q["repo"], q["kind"], "open", note,
+            EVIDENCE.get(q["kind"], EVIDENCE_DEFAULT))
+    for t in in_flight:
+        if t["crew"]["state"] == "done":
+            add(t["id"], "backlog", t["title"], t["repo"], t["kind"], "awaiting_evidence",
+                "Crew reports done; Firstmate has not recorded a merged PR or report on the row yet.",
+                EVIDENCE.get(t["kind"], EVIDENCE_DEFAULT), href=f"#t-{t['id']}")
+    for d in done:
+        if d["kind"] == "captain":
+            continue
+        if d["links"]["pr"]:
+            proof = {"kind": "pr", "ref": d["links"]["pr"][0]}
+        elif d["report_files"]:
+            proof = {"kind": "report", "ref": d["report_files"][0]}
+        else:
+            proof = None
+        add(d["id"], "backlog", _strip_proof(d["title"], proof), d["repo"], d["kind"],
+            "verified" if proof else "awaiting_evidence",
+            f"Closed {d['closed']}." if proof else f"Closed {d['closed']} with no merged PR or report on record.",
+            EVIDENCE.get(d["kind"], EVIDENCE_DEFAULT), proof)
+    for i in issues:
+        if i["state"] == "closed":
+            continue  # the alert cleared; the row that fixed it carries its own evidence
+        ref = f"{i['repo']}#{i['number']}"
+        live = next((t for t in in_flight if _mentions(t["title"] + " " + " ".join(t["prs"]), i["url"], i["repo"], i["number"])), None)
+        fixed = next((d for d in done if d["links"]["pr"]
+                      and _mentions(d["title"] + " " + " ".join(d["links"]["pr"]), i["url"], i["repo"], i["number"])), None)
+        if live:
+            status, note = "in_progress", f"Crew {live['id']} is on it."
+        elif fixed:
+            status, note = "awaiting_evidence", f"{fixed['id']} landed a fix; the alert issue is still open."
+        else:
+            status, note = "open", "No crew on it yet."
+        if i["error"]:
+            note += f" Issue state not re-checked: {i['error']}."
+        add(f"signal-{i['repo']}-{i['number']}", "evolution loop", i["title"] or f"Alert issue {ref}", i["repo"], "",
+            status, note, "The alert issue closed after a merged fix.",
+            {"kind": "issue", "ref": i["url"]} if i["url"] else None)
+    order = {s: n for n, s in enumerate(BOUNTY_STATUSES)}
+    out.sort(key=lambda b: order[b["status"]])
+    return out
+
+
+def _strip_proof(title: str, proof: dict | None) -> str:
+    """Firstmate appends the landed PR URL (or report path) to a closed row's
+    title; the card shows it as proof, so drop it from the objective."""
+    if proof:
+        title = title.replace(proof["ref"], "").strip()
+    return title
 
 
 def decision_digest(task_id: str, title: str, reason: str) -> str:
