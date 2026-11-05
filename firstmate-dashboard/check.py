@@ -59,7 +59,7 @@ def build_home(tmp: Path) -> Path:
 echo "fm-tasks-axi.sh $*" >> "{h}/cli-calls"
 case "$1" in
   list) cat "{h}/list.txt" 2>/dev/null || cat "{fx}/list.txt" ;;
-  show) cat "{fx}/show-$2.txt" ;;
+  show) cat "{h}/show-$2.txt" 2>/dev/null || cat "{fx}/show-$2.txt" ;;
   *) exit 2 ;;
 esac
 """)
@@ -215,6 +215,25 @@ def incremental(root: Path) -> None:
     backlog.write_text("# backlog\n- edited\n")
     _, ran = snap()
     check(shows(ran) == ["cap-long", "cap-xss"], "an edited backlog re-runs show")
+
+    # An answer is bound to the decision text as it stands, never a cached show.
+    snaps = server.Snapshots(home)
+    shown = snaps.refresh()
+    _, ran = snap()
+    check(shows(ran) == [], "the show cache is primed")
+    srv = server.Server(0, home, snaps)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _, _, page = request(srv.port, "GET", "/")
+        d = next(x for x in shown["decisions"] if x["id"] == "cap-xss")
+        (root / "show-cap-xss.txt").write_text((FIX / "show-cap-xss.txt").read_text().replace("Two calls", "Three calls"))
+        form = {"token": request_token(page.decode()), "decision": "cap-xss", "digest": d["digest"], "text": "Go with (a)."}
+        code, h, _ = request(srv.port, "POST", "/answer", urllib.parse.urlencode(form))
+        check(code == 303 and "changed+since" in h.get("Location", "") and not (root / "note-args").exists(),
+              "an answer to decision text changed since it was shown is refused, even with the show cached")
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:

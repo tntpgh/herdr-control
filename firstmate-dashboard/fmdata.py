@@ -348,7 +348,9 @@ class Home:
         return p if p.is_file() else None
 
     # ── the joined snapshot ───────────────────────────────────────────────
-    def snapshot(self) -> dict:
+    def snapshot(self, fresh: bool = False) -> dict:
+        """`fresh` re-runs every `show` (an answer's decision binding must not
+        rest on a cached record); crew readings are cached either way."""
         errors: list[str] = []
         try:
             rows = self.tasks()
@@ -376,7 +378,8 @@ class Home:
         stamps = {r["id"]: (_stamp(self.state / f"{r['id']}.meta"), _stamp(self.state / f"{r['id']}.status"))
                   for r in live if metas[r["id"]]}
         with self._lock:
-            full = {tid: rec for tid, (key, rec) in self._shows.items() if backlog and show_keys.get(tid) == key}
+            full = {tid: rec for tid, (key, rec) in self._shows.items()
+                    if backlog and not fresh and show_keys.get(tid) == key}
             crew = {tid: e for tid, e in self._crew.items() if tid in stamps}
         reread = [tid for tid in stamps if tid not in crew or crew[tid]["stamp"] != stamps[tid]]
         stale = sorted((crew[tid]["at"], tid) for tid in stamps

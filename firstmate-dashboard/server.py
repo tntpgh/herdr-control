@@ -66,9 +66,9 @@ class Snapshots:
             self.refresh()
             time.sleep(self.interval)
 
-    def refresh(self) -> dict:
+    def refresh(self, fresh: bool = False) -> dict:
         try:
-            snap = self.home.snapshot()
+            snap = self.home.snapshot(fresh=fresh)
         except Exception as e:  # noqa: BLE001 - a read bug must surface on the page, not kill the loop
             snap = {"ok": False, "errors": [f"snapshot failed: {type(e).__name__}: {e}"], "decisions": [],
                     "in_flight": [], "queued": [], "done": [], "bounties": [], "counts": {}, "fingerprint": "",
@@ -256,8 +256,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         text = get("text").replace("\r\n", "\n").strip()
         if not text or len(text) > render.MAX_ANSWER_CHARS:
             return self._redirect(theme, err=f"Answer must be 1-{render.MAX_ANSWER_CHARS} characters.")
-        # Re-read, not the cached snapshot: the binding check is only as fresh as this read.
-        snap = self.server.snaps.refresh()
+        # Re-read, not the cached snapshot, and every decision's `show` uncached:
+        # the binding check is only as fresh as this read.
+        snap = self.server.snaps.refresh(fresh=True)
         decision = next((d for d in snap.get("decisions", []) if d["id"] == get("decision")), None)
         if decision is None:
             return self._redirect(theme, err=f"Decision {get('decision')} is no longer open; nothing was sent.")
