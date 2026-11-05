@@ -24,7 +24,7 @@ flowchart LR
   W <--> DO[("Durable Object<br/>snapshot · results · notes · audit")]
   P["fm_publisher.py on the Mac<br/>every 15 s"] -- HMAC-signed sync --> W
   W -- owner_outbox --> P
-  P -- read --> F["fm-fleet-snapshot.sh · fm-inbox.sh ready"]
+  P -- read --> F["fm-fleet-snapshot.sh · fm-crew-state.sh · fm-inbox.sh ready"]
   P -- "the only write" --> N["fm-inbox.sh note"]
 ```
 
@@ -568,7 +568,7 @@ sync while `com.herdr-control.remote-mcp` is loaded.
 flowchart LR
   P["fm_publisher.py --loop<br/>(com.firstmate.fm-mcp-publisher)"] -->|"HMAC /ingest/sync every 15 s"| W[Worker]
   W -->|"owner_outbox · outbox · commands"| P
-  P -->|read| S["fm-fleet-snapshot.sh --json"]
+  P -->|read| S["fm-fleet-snapshot.sh --json · --contribution-input<br/>fm-crew-state.sh &lt;id&gt;"]
   P -->|read| R["fm-inbox.sh ready · receipts"]
   P -->|"the only write"| N["fm-inbox.sh note"]
   P -.->|"acked refused, never executed"| X["outbox · commands"]
@@ -625,23 +625,53 @@ flowchart LR
   cancel sweep) is acked `refused`. Every task is synced with
   `agent_live: false` and no pane/agent id, and `task_config` is `null`, so
   the Worker refuses those tools before queueing anything.
-- **Commands it may run:** `fm-fleet-snapshot.sh --json`, `fm-inbox.sh ready`,
+- **Commands it may run:** `fm-fleet-snapshot.sh --json`,
+  `fm-fleet-snapshot.sh --contribution-input`, `fm-crew-state.sh <task id>`
+  (one argument, a Firstmate id), `fm-inbox.sh ready`,
   `fm-inbox.sh receipts --after … --all-replies`,
   `fm-inbox.sh note --request-id … --json -`, `fm-inbox.sh announce --json <id>`.
   `run_cli` refuses anything else. The ingest key is stripped from their
   environment.
 
 **Cost.** One long-lived process (`--loop`), so no interpreter starts per
-tick. The fleet snapshot is the only heavy step (about 5 s of CPU on a
-12-task fleet), so it is rebuilt only when a stat fingerprint of its inputs
-(backlog, `state/*.meta|*.status`, `data/*/report.md`) changes, and never
-sooner than the CPU budget allows: the gap between rebuilds is at least the
-last rebuild's CPU divided by `REBUILD_CPU_BUDGET` (0.6% of one core), so a
-5 s rebuild runs at most every ~14 min, and a busier or larger fleet costs
-freshness, never CPU. Every snapshot carries its `generated_at`. A change to
-`read-scope`/`read-deny` rebuilds at once (if that rebuild fails, an empty
-snapshot is sent, never the old wider one). Between rebuilds each 15 s tick
-re-sends the cached snapshot; an unchanged `report.md` is not re-read.
+tick. The full fleet read (`fm-fleet-snapshot.sh --json`) is the heavy step:
+about 5–7 s of CPU on a 10-task fleet, nearly all of it one
+`fm-crew-state.sh` per task. So it runs rarely, and between full reads the
+publisher refreshes incrementally, every 2 min at most:
+
+- **delta** — a stat fingerprint of the inputs (backlog,
+  `state/*.meta|*.status`, `data/*/report.md`, the UTC day) changed. It re-reads
+  the backlog and task inventory (`--contribution-input`, ~0.15 s) and runs
+  `fm-crew-state.sh` only for tasks whose meta/status changed (at most two per
+  delta, a burst spreads over the next ones), and merges that onto the last
+  full read: a changed task gets its fresh state, a new task appears, a task
+  whose meta is gone drops, every task takes the inventory's kind and meta PR,
+  and every other field is carried over. Secondmate and remote tasks keep
+  their full-read state (no endpoint is probed). A delta does not
+  re-run Firstmate's status-stream fold, so until the next full read a
+  re-read task shows no last-event line, keeps an open-decision flag only until
+  its crew state has provably moved past it, and gets one when its state is a
+  status-log `parked` (a needs-decision line).
+- **confirm** — nothing changed: no command runs and the snapshot is
+  re-dated, unless an unchanged task's state is 15 min old, in which case that
+  one task is re-read.
+- **config** — `read-scope`/`read-deny` changed: see below.
+
+A failed read sends the last good snapshot as not live (`synced_degraded`) and
+is retried: a delta at the next gap, a full read one full gap after the
+attempt. A confirm runs no command, so it never clears that.
+
+`generated_at` is when the publisher last checked its inputs; each task card
+says when that task's state was observed (`state observed:`), since an
+unchanged task's state can be as old as the last full read. Everything stays
+inside `REBUILD_CPU_BUDGET` (0.6% of one core): full reads may use a third of
+it, deltas the rest, and the gap after each read is its CPU divided by its
+share (a 7 s full read runs about hourly, a 0.5 s delta every ~2 min), so a
+busier or larger fleet costs freshness, never CPU. A change to
+`read-scope`/`read-deny` is applied at once to the cached read, with no
+command and no wait (an empty snapshot is sent if there is no read yet, never
+a wider one). Each 15 s tick re-sends the cached snapshot; an unchanged
+`report.md` is not re-read.
 `fm-inbox.sh ready` runs at most once a minute and `receipts` only while a
 remote note awaits its reply. The LaunchAgent runs as
 `ProcessType=Background`, `Nice=10`, `LowPriorityIO`.
@@ -650,7 +680,9 @@ remote note awaits its reply. The LaunchAgent runs as
 (`fm-mcp-publisher-status.v1`) is rewritten every tick: `last_sync_at`, `ok`,
 `outcome` (`synced`, `synced_degraded`, `sync_failed`, `no_ingest_key`,
 `refused_old_publisher_loaded`), `detail`, `sync_ms`, `tick_ms`,
-`tick_cpu_ms`, `snapshot_generated_at`, `live_connected`, `tasks`,
+`tick_cpu_ms`, `snapshot_generated_at`, `refresh` (this tick's `full`,
+`delta`, `confirm`, `config`, or null), `rebuild_cpu_ms` (the last refresh's CPU),
+`full_cpu_ms`, `delta_cpu_ms`, `full_read_at`, `live_connected`, `tasks`,
 `awaiting_reply`, and `stale_after_s` (90, the Worker's own threshold: a
 `last_sync_at` older than that is what Dot/Duet see as `disconnected`; a
 missing file means the publisher never ran). Reading it is one small file,

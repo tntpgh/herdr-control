@@ -11,7 +11,8 @@ Trust boundary. Everything this file sends crosses from the Mac to Cloudflare,
 and everything it receives came from a phone app. So:
 
   * Reads go only through Firstmate's own CLIs: `fm-fleet-snapshot.sh --json`
-    and `fm-inbox.sh ready|receipts`. Nothing else in the Firstmate home is
+    and `--contribution-input`, `fm-crew-state.sh <task id>`, and
+    `fm-inbox.sh ready|receipts`. Nothing else in the Firstmate home is
     opened except `data/<task>/report.md` (single-link regular file, capped).
   * What leaves is an explicit allow-list mapping (build_snapshot): ids, titles,
     repos, branches, states, PR URLs, task kind/mode/yolo, hold reasons and the
@@ -34,11 +35,14 @@ and everything it receives came from a phone app. So:
     (`commands`) is acked `refused`, never executed. Every task is synced with
     agent_live=false and no pane/agent id, and task_config is null.
 
-Cost. The fleet snapshot costs seconds of CPU, so it is rebuilt only when a
-cheap stat fingerprint of its inputs changes (at most every MIN_REBUILD_S) or
-when it is MAX_SNAPSHOT_AGE_S old; between rebuilds each 15 s tick re-sends the
-cached snapshot. `--loop` keeps one process alive (no interpreter start per
-tick). The launchd template runs it as a Background process.
+Cost. A full fleet read costs seconds of CPU (one fm-crew-state.sh per task),
+so it runs rarely; in between, a delta re-reads only what a stat fingerprint
+says changed (the backlog and task inventory via `--contribution-input`, and
+`fm-crew-state.sh <id>` for a changed task) and merges it onto the last full
+read, every MIN_REBUILD_S at most, inside REBUILD_CPU_BUDGET (Publisher.refresh).
+Each 15 s tick re-sends the cached snapshot. `--loop` keeps one process alive
+(no interpreter start per tick). The launchd template runs it as a Background
+process.
 
 Usage:
   fm_publisher.py --dry-run   print the SyncBody it would send; no network, no writes
@@ -50,6 +54,7 @@ status.json is the read-only field a dashboard can show (last sync time/outcome)
 """
 from __future__ import annotations
 
+import copy
 import fcntl
 import fnmatch
 import hashlib
@@ -59,6 +64,7 @@ import re
 import resource
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -66,6 +72,7 @@ import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -99,12 +106,20 @@ RECEIPTS_SCHEMA = "fm-inbox-receipts.v1"
 STATUS_SCHEMA = "fm-mcp-publisher-status.v1"
 
 TICK_S = 15  # the Worker reports disconnected after 90 s without a sync
-MIN_REBUILD_S = 120
-MAX_SNAPSHOT_AGE_S = 900
-# Rebuilds may use at most this share of one core: the gap between rebuilds
-# stretches to last-rebuild-CPU / budget (5 s of CPU -> 14 min), so a busier
-# or bigger fleet costs freshness, never more CPU.
+# Refreshes may use at most REBUILD_CPU_BUDGET of one core. A full read
+# (`fm-fleet-snapshot.sh --json`, ~7 s of CPU, nearly all of it one
+# fm-crew-state.sh per task) may use FULL_CPU_SHARE of that; deltas (the
+# backlog and task inventory, plus fm-crew-state.sh for the few tasks whose
+# meta/status changed) use the rest. The gap after each read is its own CPU /
+# its share of the budget, so a busier or bigger fleet costs freshness, never
+# more CPU.
+MIN_REBUILD_S = 120  # floor between refreshes: the snapshot is at most ~2 min old
+FULL_MIN_S = 900  # floor between full reads
+STALE_TASK_S = 900  # an unchanged task's state is re-read once this old, when nothing else changed
+MAX_OBSERVE_PER_DELTA = 2  # a burst of changed tasks spreads over deltas instead of one long gap
 REBUILD_CPU_BUDGET = 0.006
+FULL_CPU_SHARE = 1 / 3
+CREW_STATE_TIMEOUT_S = 10  # fm-fleet-snapshot.sh's FM_SNAPSHOT_CREW_STATE_TIMEOUT default
 READY_EVERY_S = 60
 GUARD_EVERY_S = 60
 SNAPSHOT_TIMEOUT_S = 12
@@ -144,11 +159,14 @@ TRANSIENT_REPLY = ("ignored:queued", "ignored:delivering", "retry:", "rejected:e
 # The complete set of Firstmate commands this publisher may run.
 ALLOWED_CLI = {
     ("fm-fleet-snapshot.sh", "--json"),
+    ("fm-fleet-snapshot.sh", "--contribution-input"),
     ("fm-inbox.sh", "ready"),
     ("fm-inbox.sh", "receipts"),
     ("fm-inbox.sh", "note"),
     ("fm-inbox.sh", "announce"),
 }
+# ...plus these, with exactly one argument: a Firstmate task id.
+PER_TASK_CLI = ("fm-crew-state.sh",)
 
 CREW_TO_WORKER = {"working": "running", "parked": "parked", "paused": "paused",
                   "blocked": "blocked", "failed": "error", "unknown": "unknown"}
@@ -217,7 +235,9 @@ def child_env(extra: dict | None = None) -> dict:
 
 def run_cli(argv: list[str], stdin: str | None = None, timeout: float = CLI_TIMEOUT_S,
             extra_env: dict | None = None) -> subprocess.CompletedProcess:
-    if (argv[0], argv[1]) not in ALLOWED_CLI:
+    allowed = (argv[0], argv[1]) in ALLOWED_CLI or (
+        argv[0] in PER_TASK_CLI and len(argv) == 2 and bool(ID_RE.match(argv[1])))
+    if not allowed:
         raise PermissionError(f"not an allowed Firstmate command: {argv[:2]}")
     return subprocess.run([str(FM_BIN / argv[0]), *argv[1:]], input=stdin, capture_output=True, text=True,
                           timeout=timeout, env=child_env(extra_env), cwd=str(FM_HOME) if FM_HOME.is_dir() else None)
@@ -241,6 +261,39 @@ def read_fleet(cache_dir: Path) -> dict:
     return _json_out(proc, FLEET_SCHEMA)
 
 
+def read_contribution_input() -> dict:
+    """The backlog and task inventory without observing any worker: the same
+    backlog parse `--json` embeds, plus one {id, kind, pr} per state/<id>.meta."""
+    proc = run_cli(["fm-fleet-snapshot.sh", "--contribution-input"], timeout=SNAPSHOT_TIMEOUT_S)
+    if proc.returncode != 0:
+        raise ValueError(f"fm-fleet-snapshot.sh --contribution-input exited {proc.returncode}")
+    doc = json.loads(proc.stdout)
+    if not (isinstance(doc, dict) and isinstance(doc.get("backlog"), dict) and isinstance(doc.get("tasks"), list)):
+        raise ValueError("unexpected --contribution-input shape")
+    return doc
+
+
+CREW_SEP = " · "
+
+
+def read_crew_state(task_id: str, observed_at: str) -> dict:
+    """One task's current state from `fm-crew-state.sh <id>`, parsed and
+    bounded as fm-fleet-snapshot.sh's crew_state_json does: a failed, slow or
+    unparseable read is state unknown, source none."""
+    raw = ""
+    try:
+        proc = run_cli(["fm-crew-state.sh", task_id], timeout=CREW_STATE_TIMEOUT_S)
+        raw = (proc.stdout.splitlines() or [""])[0]
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"fm-crew-state.sh {task_id} unreadable ({exc}); state unknown")
+    state, source, detail = "unknown", "none", ""
+    if raw.startswith("state: ") and f"{CREW_SEP}source: " in raw:
+        state, rest = raw[len("state: "):].split(f"{CREW_SEP}source: ", 1)
+        source, _, detail = rest.partition(CREW_SEP)
+    return {"state": state, "source": source, "detail": detail, "raw": raw,
+            "observed_at": observed_at, "freshness": "fresh"}
+
+
 def read_ready() -> dict | None:
     try:
         return _json_out(run_cli(["fm-inbox.sh", "ready"]), READY_SCHEMA)
@@ -249,12 +302,17 @@ def read_ready() -> dict | None:
         return None
 
 
-def _stat_line(p: Path) -> str:
+def _stamp(p: Path) -> tuple[str, int | None]:
+    """(`mtime_ns|size`, mtime_ns), or ("-", None) when p is unreadable."""
     try:
         st = p.stat()
-        return f"{p}|{st.st_mtime_ns}|{st.st_size}\n"
+        return f"{st.st_mtime_ns}|{st.st_size}", st.st_mtime_ns
     except OSError:
-        return f"{p}|-\n"
+        return "-", None
+
+
+def _stat_line(p: Path) -> str:
+    return f"{p}|{_stamp(p)[0]}\n"
 
 
 def config_fingerprint() -> str:
@@ -262,29 +320,48 @@ def config_fingerprint() -> str:
     return hashlib.sha256("".join(_stat_line(CONFIG_DIR / n) for n in ("read-scope", "read-deny")).encode()).hexdigest()
 
 
-def fingerprint() -> str:
-    """Cheap stat-only digest of everything the fleet snapshot reads that a
-    file change can signal: the backlog, task metadata and status logs, and
-    scout reports."""
-    h = hashlib.sha256()
+class Inputs(NamedTuple):
+    fp: str  # digest of everything below plus the UTC day (hold buckets turn on dates)
+    stamps: dict  # task id -> its meta/status stat stamp
+    status_mtime: dict  # task id -> state/<id>.status mtime
+    reports: list  # ids with a regular data/<id>/report.md under a real directory
 
-    def add(p: Path) -> None:
-        h.update(_stat_line(p).encode())
 
-    add(FM_HOME / "data/backlog.md")
+def scan_inputs(day: str) -> Inputs:
+    """One stat pass over everything the fleet snapshot reads that a file
+    change can signal: the backlog, task metadata and status logs, and scout
+    reports. No file is opened."""
+    h = hashlib.sha256(f"day|{day}\n".encode())
+    h.update(_stat_line(FM_HOME / "data/backlog.md").encode())
+    state = FM_HOME / "state"
     try:
-        names = sorted(e.name for e in os.scandir(FM_HOME / "state") if e.name.endswith((".meta", ".status")))
+        names = sorted(e.name for e in os.scandir(state) if e.name.endswith((".meta", ".status")))
     except OSError:
         names = []
+    parts: dict[str, dict[str, str]] = {}
+    status_mtime: dict[str, float] = {}
     for n in names:
-        add(FM_HOME / "state" / n)
+        stamp, mtime_ns = _stamp(state / n)
+        h.update(f"{state / n}|{stamp}\n".encode())
+        tid, ext = n.rsplit(".", 1)
+        parts.setdefault(tid, {})[ext] = stamp
+        if ext == "status" and mtime_ns is not None:
+            status_mtime[tid] = mtime_ns / 1e9
     try:
         dirs = sorted(e.name for e in os.scandir(FM_HOME / "data") if e.is_dir(follow_symlinks=False))
     except OSError:
         dirs = []
+    reports = []
     for n in dirs:
-        add(FM_HOME / "data" / n / "report.md")
-    return h.hexdigest()
+        p = FM_HOME / "data" / n / "report.md"
+        h.update(_stat_line(p).encode())
+        try:
+            if stat.S_ISREG(p.lstat().st_mode):
+                reports.append(n)
+        except OSError:
+            pass
+    stamps = {tid: f"{v.get('meta', '-')}/{v.get('status', '-')}" for tid, v in parts.items() if "meta" in v}
+    return Inputs(h.hexdigest(), stamps, status_mtime, reports)
 
 
 # ── snapshot (the egress allow-list) ───────────────────────────────────────────
@@ -407,14 +484,15 @@ def _decision(rec: dict, title: str, gen_dt: datetime, reports: set[str]) -> dic
             "age_days": age, "origin": origin if origin in reports else None, "report_id": report_id}
 
 
-def _card(row: dict, rec: dict, task: dict, hold: str | None, last_event: str | None, detail: str | None) -> str:
+def _card(row: dict, rec: dict, task: dict, hold: str | None, last_event: str | None, detail: str | None,
+          observed: str | None) -> str:
     lines = [f"task: {row['task_id']}"]
     for key, val in (("title", row["label"]), ("kind", task.get("kind") or rec.get("kind")),
                      ("mode", task.get("mode")), ("yolo", task.get("yolo")), ("repo", row["repo"]),
                      ("branch", row["branch"]),
                      ("state", f"{row['state']} (crew: {row['stored_state'] or 'none'} via {row['state_source'] or 'none'})"),
-                     ("detail", detail), ("pr", row["closure_proof"]), ("captain hold", hold),
-                     ("last event", last_event)):
+                     ("detail", detail), ("state observed", observed), ("pr", row["closure_proof"]),
+                     ("captain hold", hold), ("last event", last_event)):
         if val:
             lines.append(f"{key}: {txt(val, TEXT_CAP if key in ('last event', 'captain hold', 'detail') else TITLE_CAP)}")
     return "\n".join(lines) + "\n"
@@ -475,7 +553,7 @@ def build_snapshot(fleet: dict, scope: str, deny: list[str], now: datetime,
         hold = rec.get("hold_reason") if rec.get("captain_actionable") else None
         detail = cur.get("detail") or None
         report = _report_path(tid)
-        local[tid] = {"card": _card(row, rec, task, hold, last_event_raw, detail),
+        local[tid] = {"card": _card(row, rec, task, hold, last_event_raw, detail, day_iso(cur.get("observed_at"))),
                       "report": str(report) if report else None, "updated_at": updated}
 
         endpoint = task.get("endpoint") or {}
@@ -491,7 +569,7 @@ def build_snapshot(fleet: dict, scope: str, deny: list[str], now: datetime,
                              "since": day_iso(rec.get("hold_set")) or created})
         elif state != "completed" and (crew == "blocked" or hints.get("pending_decision")):
             blockers.append({"task_id": tid, "label": row["label"], "pane_id": None, "agent_id": None,
-                             "kind": "blocked", "tool": None, "summary": txt(last_event_raw), "since": updated})
+                             "kind": "blocked", "tool": None, "summary": txt(last_event_raw or detail), "since": updated})
 
     open_count = sum(1 for i in order if (rec_by_id.get(i) or {}).get("captain_actionable"))
     hub = {"rev": FLEET_SCHEMA, "live_connected": False, "herdr_reachable": False,
@@ -535,6 +613,86 @@ def empty_snapshot(now: datetime) -> dict:
                     "open_decisions": None, "handoff_debt": None},
             "agents": [], "tasks": [], "blockers": [], "task_config": None, "browser": None, "owners": [],
             "firstmate": None, "decisions": [], "reports": []}
+
+
+# ── incremental refresh: a delta merged onto the last full read ────────────────
+def trim_fleet(fleet: dict, now: datetime) -> dict:
+    """The parts of a full fm-fleet-snapshot.v1 doc build_snapshot reads, kept
+    as the base every later delta is merged onto."""
+    return {"schema": FLEET_SCHEMA, "generated": day_iso(fleet.get("generated")) or z(now),
+            "backlog": fleet.get("backlog") or {},
+            "tasks": sorted((t for t in fleet.get("tasks") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)),
+                            key=lambda t: t["id"]),
+            "scout_reports": fleet.get("scout_reports") or []}
+
+
+def _last_event(task: dict) -> dict:
+    return ((task.get("paths") or {}).get("status_log") or {}).get("last_event") or {}
+
+
+def reage(raw: dict, now: datetime) -> dict:
+    """A copy of `raw` dated `now`. Every carried event age grows by the time
+    since raw's own date, so an unchanged task keeps its updated_at."""
+    out = copy.deepcopy(raw)
+    then = datetime.strptime(raw["generated"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    shift = max(0, int((now.replace(microsecond=0) - then).total_seconds()))
+    for t in out["tasks"]:
+        ev = _last_event(t)
+        if type(ev.get("age_seconds")) is int:
+            ev["age_seconds"] += shift
+    out["generated"] = z(now)
+    return out
+
+
+def observed_epoch(task: dict | None) -> float | None:
+    at = day_iso(((task or {}).get("current_state") or {}).get("observed_at"))
+    return datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() if at else None
+
+
+def observe_task(row: dict | None, task_id: str, inv: dict, crew: dict | None, now: datetime,
+                 status_mtime: float | None) -> dict:
+    """A task row after a delta: the inventory's kind/PR and, when `crew` was
+    read, its fresh current state over the last full read's row (a task new
+    since then starts bare, state unknown until its first read). The full
+    read's status-stream fold is not re-run, so its open-decision hint is kept
+    only until the crew state has provably moved past it (the rule
+    fm-fleet-snapshot.sh itself applies), and a status-log `parked` (which only
+    a needs-decision line produces) opens one. The event text waits for the
+    next full read; the status log's mtime stands in for the event time."""
+    new = copy.deepcopy(row) if row else {"id": task_id, "pr": {"url": None}, "hints": {}, "paths": {}, "endpoint": {},
+                                          "current_state": {"state": "unknown", "source": "none",
+                                                            "detail": "new task, not yet observed", "raw": ""}}
+    new["kind"] = inv.get("kind") or new.get("kind") or "ship"
+    if isinstance(inv.get("pr"), dict):  # the meta's PR: set it, or drop a meta-sourced one the meta no longer has
+        url = inv["pr"].get("url")
+        if isinstance(url, str) and url:
+            new["pr"] = {**(new.get("pr") or {}), "url": url, "source": "meta"}
+        elif (new.get("pr") or {}).get("source") == "meta":
+            new["pr"] = {**new["pr"], "url": None, "source": "absent"}
+    if crew is None:
+        return new
+    new["current_state"] = crew
+    state, source = crew["state"], crew["source"]
+    pending = bool((new.get("hints") or {}).get("pending_decision"))
+    if (source in ("run-step", "pane") and state not in ("parked", "blocked")) or state in ("done", "failed"):
+        pending = False
+    elif state == "parked" and source == "status-log":
+        pending = True
+    new["hints"] = {**(new.get("hints") or {}), "pending_decision": pending, "last_event_text": None}
+    if status_mtime is not None:
+        paths = new.setdefault("paths", {})
+        paths["status_log"] = {**(paths.get("status_log") or {}),
+                               "last_event": {"age_seconds": max(0, int(now.timestamp() - status_mtime))}}
+    return new
+
+
+def scout_rows(report_ids: list[str], tasks: list[dict], backlog: dict) -> list[dict]:
+    """fm-fleet-snapshot.sh's scout_reports for the ids on disk: kind from the
+    task, else its backlog row, else scout."""
+    kinds = {r["id"]: r.get("kind") for r in backlog.get("records") or []
+             if isinstance(r, dict) and r.get("structured") and isinstance(r.get("id"), str)}
+    kinds.update({t["id"]: t.get("kind") for t in tasks if t.get("kind")})
+    return [{"id": i, "kind": kinds.get(i) or "scout"} for i in report_ids]
 
 
 def apply_ready(base: dict, ready: dict | None, fleet_ok: bool) -> dict:
@@ -846,11 +1004,17 @@ class Publisher:
         self.base: dict | None = None
         self.local: dict = {}
         self.titles: dict = {}
+        self.raw: dict | None = None  # the last full read with every delta since merged in
+        self.observed: dict[str, str | None] = {}  # task id -> its input stamp when its state was last read
         self.fleet_ok = False
         self.built_at = 0.0
+        self.full_at = 0.0  # the last successful full read
+        self.full_try_at = 0.0  # the last full read attempted
         self.fp: str | None = None
         self.cfp: str | None = None
         self.rebuild_cpu_s = 0.0
+        self.full_cpu_s = 0.0
+        self.delta_cpu_s = 0.0
         self.ready: dict | None = None
         self.ready_at = 0.0
         self.guard_at = 0.0
@@ -861,53 +1025,145 @@ class Publisher:
         if isinstance(cached, dict) and isinstance(cached.get("base"), dict):
             self.base, self.local = cached["base"], cached.get("local") or {}
             self.titles = cached.get("titles") or {}
+            raw = cached.get("raw")
+            self.raw = raw if isinstance(raw, dict) and isinstance(raw.get("tasks"), list) else None
+            self.observed = cached.get("observed") or {}
             self.built_at, self.fp = float(cached.get("built_at") or 0), cached.get("fingerprint")
+            self.full_at = float(cached.get("full_at") or 0)
+            self.full_try_at = float(cached.get("full_try_at") or 0)
             self.cfp = cached.get("config_fingerprint")
             self.rebuild_cpu_s = float(cached.get("rebuild_cpu_s") or 0)
+            self.full_cpu_s = float(cached.get("full_cpu_s") or 0)
+            self.delta_cpu_s = float(cached.get("delta_cpu_s") or 0)
             self.fleet_ok = bool(cached.get("fleet_ok"))
         prev = read_status()
         self.last_sync_at = prev.get("last_sync_at") if prev else None
 
-    def refresh(self, now: datetime, persist: bool, cache_dir: Path) -> bool:
-        """Rebuild the base snapshot when its inputs changed or it is old, but
-        no more often than the CPU budget allows: a rebuild costs seconds of CPU
-        (fm-fleet-snapshot.sh), so the gap between rebuilds is at least the last
-        rebuild's CPU / REBUILD_CPU_BUDGET. A scope/deny change bypasses the gap:
-        narrowing what leaves the Mac must not wait. Returns True if rebuilt."""
+    def refresh(self, now: datetime, persist: bool, cache_dir: Path) -> str | None:
+        """Refresh the base snapshot inside the CPU budget. Returns the kind
+        run, or None:
+          full     fm-fleet-snapshot.sh --json, every task observed. Runs when
+                   there is no full read yet, else at most every FULL_MIN_S and
+                   never sooner than its CPU / its share of the budget.
+          delta    the inputs' stat fingerprint changed: the backlog and task
+                   inventory re-read, fm-crew-state.sh for up to
+                   MAX_OBSERVE_PER_DELTA changed tasks (else for one task whose
+                   state is STALE_TASK_S old); every other task carried over.
+          confirm  nothing changed and nothing is stale: no command runs; the
+                   snapshot is re-dated (each task card still says when its
+                   state was observed).
+          config   read-scope/read-deny changed: applied to the cached read at
+                   once, no command and no wait (narrowing what leaves the Mac
+                   must not wait); with no read yet, a full read runs instead.
+        A delta/confirm runs every MIN_REBUILD_S, never sooner than the last
+        one's CPU / the deltas' share."""
         wall = time.time()
-        fp, cfp = fingerprint(), config_fingerprint()
-        age = wall - self.built_at
-        gap = max(MIN_REBUILD_S, self.rebuild_cpu_s / REBUILD_CPU_BUDGET)
-        due = (self.base is None or cfp != self.cfp or age >= max(MAX_SNAPSHOT_AGE_S, gap)
-               or (fp != self.fp and age >= gap))
-        if not due:
-            return False
+        inputs, cfp = scan_inputs(now.strftime("%Y-%m-%d")), config_fingerprint()
+        full_gap = max(FULL_MIN_S, self.full_cpu_s / (REBUILD_CPU_BUDGET * FULL_CPU_SHARE))
+        delta_gap = max(MIN_REBUILD_S, self.delta_cpu_s / (REBUILD_CPU_BUDGET * (1 - FULL_CPU_SHARE)))
+        if self.raw is not None and cfp != self.cfp:
+            # Narrowing what leaves the Mac never waits for, or needs, a read.
+            self.base, self.local, self.titles = build_snapshot(self.raw, read_scope(), read_deny(), now, self.titles)
+            self.cfp = cfp
+            if persist:
+                self.save()
+            return "config"
+        if self.raw is None:
+            kind = "full" if self.base is None or cfp != self.cfp or wall - self.built_at >= MIN_REBUILD_S else None
+        elif wall - max(self.full_at, self.full_try_at) >= full_gap:  # a failed full read waits a gap too
+            kind = "full"
+        elif wall - self.built_at >= delta_gap:
+            kind = "delta"
+        else:
+            kind = None
+        if kind is None:
+            return None
         scope, deny = read_scope(), read_deny()
         cpu0 = _cpu_s()
         try:
-            fleet = read_fleet(cache_dir)
-            self.base, self.local, self.titles = build_snapshot(fleet, scope, deny, now, self.titles)
-            self.fleet_ok = True
+            if kind == "full":
+                self.full_try_at = wall
+                raw = trim_fleet(read_fleet(cache_dir), now)
+                observed = {t["id"]: inputs.stamps.get(t["id"]) for t in raw["tasks"]}
+            else:
+                raw, observed, kind = self.delta(now, inputs)
+            self.base, self.local, self.titles = build_snapshot(raw, scope, deny, now, self.titles)
+            self.raw, self.observed, self.fp = raw, observed, inputs.fp
+            if kind == "full":
+                self.full_at = wall
+            if kind != "confirm":  # a confirm ran no command, so it cannot clear a failed read
+                self.fleet_ok = True
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-            log(f"fleet snapshot unreadable ({exc}); re-sending the last good snapshot as not live")
+            # self.fp and self.full_at stay put, so the read is retried.
+            log(f"fleet {kind} read failed ({exc}); re-sending the last good snapshot as not live")
             self.fleet_ok = False
-            if self.base is None:
+            if self.base is None or cfp != self.cfp:  # no read yet: nothing to narrow but an empty snapshot
                 self.base, self.local = empty_snapshot(now), {}
-            elif cfp != self.cfp:  # cannot re-apply a narrower scope/deny to the old snapshot
-                self.base, self.local = empty_snapshot(now), {}
-        self.rebuild_cpu_s = _cpu_s() - cpu0
-        self.built_at, self.fp, self.cfp = wall, fp, cfp
-        self.ready_at = 0.0  # read liveness alongside a rebuild
+        cost = _cpu_s() - cpu0
+        if kind == "full":
+            self.full_cpu_s = cost
+        else:
+            self.delta_cpu_s = cost
+        self.rebuild_cpu_s = cost
+        self.built_at, self.cfp = wall, cfp
+        if kind != "confirm":
+            self.ready_at = 0.0  # read liveness alongside a read
         if persist:
-            _write_json(STATE_DIR / "snapshot.json", {"base": self.base, "local": self.local, "titles": self.titles,
-                                                       "built_at": self.built_at,
-                                                       "fingerprint": fp, "config_fingerprint": cfp,
-                                                       "rebuild_cpu_s": self.rebuild_cpu_s, "fleet_ok": self.fleet_ok})
-        return True
+            self.save()
+        return kind
 
-    def body(self, now: datetime, st: dict, persist: bool, cache_dir: Path) -> tuple[dict, bool]:
+    def save(self) -> None:
+        _write_json(STATE_DIR / "snapshot.json", {
+            "base": self.base, "local": self.local, "titles": self.titles, "raw": self.raw,
+            "observed": self.observed, "built_at": self.built_at, "full_at": self.full_at,
+            "full_try_at": self.full_try_at, "fingerprint": self.fp, "config_fingerprint": self.cfp,
+            "rebuild_cpu_s": self.rebuild_cpu_s, "full_cpu_s": self.full_cpu_s, "delta_cpu_s": self.delta_cpu_s,
+            "fleet_ok": self.fleet_ok})
+
+    def delta(self, now: datetime, inputs: Inputs) -> tuple[dict, dict, str]:
+        """self.raw brought up to `now` reading only what changed (see refresh)."""
+        raw = reage(self.raw, now)
+        old = {t["id"]: t for t in raw["tasks"]}
+        kind = "confirm"
+        if inputs.fp != self.fp:
+            ci = read_contribution_input()
+            inv = {t["id"]: t for t in ci["tasks"]
+                   if isinstance(t, dict) and isinstance(t.get("id"), str) and ID_RE.match(t["id"])}
+            raw["backlog"], kind = ci["backlog"], "delta"
+        else:  # same fingerprint, same state/*.meta set
+            inv = {tid: {} for tid in old}
+
+        def readable(tid: str) -> bool:
+            # A secondmate's state is the full read's: fm-fleet-snapshot.sh
+            # never probes a remote endpoint, and a new one may be remote.
+            row = old.get(tid) or {}
+            return not row.get("remote") and (inv[tid].get("kind") or row.get("kind")) != "secondmate"
+
+        changed = sorted((tid for tid in inv if readable(tid) and
+                          (tid not in old or self.observed.get(tid) != inputs.stamps.get(tid))),
+                         key=lambda tid: (tid in old, observed_epoch(old.get(tid)) or 0.0, tid))
+        observe = changed[:MAX_OBSERVE_PER_DELTA]
+        if not observe:
+            stale = sorted((at or 0.0, tid) for tid in inv if tid in old and readable(tid)
+                           for at in [observed_epoch(old[tid])] if at is None or now.timestamp() - at >= STALE_TASK_S)
+            observe = [stale[0][1]] if stale else []
+        tasks, observed = [], {}
+        for tid in sorted(inv):
+            if tid in observe:
+                crew = read_crew_state(tid, raw["generated"])
+                tasks.append(observe_task(old.get(tid), tid, inv[tid], crew, now, inputs.status_mtime.get(tid)))
+                observed[tid], kind = inputs.stamps.get(tid), "delta"
+            else:
+                tasks.append(observe_task(old.get(tid), tid, inv[tid], None, now, None))
+                observed[tid] = self.observed.get(tid)
+        raw["tasks"] = tasks
+        if inputs.fp != self.fp:
+            raw["scout_reports"] = scout_rows(inputs.reports, tasks, raw["backlog"])
+        return raw, observed, kind
+
+    def body(self, now: datetime, st: dict, persist: bool, cache_dir: Path) -> tuple[dict, str | None]:
         mono = time.monotonic()
-        rebuilt = self.refresh(now, persist, cache_dir)
+        refreshed = self.refresh(now, persist, cache_dir)
         if mono - self.ready_at >= READY_EVERY_S or self.ready_at == 0.0:
             self.ready, self.ready_at = read_ready(), mono
         snapshot = apply_ready(self.base, self.ready, self.fleet_ok)
@@ -916,7 +1172,7 @@ class Publisher:
         return {"snapshot": snapshot, "results": results, "acks": st.get("pending_acks") or [],
                 "command_acks": st.get("pending_command_acks") or [],
                 "owner_acks": st.get("pending_owner_acks") or [], "owner_replies": [],
-                "audit_cursor": st.get("audit_cursor", 0), "lease": True}, rebuilt
+                "audit_cursor": st.get("audit_cursor", 0), "lease": True}, refreshed
 
     def guard(self, mono: float) -> bool:
         if mono - self.guard_at >= GUARD_EVERY_S or self.guard_at == 0.0:
@@ -943,7 +1199,7 @@ class Publisher:
             return finish(1, "no_ingest_key")
 
         st = load_state()
-        body, rebuilt = self.body(now, st, True, STATE_DIR / "snapshot-cache")
+        body, refreshed = self.body(now, st, True, STATE_DIR / "snapshot-cache")
         snap = body["snapshot"]
         retry_announces(st, now.timestamp())
         rows, replies = collect_replies(st)
@@ -1008,8 +1264,11 @@ class Publisher:
                 log(f"ack sync failed, acks re-sent next tick: {exc}")
         pending = sum(1 for ex in st["exchanges"].values() if ex.get("announced") and not ex.get("settled"))
         return finish(0, "synced" if snap["hub"]["live_connected"] else "synced_degraded",
-                      sync_ms=round(sync_ms, 1), snapshot_generated_at=snap["generated_at"], snapshot_rebuilt=rebuilt,
+                      sync_ms=round(sync_ms, 1), snapshot_generated_at=snap["generated_at"],
+                      snapshot_rebuilt=refreshed is not None, refresh=refreshed,
                       rebuild_cpu_ms=round(self.rebuild_cpu_s * 1000, 1),
+                      full_cpu_ms=round(self.full_cpu_s * 1000, 1), delta_cpu_ms=round(self.delta_cpu_s * 1000, 1),
+                      full_read_at=z(datetime.fromtimestamp(self.full_at, timezone.utc)) if self.full_at else None,
                       live_connected=snap["hub"]["live_connected"], tasks=len(snap["tasks"]),
                       results=len(body["results"]), awaiting_reply=pending)
 
@@ -1023,7 +1282,7 @@ def dry_run() -> int:
     """The SyncBody the next tick would send: no network, no Firstmate writes,
     no state written (the snapshot cache goes to a throwaway directory)."""
     pub = Publisher()
-    pub.base = None  # always a fresh read
+    pub.base, pub.raw = None, None  # always a fresh full read
     with tempfile.TemporaryDirectory(prefix="fm-mcp-dry-") as tmp:
         body, _ = pub.body(datetime.now(timezone.utc), load_state() | {"results": {}}, False, Path(tmp))
     json.dump(body, sys.stdout, indent=1)
