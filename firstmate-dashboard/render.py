@@ -314,8 +314,8 @@ function watchArt(){if(!io)return;io.disconnect();var a=$('.fm-art');if(a)io.obs
 watchArt();
 function rel(iso){var t=Date.parse(iso);if(isNaN(t))return '';var s=(Date.now()-t)/1000;if(s<45)return 'just now';
 var m=Math.round(s/60);if(m<60)return m+'m ago';var h=Math.round(m/60);return h<48?h+'h ago':Math.round(h/24)+'d ago'}
-function times(r){$$('time[datetime]',r).forEach(function(e){var iso=e.getAttribute('datetime'),x=rel(iso);
-if(x){e.textContent=x;e.title=new Date(iso).toLocaleString()}})}
+function times(r){$$('time[datetime]',r).forEach(function(e){var iso=e.getAttribute('datetime'),x=rel(iso);if(!x)return;
+var t=new Date(iso).toLocaleString();if(e.textContent!==x)e.textContent=x;if(e.title!==t)e.title=t})}
 var q='',bs='',auto=false,fi=$('#fm-find'),fn=$('#fm-find-n');
 function apply(){var n=0;$$('.fm-decision,.fm-bounty,.fm-room tbody tr').forEach(function(e){
 var hit=!q||e.textContent.toLowerCase().indexOf(q)>=0;if(q&&hit)n++;
