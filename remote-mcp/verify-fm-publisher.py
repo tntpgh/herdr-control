@@ -894,8 +894,8 @@ class SyncTarget(unittest.TestCase):
         [public_url] = re.findall(r'"PUBLIC_URL":\s*"([^"]+)"', "\n".join(live))
         self.assertEqual(self.load_sync_client(None).URL, public_url)
 
-    def test_herdr_mcp_url_still_overrides_it_for_rollback(self):
-        self.assertEqual(self.load_sync_client("https://herdr-mcp.teamthurber.com/").URL, "https://herdr-mcp.teamthurber.com")
+    def test_herdr_mcp_url_overrides_it(self):
+        self.assertEqual(self.load_sync_client("https://staging.example.test/").URL, "https://staging.example.test")
 
 
 

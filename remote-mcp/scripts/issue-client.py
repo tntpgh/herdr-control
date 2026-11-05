@@ -31,8 +31,8 @@ before the credential is used.
                      fm:decide-note) fails this; reconnect to re-consent.
   read               fm:read, fm:reports -- look, never write.
   legacy-peer-inbox  herdr:read, herdr:message.owner -- a connection made at
-                     herdr-mcp before the cutover, still honoured while the
-                     Worker's LEGACY_HERDR_SCOPES is "true".
+                     herdr-mcp before the cutover; honoured only if the
+                     Worker's LEGACY_HERDR_SCOPES is set back to "true".
 Either way the check is an EXACT set match: anything extra or missing is
 refused, never silently narrowed or widened. A client with several grants
 is checked against the one that matches, if any.
