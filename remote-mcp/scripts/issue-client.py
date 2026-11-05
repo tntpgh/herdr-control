@@ -26,8 +26,9 @@ before the credential is used.
 --profile (default: the name's own profile, for dot and duet):
   dot                fm:read, fm:reports, fm:request, fm:decide-note, fm:peer
                      -- Dot's whole grant ceiling.
-  duet               fm:read, fm:reports, fm:request, fm:peer -- never
-                     fm:decide-note.
+  duet               the same five scopes -- Duet's whole grant ceiling, equal
+                     to Dot's. A Duet grant from before parity (no
+                     fm:decide-note) fails this; reconnect to re-consent.
   read               fm:read, fm:reports -- look, never write.
   legacy-peer-inbox  herdr:read, herdr:message.owner -- a connection made at
                      herdr-mcp before the cutover, still honoured while the
@@ -79,7 +80,7 @@ PEERS_PATH = "/admin/peers"
 FM_ALL = frozenset({"fm:read", "fm:reports", "fm:request", "fm:decide-note", "fm:peer"})
 SCOPE_PROFILES: dict[str, frozenset[str]] = {
     "dot": FM_ALL,
-    "duet": FM_ALL - {"fm:decide-note"},
+    "duet": FM_ALL,
     "read": frozenset({"fm:read", "fm:reports"}),
     "legacy-peer-inbox": frozenset({"herdr:read", "herdr:message.owner"}),
 }

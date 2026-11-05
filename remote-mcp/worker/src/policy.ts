@@ -18,15 +18,16 @@ export function offeredScopes(env: Env): string[] {
 // The only OAuth clients that may hold any scope at all, by their
 // Client-ID Metadata Document URL (the provider fetches and verifies the
 // document, so the id is the app's own HTTPS URL, not a self-declared name).
-// Each gets only what it actually used on herdr-mcp: Dot relays the captain's
-// decisions, so it may file decision notes; Duet never did, so it may not.
-// Any other client -- including every Dynamic Client Registration -- is
-// refused at consent and at /mcp. Widening a client is a code change and a
-// security review.
+// Dot and Duet get the same ceiling: they are the same assistant role
+// reached from different tools (ChatGPT, Claude.ai), so either may relay the
+// captain's decisions as a decision note -- a note Firstmate judges, never
+// the captain's answer. Any other client -- including every Dynamic Client
+// Registration -- is refused at consent and at /mcp. Widening a client is a
+// code change and a security review.
 export interface ClientGrant { label: string; scopes: readonly string[] }
 export const CLIENT_GRANTS: Readonly<Record<string, ClientGrant>> = {
   "https://chatgpt.com/oauth/client.json": { label: "dot", scopes: [FM_READ, FM_REPORTS, FM_REQUEST, FM_DECIDE_NOTE, FM_PEER] },
-  "https://claude.ai/oauth/mcp-oauth-client-metadata": { label: "duet", scopes: [FM_READ, FM_REPORTS, FM_REQUEST, FM_PEER] },
+  "https://claude.ai/oauth/mcp-oauth-client-metadata": { label: "duet", scopes: [FM_READ, FM_REPORTS, FM_REQUEST, FM_DECIDE_NOTE, FM_PEER] },
 };
 
 export function clientGrant(clientId: string): ClientGrant | null {

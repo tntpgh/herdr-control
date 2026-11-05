@@ -6,7 +6,7 @@
 	<string>com.herdr-control.remote-mcp</string>
 	<key>ProgramArguments</key>
 	<array>
-		<!-- One publisher tick: push herdr status to herdr-mcp.teamthurber.com,
+		<!-- One publisher tick: push herdr status to bebop.teamthurber.com,
 		     deliver the messages it queued (remote-mcp/README.md). It reads its
 		     one credential, HERDR_MCP_INGEST_KEY, from
 		     ~/.config/op/launchd-secrets.env with the same literal parser as the

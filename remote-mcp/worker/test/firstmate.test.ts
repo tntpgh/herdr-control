@@ -15,6 +15,8 @@ const e = env as unknown as Env;
 const fleet = () => e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
 const USER = "tnt@teamthurber.com";
 const ALL = ["fm:read", "fm:reports", "fm:request", "fm:decide-note", "fm:peer"];
+// What Duet held before it got Dot's ceiling: everything but fm:decide-note.
+const PRE_PARITY_DUET = ["fm:read", "fm:reports", "fm:request", "fm:peer"];
 // Consumer tools are build-switched off in this project.
 const CATALOG = Object.keys(TOOL_CATALOG).filter((t) => !t.endsWith("_consumer_position")).sort();
 
@@ -79,23 +81,19 @@ describe("scope enforcement: every tool is denied without its scope", () => {
 });
 
 describe("per-client grants", () => {
-  it("Dot is offered all five scopes; Duet never fm:decide-note, even when it asks", async () => {
-    const dotPage = await (await consentPage(DOT)).text();
-    for (const s of ALL) expect(dotPage).toContain(`value="${s}"`);
-    const duetPage = await (await consentPage(DUET)).text();
-    expect(duetPage).not.toContain('value="fm:decide-note"');
-    for (const s of ALL.filter((x) => x !== "fm:decide-note")) expect(duetPage).toContain(`value="${s}"`);
-
-    const duet = await oauthToken(ALL, USER, "duet");
-    expect(duet.scope.split(" ").sort()).toEqual(["fm:peer", "fm:read", "fm:reports", "fm:request"]);
-    const names = await toolNames(duet.access_token);
-    expect(names).not.toContain("answer_decision");
-    expect(names).toContain("request_task");
-    const dot = await oauthToken(ALL, USER, "dot");
-    expect(await toolNames(dot.access_token)).toEqual(CATALOG);
+  it("Dot and Duet share one ceiling: all five scopes offered, granted, and every tool listed", async () => {
+    for (const client of [DOT, DUET]) {
+      const page = await (await consentPage(client)).text();
+      for (const s of ALL) expect(page).toContain(`value="${s}"`);
+    }
+    for (const client of ["dot", "duet"] as const) {
+      const { access_token, scope } = await oauthToken(ALL, USER, client);
+      expect(scope.split(" ").sort()).toEqual([...ALL].sort());
+      expect(await toolNames(access_token)).toEqual(CATALOG);
+    }
 
     const health = await (await SELF.fetch(`${BASE}/healthz`)).json();
-    expect(health).toMatchObject({ clients: { dot: ALL, duet: ["fm:read", "fm:reports", "fm:request", "fm:peer"] } });
+    expect(health).toMatchObject({ clients: { dot: ALL, duet: ALL } });
   });
 
   it("a client off the allowlist gets no consent page and no tools: unknown CIMD, DCR, or a forged grant", async () => {
@@ -113,7 +111,9 @@ describe("per-client grants", () => {
   });
 
   it("effective scopes are token x offered x ceiling, with legacy herdr:* mapped only while the switch is on", () => {
-    expect(effectiveScopes(e, DUET, ALL)).toEqual(["fm:read", "fm:reports", "fm:request", "fm:peer"]);
+    expect(effectiveScopes(e, DUET, ALL)).toEqual(ALL);
+    // A Duet grant consented before parity does not silently gain fm:decide-note.
+    expect(effectiveScopes(e, DUET, PRE_PARITY_DUET)).toEqual(PRE_PARITY_DUET);
     expect(effectiveScopes(e, DOT, ["herdr:read", "herdr:message.owner", "herdr:message", "herdr:task.start"]))
       .toEqual(["fm:read", "fm:reports", "fm:request", "fm:peer"]);
     expect(effectiveScopes({ ...e, LEGACY_HERDR_SCOPES: "false" }, DOT, ["herdr:read", "herdr:message.owner"])).toEqual([]);
@@ -251,6 +251,23 @@ describe("note-only writes", () => {
       .toEqual([["queued", "", "dot"], ["refused", "no_open_decision", "dot"]]);
   });
 
+  it("Duet's answer_decision is the same note as Dot's: labelled duet, open holds only, the hold stays open", async () => {
+    await signedSync(syncBody({ snapshot: fmSnapshot() }));
+    const { access_token } = await oauthToken(ALL, USER, "duet");
+    expect((await callTool(access_token, "answer_decision",
+      { task_id: "task_D2", answer: "Captain said (a) on the call.", client_msg_id: "dd-1" })).isError).toBe(false);
+    expect((await callTool(access_token, "answer_decision",
+      { task_id: "task_A", answer: "go", client_msg_id: "dd-2" })).data.error).toBe("no_open_decision");
+
+    const reply = await syncJson(await signedSync(syncBody({ snapshot: fmSnapshot() })));
+    expect(reply.owner_outbox).toEqual([expect.objectContaining({ owner_label: "firstmate", kind: "decision_note",
+      meta: { task_id: "task_D2" }, sender_label: "duet" })]);
+    const open = await callTool<{ decisions: DecisionRow[] }>(access_token, "list_decisions");
+    expect(open.data.decisions.map((d) => d.task_id)).toEqual(["task_D2"]);
+    expect(reply.audit.filter((a) => a.tool === "answer_decision").map((a) => [a.decision, a.reason, a.client_label]))
+      .toEqual([["queued", "", "duet"], ["refused", "no_open_decision", "duet"]]);
+  });
+
   it("refuses a bad project or kind, and the DO refuses a decision note without fm:decide-note", async () => {
     await signedSync(syncBody({ snapshot: fmSnapshot() }));
     const { access_token } = await oauthToken(ALL);
@@ -260,7 +277,7 @@ describe("note-only writes", () => {
       { project: "kb", kind: "deploy", objective: "x", client_msg_id: "bk" })).isError).toBe(true);
     const duet = { email: USER, client_id: DUET, client_name: "Claude" };
     const out = await runInDurableObject(fleet(), (o: HerdrState) => o.sendOwnerMessage(Date.now(), duet,
-      effectiveScopes(e, DUET, ALL), "firstmate", "a", "dn", { kind: "decision_note", task_id: "task_D2" }));
+      effectiveScopes(e, DUET, PRE_PARITY_DUET), "firstmate", "a", "dn", { kind: "decision_note", task_id: "task_D2" }));
     expect(out).toEqual({ ok: false, reason: "missing_scope fm:decide-note" });
   });
 

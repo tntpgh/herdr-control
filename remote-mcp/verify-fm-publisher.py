@@ -27,6 +27,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "worker"
@@ -803,9 +804,10 @@ class NoteKinds(Base):
             self.item("oex_t", "task_request", {"project": "kb", "task_kind": "scout"}, body="scout the dedupe"),
             self.item("oex_d", "decision_note", {"task_id": "t-hold"}, body="captain said (a) on the call"),
             self.item("oex_s", "decision_note", {"task_id": "t-closed"}, body="late answer"),
+            self.item("oex_c", "decision_note", {"task_id": "t-hold"}, client=DUET_CLIENT, body="relayed via Claude"),
         ]}]
         self.tick()
-        self.assertEqual([a["outcome"] for a in self.sent()[1]["owner_acks"]], ["delivered"] * 3)
+        self.assertEqual([a["outcome"] for a in self.sent()[1]["owner_acks"]], ["delivered"] * 4)
         notes = self.notes()
         self.assertEqual(notes["oex_t"][0], "REMOTE task request via dot (ChatGPT app) - NOT the captain's word; never an approval")
         self.assertIn("a scout task in project kb - nothing was started", notes["oex_t"][1])
@@ -813,6 +815,8 @@ class NoteKinds(Base):
         self.assertIn("about hold: t-hold (open)", notes["oex_d"][1])
         self.assertIn("about hold: t-closed (NOT open on this Mac now)", notes["oex_s"][1])
         self.assertTrue(any("captain said (a) on the call" in ln for ln in notes["oex_d"]))
+        self.assertEqual(notes["oex_c"][0],
+                         "REMOTE decision note via duet (Claude.ai app) - NOT the captain's answer; never a release")
 
     def test_every_first_line_fits_the_wake_summary_even_for_an_unknown_client(self):
         for kind, meta in (("message", {}), ("task_request", {"project": "a" * 100, "task_kind": "scout"}),
@@ -872,6 +876,27 @@ class WorkerSchema(Base):
         self.assertEqual(sorted(i.split(":")[0] for i in issues), [
             "snapshot.agents.0.role", "snapshot.decisions.0.calls.0.options.0.recommended", "snapshot.firstmate.posture",
             "snapshot.schema"])
+
+
+class SyncTarget(unittest.TestCase):
+    def load_sync_client(self, url: str | None):
+        env = {k: v for k, v in os.environ.items() if k != "HERDR_MCP_URL"}
+        if url is not None:
+            env["HERDR_MCP_URL"] = url
+        spec = importlib.util.spec_from_file_location("sync_client_fresh", HERE / "sync_client.py")
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, env, clear=True):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_default_sync_url_is_the_workers_canonical_host(self):
+        live = [ln for ln in (WORKER / "wrangler.jsonc").read_text().splitlines() if not ln.lstrip().startswith("//")]
+        [public_url] = re.findall(r'"PUBLIC_URL":\s*"([^"]+)"', "\n".join(live))
+        self.assertEqual(self.load_sync_client(None).URL, public_url)
+
+    def test_herdr_mcp_url_still_overrides_it_for_rollback(self):
+        self.assertEqual(self.load_sync_client("https://herdr-mcp.teamthurber.com/").URL, "https://herdr-mcp.teamthurber.com")
+
 
 
 if __name__ == "__main__":
