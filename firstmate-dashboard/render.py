@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import hub_ui  # noqa: E402
+import report_md  # noqa: E402
 
 THEMES = hub_ui.THEMES
 DEFAULT_THEME = hub_ui.DEFAULT_THEME
@@ -262,6 +263,48 @@ button.fm-bstat[data-bounty=verified][aria-pressed=true]{box-shadow:0 0 0 2px va
 .fm-decision:target,.fm-bounty:target{animation:fm-hl 1.8s ease-out 1}
 .fm-decision.fm-new,.fm-bounty.fm-new,.fm-slot.fm-new>.fm-slot-link{animation:fm-hl 1.8s ease-out 1,fm-hl-in .35s ease-out 1}
 tr.fm-changed>td,tr.fm-new>td,tr:target>td,.fm-room:target>h2{animation:fm-hl-row 1.8s ease-out 1}
+header nav a[aria-current=page]{color:var(--fg);border-bottom-color:var(--accent)}
+/* reports: a list of data/<id>/report.md, and one report as a document */
+.fm-back{font-size:12.5px;margin:4px 0 0}
+.fm-rlist td{word-break:break-word}
+.fm-rlist b a{color:var(--fg)}
+.fm-held-chip{font-weight:700;color:var(--warn)}
+.fm-md{font-size:14px;line-height:1.55;min-width:0}
+.fm-md h1{font-size:22px;line-height:1.3;margin:10px 0 4px}
+.fm-md h2{font-size:17px;text-transform:none;letter-spacing:0;color:var(--fg);margin:30px 0 8px}
+.fm-md h3{font-size:15px;margin:20px 0 6px}
+.fm-md h4,.fm-md h5,.fm-md h6{font-size:13.5px;margin:16px 0 4px}
+.fm-md p,.fm-md li{max-width:120ch}
+.fm-md li{margin:2px 0}
+.fm-md :not(pre)>code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--surface-2);padding:0 4px;border-radius:4px;word-break:break-word}
+.fm-md pre{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;word-break:normal}
+.fm-md blockquote{margin:8px 0;padding:2px 14px;border-left:4px solid var(--brass);color:var(--muted)}
+.fm-md hr{border:0;border-top:1px solid var(--border);margin:20px 0}
+.fm-md figure{margin:10px 0}.fm-md figcaption{font-size:11.5px;color:var(--muted);margin:0 0 4px}
+.fm-toc{display:flex;flex-wrap:wrap;gap:4px 16px;margin:10px 0;padding:8px 12px;font-size:12.5px;background:var(--surface);
+  border:1px solid var(--border);border-radius:8px}
+.fm-toc b{color:var(--muted);font-weight:600}
+.fm-pin{margin:14px 0 22px;padding:4px 18px 10px;background:var(--surface);border:2px solid var(--brass);border-left:6px solid var(--accent);border-radius:12px}
+.fm-pin[data-held]{border-left-color:var(--warn)}
+.fm-pin>h2{margin-top:10px}
+.fm-pin>h2 small{font-size:12px;font-weight:400;color:var(--muted);margin-left:8px}
+.fm-held{margin:6px 0 10px;padding:8px 12px;border:1px dashed var(--warn);border-radius:8px;font-size:13px;list-style:none}
+.fm-held-none{font-size:12.5px;color:var(--muted)}
+.fm-mdt{margin:10px 0 18px;min-width:0}
+.fm-tbar{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;margin:0 0 6px;font-size:12px;color:var(--muted)}
+.fm-tbar select{font:12px system-ui;max-width:16em;padding:1px 4px;color:var(--fg);background:var(--surface);border:1px solid var(--border);border-radius:5px}
+.fm-tn{margin-left:auto;font-variant-numeric:tabular-nums}
+.fm-tscroll{overflow-x:auto}
+.fm-mdt table{font-size:12.5px;line-height:1.45}
+.fm-mdt td{word-break:break-word}.fm-mdt th,.fm-mdt td.fm-nw{white-space:nowrap}
+.fm-sort{all:unset;cursor:pointer;color:inherit}
+.fm-sort::after{content:" \\21C5";opacity:.45}
+th[aria-sort=ascending] .fm-sort::after{content:" \\25B2";opacity:1;color:var(--accent)}
+th[aria-sort=descending] .fm-sort::after{content:" \\25BC";opacity:1;color:var(--accent)}
+html:not([data-js]) .fm-sort{cursor:text}html:not([data-js]) .fm-sort::after{content:none}
+.fm-cpc{width:1%;white-space:nowrap}
+.fm-cp{font:600 11px system-ui;padding:1px 7px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer}
+.fm-cp:hover,tr:hover .fm-cp{color:var(--accent);border-color:var(--accent)}
 @media (prefers-reduced-motion:no-preference){html:not([data-reduce]){scroll-behavior:smooth}}
 @media (min-width:__WIDE__px){body>header{position:sticky;top:0;z-index:20}main [id]{scroll-margin-top:96px}}
 @media (max-width:__NARROW__px){
@@ -283,6 +326,16 @@ tr.fm-changed>td,tr.fm-new>td,tr:target>td,.fm-room:target>h2{animation:fm-hl-ro
   .fm-find{flex:1 1 100%}
   .fm-find input{flex:1;width:auto}
   .fm-hint,.fm-find kbd{display:none}
+  .fm-mdt table,.fm-mdt thead,.fm-mdt tbody,.fm-mdt tr,.fm-mdt td{display:block}
+  .fm-mdt thead tr{display:flex;flex-wrap:wrap;gap:2px 4px;padding:4px 6px}
+  .fm-mdt th{border:0;padding:2px 6px}
+  .fm-mdt th.fm-cpc{display:none}
+  .fm-mdt tbody tr{border-top:1px solid var(--border);padding:6px 0}
+  .fm-mdt td{border-top:0;padding:2px 10px}
+  .fm-mdt td::before{content:attr(data-label);display:block;font-size:11px;font-weight:600;color:var(--muted)}
+  .fm-mdt td.fm-cpc{width:auto;padding:4px 10px}.fm-mdt td.fm-cpc::before{content:none}
+  .fm-tscroll{overflow-x:visible}
+  .fm-md pre{white-space:pre-wrap;word-break:break-word}
 }
 """.replace("__NARROW__", str(NARROW_PX)).replace("__WIDE__", str(NARROW_PX + 1)).replace(
     "__SCAN__", f"{HULL[3] / HULL[2] * 100:.2f}")
@@ -293,12 +346,16 @@ _BOOT = ("(function(){var d=document.documentElement;d.setAttribute('data-js','1
 # motion in a hidden tab or with the art scrolled away, relative ages on
 # <time>, the filter (`/` focuses it, Esc clears), the bounty status chips,
 # and the answer form's busy state, length counter and Cmd/Ctrl+Enter.
+# Report pages: a table header sorts its column (again: the other way), a
+# facet menu narrows a table to one value, and a row's copy button puts its
+# one-line reference on the clipboard; the filter narrows table rows.
 # The ship page (C.live) also polls /api/summary every C.poll seconds; the
 # header says live / update waiting / data old / read failing / offline, and
 # a new fingerprint swaps <main> in place (open <details>, filter and focus
 # kept) and marks what changed. It never swaps under an answer being
 # written: a decision's text must not change under the captain's reply.
-# No timer but the poll; every animation is one-shot.
+# No timer but the poll and a copy button's one-shot label reset; every
+# animation is one-shot.
 _SCRIPT = r"""(function(){var d=document.documentElement,C=__CFG__,b=document.getElementById('fm-motion');
 function $(s,r){return (r||document).querySelector(s)}
 function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
@@ -317,14 +374,33 @@ var m=Math.round(s/60);if(m<60)return m+'m ago';var h=Math.round(m/60);return h<
 function times(r){$$('time[datetime]',r).forEach(function(e){var iso=e.getAttribute('datetime'),x=rel(iso);if(!x)return;
 var t=new Date(iso).toLocaleString();if(e.textContent!==x)e.textContent=x;if(e.title!==t)e.title=t})}
 var q='',bs='',auto=false,fi=$('#fm-find'),fn=$('#fm-find-n');
-function apply(){var n=0;$$('.fm-decision,.fm-bounty,.fm-room tbody tr').forEach(function(e){
-var hit=!q||e.textContent.toLowerCase().indexOf(q)>=0;if(q&&hit)n++;
+function facets(){$$('.fm-mdt').forEach(function(w){var fs=$$('.fm-tbar select',w).filter(function(s){return s.value});
+$$('tbody tr',w).forEach(function(r){var ok=fs.every(function(s){
+return (r.getAttribute('data-f'+s.getAttribute('data-col'))||'').split('\n').indexOf(s.value)>=0});
+if(ok)r.removeAttribute('data-fx');else r.setAttribute('data-fx','')})})}
+function apply(){facets();var n=0;$$('.fm-decision,.fm-bounty,.fm-room tbody tr,.fm-rlist tbody tr,.fm-mdt tbody tr').forEach(function(e){
+var hit=(!q||e.textContent.toLowerCase().indexOf(q)>=0)&&!e.hasAttribute('data-fx');if(q&&hit)n++;
 if(bs&&e.classList.contains('fm-bounty')&&e.getAttribute('data-bounty')!==bs)hit=false;e.classList.toggle('fm-out',!hit)});
 $$('.fm-room table').forEach(function(t){t.classList.toggle('fm-out',!!q&&!$('tbody tr:not(.fm-out)',t))});
+$$('.fm-mdt').forEach(function(w){var all=$$('tbody tr',w).length,v=$$('tbody tr:not(.fm-out)',w).length,c=$('.fm-tn',w);
+if(c)c.textContent=(v===all?'':v+' of ')+all+(all===1?' row':' rows')});
 var v=$('#fm-verified');if(v){var want=!!(q||bs)&&!!$('.fm-bounty:not(.fm-out)',v);
 if(want&&!v.open){v.open=true;auto=true}else if(!want&&auto){v.open=false;auto=false}}
 if(fn)fn.textContent=q?n+(n===1?' match':' matches'):'';
 $$('.fm-tally button').forEach(function(x){x.disabled=false;x.setAttribute('aria-pressed',x.getAttribute('data-bounty')===bs?'true':'false')})}
+var coll=window.Intl?new Intl.Collator(undefined,{numeric:true,sensitivity:'base'}):null;
+function sortBy(th){var t=th.closest('table'),i=th.cellIndex,tb=t.tBodies[0],rows=$$('tr',tb),
+dir=th.getAttribute('aria-sort')==='ascending'?'descending':'ascending',
+keys=rows.map(function(r){var c=r.cells[i];return c?(c.getAttribute('data-s')||c.textContent).trim():''});
+$$('thead th',t).forEach(function(h){h.removeAttribute('aria-sort')});th.setAttribute('aria-sort',dir);
+rows.map(function(r,k){return k}).sort(function(a,b){var x=keys[a],y=keys[b];if(!x!==!y)return x?-1:1;
+var c=coll?coll.compare(x,y):(x<y?-1:x>y?1:0);return (dir==='descending'?-c:c)||a-b}).forEach(function(k){tb.appendChild(rows[k])})}
+function copied(x,ok){var a=$('#fm-announce');x.textContent=ok?'copied':'copy failed';if(a)a.textContent=ok?'Row reference copied.':'Copy failed.';
+setTimeout(function(){x.textContent='copy'},1600)}
+function copy(x){var s=x.getAttribute('data-ref');function old(){var a=document.createElement('textarea'),ok=false;a.value=s;
+a.setAttribute('readonly','');a.className='sr-only';document.body.appendChild(a);a.select();try{ok=document.execCommand('copy')}catch(e){}
+a.remove();x.focus();copied(x,ok)}
+if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(s).then(function(){copied(x,true)},old);else old()}
 function count(t){var c=t.form&&$('.fm-count',t.form);if(!c)return;var n=t.value.length;
 c.textContent=n?n+' / '+t.maxLength:'';if(n>t.maxLength*0.9)c.setAttribute('data-near','');else c.removeAttribute('data-near')}
 document.addEventListener('input',function(e){var t=e.target;if(t===fi){q=t.value.trim().toLowerCase();apply()}
@@ -333,8 +409,10 @@ document.addEventListener('keydown',function(e){var t=e.target,tag=t.tagName;
 if(e.key==='/'&&fi&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&tag!=='INPUT'&&tag!=='TEXTAREA'&&!t.isContentEditable){e.preventDefault();fi.focus();fi.select()}
 else if(e.key==='Escape'&&t===fi){fi.value='';q='';apply();fi.blur()}
 else if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)&&tag==='TEXTAREA'&&t.form){e.preventDefault();t.form.requestSubmit()}});
-document.addEventListener('click',function(e){var x=e.target.closest&&e.target.closest('.fm-tally button');if(!x)return;
+document.addEventListener('click',function(e){var x=e.target.closest&&e.target.closest('.fm-tally button,.fm-sort,.fm-cp');if(!x)return;
+if(x.classList.contains('fm-sort'))return sortBy(x.closest('th'));if(x.classList.contains('fm-cp'))return copy(x);
 var s=x.getAttribute('data-bounty');bs=bs===s?'':s;apply()});
+document.addEventListener('change',function(e){if(e.target.matches('.fm-tbar select'))apply()});
 document.addEventListener('submit',function(e){var f=e.target;if(!f.closest('.fm-decision'))return;
 if(f.hasAttribute('data-busy')){e.preventDefault();return}
 f.setAttribute('data-busy','');f.setAttribute('aria-busy','true');var x=$('button[type=submit]',f);if(x)x.textContent='Sending\u2026'});
@@ -448,9 +526,10 @@ def _time(iso: str | None) -> str:
     return f"<time datetime='{esc(iso)}'>{esc(iso)}</time>" if iso else ""
 
 
-def page(title: str, body: str, theme: dict, nonce: str, live: dict | None = None) -> str:
+def page(title: str, body: str, theme: dict, nonce: str, live: dict | None = None, find: str = "", here: str = "") -> str:
     """`live` (the ship page only): {"ok", "fp", "nav": {"decisions"|"bounties"|"rooms": (n, hot)}}.
-    It turns on the poll, the filter and the live indicator, and puts counts in the nav."""
+    It turns on the poll, the filter and the live indicator, and puts counts in the nav.
+    `find` (a report page): the filter alone, with this placeholder. `here`: "reports" marks the Reports link."""
     tid = theme["id"]
     switch = " ".join(
         f"<a href='/{_q(t)}'{' aria-current=page' if t == tid else ''}>{esc(THEMES[t].get('name') or t)}</a>"
@@ -464,11 +543,12 @@ def page(title: str, body: str, theme: dict, nonce: str, live: dict | None = Non
         badge = (f" <span class=fm-n{' data-hot' if c[1] else ''}>{esc(c[0])}</span>" if c else "")
         return f"<a href='/{_q(tid)}#{anchor}'>{label}{badge}</a>"
 
-    tools = ("<label class=fm-find><span class=sr-only>Filter calls, crews and bounties</span>"
-             "<input type=search id=fm-find autocomplete=off spellcheck=false placeholder='Filter: id, repo, title'>"
-             "<kbd aria-hidden=true>/</kbd><span id=fm-find-n class=fm-find-n aria-live=polite></span></label>"
-             f"<span id=fm-live class=fm-live data-s={'ok' if live.get('ok') else 'bad'}><span class=fm-live-dot aria-hidden=true></span>"
-             f"<span class=fm-live-txt>{'live' if live.get('ok') else 'read failing'}</span></span>") if live else ""
+    filt = "Filter: id, repo, title" if live else find
+    tools = ((f"<label class=fm-find><span class=sr-only>{esc(filt)}</span>"
+              f"<input type=search id=fm-find autocomplete=off spellcheck=false placeholder='{esc(filt)}'>"
+              "<kbd aria-hidden=true>/</kbd><span id=fm-find-n class=fm-find-n aria-live=polite></span></label>") if filt else "") \
+        + (f"<span id=fm-live class=fm-live data-s={'ok' if live.get('ok') else 'bad'}><span class=fm-live-dot aria-hidden=true></span>"
+           f"<span class=fm-live-txt>{'live' if live.get('ok') else 'read failing'}</span></span>" if live else "")
     cfg = json.dumps({"live": bool(live), "fp": (live or {}).get("fp", ""), "poll": POLL_S, "stale": STALE_S})
     return (f"<!doctype html><html lang=en data-theme='{esc(tid)}'><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -477,7 +557,8 @@ def page(title: str, body: str, theme: dict, nonce: str, live: dict | None = Non
             "<a class=skip href='#main'>Skip to content</a>"
             f"<header><b class='brand fm-brand'>FIRSTMATE{f'<small>{tagline}</small>' if tagline else ''}</b>"
             f"<nav id=fm-nav aria-label=Sections>{nav('ship', 'Ship')}{nav('decisions', 'Your calls', 'decisions')}"
-            f"{nav('rooms', 'Rooms', 'rooms')}{nav('bounties', 'Bounties', 'bounties')}</nav>{tools}"
+            f"{nav('rooms', 'Rooms', 'rooms')}{nav('bounties', 'Bounties', 'bounties')}"
+            f"<a href='/reports{_q(tid)}'{' aria-current=page' if here == 'reports' else ''}>Reports</a></nav>{tools}"
             f"<span class='dim hdr-meta'>read-only · theme: {switch} · <a href='/api/summary'>json</a></span>"
             "<button type=button id=fm-motion class=fm-motion aria-pressed=false>Reduce motion</button></header>"
             f"<main id=main tabindex=-1>{body}</main><p id=fm-announce class=sr-only role=status aria-live=polite></p>"
@@ -742,10 +823,82 @@ def dashboard(snap: dict, theme: dict, token: str, nonce: str, flash: str = "", 
     return page(title, "".join(parts), theme, nonce, {"ok": ok, "fp": snap.get("fingerprint", ""), "nav": nav})
 
 
-def report(rel: str, text: str, theme: dict, nonce: str) -> str:
-    body = (f"<p><a href='/{_q(theme['id'])}#decisions'>&larr; back to the ship</a></p>"
-            f"<h2>{esc(rel)}</h2><pre>{esc(text)}</pre>")
-    return page(f"Report · {rel}", body, theme, nonce)
+# ── reports ───────────────────────────────────────────────────────────────────
+def held_for(rel: str, decisions: list[dict]) -> list[dict]:
+    """Open captain holds that come from this report: the hold's `Captain hold
+    origin` is the report's task id (data/<id>/report.md), or its reason names the file."""
+    parts = rel.split("/")
+    rid = parts[1] if len(parts) == 3 else ""
+    return [d for d in decisions if (rid and d.get("origin") == rid) or rel in d.get("reports", [])]
+
+
+def _held_links(held: list[dict], tid: str) -> str:
+    return "".join(f"<li>Held for you as <a href='/{_q(tid)}#d-{esc(d['id'])}'><code>{esc(d['id'])}</code> "
+                   f"{esc(d['title'])}</a>: answer it on the Bridge.</li>" for d in held)
+
+
+def reports(items: list[dict], decisions: list[dict] | None, theme: dict, nonce: str) -> str:
+    """Every data/<id>/report.md, newest first. `decisions` None: the last read failed, so holds are unknown."""
+    tid = theme["id"]
+    rows = []
+    for r in items:
+        held = held_for(r["path"], decisions or [])
+        if decisions is None:
+            calls, key = f"<span class=fm-unknown>unknown</span>{' · in report' if r['calls'] else ''}", "1"
+        elif held:
+            calls = " ".join(f"<a class=fm-held-chip href='/{_q(tid)}#d-{esc(d['id'])}'>held: {esc(d['id'])}</a>" for d in held)
+            key = "3"
+        elif r["calls"]:
+            calls, key = "in report, none held", "2"
+        else:
+            calls, key = "<span class=dim>—</span>", "0"
+        size = f"{r['size'] / 1024:.0f} KB" if r["size"] >= 1024 else f"{r['size']} B"
+        rows.append(f"<tr id='rep-{esc(r['id'])}'><td><b><a href='/report{_q(tid, path=r['path'])}'>{esc(r['title'] or r['id'])}</a></b>"
+                    f"<div class=dim><code>{esc(r['path'])}</code></div></td>"
+                    f"<td data-s='{esc(r['updated'])}'>{_time(r['updated'])}</td>"
+                    f"<td data-s='{int(r['size'])}'>{esc(size)}</td><td data-s='{key}'>{calls}</td></tr>")
+    th = lambda label, sort="": f"<th scope=col{f' aria-sort={sort}' if sort else ''}><button type=button class=fm-sort>{label}</button></th>"  # noqa: E731
+    table = (f"<table class=fm-rlist><thead><tr>{th('Report')}{th('Updated', 'descending')}{th('Size')}{th('Captain calls')}</tr></thead>"
+             f"<tbody>{''.join(rows)}</tbody></table>") if rows else "<p class=fm-empty>No data/&lt;id&gt;/report.md in this home yet.</p>"
+    body = ("<h2 id=reports>Reports</h2><p class=fm-intro>Every <code>data/&lt;id&gt;/report.md</code> in this Firstmate home, "
+            "newest first. A report whose captain calls are held in the backlog links to that call on the Bridge.</p>" + table)
+    return page("Reports · Firstmate", body, theme, nonce, find="Filter reports", here="reports")
+
+
+def report(rel: str, text: str, theme: dict, nonce: str, decisions: list[dict] | None = None,
+           updated: str | None = None, cut_at: int = 0) -> str:
+    """A report page. Markdown is drawn as a document whose tables sort, filter
+    and copy, with its captain calls pinned on top; any other file stays text.
+    `decisions` None: the last read failed, so whether a call is held is unknown.
+    `cut_at`: the file is longer than this many bytes, and only those are shown."""
+    tid = theme["id"]
+    back = f"<p class=fm-back><a href='/reports{_q(tid)}'>&larr; Reports</a> · <a href='/{_q(tid)}#decisions'>the ship</a></p>"
+    cut = f"<p class='fm-flash bad' role=status>Shown up to its first {cut_at} bytes; the file is longer.</p>" if cut_at else ""
+    if not rel.endswith(".md"):
+        return page(f"Report · {rel}", f"{back}<h1>{esc(rel)}</h1>{cut}<pre>{esc(text)}</pre>", theme, nonce, here="reports")
+    doc = report_md.render(text, rel)
+    held = held_for(rel, decisions or [])
+    calls = doc["calls"]
+    pin_id = f"r-{calls['id'] if calls else 'captain-calls'}"
+    meta = (f"<div class=fm-meta><code>{esc(rel)}</code>{f'<span>updated {_time(updated)}</span>' if updated else ''}"
+            + "".join(f"<a class=fm-held-chip href='#{esc(pin_id)}'>held: {esc(d['id'])}</a>" for d in held) + "</div>")
+    toc = ("<nav class=fm-toc aria-label='In this report'><b>Contents</b>"
+           + "".join(f"<a href='#r-{esc(i)}'>{esc(t)}</a>" for i, t in doc["toc"]) + "</nav>") if len(doc["toc"]) > 1 else ""
+    pin = ""
+    if calls or held:
+        if decisions is None:
+            status = f"<p class='fm-held-none fm-unknown'>{esc(UNKNOWN)} Whether these calls are held is unknown.</p>"
+        elif held:
+            status = f"<ul class=fm-held>{_held_links(held, tid)}</ul>"
+        else:
+            status = "<p class=fm-held-none>No open captain hold in the backlog comes from this report.</p>"
+        note = (f"{_plural(calls['count'], 'call', 'calls')} · " if calls and calls["count"] else "") + "pinned from the report"
+        pin = (f"<section class=fm-pin id='{esc(pin_id)}'{' data-held' if held else ''}>"
+               f"<h2>{esc(calls['title'] if calls else 'Captain calls')}{f'<small>{note}</small>' if calls else ''}</h2>"
+               f"{status}{calls['html'] if calls else ''}</section>")
+    title = doc["title_html"] or f"<h1>{esc(rel)}</h1>"
+    body = f"{back}<article class=fm-md>{title}{meta}{cut}{toc}{pin}{doc['body']}</article>"
+    return page(f"{doc['title'] or rel} · Report", body, theme, nonce, find="Filter table rows", here="reports")
 
 
 def message(title: str, text: str, theme: dict, nonce: str) -> str:
