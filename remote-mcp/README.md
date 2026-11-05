@@ -643,7 +643,8 @@ publisher refreshes incrementally, every 2 min at most:
   `state/*.meta|*.status`, `data/*/report.md`, the UTC day) changed. It re-reads
   the backlog and task inventory (`--contribution-input`, ~0.15 s) and runs
   `fm-crew-state.sh` only for tasks whose meta/status changed (at most two per
-  delta, a burst spreads over the next ones), and merges that onto the last
+  delta, a burst spreads over the next ones; a spare slot re-reads the task
+  whose state is oldest, once it is 15 min old), and merges that onto the last
   full read: a changed task gets its fresh state, a new task appears, a task
   whose meta is gone drops, every task takes the inventory's kind and meta PR,
   and every other field is carried over. Secondmate and remote tasks keep
@@ -652,9 +653,8 @@ publisher refreshes incrementally, every 2 min at most:
   re-read task shows no last-event line, keeps an open-decision flag only until
   its crew state has provably moved past it, and gets one when its state is a
   status-log `parked` (a needs-decision line).
-- **confirm** — nothing changed: no command runs and the snapshot is
-  re-dated, unless an unchanged task's state is 15 min old, in which case that
-  one task is re-read.
+- **confirm** — nothing changed and no task's state is 15 min old: no command
+  runs and the snapshot is re-dated.
 - **config** — `read-scope`/`read-deny` changed: see below.
 
 A failed read sends the last good snapshot as not live (`synced_degraded`) and

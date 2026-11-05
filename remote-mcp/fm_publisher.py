@@ -115,7 +115,7 @@ TICK_S = 15  # the Worker reports disconnected after 90 s without a sync
 # more CPU.
 MIN_REBUILD_S = 120  # floor between refreshes: the snapshot is at most ~2 min old
 FULL_MIN_S = 900  # floor between full reads
-STALE_TASK_S = 900  # an unchanged task's state is re-read once this old, when nothing else changed
+STALE_TASK_S = 900  # an unchanged task's state is re-read once this old, in a refresh's spare read slot
 MAX_OBSERVE_PER_DELTA = 2  # a burst of changed tasks spreads over deltas instead of one long gap
 REBUILD_CPU_BUDGET = 0.006
 FULL_CPU_SHARE = 1 / 3
@@ -1047,8 +1047,9 @@ class Publisher:
                    never sooner than its CPU / its share of the budget.
           delta    the inputs' stat fingerprint changed: the backlog and task
                    inventory re-read, fm-crew-state.sh for up to
-                   MAX_OBSERVE_PER_DELTA changed tasks (else for one task whose
-                   state is STALE_TASK_S old); every other task carried over.
+                   MAX_OBSERVE_PER_DELTA changed tasks (a spare slot goes to the
+                   task whose state is oldest, once STALE_TASK_S old); every
+                   other task carried over.
           confirm  nothing changed and nothing is stale: no command runs; the
                    snapshot is re-dated (each task card still says when its
                    state was observed).
@@ -1143,10 +1144,10 @@ class Publisher:
                           (tid not in old or self.observed.get(tid) != inputs.stamps.get(tid))),
                          key=lambda tid: (tid in old, observed_epoch(old.get(tid)) or 0.0, tid))
         observe = changed[:MAX_OBSERVE_PER_DELTA]
-        if not observe:
-            stale = sorted((at or 0.0, tid) for tid in inv if tid in old and readable(tid)
+        if len(observe) < MAX_OBSERVE_PER_DELTA:  # a spare slot re-reads the stalest task
+            stale = sorted((at or 0.0, tid) for tid in inv if tid in old and tid not in observe and readable(tid)
                            for at in [observed_epoch(old[tid])] if at is None or now.timestamp() - at >= STALE_TASK_S)
-            observe = [stale[0][1]] if stale else []
+            observe += [stale[0][1]] if stale else []
         tasks, observed = [], {}
         for tid in sorted(inv):
             if tid in observe:

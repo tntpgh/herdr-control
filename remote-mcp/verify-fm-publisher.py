@@ -807,6 +807,17 @@ class Incremental(Base):
         self.run_tick()
         self.assertEqual(self.ran(), [["fm-crew-state.sh", "t-failed"]])
 
+    def test_a_delta_with_a_spare_slot_also_rereads_the_stalest_task(self):
+        fm.STALE_TASK_S = 900
+        for t in self.pub.raw["tasks"]:
+            t["current_state"]["observed_at"] = fm.z(datetime.now(timezone.utc))
+        for tid, at in (("t-failed", "2026-01-02T00:00:00Z"), ("t-paused", "2026-01-01T00:00:00Z")):
+            [t] = [t for t in self.pub.raw["tasks"] if t["id"] == tid]
+            t["current_state"]["observed_at"] = at
+        self.change("t-run")
+        self.run_tick()
+        self.assertEqual(sorted(a[1] for a in self.ran() if a[0] == "fm-crew-state.sh"), ["t-paused", "t-run"])
+
     def test_a_burst_of_changes_is_spread_over_deltas(self):
         for tid in ("t-run", "t-review", "t-paused"):
             self.change(tid)
