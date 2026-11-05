@@ -57,9 +57,10 @@ REDACTIONS = [
     (re.compile(r"(?i)\b([a-z][a-z0-9_]*_(?:key|auth)[a-z0-9_]*|[A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*=\s*(['\"]?)[^\s'\"]{6,}\2"),
      r"\1=[REDACTED]"),
     (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*:\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
-    # Local filesystem paths: absolute (/Users/…, /var/folders/…) and home-relative (~/…).
-    # A leading word, dot, colon or slash means a URL or repo-relative path, which stays.
-    (re.compile(r"(?<![\w.:/~\-])~?/[\w.\-@+]+(?:/[\w.\-@+]*)*"), "[path]"),
+    # Local filesystem paths under real roots (any prefix, file:// too, spaces inside a segment) and worktrees.
+    (re.compile(r"(?:file://)?(?:~|(?<![\w.\-])/(?:Users|home|private|var|tmp|opt|Volumes))/[^\s\"'<>()\[\]]*"
+                r"(?: [A-Z][^\s/]*/[^\s\"'<>()\[\]]*)*"), "[path]"),
+    (re.compile(r"\S*\.(?:treehouse|herdr/worktrees)/\S*"), "[path]"),
 ]
 
 
