@@ -12,7 +12,9 @@ right status for each source and reads Verified only with a merged PR or
 report on record, both palettes keep AA contrast, the summary counts the omp
 status line reads, the answer path's guards (token, Host/Origin, stale
 decision text), that an accepted answer reaches the inbox CLI naming its
-decision, and that a failed read never reports zero counts.
+decision and its confirmation shows under Your calls, that a call counts as
+answered only for the text the answer was bound to, and that a failed read
+never reports zero counts or an empty fleet, in the API or on the page.
 """
 from __future__ import annotations
 
@@ -70,7 +72,7 @@ esac
 cat "{h}/crew/$1.txt" 2>/dev/null || cat "{fx}/$1.txt" 2>/dev/null || echo 'state: unknown · source: none · no fixture'
 """)
     tool(home / "bin" / "fm-inbox.sh", f"""case "$1" in
-  receipts) cat "{fx}/receipts.json" ;;
+  receipts) cat "{h}/receipts.json" 2>/dev/null || cat "{fx}/receipts.json" ;;
   note) shift; printf '%s\\n' "$@" > "{h}/note-args"; cat > "{h}/note-body"
         echo '{{"schema":"fm-inbox-note.v1","outcome":"created","id":"1700000000-TEST01"}}' ;;
   *) exit 2 ;;
@@ -273,7 +275,9 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
         low = [(fg, bg, round(render.contrast(pal[fg], pal[bg]), 2))
                for fg in ("--fg", "--muted", "--accent", "--warn", "--ok", "--info", "--bad", "--brass")
                for bg in ("--bg", "--surface", "--surface-2") if render.contrast(pal[fg], pal[bg]) < 4.5]
-        low += [("--bg", "--ok", round(render.contrast(pal["--bg"], pal["--ok"]), 2))] if render.contrast(pal["--bg"], pal["--ok"]) < 4.5 else []
+        # --bg text on a filled chip: Verified (--ok) and the nav's hot count (--warn)
+        low += [("--bg", fill, round(render.contrast(pal["--bg"], pal[fill]), 2))
+                for fill in ("--ok", "--warn") if render.contrast(pal["--bg"], pal[fill]) < 4.5]
         check(not low, f"{theme}: every text colour is AA (4.5:1) on every surface it is drawn on {low or ''}")
 
     # the whole page is the ship: the cutaway, one live card per room, Big Shot's screen
@@ -330,8 +334,11 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
 
     # status crew state + PR from the status log
     check("data-d='blocked'>blocked</span>" in page, "crew-state word shown verbatim with its style")
-    check(len(re.findall(r"<div class=dim>state read \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ</div>", page)) == 4,
-          "each crew row says when its state was read")
+    stamp = r"<time datetime='(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)'>\1</time>"
+    check(len(re.findall(r"state read " + stamp, page)) == 4, "each crew row says when its state was read")
+    check(re.search(r"<tr id='t-crew-blocked' data-attn>.*?last report " + stamp, page) is not None
+          and "<a href='/#t-crew-blocked'>1 crew needs a look</a>" in page,
+          "a crew row says when it last reported; the attention count links to the crew that needs a look")
     check("https://github.com/example/demo-repo/pull/41" in page, "PR URL read from the status log")
 
     # summary + projects
@@ -399,6 +406,26 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
           "inbox note carries the idempotency key")
     check("decision cap-xss" in sent and "Go with (a)." in sent and d["digest"] in sent,
           "inbox note names the decision, the shown text's digest and the answer")
+    code, _, landed = request(port, "GET", h.get("Location", "/").split("#")[0])
+    bridge = section(landed.decode(), "bridge")
+    check(code == 200 and bridge.find("id=decisions") < bridge.find("Sent to the Firstmate inbox as note 1700000000-TEST01") > 0,
+          "the sent confirmation is drawn under Your calls, where the redirect lands")
+
+    # An answer counts as answered only for the decision text it was bound to.
+    receipts = json.loads((FIX / "receipts.json").read_text())
+    receipts["pending"].append({"id": "1700000000-TEST01", "at": "2026-11-05T09:00:00Z", "acknowledged": False,
+                                "request_id": fmdata.request_id("cap-xss", d["digest"], "Go with (a).")})
+    (Path(home.home) / "receipts.json").write_text(json.dumps(receipts))
+    snaps.refresh()
+    _, _, page = request(port, "GET", "/")
+    page = page.decode()
+    card = lambda i: page[page.find(f"id='d-{i}'"):page.find("</article>", page.find(f"id='d-{i}'"))]  # noqa: E731
+    check("data-answered>" in card("cap-xss") and "class=fm-chip>answered<" in card("cap-xss"),
+          "a call answered at its current text is marked answered")
+    check("data-answered" not in card("cap-long") and "text changed since your answer" in card("cap-long"),
+          "a call answered only at an earlier text still needs you, and says its text changed")
+    check("Needs your call: <strong>1</strong> <span class=dim>· 1 answered" in page and "<title>(1) Firstmate</title>" in page,
+          "the call bar and tab title count only calls that still need you")
 
     # a failed read must not look like an empty fleet
     (Path(home.home) / "FAIL_LIST").touch()
@@ -407,7 +434,11 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     s = json.loads(s)
     check(code == 503 and "attention" not in s and "open_decisions" not in s, "failed read: 503 with no counts")
     code, _, page = request(port, "GET", "/")
-    check(code == 200 and "backlog unreadable" in page.decode(), "failed read shown on the page")
+    page = page.decode()
+    check(code == 200 and "backlog unreadable" in page, "failed read shown on the page")
+    check("Nothing is waiting on you" not in page and "No crew here right now" not in page
+          and "Needs your call: <strong>?</strong>" in page and "<title>(!) Firstmate</title>" in page,
+          "failed read: the page never says nothing needs you, and its counts read unknown")
 
 
 def hdrs_of(port: int, path: str) -> dict:

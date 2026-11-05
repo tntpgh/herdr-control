@@ -582,18 +582,20 @@ def _origin(body: str) -> str:
 
 
 def _answers_by_decision(receipts: dict) -> dict[str, list[dict]]:
-    """Inbox notes this dashboard sent, keyed by decision id (from request_id)."""
+    """Inbox notes this dashboard sent, keyed by decision id (from request_id).
+    `digest8` is the start of the decision digest the answer was bound to, so
+    the page can tell an answer to the text shown now from one to an earlier text."""
     replies = {r.get("id") or r.get("note_id"): r for r in receipts.get("replies", []) or [] if isinstance(r, dict)}
     out: dict[str, list[dict]] = {}
     for bucket, acked in (("pending", False), ("handled", True)):
         for n in receipts.get(bucket, []) or []:
             rid = str(n.get("request_id") or "")
-            m = re.match(r"^dash-(.+)-[0-9a-f]{8}-[0-9a-f]{12}$", rid)
+            m = re.match(r"^dash-(.+)-([0-9a-f]{8})-[0-9a-f]{12}$", rid)
             if not m:
                 continue
             reply = n.get("reply") or replies.get(n.get("id"))
             out.setdefault(m.group(1), []).append({
                 "note": n.get("id"), "at": n.get("at"), "acknowledged": bool(n.get("acknowledged", acked)),
-                "reply": reply.get("body") if isinstance(reply, dict) else reply,
+                "reply": reply.get("body") if isinstance(reply, dict) else reply, "digest8": m.group(2),
             })
     return out
