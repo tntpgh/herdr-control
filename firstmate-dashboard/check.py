@@ -4,20 +4,25 @@
     python3 firstmate-dashboard/check.py
 
 Builds a throwaway Firstmate home from fixtures/ with stand-in CLIs (the
-real ones need a real home), serves it on an ephemeral 127.0.0.1 port, and
-checks: every open captain decision appears, hostile text is escaped, the
-Bebop theme and its ship art load, the summary counts the omp status line
-reads, the answer path's guards (token, Host/Origin, stale decision text),
-that an accepted answer reaches the inbox CLI naming its decision, and that
-a failed read never reports zero counts.
+real ones need a real home, and a stand-in `gh` so nothing leaves the
+machine), serves it on an ephemeral 127.0.0.1 port, and checks: every open
+captain decision appears, hostile text is escaped, Bebop draws the whole page
+as the ship with each crew in its room, Big Shot's bounty board carries the
+right status for each source and reads Verified only with a merged PR or
+report on record, both palettes keep AA contrast, the summary counts the omp
+status line reads, the answer path's guards (token, Host/Origin, stale
+decision text), that an accepted answer reaches the inbox CLI naming its
+decision, and that a failed read never reports zero counts.
 """
 from __future__ import annotations
 
 import http.client
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -66,7 +71,30 @@ esac
   *) exit 2 ;;
 esac
 """)
+    # Alert issues: #7 open, #8 closed, #9 unreadable. Every call is logged.
+    tool(home / "bin" / "gh", f"""echo "$*" >> "{h}/gh-calls"
+case "$3" in
+  7) echo '{{"state":"OPEN","title":"Alert: <b>deploy</b> health failing","url":"https://github.com/example/demo-repo/issues/7"}}' ;;
+  8) echo '{{"state":"CLOSED","title":"Alert: fixed","url":"https://github.com/example/demo-repo/issues/8"}}' ;;
+  *) echo 'HTTP 404' >&2; exit 1 ;;
+esac
+""")
+    proj = home / "projects" / "demo-repo"
+    proj.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "remote", "add", "origin", "https://github.com/example/demo-repo.git"], check=True)
     return home
+
+
+def section(page: str, sid: str) -> str:
+    """One room's markup: from its id to the next room."""
+    i = page.find(f"id='room-{sid}'")
+    j = page.find("class=fm-room id=", i + 1)
+    return page[i:j if j > 0 else None] if i >= 0 else ""
+
+
+def text_of(markup: str) -> str:
+    return re.sub(r"<[^>]+>", " ", markup)
 
 
 def request(port: int, method: str, path: str, body: str | None = None, headers: dict | None = None):
@@ -89,7 +117,8 @@ def open_decision_ids() -> list[str]:
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="fmdash-check-") as t:
-        home = fmdata.Home(build_home(Path(t)))
+        root = build_home(Path(t))
+        home = fmdata.Home(root, gh=str(root / "bin" / "gh"))
         snaps = server.Snapshots(home)
         snaps.refresh()
         srv = server.Server(0, home, snaps)
@@ -119,7 +148,7 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     check("sent as inbox note <code>1700000000-PREV01</code>" in page, "an earlier dashboard answer is shown on its decision")
 
     # escaping
-    for raw in ("<script>alert", "<img src=x", "<b>feed</b>"):
+    for raw in ("<script>alert", "<img src=x", "<b>feed</b>", "<b>deploy</b>", "<i>next</i>"):
         check(raw not in page, f"hostile text not emitted raw: {raw}")
     check("Pick &lt;script&gt;alert(&quot;t&quot;)&lt;/script&gt; &amp; go" in page, "decision title escaped")
     check("&lt;img src=x onerror=alert(1)&gt;\nline two" in page, "decision reason escaped, line break kept")
@@ -136,6 +165,61 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     code, _, plain = request(port, "GET", "/?theme=plain")
     check(code == 200 and "data-theme='plain'" in plain.decode() and ship not in plain.decode()
           and "class=crew-badge" not in plain.decode(), "plain theme: no art, no badges")
+    for theme in ("plain", "bebop"):
+        pal = render.THEMES[theme]["palette"]
+        low = [(fg, bg, round(render.contrast(pal[fg], pal[bg]), 2))
+               for fg in ("--fg", "--muted", "--accent", "--warn", "--ok", "--info", "--bad", "--brass")
+               for bg in ("--bg", "--surface", "--surface-2") if render.contrast(pal[fg], pal[bg]) < 4.5]
+        low += [("--bg", "--ok", round(render.contrast(pal["--bg"], pal["--ok"]), 2))] if render.contrast(pal["--bg"], pal["--ok"]) < 4.5 else []
+        check(not low, f"{theme}: every text colour is AA (4.5:1) on every surface it is drawn on {low or ''}")
+
+    # the whole page is the ship: the cutaway, one live card per room, Big Shot's screen
+    check("class=fm-art role=img" in page and "class=fm-bigshot-art role=img" in page and ".fm-art{aspect-ratio:" in page,
+          "bebop draws the ship cutaway and Big Shot's screen from the ship art")
+    slots = re.findall(r"<li class=fm-slot data-station='(\w+)'", page)
+    check(slots == [s["id"] for s in render.STATIONS], f"one live card per ship room, in art order ({slots})")
+    check("crew-blocked" in section(page, "buildbay") and "crew-done" in section(page, "buildbay")
+          and "crew-working" in section(page, "scout") and "crew-odd" in section(page, "cargo")
+          and "crew-blocked" not in section(page, "scout"),
+          "each crew sits in its kind's room; an unknown kind goes to the cargo hold, not a guessed room")
+    check("id=decisions" in section(page, "bridge") and "data-decision='cap-xss'" in section(page, "bridge"),
+          "captain calls are answered on the Bridge")
+    check(re.search(r"data-station='scout' data-live", page) is not None
+          and re.search(r"data-station='buildbay' data-live", page) is None
+          and re.search(r"data-station='buildbay'[^>]* data-hot", page) is not None,
+          "only a room with a working crew moves; a blocked crew marks its room for attention")
+    plain_page = plain.decode()
+    check(re.findall(r"<li class=fm-slot data-station='(\w+)'", plain_page) == slots and "id=bounties" in plain_page
+          and "class=fm-art" not in plain_page, "plain draws the same rooms and bounty board, with no art")
+
+    # Big Shot's bounty board
+    board = {b["id"]: b for b in snaps.get()["bounties"]}
+    want = {"cap-xss": "open", "cap-long": "in_progress", "wait-dep": "open", "next-up": "open",
+            "crew-done": "awaiting_evidence", "old-done": "verified", "scout-done": "verified",
+            "bare-done": "awaiting_evidence", "signal-demo-repo-7": "in_progress", "signal-demo-repo-9": "open"}
+    got = {i: board.get(i, {}).get("status") for i in want}
+    check(got == want, f"bounty status per source ({ {i: s for i, s in got.items() if s != want[i]} or 'all match'})")
+    check("call-done" not in board and "signal-demo-repo-8" not in board and "crew-blocked" not in board,
+          "no card for an answered call, a closed alert issue, or routine crew work")
+    for bid, status in want.items():
+        check(f"id='b-{bid}' data-bounty='{status}'" in page, f"bounty {bid} drawn as {status}")
+    check(all((b.get("proof") or {}).get("kind") in ("pr", "report") for b in board.values() if b["status"] == "verified")
+          and page.count("<strong>Verified</strong>") == sum(1 for b in board.values() if b["status"] == "verified"),
+          "Verified only with a merged PR or report on record")
+    check("merged PR <a href='https://github.com/example/demo-repo/pull/40'" in page
+          and "report <a href='/report?path=data%2Fscout-done%2Freport.md'>" in page,
+          "a verified card links its merged PR or report")
+    check(board["next-up"]["note"] == "Starts after crew-working." and "dependency" in board["wait-dep"]["note"]
+          and "not re-checked" in board["signal-demo-repo-9"]["note"] and "crew-done" in board["signal-demo-repo-7"]["note"],
+          "each open card says what it is waiting on")
+    i, j = page.find("<aside id=bounties"), page.find("</aside>")
+    words = text_of(page[i:j]).replace("No money, rewards, points or revenue", "")
+    money = re.findall(r"\$|\breward|\bpayout|\bprize|\bpoints?\b|\brevenue|\bamount|\bprice|\busd\b", words, re.I)
+    check(i >= 0 and not money, f"bounty board has no money/reward wording {money or ''}")
+    calls = (Path(home.home) / "gh-calls").read_text().splitlines()
+    snaps.refresh()
+    check(len(calls) == 3 and len((Path(home.home) / "gh-calls").read_text().splitlines()) == 3,
+          f"alert issues are looked up once per refresh window, not every refresh ({len(calls)} calls)")
 
     # page hardening
     csp = hdrs_of(port, "/").get("Content-Security-Policy", "")
@@ -148,7 +232,7 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     # summary + projects
     code, _, s = request(port, "GET", "/api/summary")
     s = json.loads(s)
-    check(code == 200 and s["open_decisions"] == 2 and s["attention"] == 1 and s["in_flight"] == 2 and s["queued"] == 1,
+    check(code == 200 and s["open_decisions"] == 2 and s["attention"] == 1 and s["in_flight"] == 4 and s["queued"] == 2,
           f"/api/summary counts ({ {k: s.get(k) for k in ('open_decisions', 'attention', 'in_flight', 'queued')} })")
     check(s["open_ids"] == "cap-long,cap-xss", "/api/summary open_ids")
     code, _, p = request(port, "GET", "/api/projects")
@@ -156,13 +240,15 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     demo = p.get("demo-repo", {})
     check(code == 200 and {"project", "repo", "tasks", "prs", "open_decisions", "next_step", "needs_wake"} <= demo.keys(),
           "/api/projects rows carry the fields fleet-tools.ts reads")
-    check([d["id"] for d in demo.get("open_decisions", [])] == ["cap-xss"] and len(demo.get("tasks", [])) == 2
+    check([d["id"] for d in demo.get("open_decisions", [])] == ["cap-xss"] and len(demo.get("tasks", [])) == 4
           and demo.get("prs", [{}])[0].get("number") == 41, "/api/projects joins decisions, crews and PRs per repo")
 
     # reports: only ones an open decision names, only inside data/
     code, _, r = request(port, "GET", "/report?path=" + urllib.parse.quote("data/cap-xss/report.md"))
     check(code == 200 and "&lt;script&gt;alert(&quot;report&quot;)" in r.decode() and "<script>alert" not in r.decode(),
           "named report served, escaped")
+    code, _, r = request(port, "GET", "/report?path=" + urllib.parse.quote("data/scout-done/report.md"))
+    check(code == 200 and "Findings &lt;b&gt;here&lt;/b&gt;" in r.decode(), "a verified bounty's report is served, escaped")
     for bad in ("../../../etc/passwd", "data/../state/crew-blocked.meta", "data/other.md"):
         code, _, _ = request(port, "GET", "/report?path=" + urllib.parse.quote(bad))
         check(code == 404, f"report refused: {bad}")

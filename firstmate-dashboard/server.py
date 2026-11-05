@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""firstmate-dashboard — a read-only, Bebop-themed view of one Firstmate home.
+"""firstmate-dashboard — a read-only view of one Firstmate home, drawn as the Bebop ship.
 
     python3 firstmate-dashboard/server.py --home ~/Code/firstmate [--port 8600]
 
@@ -13,8 +13,8 @@ the exact decision text the page showed (its digest) and refused if that
 text has changed since, so a stale page cannot answer a different question.
 
 Routes
-  /               the dashboard
-  /report?path=   a report file an open decision names (inside data/ only)
+  /               the ship: rooms with live crews, Big Shot's bounty board, your calls
+  /report?path=   a report file an open decision or a verified bounty names (inside data/ only)
   /answer         POST: decision answer -> Firstmate captain inbox
   /api/summary    counts; the field names the omp status line reads
   /api/projects   read-only per-repo join in the shape fleet-tools.ts reads
@@ -71,7 +71,8 @@ class Snapshots:
             snap = self.home.snapshot()
         except Exception as e:  # noqa: BLE001 - a read bug must surface on the page, not kill the loop
             snap = {"ok": False, "errors": [f"snapshot failed: {type(e).__name__}: {e}"], "decisions": [],
-                    "in_flight": [], "queued": [], "done": [], "counts": {}, "fingerprint": "", "home": str(self.home.home)}
+                    "in_flight": [], "queued": [], "done": [], "bounties": [], "counts": {}, "fingerprint": "",
+                    "home": str(self.home.home)}
         with self._lock:
             self._snap = snap
         self._ready.set()
@@ -81,7 +82,7 @@ class Snapshots:
         self._ready.wait(timeout)
         with self._lock:
             return self._snap or {"ok": False, "errors": ["first read still running"], "decisions": [], "in_flight": [],
-                                  "queued": [], "done": [], "counts": {}, "fingerprint": ""}
+                                  "queued": [], "done": [], "bounties": [], "counts": {}, "fingerprint": ""}
 
 
 def summary(snap: dict) -> dict:
@@ -221,10 +222,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._html(200, render.dashboard(snap, theme, self.server.token, nonce, flash, bool(bad)), nonce)
         if url.path == "/report":
             rel = (q.get("path") or [""])[0]
-            named = {r for d in snap.get("decisions", []) for r in d["reports"]}
+            named = {r for d in snap.get("decisions", []) for r in d["reports"]} | {
+                b["proof"]["ref"] for b in snap.get("bounties", [])
+                if b["status"] == "verified" and (b.get("proof") or {}).get("kind") == "report"}
             p = self.server.home.report_file(rel) if rel in named else None
             if p is None:
-                return self._html(404, render.message("Not found", "That report is not one an open decision names.", theme, nonce), nonce)
+                return self._html(404, render.message("Not found", "That report is not one an open decision or a verified bounty names.", theme, nonce), nonce)
             data = p.read_bytes()[:MAX_REPORT].decode("utf-8", "replace")
             return self._html(200, render.report(rel, data, theme, nonce), nonce)
         return self._send(404, "text/plain", b"not found")
