@@ -1,0 +1,3 @@
+working [at=1793836000]: setup done
+paused [at=1793836100]: PR https://github.com/example/demo-repo/pull/41 opened; waiting on checks
+blocked [at=1793836200]: same obstacle twice on https://github.com/example/demo-repo/pull/41
