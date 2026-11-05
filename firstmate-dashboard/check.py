@@ -13,8 +13,11 @@ report on record, both palettes keep AA contrast, the summary counts the omp
 status line reads, the answer path's guards (token, Host/Origin, stale
 decision text), that an accepted answer reaches the inbox CLI naming its
 decision and its confirmation shows under Your calls, that a call counts as
-answered only for the text the answer was bound to, and that a failed read
-never reports zero counts or an empty fleet, in the API or on the page.
+answered only for the text the answer was bound to, that the Reports view
+lists only data/<id>/report.md inside data/, escapes every report, pins its
+captain calls linked to the held decision and makes its tables sortable,
+faceted and copyable, and that a failed read never reports zero counts, an
+empty fleet or an unheld call, in the API or on the page.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -365,6 +369,8 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
         code, _, _ = request(port, "GET", "/report?path=" + urllib.parse.quote(bad))
         check(code == 404, f"report refused: {bad}")
 
+    reports_view(port, home)
+
     # answer guards
     d = next(x for x in snaps.get()["decisions"] if x["id"] == "cap-xss")
     good = {"token": request_token(page), "decision": "cap-xss", "digest": d["digest"], "text": "Go with (a)."}
@@ -439,6 +445,104 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     check("Nothing is waiting on you" not in page and "No crew here right now" not in page
           and "Needs your call: <strong>?</strong>" in page and "<title>(!) Firstmate</title>" in page,
           "failed read: the page never says nothing needs you, and its counts read unknown")
+    code, _, r = request(port, "GET", "/report?path=" + urllib.parse.quote("data/crew-blocked/report.md"))
+    r = r.decode()
+    check(code == 200 and "Whether these calls are held is unknown" in r and "No open captain hold" not in r,
+          "failed read: a report still opens, and never says its calls are not held")
+
+
+def reports_view(port: int, home: fmdata.Home) -> None:
+    """The Reports view: every data/<id>/report.md newest first, drawn as a
+    document with its captain calls pinned and linked to the held decision."""
+    data = Path(home.home) / "data"
+    for age, rid in enumerate(("crew-blocked", "scout-done", "cap-xss")):
+        os.utime(data / rid / "report.md", (1_800_000_000 - age * 3600,) * 2)
+    (data / "escape").mkdir()
+    (data / "escape" / "report.md").symlink_to(Path(home.home) / "state" / "crew-blocked.meta")
+    (data / "notes.md").write_text("# not a report\n")
+
+    code, hdrs, body = request(port, "GET", "/reports")
+    page = body.decode()
+    listed = re.findall(r"<tr id='rep-([^']+)'>", page)
+    check(code == 200 and listed == ["crew-blocked", "scout-done", "cap-xss"],
+          f"/reports lists each data/<id>/report.md newest first, nothing outside data/ or not a report ({listed})")
+    row = lambda rid: page[page.find(f"<tr id='rep-{rid}'>"):page.find("</tr>", page.find(f"<tr id='rep-{rid}'>"))]  # noqa: E731
+    check(">Feed fix: &lt;b&gt;debt&lt;/b&gt; &amp; calls</a>" in row("crew-blocked"),
+          "a listed report is titled by its first heading, escaped; a heading inside a code fence is not it")
+    check("href='/#d-cap-xss'>held: cap-xss</a>" in row("crew-blocked") and "href='/#d-cap-xss'>held: cap-xss</a>" in row("cap-xss")
+          and "held:" not in row("scout-done"),
+          "a report links the held decision whose hold origin is its task, or whose reason names it; others link none")
+    csp = lambda h: re.sub(r"'nonce-[^']+'", "'nonce'", h.get("Content-Security-Policy", ""))  # noqa: E731
+    check(csp(hdrs) == csp(hdrs_of(port, "/")) and "script-src 'nonce'" in csp(hdrs),
+          "report pages carry the ship page's CSP unchanged")
+    for bad in ("data/escape/report.md", "data/notes.md", "data/./crew-blocked/report.md", "data/../data/crew-blocked/report.md"):
+        code, _, _ = request(port, "GET", "/report?path=" + urllib.parse.quote(bad))
+        check(code == 404, f"report refused: {bad}")
+    code, _, _ = request(port, "POST", "/report?path=data%2Fcrew-blocked%2Freport.md", "x=1")
+    check(code == 404 and not (Path(home.home) / "note-args").exists(), "a report takes no POST: the only write is /answer")
+
+    code, _, body = request(port, "GET", "/report?path=" + urllib.parse.quote("data/crew-blocked/report.md"))
+    r = body.decode()
+    check(code == 200 and "<title>Feed fix: &lt;b&gt;debt&lt;/b&gt; &amp; calls · Report</title>" in r, "a report renders, titled")
+    for raw in ("<img src=x", "<script>alert(\"cell\")", "<script>alert('m')", "<b>debt</b>", "javascript:"):
+        check(raw not in r, f"report markdown never emits raw markup or a script link: {raw}")
+    check("&lt;img src=x onerror=alert(2)&gt;" in r and "a trap" in r
+          and "<a href='https://github.com/example/demo-repo/pull/41' rel=noreferrer>the PR</a>" in r
+          and "<a href='https://github.com/example/demo-repo/issues/7' rel=noreferrer>https://github.com/example/demo-repo/issues/7</a>." in r
+          and "<a href='#r-debt-register'>the register</a>" in r and "<h2 id='r-debt-register'>" in r,
+          "report links: http(s) leave the page, #anchors land in the report, anything else stays text")
+    check("class=fm-mermaid" in r and "A[&quot;&lt;script&gt;alert(&#x27;m&#x27;)&lt;/script&gt;&quot;] --&gt; B" in r,
+          "a mermaid block is shown as escaped source")
+    pin, first_h2 = r.find("class=fm-pin id='r-captain-calls' data-held"), r.find("<h2 id='r-debt-register'>")
+    calls = r[pin:r.find("</section>", pin)]
+    check(0 < pin < first_h2 and r.count("id='r-captain-calls'") == 1,
+          "the Captain calls section is pinned above the report body, once")
+    check("2 calls · pinned from the report" in calls and "<li value=2><strong>Retire the old feed.</strong>" in calls
+          and "<ul><li>(a) yes. <strong>Recommended.</strong></li>" in calls,
+          "pinned calls keep the report's numbering and nesting")
+    check("Held for you as <a href='/#d-cap-xss'><code>cap-xss</code>" in calls,
+          "pinned calls link the matching held decision card on the Bridge")
+    code, _, body = request(port, "GET", "/report?path=" + urllib.parse.quote("data/scout-done/report.md"))
+    check(code == 200 and "No open captain hold" not in body.decode() and "class=fm-pin" not in body.decode(),
+          "a report with no calls and no hold pins nothing")
+
+    i = r.find("<table id=rt-1")
+    table = r[r.rfind("<div class=fm-mdt", 0, i):r.find("</table>", i)]
+    heads = re.findall(r"<th scope=col><button type=button class=fm-sort>([^<]*)</button></th>", table)
+    menus = re.findall(r"<label>(\w+) <select data-col=(\d+)", table)
+    check(heads == ["ID", "Repo", "Item", "Sev"], f"every column header sorts ({heads})")
+    check(menus == [("Repo", "1"), ("Sev", "3")] and "<option value='P2'>P2 (2)</option>" in table
+          and "<option value='other-repo'>other-repo (2)</option>" in table,
+          f"facet menus for short repeating columns, with counts; none for unique or long ones ({menus})")
+    check("<tr data-i=1 data-f1='demo-repo\nother-repo' data-f3='P2'>" in table,
+          "a comma-listed cell belongs to each value's facet")
+    check("data-ref='data/crew-blocked/report.md#debt-register — D-002 | demo-repo, other-repo | pipe in code: a | b | P2'" in table,
+          "a row's copy reference is one line: report#section, then its cells as text")
+
+    # A hostile report: every line below backtracked for seconds to minutes in
+    # an earlier draft, and a regex holds the GIL, so it would stall the whole
+    # dashboard. Both report routes must still answer at once.
+    hostile = data / "zz-hostile"
+    hostile.mkdir()
+    (hostile / "report.md").write_text("\n\n".join([
+        "# Hostile" + " " * 50_000 + "x",
+        " ".join("`" * k for k in range(1, 700)),
+        "```" + "a" * 50_000 + "`",
+        "[" * 50_000,
+        "a \\| b\n" + " " * 50_000 + "x\\|",
+        "-" + " -" * 20_000 + " x",
+        ">" * 20_000 + " x",
+        "| ID | Note |\n|---|---|\n| D-1 | ok\x1b[201~rm -rf ~\x0f\u202eevil |",
+    ]))
+    os.utime(hostile / "report.md", (1_700_000_000,) * 2)
+    for path in ("/reports", "/report?path=" + urllib.parse.quote("data/zz-hostile/report.md")):
+        t = time.monotonic()
+        code, _, body = request(port, "GET", path)
+        took = time.monotonic() - t
+        check(code == 200 and took < 2, f"a hostile report renders in linear time: {path} ({code}, {took:.2f}s)")
+    refs = re.findall(r"data-ref='([^']*)'", body.decode())
+    check(refs == ["data/zz-hostile/report.md#hostile-x — D-1 | ok [201~rm -rf ~ evil"],
+          f"a copied reference carries no control or bidi characters a terminal would act on ({refs})")
 
 
 def hdrs_of(port: int, path: str) -> dict:
