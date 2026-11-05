@@ -46,7 +46,11 @@ for d in (HOME / "state", HOME / "data", BIN, HERDR):
 for tid in ("t-run", "t-review", "t-secret"):
     (HOME / f"state/{tid}.meta").write_text(f"id={tid}\n")
 (HOME / "data/t-review").mkdir()
-(HOME / "data/t-review/report.md").write_text(f"# Report\nverdict: ship it\nleaked {GH_TOKEN} here\n{PEM}\n")
+LEAK_PATHS = ["/Users/LEAKUSER/proj/notes.txt", "~/LEAKHOME/file", "~/.treehouse/LEAKTREE/wt",
+              "/opt/x/.herdr/worktrees/LEAKWT/kb"]
+KEEP_TEXT = ["https://github.com/tntpgh/x/pull/7", "remote-mcp/fm_publisher.py"]
+PATH_TEXT = " ".join(LEAK_PATHS + KEEP_TEXT)
+(HOME / "data/t-review/report.md").write_text(f"# Report\nverdict: ship it\nleaked {GH_TOKEN} here\n{PEM}\n{PATH_TEXT}\n")
 (HOME / "data/t-secret").mkdir()
 (HOME / "data/t-secret/report.md").write_text("DENIED-REPORT-TEXT\n")
 (HERDR / "client-labels.json").write_text(json.dumps({DOT_CLIENT: "dot", DUET_CLIENT: "duet"}))
@@ -68,7 +72,7 @@ def task(tid, crew, *, last="", pr=None, source="pane", target=None):
             "paths": {"meta": {"path": f"/Users/SENTINEL-PATH/state/{tid}.meta", "present": True},
                       "status_log": {"path": "/Users/SENTINEL-PATH/x", "present": True, "kind": "status",
                                      "last_event": {"state": crew, "note": last, "raw": "SENTINEL-CRAW", "age_seconds": 60}}},
-            "current_state": {"state": crew, "source": source, "detail": f"detail {crew}", "raw": "SENTINEL-CRAW",
+            "current_state": {"state": crew, "source": source, "detail": f"detail {crew} at {PATH_TEXT}", "raw": "SENTINEL-CRAW",
                               "observed_at": "2026-11-05T00:00:00Z", "freshness": "fresh"},
             "endpoint": {"target": target or f"default:w{tid}:p2", "exists": True, "agent_alive": "not_checked",
                          "status": "unknown"},
@@ -85,7 +89,7 @@ def fleet_doc():
         "backlog": {"path": "/Users/SENTINEL-PATH/data/backlog.md", "present": True, "records": [
             rec("t-run"),
             rec("t-hold", captain_actionable=True, hold_kind="captain", hold_set="2026-11-02",
-                hold_reason=f"merge PR? token {GH_TOKEN} was pasted"),
+                hold_reason=f"merge PR? token {GH_TOKEN} was pasted in {PATH_TEXT}"),
             rec("t-queued", state="queued"),
             rec("t-done", state="done", completion={"verb": "merged", "date": "2026-11-03"},
                 pr_url="https://github.com/tntpgh/x/pull/9"),
@@ -95,7 +99,7 @@ def fleet_doc():
             {"id": None, "structured": False, "raw": "free-form SENTINEL-RAW"},
         ]},
         "tasks": [
-            task("t-run", "working", last="working [at=1]: SENTINEL-free progress"),
+            task("t-run", "working", last=f"working [at=1]: SENTINEL-free progress {PATH_TEXT}"),
             task("t-review", "done", pr="https://github.com/tntpgh/x/pull/10", source="run-step"),
             task("t-blocked", "blocked", last=f"blocked [at=2]: aws key {AWS_KEY} rejected"),
             task("t-parked", "parked"), task("t-paused", "paused"), task("t-failed", "failed"),
@@ -354,6 +358,19 @@ class Egress(Base):
         self.assertEqual(len(report), 1)
         self.assertIn("verdict: ship it", report[0]["text"])
         self.assertIn("[REDACTED:private-key]", report[0]["text"])
+
+    def test_local_paths_are_redacted_but_urls_and_repo_paths_survive(self):
+        self.tick()
+        body = self.sent()[0]
+        text = json.dumps(body)
+        for leak in ("LEAKUSER", "LEAKHOME", "LEAKTREE", "LEAKWT"):
+            self.assertNotIn(leak, text)
+        report = [r for r in body["results"] if r["task_id"] == "t-review" and r["source"] == "report.md"][0]["text"]
+        hold = {b["task_id"]: b for b in body["snapshot"]["blockers"]}["t-hold"]["summary"]
+        for field in (report, hold):
+            self.assertIn("[path]", field)
+        for keep in KEEP_TEXT:
+            self.assertIn(keep, report)
 
     def test_fields_outside_the_allow_list_never_leave(self):
         self.tick()

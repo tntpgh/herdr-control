@@ -690,7 +690,9 @@ flowchart LR
   reasons, last-event lines (240 chars), pane targets and harness names,
   `data/<task>/report.md` (single-link regular file, 64 KB) as source
   `report.md`, and a generated `firstmate:card` per task. Every free-text
-  field is redacted, then capped. **Never:** note bodies, terminal captures,
+  field is redacted (credential shapes, and local paths such as `/Users/…`,
+  `~/…` or worktree locations become `[path]`; URLs and repo-relative paths
+  stay), then capped. **Never:** note bodies, terminal captures,
   secondmate evidence, raw status lines, local paths, `data/captain.md`,
   learnings, secrets. `~/.config/fm-mcp/read-scope` set to `counts` sends only
   numbers and liveness (any value other than `full`/`counts` fails closed to
