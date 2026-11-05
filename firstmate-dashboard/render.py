@@ -377,7 +377,9 @@ def _crew_table(theme: dict, tasks: list[dict]) -> str:
     rows = "".join(
         f"<tr id='t-{esc(t['id'])}'><td>{_badge(theme, t['kind'])}</td><td><b>{esc(t['title'])}</b><div class=dim><code>{esc(t['id'])}</code>"
         f" · {esc(t['repo'])} · {esc(t['kind'])}{(' · ' + esc(t['mode'])) if t['mode'] else ''}</div></td>"
-        f"<td>{_state(t['crew']['state'])}<div class=fm-detail>{esc(t['crew']['detail'])}</div></td>"
+        f"<td>{_state(t['crew']['state'])}<div class=fm-detail>{esc(t['crew']['detail'])}</div>"
+        + (f"<div class=dim>state read {esc(t['crew']['observed_at'])}</div>" if t["crew"].get("observed_at") else "")
+        + "</td>"
         f"<td>{_links(t['prs'])}</td><td class=dim>{esc(t['window'])}</td></tr>"
         for t in tasks)
     return ("<table><thead><tr><th><span class=sr-only>Crew</span></th><th>Task</th><th>State</th><th>PR</th><th>Window</th></tr></thead>"
