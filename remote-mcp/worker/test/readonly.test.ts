@@ -1,31 +1,34 @@
-// The Worker as first deployed: MESSAGING_ENABLED is off. A client that asks
-// for herdr:message still gets a read-only grant, sees no send_message, and
-// the Durable Object refuses a message even for a caller claiming the scope.
+// The owner inbox switched off: Bebop offers fm:read and fm:reports only. A
+// client that asks for a note scope still gets a read-only grant, sees no
+// write tool, and the Durable Object refuses a note even for a caller
+// claiming the scope.
 import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, expect, it } from "vitest";
 import type { HerdrState } from "../src/state";
 import type { Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, queueRaw, queueRawOwner, signedSync, snapshot, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, DOT, oauthToken, queueRaw, queueRawOwner, signedSync, syncBody, toolNames } from "./helpers";
 
 const e = env as unknown as Env;
 beforeEach(() => reset());
 
-it("advertises only herdr:read, and says so on /healthz before anyone connects", async () => {
+it("advertises only fm:read and fm:reports, and says so on /healthz before anyone connects", async () => {
   const as: { scopes_supported?: string[] } = await (await SELF.fetch(`${BASE}/.well-known/oauth-authorization-server`)).json();
-  expect(as.scopes_supported).toEqual(["herdr:read"]);
+  expect(as.scopes_supported).toEqual(["fm:read", "fm:reports"]);
   const health = await (await SELF.fetch(`${BASE}/healthz`)).json();
-  expect(health).toMatchObject({ messaging_enabled: false, scopes_offered: ["herdr:read"], build_sha: "unstamped" });
+  expect(health).toMatchObject({ service: "bebop", owner_inbox_enabled: false, scopes_offered: ["fm:read", "fm:reports"],
+    clients: { dot: ["fm:read", "fm:reports"], duet: ["fm:read", "fm:reports"] }, build_sha: "unstamped" });
 });
 
-it("offers no owner-inbox scope and refuses send_owner_message in the Durable Object, off by default", async () => {
-  const as: { scopes_supported?: string[] } = await (await SELF.fetch(`${BASE}/.well-known/oauth-authorization-server`)).json();
-  expect(as.scopes_supported).not.toContain("herdr:message.owner");
-  const health = await (await SELF.fetch(`${BASE}/healthz`)).json();
-  expect(health).toMatchObject({ owner_inbox_enabled: false });
-  const out = await runInDurableObject(e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet")), (o: HerdrState) =>
-    o.sendOwnerMessage(Date.now(), { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" },
-      ["herdr:read", "herdr:message.owner"], "conductor", "hi", "cm1"));
-  expect(out).toEqual({ ok: false, reason: "owner_inbox_disabled" });
+it("refuses every kind of note in the Durable Object while the owner inbox is off", async () => {
+  const caller = { email: "tnt@teamthurber.com", client_id: DOT, client_name: "ChatGPT" };
+  const fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
+  const all = ["fm:read", "fm:request", "fm:decide-note"];
+  expect(await runInDurableObject(fleet, (o: HerdrState) => o.sendOwnerMessage(Date.now(), caller, all, "firstmate", "hi", "cm1")))
+    .toEqual({ ok: false, reason: "owner_inbox_disabled" });
+  expect(await runInDurableObject(fleet, (o: HerdrState) => o.sendOwnerMessage(Date.now(), caller, all, "firstmate", "go", "cm2",
+    { kind: "task_request", project: "kb", task_kind: "scout" }))).toEqual({ ok: false, reason: "owner_inbox_disabled" });
+  expect(await runInDurableObject(fleet, (o: HerdrState) => o.sendOwnerMessage(Date.now(), caller, all, "firstmate", "a", "cm3",
+    { kind: "decision_note", task_id: "task_A" }))).toEqual({ ok: false, reason: "owner_inbox_disabled" });
 });
 
 it("never hands out an owner message queued before owner-inbox was switched off", async () => {
@@ -39,47 +42,25 @@ it("never hands out an owner message queued before owner-inbox was switched off"
   expect([m?.status, m?.detail]).toEqual(["blocked:owner_inbox_disabled", "owner_inbox_disabled"]);
 });
 
-it("offers no messaging checkbox and grants read only, even when the client asks for herdr:message", async () => {
-  const page = await SELF.fetch(`${BASE}/authorize?response_type=code&client_id=x`, {
-    headers: { "cf-access-jwt-assertion": await accessJwt("tnt@teamthurber.com") },
-  });
-  // client_id x is unregistered, so the page itself is an error; the grant below is the real check.
-  expect(await page.text()).not.toContain('value="herdr:message"');
-  const { access_token, scope } = await oauthToken(["herdr:read", "herdr:message"]);
-  expect(scope).toBe("herdr:read");
+it("offers no note checkbox and grants read only, even when the client asks for fm:request", async () => {
+  const q = new URLSearchParams({ response_type: "code", client_id: DOT, redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    code_challenge: "x".repeat(43), code_challenge_method: "S256", scope: "fm:read fm:request", resource: `${BASE}/mcp` });
+  const page = await SELF.fetch(`${BASE}/authorize?${q}`, { headers: { "cf-access-jwt-assertion": await accessJwt("tnt@teamthurber.com") } });
+  const html = await page.text();
+  expect(html).toContain('value="fm:read"');
+  expect(html).not.toContain('value="fm:request"');
+  const { access_token, scope } = await oauthToken(["fm:read", "fm:request"]);
+  expect(scope).toBe("fm:read");
 
-  const list = await SELF.fetch(`${BASE}/mcp`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
-  });
-  const names = ((await list.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
-  expect(names).not.toContain("send_message");
+  const names = await toolNames(access_token);
+  expect(names).not.toContain("send_owner_message");
+  expect(names).not.toContain("request_task");
   expect(names).toContain("get_status");
 
   await signedSync(syncBody());
-  const status = await callTool<{ your_scopes: string[]; server: { messaging_enabled: boolean } }>(access_token, "get_status");
-  expect([status.data.connection?.state, status.data.your_scopes, status.data.server.messaging_enabled])
-    .toEqual(["connected", ["herdr:read"], false]);
-});
-
-it("reports the Mac's real-Chrome health from the snapshot, and null when the publisher sent none", async () => {
-  const { access_token } = await oauthToken(["herdr:read"]);
-  await signedSync(syncBody());
-  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toBeNull();
-
-  const browser = {
-    checked_at: "2026-10-02T18:00:00Z", real_chrome_running: true, relay: "connected",
-    extensions: { omp_relay: "enabled", "1password": "unknown", chatgpt: "missing" } as const,
-    stray_omp_chromes: 1, healthy: false,
-  };
-  await signedSync(syncBody({ snapshot: snapshot({ browser }) }));
-  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toEqual(browser);
-
-  // Drift on the Mac must not cost the sync: the block degrades to null.
-  const res = await signedSync(syncBody({ snapshot: snapshot({ browser: { ...browser, relay: "connected to /Users/x" } }) }));
-  expect(res.status).toBe(200);
-  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toBeNull();
+  const status = await callTool<{ your_scopes: string[]; your_client: string; server: { owner_inbox_enabled: boolean } }>(access_token, "get_status");
+  expect([status.data.connection?.state, status.data.your_scopes, status.data.your_client, status.data.server.owner_inbox_enabled])
+    .toEqual(["connected", ["fm:read"], "dot", false]);
 });
 
 it("refuses and audits a message in the Durable Object regardless of the scopes passed in", async () => {
@@ -102,25 +83,19 @@ it("never hands out a message queued before messaging was switched off", async (
 });
 
 it("consumer tools are absent and Durable Object calls refuse when the feature is off", async () => {
-  const { access_token } = await oauthToken(["herdr:read"]);
-  const response = await SELF.fetch(`${BASE}/mcp`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
-  });
-  const body = await response.json() as { result: { tools: { name: string }[] } };
-  const names = body.result.tools.map((tool) => tool.name);
+  const { access_token } = await oauthToken(["fm:read"]);
+  const names = await toolNames(access_token);
   expect(names).not.toContain("get_consumer_position");
   expect(names).not.toContain("commit_consumer_position");
   expect(names).not.toContain("rebase_consumer_position");
   expect((await callTool(access_token, "get_consumer_position", { consumer_id: "zero" })).isError).toBe(true);
   const fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
   const caller = { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" };
-  expect((await fleet.getConsumerPosition(Date.now(), caller, ["herdr:read"], "zero")).result)
+  expect((await fleet.getConsumerPosition(Date.now(), caller, ["fm:read"], "zero")).result)
     .toBe("event_consumers_disabled");
-  expect((await fleet.commitConsumerPosition(Date.now(), caller, ["herdr:read"], "zero", 0, 0, 1)).result)
+  expect((await fleet.commitConsumerPosition(Date.now(), caller, ["fm:read"], "zero", 0, 0, 1)).result)
     .toBe("event_consumers_disabled");
-  expect((await fleet.rebaseConsumerPosition(Date.now(), caller, ["herdr:read"], "zero", 0, 0, 1, "0".repeat(64), true)).result)
+  expect((await fleet.rebaseConsumerPosition(Date.now(), caller, ["fm:read"], "zero", 0, 0, 1, "0".repeat(64), true)).result)
     .toBe("event_consumers_disabled");
   const rows = await runInDurableObject(fleet, (_o: HerdrState, state) =>
     state.storage.sql.exec(`SELECT * FROM event_consumers`).toArray());

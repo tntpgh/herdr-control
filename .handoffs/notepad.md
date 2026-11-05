@@ -23,3 +23,15 @@
 - `python3 firstmate-dashboard/check.py` -> 43 ok, `all checks passed`.
 - `firstmate-dashboard/launchd.sh render --home ~/Code/firstmate | plutil -lint -` -> OK.
 - Real-home run: `python3 firstmate-dashboard/server.py --home ~/Code/firstmate --port <spare>`; `curl -s 127.0.0.1:<spare>/api/summary`.
+
+## Completed
+- fm-mcp-p2 (branch fm/fm-mcp-p2): Bebop Phase 2. Worker: fm:* scopes (read/reports/request/decide-note/peer), CLIENT_GRANTS dot/duet ceilings + default deny, TOOL_CATALOG per-tool limits (re-checked atomically inside sendOwnerMessage/sendPeerMessage), client_label on audit, duplicate audit rows, typed decisions/reports/posture tools, request_task/answer_decision as notes only, bebop canonical + herdr-mcp alias (per-origin provider + helpers, 421 unknown host). Publisher: decisions/reports/posture/pr_url fields with redaction, note kinds re-checked on Mac, symlinked data/<id> refused. issue-client dot/duet profiles + contract test (now in CI). provision.sh multi-host Access + domains + VERIFY. README scope matrix, herdr-mcp comparison, client reconnect, Bebop cutover runbook with rollback.
+- Verified: tsc clean, vitest 133/133, authorization-offline 35, verify-fm-publisher 41, verify-issue-client 10, live --dry-run OK. Security review: 0 high/critical; lows fixed.
+
+## Recommended next steps
+- Attended cutover per remote-mcp/README.md "Bebop cutover runbook" (deploy, Access, reconnect Dot/Duet, sync_client URL -> bebop, LEGACY_HERDR_SCOPES=false, drop alias).
+- Phase 3: delete dormant herdr message/task DO paths, publisher.py, tasks.py.
+
+## Key decisions
+- Worker script name stays herdr-mcp so DO/KV/grants carry over; one Access app covers both hosts so ACCESS_AUD is unchanged.
+- duet ceiling excludes fm:decide-note; legacy herdr:message.owner never maps to fm:decide-note.

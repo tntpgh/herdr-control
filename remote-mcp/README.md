@@ -1,23 +1,31 @@
-# herdr-mcp — authenticated remote MCP over herdr status
+# Bebop — Firstmate's authenticated remote MCP
 
-A remote MCP server at **`https://herdr-mcp.teamthurber.com/mcp`** that lets an
-outside MCP client (ChatGPT / Codex, Claude, any OAuth-capable MCP client) read
-the herdr fleet — agents, tasks, status, blockers, bounded task results — and,
-with a separate scope, leave a one-line note for a live task's agent.
+A remote MCP server at **`https://bebop.teamthurber.com/mcp`** that lets two
+named apps, **Dot** (ChatGPT) and **Duet** (Claude.ai), read the Firstmate
+fleet (tasks, typed PR links, open captain decisions with their options and
+recommendation, scout/ship reports, Firstmate's posture) and leave Firstmate
+**notes**: a message, a task request, a note about an open decision, or an
+app-to-app peer note. Nothing a remote app sends is ever auto-actioned or
+treated as the captain's word.
 
 It is not a remote desktop. There is no tool that runs a command, presses a
-key, answers or lists answerable approval prompts, or reaches the loopback hub.
+key, starts or cancels a task, answers an approval prompt, releases a hold,
+or reaches the loopback hub.
+
+Bebop is the herdr-mcp Worker renamed and narrowed (Phase 2). The Worker
+script keeps its `herdr-mcp` name, so the Durable Object, the OAuth KV and
+every grant carry over. `herdr-mcp.teamthurber.com` is still served as an
+**alias** during the cutover (see "Bebop cutover runbook").
 
 ```mermaid
 flowchart LR
-  C[MCP client] -- OAuth 2.1 bearer --> W[Worker herdr-mcp<br/>/mcp tools]
-  C -. browser .-> A[Cloudflare Access<br/>Google SSO] --> AU[/authorize consent/]
-  W <--> DO[(Durable Object<br/>snapshot · results · messages · owner messages · audit)]
-  P[publisher.py on the Mac<br/>every 15 s] -- HMAC-signed sync --> W
-  W -- outbox --> P
-  P -- loopback GET --> H[hub 127.0.0.1:8600]
-  P -- herdr-deliver.sh, no --force --> PANE[agent pane]
-  P -- write-only, never typed --> INBOX[(~/.local/state/herdr/inbox/&lt;label&gt;/)]
+  C["Dot / Duet"] -- OAuth 2.1 bearer --> W["Worker herdr-mcp<br/>bebop.teamthurber.com/mcp"]
+  C -. browser .-> A["Cloudflare Access<br/>Google SSO"] --> AU[/authorize consent/]
+  W <--> DO[("Durable Object<br/>snapshot · results · notes · audit")]
+  P["fm_publisher.py on the Mac<br/>every 15 s"] -- HMAC-signed sync --> W
+  W -- owner_outbox --> P
+  P -- read --> F["fm-fleet-snapshot.sh · fm-inbox.sh ready"]
+  P -- "the only write" --> N["fm-inbox.sh note"]
 ```
 
 The Mac only makes outbound HTTPS calls. Nothing new listens on it, and the hub
@@ -27,146 +35,127 @@ stays loopback-only.
 
 | Surface | Mechanism |
 |---|---|
-| MCP client → `/mcp` | OAuth 2.1 authorization code + PKCE (S256) bearer token, audience-bound to `https://herdr-mcp.teamthurber.com/mcp` (RFC 8707 `resource`). Clients register by DCR (`/oauth/register`) or CIMD. RFC 9207 `iss` in every authorization response. Discovery: `/.well-known/oauth-protected-resource/mcp` (RFC 9728), `/.well-known/oauth-authorization-server` (RFC 8414). Access token 1 h; refresh 30 days, idles out after 7. |
-| Human consent → `/authorize` | Path-scoped Cloudflare Access app `herdr-mcp-authorize` (Google Workspace IdP pinned, policy = `ALLOWED_EMAILS`). The Worker **also** verifies the `Cf-Access-Jwt-Assertion` (RS256 against the team JWKS, issuer- and AUD-pinned, email allowlisted), so a removed or widened Access app fails closed. Consent is CSRF-bound to the browser by the provider's `__Host-` cookie + handle. |
+| App → `/mcp` | OAuth 2.1 authorization code + PKCE (S256) bearer token, audience-bound to `<origin>/mcp` (RFC 8707 `resource`). Clients identify by CIMD (their client ID metadata document URL); only the two in `CLIENT_GRANTS` hold anything. RFC 9207 `iss` in every authorization response. Discovery: `/.well-known/oauth-protected-resource/mcp` (RFC 9728), `/.well-known/oauth-authorization-server` (RFC 8414). Access token 1 h; refresh 30 days, idles out after 7. |
+| Human consent → `/authorize` | Path-scoped Cloudflare Access app `herdr-mcp-authorize` covering `<host>/authorize` for every served host (Google Workspace IdP pinned, policy = `ALLOWED_EMAILS`). The Worker **also** verifies the `Cf-Access-Jwt-Assertion` (RS256 against the team JWKS, issuer- and AUD-pinned, email allowlisted), so a removed or widened Access app fails closed. Consent is CSRF-bound to the browser by the provider's `__Host-` cookie + handle, and refuses any client outside `CLIENT_GRANTS` before the page renders. |
 | Mac → `/ingest/sync` | HMAC-SHA256 over `ts.nonce.sha256(body)` with `INGEST_KEY`; ±300 s skew; nonces single-use. Never an OAuth token. |
 
-Scopes:
+**Hosts.** `PUBLIC_URL` (bebop) is canonical; each origin in `ALIAS_URLS`
+(herdr-mcp, during the cutover) is a full second OAuth front door with its own
+issuer, resource and metadata — the provider is built per origin. A token
+issued with a resource is audience-bound to that origin, so it never works on
+the other host; a stored token with no audience resolves to whichever host it
+is presented at, which grants nothing extra (effective scopes do not depend on
+the host). Any other `Host` gets `421 Misdirected Request`.
+`/healthz` reports `host_role` (`canonical`/`alias`) and `canonical_mcp`.
 
-- `herdr:read` — every read tool. Pre-ticked on the consent page.
-- `herdr:message` — `send_message` only. The Worker var `MESSAGING_ENABLED`
-  decides whether the scope exists at all: while it is `"false"` the consent
-  page does not offer it, the AS metadata does not advertise it,
-  `send_message` is not listed, and the Durable Object refuses messages even
-  for a token granted while it was on. The Mac has its own switch: the
-  publisher refuses every leased message unless its environment has
-  `HERDR_MCP_MESSAGING=1`, which only `install.sh --remote-mcp-messaging` sets.
-- `herdr:task.start` — `start_task` in research mode (read-only, no git
-  writes), plus reading that task's own answer/events. `herdr:task.implement`
-  — `start_task` in implement mode (commits and pushes its own branch); a
-  separate tick so research can be granted without implement. `herdr:task.cancel`
-  — `cancel_task` and `resume_task` for a task this connection started. All
-  three exist only while the Worker var `TASKS_ENABLED` is `"true"` (same
-  all-or-nothing gate as `MESSAGING_ENABLED`: off hides them from the consent
-  page and the AS metadata, and the Durable Object refuses every task tool
-  even for a token granted while it was on). The Mac has its own switch:
-  `HERDR_MCP_TASKS=1`, set only by `install.sh --remote-mcp-tasks`; `list_capabilities`
-  reports `mac_enabled` so a client can tell "off on the Worker" from "off on
-  the Mac" before ever calling `start_task`.
-- `herdr:message.owner` — `send_owner_message`, `get_owner_message_status`,
-  `get_owner_reply`. Targets a REGISTERED owning session (a conductor, a
-  dedicated long-lived tab — `register-owner.sh`), never a spawned task's
-  agent (that is `send_message`). The body is written to a file on the Mac
-  and never typed into a pane: it reaches the owner as data to read, never
-  as a command or an approval. Same `OWNER_INBOX_ENABLED` all-or-nothing gate
-  as the other two, plus its own Mac switch `HERDR_MCP_OWNER_INBOX=1`
-  (`install.sh --remote-mcp-owner-inbox`), plus its own fixed, non-adjustable
-  rate limit (10/minute, 120/hour per sender) separate from message/task
-  limits. `list_capabilities` reports `owner_inbox: {enabled, scope, limits}`.
+### Scopes (`fm:*`), least privilege
 
-**Per-client identity** (SPEC: `.handoffs/DUET-IDENTITY-SPEC-20261031.md`,
-T first-hand YES 2026-10-31, applied to "duet" and "dot", alias "zero"):
-every connected client gets its own OAuth client_id the instant it does its
-own DCR — nothing here is shared, and the Worker derives `caller.client_id`
-from the verified resource token (`mcp.ts`'s `apiHandler`), never from
-request body or the self-declared `client_name` a DCR registration can
-claim to be anything. A client registered via CIMD (client ID metadata
-document) has that document's URL AS its client_id — Claude.ai's is
-`https://claude.ai/oauth/mcp-oauth-client-metadata` (labelled "duet"),
-ChatGPT's is `https://chatgpt.com/oauth/client.json` (labelled "dot") —
-compared byte-for-byte like any other client_id, no special casing.
-`owner_outbox` (and `sendOwnerMessage`'s audit rows) carry that verified
-`sender_client` alongside `sender` (the account email, the same for every
-client) and the self-declared `client_name` — so two connections under one
-account are told apart by the field that cannot be spoofed, never the one
-that can. Scoping a new client is still a manual consent-page tick, checked
-against an EXACT named profile, not assumed from the tick count:
-`issue-client.py`'s `--profile peer-inbox` (default — read assigned, reply,
-ack, report-blocked: `herdr:read` + `herdr:message.owner`, never a
-`herdr:task.*` box) or `--profile full` (peer-inbox plus `herdr:message`
-and all three `herdr:task.*` verbs, for a client trusted with the whole
-surface). After Terrence completes consent himself in his browser,
-`python3 remote-mcp/scripts/issue-client.py label <name> --client-id <id>
-[--profile full] --apply` verifies the resulting grant's scope is EXACTLY
-the chosen profile's set (fails loud, refuses to label, if a scope snuck in
-or is missing) and records a local, non-secret `client_id -> name` mapping
-for `grants.py list`/`revoke` to reference later — it never touches
-`/oauth/token` and never sees a token.
+| Scope | Tools | Writes |
+|---|---|---|
+| `fm:read` | `get_status`, `get_posture`, `list_agents`, `list_tasks`, `get_task`, `list_blockers`, `list_decisions`, `get_decision`, `list_events`, `wait_for_events`, consumer positions | none |
+| `fm:reports` | `get_task_result`, `list_reports`, `get_report` | none |
+| `fm:request` | `send_owner_message`, `request_task`, plus status/reply of its own notes | a note in Firstmate's inbox |
+| `fm:decide-note` | `answer_decision`, plus status/reply of its own notes | a note in Firstmate's inbox, tied to an OPEN decision |
+| `fm:peer` | `send_peer_message`, `list_peer_messages` | a note held on the server for the other app |
 
-Messaging was off for the first connection and turned on as its own decision.
-Turning it on, in order:
+`fm:request`, `fm:decide-note` and `fm:peer` exist only while
+`OWNER_INBOX_ENABLED` is `"true"`: off, the consent page does not offer them,
+the AS metadata does not advertise them, their tools are not listed, and the
+Durable Object refuses them even on a token granted while it was on. Every
+note travels the owner inbox, which also has its Mac switch
+(`fm_publisher.py` delivers only to the registered `firstmate` owner).
 
-1. `scripts/grants.py` exists to revoke one connection without removing the
-   only allowlisted email (round-2 review N5, see Operations);
-2. `MESSAGING_ENABLED="true"` (in `wrangler.jsonc`), merged, then a redeploy
-   through `provision.sh --apply`; `/healthz` must show
-   `messaging_enabled:true` and the merged commit;
-3. `./install.sh --apply --remote-mcp-messaging` on the Mac;
-4. a fresh consent that ticks `herdr:message` deliberately (it is never
-   pre-ticked): disconnect and reconnect the client.
+**Effective scopes** (`policy.ts` `effectiveScopes`) = what the token was
+granted ∩ what this deployment offers ∩ the client's ceiling. Computed on
+every request, so a grant can never outgrow its client. A tool is registered
+only when one of its scopes is effective, and the gate re-checks before it
+runs.
 
-Turning it off: `"false"` + redeploy (queued messages are cancelled on the
-next sync), and `./install.sh --apply --remote-mcp` (Mac switch off). Either
-alone stops delivery.
+### Per-client grants (default deny)
 
-Tasks were off for the first connection too. Turning them on, in order:
+| Client | CIMD client_id | Ceiling |
+|---|---|---|
+| **dot** (ChatGPT) | `https://chatgpt.com/oauth/client.json` | `fm:read fm:reports fm:request fm:decide-note fm:peer` |
+| **duet** (Claude.ai) | `https://claude.ai/oauth/mcp-oauth-client-metadata` | `fm:read fm:reports fm:request fm:peer` |
+| anything else (any DCR registration, any other CIMD URL) | — | nothing: consent refused, `/mcp` returns `403 client_not_allowed` |
 
-1. `TASKS_ENABLED="true"` (in `wrangler.jsonc`), merged, then a redeploy
-   through `provision.sh --apply`; `/healthz` must show `tasks_enabled:true`
-   and the merged commit;
-2. `./install.sh --apply --remote-mcp-tasks` on the Mac (also sets
-   `remote-mcp/task-allowlist.json`'s repos/modes/caps — edit that file, not
-   a hand-duplicated table, to change what a task can reach);
-3. a fresh consent that ticks `herdr:task.start` and/or `herdr:task.implement`
-   and `herdr:task.cancel` deliberately (never pre-ticked).
+Dot relays the captain's decisions, so it may file decision notes; Duet never
+did, so it may not. Widening a client is a change to `CLIENT_GRANTS` and a
+security review; `scripts/issue-client.py`'s `dot`/`duet` profiles must equal
+these ceilings (`verify-issue-client.py` parses `policy.ts` to enforce it).
 
-Turning tasks off: `"false"` + redeploy (every queued start/resume command is
-cancelled on the next sync, a queued `cancel` still goes through, and a task
-already running on the Mac is NOT killed by this alone — see kill switches
-below), and `./install.sh --apply --remote-mcp` (Mac switch off: the Mac
-refuses every future leased start/resume, but a task already running keeps
-running until its own deadline backstop force-cancels it, same as a task
-that outran `max_minutes`).
+**Legacy tokens.** While `LEGACY_HERDR_SCOPES` is `"true"`, a token granted
+before the cutover keeps working: `herdr:read` → `fm:read fm:reports`,
+`herdr:message.owner` → `fm:request fm:peer` (never `fm:decide-note`: that
+needs a fresh consent). Every other herdr scope maps to nothing. Set it to
+`"false"` once Dot and Duet have re-consented at bebop.
 
-Owner messaging (ZERO-LOOP-001 #5) was off for the first connection too, and
-ships OFF by default even once this code deploys (`OWNER_INBOX_ENABLED` is
-`"false"` in `wrangler.jsonc`) — it is design-approval-only pending
-Terrence's review of this feature, not just another default-off switch.
-Turning it on, in order:
+### Per-tool rate limits
 
-1. Register the target session first: `./register-owner.sh <label> <pane>`
-   (e.g. a conductor tab) writes the `owners` row (`lib/run-registry.sh`
-   schema v8) the publisher checks before every delivery;
-   `./unregister-owner.sh <label>` removes it.
-2. `OWNER_INBOX_ENABLED="true"` (in `wrangler.jsonc`), merged, then a
-   redeploy through `provision.sh --apply`; `/healthz` must show
-   `owner_inbox_enabled:true` and the merged commit;
-3. `./install.sh --apply --remote-mcp-messaging --remote-mcp-tasks --remote-mcp-owner-inbox`
-   on the Mac -- **every** Mac switch you want left ON, every time, not just
-   the new one: the plist is rewritten WHOLE from only the flags passed to
-   THAT invocation, so `--remote-mcp-owner-inbox` alone silently turns
-   messaging and tasks back off if they were on (install.sh itself now
-   warns loudly, to stderr, on any switch a given `--apply` is about to
-   turn off, REVIEW-219 M6);
-4. a fresh consent that ticks `herdr:message.owner` deliberately (never
-   pre-ticked).
+Per client identity (email + client_id), on top of the global 60/minute and
+2000/day per client. `TOOL_CATALOG` in `policy.ts` is the source; changing a
+number is a code change and a review.
 
-Turning it off: `"false"` + redeploy (every queued owner message is
-cancelled on the next sync with `blocked:owner_inbox_disabled`), and
-`./install.sh --apply --remote-mcp-messaging --remote-mcp-tasks` (owner-inbox
-flag omitted, Mac switch off: the Mac refuses every future leased owner
-message and stops scanning for replies) -- pass the OTHER switches you want
-to keep, same "every switch together" rule as turning it on; passing bare
-`--remote-mcp` turns messaging and tasks off too, not just owner-inbox.
-Either `OWNER_INBOX_ENABLED="false"` or the Mac switch off, alone, stops
-delivery.
+| Tool | per minute | per hour |
+|---|---|---|
+| `request_task` | 2 | 12 |
+| `answer_decision` | 4 | 30 |
+| `send_owner_message`, `send_peer_message` | 10 | 120 |
+| `wait_for_events` | 10 | 300 |
+| consumer positions (each) | 10 | 120 |
+| `list_reports` | 20 | 300 |
+| `get_status`, `get_posture`, `list_agents`, `list_tasks`, `list_blockers`, `list_decisions`, `list_events`, `list_peer_messages` | 20 | 600 |
+| `get_task_result`, `get_report` | 30 | 600 |
+| `get_task`, `get_decision`, `get_owner_message_status`, `get_owner_reply` | 30 | 900 |
 
-Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
-typing check received the typed text) is fixed: the prompt is re-checked as
-the last step before typing, and nothing else reads the pane between that
-check and `send-text` (`verify-typing-guard.sh` has the regression). What is
-left is the check's own reads (one for menus the parser knows, two for a
-Claude-style y/n menu); herdr has no atomic check-and-type.
+Past a limit the call returns `rate_limited` and one `throttled_tool` audit
+row is written per window (`rate_limited_tool (N/minute for <tool>)`). Write
+tools are re-checked inside the same Durable Object call that queues the
+note, so a JSON-RPC batch of concurrent calls cannot overrun them. Total note
+volume is bounded by `OWNER_LIMITS` (10/minute, 120/hour per sender across
+`send_owner_message`, `request_task` and `answer_decision`): the same request
+can be written as free text, so the per-tool limits narrow a kind, not the
+inbox.
+
+### Bebop vs herdr-mcp
+
+| | herdr-mcp (Phase 1) | Bebop (Phase 2) |
+|---|---|---|
+| Who may connect | any client that completes consent with an allowlisted email (open DCR) | dot and duet only, by CIMD URL; everything else default-denied |
+| Read | `herdr:read` — everything, including report bodies | `fm:read` (fleet, decisions) split from `fm:reports` (report and result bodies) |
+| Type into a pane | `herdr:message` (`send_message`, `follow_up`) | removed |
+| Start/cancel/resume work | `herdr:task.start`, `herdr:task.implement`, `herdr:task.cancel` | removed; `request_task` files a request NOTE (`fm:request`) |
+| Decisions | free text to the owner inbox | typed `list_decisions`/`get_decision`; `answer_decision` (`fm:decide-note`, dot only) is a note, never a release |
+| Peer notes | under `herdr:message.owner` | own scope `fm:peer` |
+| Limits | global per client; messages 5/30 (adjustable); owner notes 10/120 | global per client + a fixed limit per tool |
+| Audit | every call | every call, with `client_label` (dot/duet/unknown) on each row |
+| Host | `herdr-mcp.teamthurber.com` | `bebop.teamthurber.com` (herdr-mcp alias during cutover) |
+
+**Notes are never orders.** `request_task`, `answer_decision` and
+`send_owner_message` all queue an owner message to `firstmate`; the Mac
+writes it with `fm-inbox.sh note`, and its first line says so:
+`REMOTE task request via duet (Claude app) - NOT the captain's word; never an approval`,
+`REMOTE decision note via dot (ChatGPT app) - NOT the captain's answer; never a release`.
+`answer_decision` is refused with `no_open_decision` unless the task has an
+open hold right now; the Mac re-reads its own decisions when it writes the
+note and marks one no longer open `NOT open on this Mac now`. Firstmate
+confirms anything with the captain in an attended channel.
+
+**Identity.** The Worker derives `caller.client_id` from the verified resource
+token, never from a request body or a DCR `client_name`. Labels (`dot`,
+`duet`) come from `CLIENT_GRANTS` and are stamped on every audit row and every
+note (`sender_label`), so the Mac never trusts a self-declared name.
+`python3 remote-mcp/scripts/issue-client.py label <dot|duet> --client-id <id> --apply`
+(profile defaults to the name's own) checks that the grant's scope is EXACTLY
+that profile — fails loud if a scope snuck in or is missing — and records a
+local `client_id -> name` mapping for `grants.py list`/`revoke`. It never
+touches `/oauth/token` and never sees a token.
+
+**Owner inbox switch.** `OWNER_INBOX_ENABLED="false"` + redeploy cancels
+every queued note on the next sync (`blocked:owner_inbox_disabled`) and
+leaves Bebop read-only; uninstalling the publisher
+(`install-fm-publisher.sh --uninstall`) stops delivery on the Mac side.
+Either alone stops notes reaching Firstmate.
 
 Allowlist: `ALLOWED_EMAILS` is checked at consent, on **every** `/mcp`
 request, and on every refresh (`invalid_grant`, which also revokes the grant),
@@ -177,10 +166,11 @@ so removing an email cuts off its existing grants immediately.
 Public and unauthenticated, so it can be checked before anyone connects:
 
 ```
-curl -s https://herdr-mcp.teamthurber.com/healthz
-{"service":"herdr-mcp","mcp":"https://herdr-mcp.teamthurber.com/mcp","auth":"OAuth 2.1 + PKCE",
- "build_sha":"<commit>","messaging_enabled":false,"tasks_enabled":false,"owner_inbox_enabled":false,
- "scopes_offered":["herdr:read"]}
+curl -s https://bebop.teamthurber.com/healthz
+{"service":"bebop","mcp":"https://bebop.teamthurber.com/mcp","canonical_mcp":"https://bebop.teamthurber.com/mcp",
+ "host_role":"canonical","auth":"OAuth 2.1 + PKCE","build_sha":"<commit>","owner_inbox_enabled":true,
+ "legacy_herdr_scopes":true,"scopes_offered":["fm:read","fm:reports","fm:request","fm:decide-note","fm:peer"],
+ "clients":{"dot":[…all five…],"duet":[…all but fm:decide-note…]}}
 ```
 
 `build_sha` is the commit `provision.sh` deployed; it refuses to deploy from a
@@ -194,36 +184,33 @@ not go through `provision.sh`. The same `server` block comes back in
 Every response carries `connection`:
 `{state: connected | degraded | disconnected | never_connected, last_sync_at, age_seconds, stale_after_seconds, herdr_live, hub_rev, note}`.
 `disconnected` = no sync for 90 s; the data that follows is the last known
-state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
+state. `degraded` = the Mac is syncing but could not read part of the fleet.
 
 | Tool | Scope | Input | Returns |
 |---|---|---|---|
-| `get_status` | read | — | connection, fleet counts, your scopes, and `browser`: the Mac's real Chrome (running, relay connected\|no-extension\|down, `extensions` omp_relay/1password/chatgpt enabled\|disabled\|missing\|unknown — unknown because the publisher's LaunchAgent cannot read Chrome's prefs; omp_relay is proven by a connected relay — stray omp Chromes, `healthy` = no evidence of a problem) from `chrome-relay.py --status --json`, null when unknown. The harmless first call. |
-| `list_agents` | read | `status?` idle\|working\|blocked\|done\|unknown | agents: `agent_id` (herdr terminal id, stable for the pane's life), `pane_id`, role worker\|conductor\|session, status, `status_since`, `task_id` |
-| `list_tasks` | read | `filter` active (default)\|attention\|done\|all, `project?`, `updated_since?` ISO, `limit` 1–100 (50) | tasks newest first: stable `task_id`, label, project, state, `created_at`/`updated_at`/`completed_at`, closure, `messageable` |
-| `get_task` | read | `task_id` | task, its agent, its blockers |
-| `list_blockers` | read | — | permission prompts / stalls: kind, tool, redacted summary (≤240 chars), since |
-| `get_task_result` | read | `task_id`, `path` (`.handoffs/PROOF.md`), `offset` (0), `max_chars` 1–16000 (4000) | closure reason/proof + a paged, redacted file: `total_chars`, `next_offset`, `sha256`, `source_mtime` |
-| `get_message_status` | read or message | `message_id` | queued\|delivering\|delivered\|refused\|failed\|expired + detail (only your own messages) |
-| `send_message` | message (listed only when enabled) | `target` (task_id, agent_id, or task label), `text` | `message_id`, status `queued`, resolved target |
-| `list_capabilities` | read | — | what `start_task` can do right now: `mac_enabled`, allow-listed `repos`, each mode's git/secrets/write policy, today's `caps` — from the Mac's own `task-allowlist.json`, never a hand-duplicated table |
-| `start_task` | task.start (research) or task.implement | `repo` (allow-listed), `mode` research\|implement, `objective` ≤4000 chars | `task_id` immediately, state `queued`, before the Mac has acted |
-| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `verified_kind` (`source_link_present`/`pushed_sha_matches`, which closure check `verified` is), `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md`. Only the connection that started the task, or one it was shared with (`send_peer_message` `task_id`); anyone else gets the same `not_found` |
-| `follow_up` | message | `task_id`, `text` | = `send_message` addressed by remote `task_id`; refused if the task was never actually spawned |
-| `cancel_task` | task.cancel | `task_id` | new state (`cancelled` if never spawned, else `cancelling`); refused if already terminal |
-| `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
-| `list_events` | read | `since_cursor` (0), `since_scope_hash?`, `limit` 1–500 (100) | `result` ok\|cursor_pruned\|cursor_scope_mismatch, `scanned_through_cursor`, `latest_cursor`, `replay_floor_cursor`, `scope_hash`, and `events`: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected`, and (visible only to the original sender/client, by identity match — not gated on currently holding `herdr:message.owner`) `owner.reply_ready` — never the reply text itself. See "Watching for an owner reply" below. |
-| `wait_for_events` | read | `since_cursor` (0), `since_scope_hash?`, `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop). Same `result`/cursor contract as `list_events`. |
-| `get_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id` (1–200 chars) | creates an unread checkpoint if absent; otherwise returns the durable position, epoch, scope hashes, diagnostics, watermark/floor, and typed result |
-| `commit_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id`, `expected_committed_cursor`, `new_cursor`, `lease_epoch` (nonnegative safe integers) | conditional ACK of a fully handled prefix; stale cursor/epoch, scope change, retention gap, backwards or past-latest commits are refused without changing the row |
-| `rebase_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id`, `expected_committed_cursor`, `resume_cursor`, `lease_epoch` (nonnegative safe integers), `current_authorization_scope_hash` (64 lowercase hex chars), `reconciled: true` | conditional, audited acknowledgement of a reconciled replay gap or scope rebind; increments the checkpoint generation; stale cursor/epoch/scope, below-floor, backwards or past-latest resumes are refused without changing the row |
-| `send_owner_message` | message.owner (listed only when enabled) | `owner_label`, `body` (≤4000 chars), `client_msg_id` | `exchange_id`, `state` `queued` |
-| `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only messages this connection — email AND client_id — sent) |
-| `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only messages this connection sent) |
-| `send_peer_message` | message.owner (listed with it) | `to` (peer label), `body` (≤4000 chars), `client_msg_id`, `task_id?` | `message_id`, `to`, `shared_task_id` — see "Duet<->Dot coordination" |
-| `list_peer_messages` | message.owner | `after_seq` (0), `limit` 1–50 (20) | `me`, `peers`, `messages` (seq, message_id, from, at, body, task_id), `next_after_seq` |
+| `get_status` | read | — | connection, Firstmate's posture, fleet counts, and `your_client`, `your_scopes`, `your_tools`. The harmless first call. |
+| `get_posture` | read | — | `posture` present\|away\|quiet\|unknown, `can_receive`, `observed_at`. Away/quiet means notes queue and wait. |
+| `list_agents` | read | `status?` | crewmate panes: `agent_id`, `pane_id`, role, status, `task_id` |
+| `list_tasks` | read | `filter` active (default)\|attention\|done\|all, `project?`, `updated_since?`, `limit` 1–100 | tasks newest first, with typed `pr_url` (GitHub PR URL or null), `kind`, `mode`, `yolo` |
+| `get_task` | read | `task_id` | task, its agent, its blockers, its open decision if any |
+| `list_blockers` | read | — | permission prompts / stalls / blocked tasks, redacted summary |
+| `list_decisions` | read | `repo?` | open captain holds: `question` (redacted), `calls` each with `options` (the recommended one marked) and its `recommendation`, the overall `recommendation`, `since`/`age_days`, `report_id` when a published report backs it |
+| `get_decision` | read | `task_id` | one hold, plus the task and the backing report's index entry |
+| `list_events`, `wait_for_events` | read | `since_cursor`, `since_scope_hash?`, `limit`/`timeout_s` | the event feed; see "Watching for an owner reply" |
+| consumer positions | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | see below | durable named checkpoints |
+| `get_task_result` | reports | `task_id`, `path` (`firstmate:card` or `report.md`), `offset`, `max_chars` ≤ 16000 | closure (reason, PR) + a paged, redacted document |
+| `list_reports` | reports | `kind?`, `limit` 1–200 (50) | newest first: `report_id`, `kind`, `title`, `task_id`, `updated_at`, synced `chars`/`sha256` |
+| `get_report` | reports | `report_id`, `offset`, `max_chars` | one report's redacted text, paged |
+| `send_owner_message` | request | `owner_label`, `body` ≤ 2000, `client_msg_id` | `exchange_id`, `state` `queued` |
+| `request_task` | request | `project`, `kind` scout\|ship, `objective`, `client_msg_id` | `exchange_id`; a request NOTE, nothing starts |
+| `answer_decision` | decide-note | `task_id` (an open hold), `answer` ≤ 2000, `client_msg_id` | `exchange_id`; a NOTE, the hold stays open |
+| `get_owner_message_status` | request or decide-note | `exchange_id` | status + detail (only notes this connection sent) |
+| `get_owner_reply` | request or decide-note | `exchange_id` | Firstmate's reply once one exists (only notes this connection sent) |
+| `send_peer_message` | peer | `to`, `body` ≤ 2000, `client_msg_id` | `message_id`, `to` — see "Duet<->Dot coordination" |
+| `list_peer_messages` | peer | `after_seq`, `limit` | `me`, `peers`, `messages`, `next_after_seq` |
 
-`tools/list` on the live server is the authoritative JSON Schema.
+`tools/list` on the live server is the authoritative JSON Schema; it lists
+only what the caller's effective scopes admit.
 
 Event `detail` is stored as valid JSON with a 2000-character serialized limit.
 Oversized payloads are replaced by
@@ -232,8 +219,8 @@ the digest covers the full serialized payload so different oversized payloads
 remain distinguishable by the immutable event-id check. The omitted text is
 not recoverable from this marker. A malformed historical detail is returned as
 `{ "detail_error": "invalid_json" }` rather than failing the page.
-`list_events`, `wait_for_events`, and `get_task_answer` progress retain the
-row's envelope and cursor; visibility checks and pagination are unchanged.
+`list_events` and `wait_for_events` retain the row's envelope and cursor;
+visibility checks and pagination are unchanged.
 
 ### Watching for an owner reply (the watcher recipe)
 
@@ -271,12 +258,12 @@ platform's own retry/resume) should follow this sequence exactly:
    is Phase 3/4 territory -- named consumer checkpoints and Slack/other
    adapters -- not this MVP).
 
-### Durable named consumer positions (built, disabled)
+### Durable named consumer positions
 
-`EVENT_CONSUMERS_ENABLED` defaults to `"false"` in the Worker. Only the literal
-`"true"` exposes these three tools to `herdr:read` callers; the Durable Object
-checks the flag and scope again. Build/review authorization is **not**
-activation authorization. No deploy or activation is part of this change.
+`EVENT_CONSUMERS_ENABLED` defaults to `"false"` in the Worker (this
+deployment sets `"true"`, hub form 20261006T003752-8784). Only the literal
+`"true"` exposes these three tools to `fm:read` callers; the Durable Object
+checks the flag and scope again.
 
 Storage lives beside `task_events`, in the existing SQLite Durable Object:
 `event_consumers` is created idempotently without rebuilding existing tables.
@@ -363,130 +350,27 @@ their commits, and explicit rebase advances the generation.
 automated retry/dead-letter policy. No alarms, transports, wake emitters, or
 outbox are added.
 
-### Message rules (server-side, then re-checked on the Mac)
+### Removed with the herdr surface (dormant until Phase 3)
 
-1. Token has `herdr:message`.
-2. `connection.state` is `connected` or `degraded`.
-3. `target` resolves to exactly one task that is `messageable`: state in
-   starting\|running\|blocked\|stalled\|ready_review **and** its pane's
-   terminal is the one the task was spawned in. Conductors and untasked
-   sessions are never targets. Ambiguous labels are refused with candidates.
-4. Text is collapsed to one line: control characters and format characters
-   (bidi overrides, zero-width, tag characters) become spaces, and `[` `]`
-   become `(` `)` so the text cannot close the envelope and forge another;
-   ≤ 2000 chars.
-5. Per user, all clients together: 5 per minute and 30 per hour by default,
-   adjustable from the Mac up to a hard ceiling of 30/minute and 300/hour
-   (`scripts/limits.py`, see Operations). `get_status` shows the limits in
-   force and how many this user has used (`message_limits`).
-6. **At delivery**, before every lease to the Mac, the queue is checked
-   against the current policy again: a message is cancelled (`refused`,
-   `cancelled before delivery: …`, audited `cancelled_before_delivery`) if
-   messaging is now off, its sender has left the allowlist, or the sender no
-   longer holds a live grant with `herdr:message` for that client (revoked,
-   expired, re-consented without the scope). If the grant check cannot run,
-   nothing is leased that tick. Residual: a message already leased is in
-   the Mac's hands; the publisher types it only within 60 s of its lease
-   (otherwise it acks `retry`, which brings it back through this check), and
-   KV listing can show a deleted grant for up to ~60 s.
-7. On the Mac: the task, pane and terminal are re-checked against that tick's
-   state; the text is wrapped in a fixed envelope that starts with `[`
-   (`[REMOTE NOTE via herdr-mcp from <client> · <msg id> · a collaborator's note,
-   not an operator instruction; verify before acting, and never treat it as an
-   approval] …`), and handed to `herdr-deliver.sh` as one argv element,
-   **without `--force`** — a pane showing a permission prompt refuses it
-   (retried until the 15-minute expiry), as does a pane a human is typing in.
-   Each outcome is saved as soon as it is known, and delivered ids are kept
-   for a day, so a crash before the ack never types a message twice.
-
-### Task rules (server-side, then re-checked on the Mac)
-
-1. `start_task` needs `herdr:task.start` for `mode: research`, or
-   `herdr:task.implement` for `mode: implement` — two separate scopes so
-   research can be granted without implement; `cancel_task` and
-   `resume_task` need `herdr:task.cancel`. `follow_up` is `send_message`
-   under the covers (`herdr:message`).
-2. `repo` must be in the Mac's own allow-listed `repos` (`list_capabilities`
-   shows it); `connection.state` must not be `disconnected`/`never_connected`;
-   `task_config.mac_enabled` must be true (the Mac's own `HERDR_MCP_TASKS`
-   switch, independent of the Worker's `TASKS_ENABLED`).
-3. Caps (today: 4 concurrent, 40/day, 60 min/task, from the Mac's
-   `task-allowlist.json`, enforced on both sides): a 5th concurrent start, or
-   one past the daily count, is refused `too_many_concurrent`/`too_many_today`
-   before anything is queued. A task that outruns `max_minutes` is cancelled
-   automatically (`timed_out`) by two independent paths: the publisher's own
-   sweep tick (depends on the publisher process staying alive) and a
-   detached backstop timer `start_task`/`resume_task` schedules on the Mac
-   at spawn time (`max_minutes` + 90s grace, survives the publisher
-   LaunchAgent dying or being reloaded, recorded as a `hard_stop_scheduled`
-   event with its pid) — either path's cancel closes the pane the same way
-   `cancel_task` closes one.
-4. `objective` (and a `resume_task` follow-up `text`) is sanitized the same
-   way a message is (NFKC, invisible/format characters to spaces, every
-   bracket shape to `(`/`)`, `@` to fullwidth `＠`) before it is ever stored —
-   including collapsing to one line, the same as a message, since
-   invisible/format characters are `\p{C}`, which includes newlines. It is
-   embedded as a fenced UNTRUSTED block in the spawned worker's own
-   SPEC.md, never typed into a terminal composer.
-5. Modes (`lib/task-manifest.sh`): **research** — git `none`, writes only
-   `.handoffs/**`, the read-only credential vault, must run end to end with
-   no approval escalation. **implement** — git `push-own-branch` only (never
-   merge, never main, never deploy), may open a draft PR. Neither the
-   objective nor a follow-up is ever treated as an approval; what the
-   objective asks for is work, not permission.
-6. Lifecycle states shown to a client: `queued`, `starting`, `running`,
-   `finished` (research: ANSWER.md verified and the orchestrator closed it;
-   implement: its `completion_event` landed), `verified`, `failed`,
-   `cancelled`, `lost`, `timed_out`. `verified` = `finished` and its mode's
-   check passed: research → `.handoffs/ANSWER.md` is non-empty and contains
-   ≥1 real source link (a GitHub permalink
-   `https://github.com/<owner>/<repo>/(blob|tree)/<ref>/<path>`, optionally
-   `#L..`, or any other `https://` URL — a bare `path:line` reference does
-   NOT count); implement → the branch named in its closure event is pushed
-   and its head sha matches (`get_task_answer`'s `verified_kind`,
-   `source_link_present` / `pushed_sha_matches`, names which one — a
-   FORMAT/CLOSURE check against the task's own completion claim, never a
-   semantic read of whether the answer is actually correct). A research
-   task can never close itself — its manifest restricts the write tool to
-   `.handoffs/ANSWER.md` (`handoffs_write`), so it has no way to append a
-   completion event — and is never told to try: the TRUSTED orchestrator
-   (`remote-mcp/tasks.py`'s `sweep()`, outside the worker's own write
-   authority) closes it once ANSWER.md verifies and the pane goes idle
-   (`close-done-workers.sh --task=<id> --apply --reason=no-follow-on
-   --proof=<answer sha256>`), and records `actor: "orchestrator"` on the
-   closure event so it is never mistaken for one the worker performed
-   itself. An implement task still reports its own `completion_event` (its
-   manifest carries no such restriction) and is auto-closed the same way.
-   A cancelled/timed-out task's pane is CONFIRMED gone -- closed by the
-   cancel, or already recycled to a different occupant -- before its state
-   is ever set to a terminal value: a `herdr pane list`/`close` failure, or
-   a pane still reporting the same occupant right after the close, leaves
-   the row non-terminal for the next retry instead of claiming victory early.
-7. **At delivery**, exactly like a message: a queued start/cancel/resume is
-   cancelled before the Mac ever sees it if tasks are now off (Worker or Mac
-   switch), the requester has left the allowlist, or no longer holds a live
-   grant with the scope that command's mode needed (revoked, expired,
-   re-consented without it). The SAME re-check also covers a task that has
-   ALREADY been spawned and is running on the Mac with no queued command at
-   all: losing the allowlist or the grant queues a fresh `cancel` for it on
-   the next sync, same as `cancel_task` would.
-8. A real capability probe (never a guess) is recorded on every start:
-   `secrets_granted` (was `--secrets` passed to `spawn-task.sh`) and, for
-   `knowledge-base`, `kb_http_reachable` (a plain 2xx-only HTTPS
-   reachability check, **never** a credential value and never proof of
-   authenticated access -- there is no `kb_auth_ok`: this process runs on
-   the Mac before a worker is spawned and never holds the KB credential
-   itself) — both land in the task's own event feed (`capability_probe`)
-   and in `get_task_answer`.
+Bebop does not register `send_message`, `follow_up`, `get_message_status`,
+`list_capabilities`, `start_task`, `get_task_answer`, `cancel_task` or
+`resume_task`, and no `fm:*` scope admits them. `MESSAGING_ENABLED` and
+`TASKS_ENABLED` are `"false"`, so anything still queued on those paths is
+cancelled on the next sync, and `fm_publisher.py` acks every `outbox` and
+`commands` item `refused`. The Durable Object code behind them stays only
+until Phase 3 deletes it; nothing reaches it. A task request is
+`request_task`: a note Firstmate triages, never a spawn.
 
 ### Owner message rules (server-side, then re-checked on the Mac)
 
-1. Token has `herdr:message.owner`. `connection.state` is `connected` or
-   `degraded`.
+1. Token holds `fm:request` (`send_owner_message`, `request_task`) or
+   `fm:decide-note` (`answer_decision`). `connection.state` is `connected`
+   or `degraded`.
 2. `owner_label` matches register-owner.sh's own `^[a-z0-9][a-z0-9-]{1,40}$`
    and names a label the `owners` registry currently has a row for (checked
-   against the latest synced snapshot — not resolved against a task, agent,
-   or pane, the way `send_message`'s `target` is).
+   against the latest synced snapshot). `request_task` and `answer_decision`
+   always address `firstmate`; `answer_decision` also needs `task_id` to be
+   an open decision in that snapshot (`no_open_decision`).
 3. `body` is sanitized the same way an objective is (NFKC, invisible/format
    characters to spaces per LINE so multi-line structure survives, every
    bracket shape to `(`/`)`, `@` to fullwidth `＠`), ≤ `MAX_MESSAGE_CHARS`
@@ -495,9 +379,10 @@ outbox are added.
    the same id from the same sender returns the ORIGINAL `exchange_id` and
    state instead of queuing twice, even if the retry's own label or body
    would otherwise be refused.
-5. Per sender, all clients together: a fixed 10/minute and 120/hour — not
-   adjustable from the Mac the way message limits are (`OWNER_LIMITS` in
-   `policy.ts`, a code change and a review, never `scripts/limits.py`).
+5. Per sender, all clients together: a fixed 10/minute and 120/hour
+   (`OWNER_LIMITS` in `policy.ts`), plus each tool's own limit from
+   `TOOL_CATALOG` (`request_task` 2/12, `answer_decision` 4/30). A code
+   change and a review, never adjustable from the Mac.
 6. **At delivery**, before every lease to the Mac, the queue is checked
    against the current policy again — same shape as a message's own
    re-check: a message is cancelled (`blocked`, `owner_inbox_disabled` or
@@ -574,54 +459,51 @@ outbox are added.
    local and unaccepted; it is not deleted or silently attributed to the
    new owner. The new identity record stays on the Mac; replies retain the
    existing opaque session token, not the registration fields. The Worker checks the
-   sender allowlist, live unexpired grant with `herdr:message.owner`, and
+   sender allowlist, live unexpired grant with an effective note scope, and
    inbox switch for reply acceptance as well as delivery. A grant-lookup
    hold remains transient; revoked/expired grants, removed scope, disabled
    inboxes and mismatched labels do not gain reply access.
 
 ### Duet<->Dot coordination
 
-Two app connections (Duet = Claude.ai, Dot = ChatGPT) both run tasks AND
-leave each other notes. There is no client-to-client channel in MCP and the
-owner inbox needs a registered pane on the Mac, so notes are held in the
-Durable Object and pulled by the recipient — no Mac, no pane, no publisher
-change, no sync-shape change.
+Two app connections (Duet = Claude.ai, Dot = ChatGPT) leave each other
+notes. There is no client-to-client channel in MCP and the owner inbox
+needs a registered pane on the Mac, so notes are held in the Durable Object
+and pulled by the recipient — no Mac, no pane, no publisher change, no
+sync-shape change.
 
 1. **Identity** is the verified pair `(email, client_id)`, where client_id is
    the app platform's CIMD URL — one shared value for every Claude.ai (or
    every ChatGPT) connection, not one per chat, session or install. So
    identity means "this email on this platform": two Claude.ai connections
-   under the same email are the SAME peer (one label, one inbox, one task
-   set, one rate limit) and cannot be told apart. Different emails stay
+   under the same email are the SAME peer (one label, one inbox, one rate
+   limit) and cannot be told apart. Different emails stay
    separate; only allowlisted emails ever get a grant.
 2. **Labels** are set only from the Mac:
-   `python3 remote-mcp/scripts/issue-client.py label duet --client-id <id> --profile full --peer --apply`
+   `python3 remote-mcp/scripts/issue-client.py label duet --client-id <id> --peer --apply`
    (and `dot`); `… peers` lists them, `… unpeer <name> --apply` removes one. Route `/admin/peers`
    (`list`/`set`/`remove`), signed like `/admin/grants`, audited
    `admin_peers_*`. `set` refuses a client_id with no live grant for that
-   user, or whose grant lacks `herdr:message.owner`. One label per
+   user, or whose grant lacks an effective `fm:peer`. One label per
    identity; relabelling drops the old one. No reconnect.
-3. **`send_peer_message`**, in order: per-call throttle → `OWNER_INBOX_ENABLED`
-   → `herdr:message.owner` → `client_msg_id` dedupe (a retry returns the
-   original) → sender labelled (`sender_not_labelled`) → peer exists, not
-   self, email still allowlisted → `sanitizeOwnerMessage` → `task_id` (if
-   given) must be a remote task THIS identity started (`not_your_task`,
-   also for an unknown id) → `OWNER_LIMITS` (10/minute, 120/hour per sending
-   identity) → one transaction: note, share, `peer.message_ready` event,
-   audit (`chars=`, never the body). The recipient identity is fixed when the
-   note is sent; relabelling later never redirects it.
+3. **`send_peer_message`**, in order: per-call and per-tool throttle →
+   `OWNER_INBOX_ENABLED` → `fm:peer` → `client_msg_id` dedupe (a retry
+   returns the original) → sender labelled (`sender_not_labelled`) → peer
+   exists, not self, email still allowlisted → `sanitizeOwnerMessage` →
+   `OWNER_LIMITS` (10/minute, 120/hour per sending identity) → one
+   transaction: note, `peer.message_ready` event, audit (`chars=`, never the
+   body). The recipient identity is fixed when the note is sent;
+   relabelling later never redirects it.
 4. **`list_peer_messages`** returns only notes addressed to the caller's own
    identity; `me` is its label (null until labelled), `peers` the other
    labels. A note from an email since removed from `ALLOWED_EMAILS` is hidden.
    `wait_for_events` wakes on `peer.message_ready`, visible only to the
    recipient.
 5. **Segmentation** is per identity, not per connection. Each identity sees
-   its own remote tasks (`get_task_answer`, `cancel_task`, `resume_task`),
-   owner exchanges and peer notes. Sharing is explicit: a note's `task_id` gives the peer
-   `get_task_answer` read access, never cancel/resume. The fleet view
-   (`list_tasks`, `get_task`, `get_task_result`, `list_blockers`) and public
-   lifecycle events in `list_events` stay fleet-wide metadata.
-6. Retention: notes and their events 30 days; shares go with their task row.
+   its own owner exchanges and peer notes. The fleet view (`list_tasks`,
+   `get_task`, `list_decisions`, `list_reports`, `list_blockers`) and public
+   events in `list_events` stay fleet-wide metadata.
+6. Retention: notes and their events 30 days.
    Revoking the sender's grant does not pull back a note already sent.
 
 ### Audit and limits
@@ -629,15 +511,21 @@ change, no sync-shape change.
 Every tool call (allowed or refused, including calls the MCP SDK rejects
 before a handler runs: unknown tool, schema violation), every
 queue/delivery/expiry, lands in the Durable Object's `audit` table (180-day
-retention) and is pulled by the publisher into
-`~/.local/state/herdr/remote-mcp/audit.jsonl` (mode 600) on the Mac.
-Deliveries also record the registry's own `brief_delivered` event.
+retention) with the caller's `client_label` (`dot`, `duet`, or `unknown`
+for a refused stranger), and is pulled by the publisher into
+`~/.local/state/herdr/remote-mcp/audit.jsonl` (mode 600) on the Mac. A note
+that the Mac cannot deliver (unknown kind, malformed meta) is refused as
+`deliver_failed:bad_kind`/`deliver_failed:bad_meta`, never written.
 
-Every client is held to 60 calls a minute and 2000 a day. Past that, one
-`throttled` row is written per window and further calls are refused without
-rows, so a loop or a leaked token cannot grow storage.
+Every client is held to 60 calls a minute and 2000 a day, and each tool to
+its own limit (see "Per-tool rate limits"). Past a limit, one `throttled` /
+`throttled_tool` row is written per window and further calls are refused
+without rows, so a loop or a leaked token cannot grow storage.
 
-## What leaves the Mac
+## What leaves the Mac (old herdr `publisher.py`)
+
+Bebop's publisher is `fm_publisher.py` (next section); this is what the
+herdr publisher it replaced sends, kept while that code exists.
 
 Per task: id, run id, label, project, repo **name**, branch, state, times,
 closure reason/proof, pane id, terminal id, and (once a task is remote) its
@@ -661,16 +549,15 @@ grant passed, was KB HTTP-reachable).
 Redaction (`sync_client.py` `REDACTIONS`, shared by both publishers) removes
 common credential shapes. It is a ceiling, not a guarantee, and it does not
 detect client names or addresses that a worker wrote into PROOF.md — those
-reach whoever holds a `herdr:read` token.
+reach whoever holds an `fm:reports` token.
 
 ## Firstmate publisher (`fm_publisher.py`)
 
-Serves the **Firstmate** fleet to Dot and Duet through this same Worker,
-OAuth front door, scopes, limits, audit and peer inbox, with no Worker change.
-It replaces only the Mac half: `publisher.py` read the herdr hub and run
-registry; `fm_publisher.py` reads Firstmate through its own CLIs. Run one
-publisher, never both: it refuses to sync while
-`com.herdr-control.remote-mcp` is loaded.
+Serves the **Firstmate** fleet to Dot and Duet through Bebop's OAuth front
+door, scopes, limits, audit and peer inbox. It replaces only the Mac half:
+`publisher.py` read the herdr hub and run registry; `fm_publisher.py` reads
+Firstmate through its own CLIs. Run one publisher, never both: it refuses to
+sync while `com.herdr-control.remote-mcp` is loaded.
 
 ```mermaid
 flowchart LR
@@ -686,23 +573,38 @@ flowchart LR
 (`build_snapshot`); data arriving from a phone app is only ever a request.
 
 - **Out (scope `full`, the default):** task ids, titles, repo names,
-  branches, states and state detail, PR URLs (as `closure_proof`), captain-hold
-  reasons, last-event lines (240 chars), pane targets and harness names,
-  `data/<task>/report.md` (single-link regular file, 64 KB) as source
-  `report.md`, and a generated `firstmate:card` per task. Every free-text
+  branches, states and state detail, `pr_url` (only a strict
+  `https://github.com/<owner>/<repo>/pull/<n>`, also as `closure_proof`),
+  `kind`/`mode`/`yolo`, captain-hold reasons, last-event lines (240 chars),
+  pane targets and harness names, `data/<task>/report.md` (single-link
+  regular file, 64 KB) as source `report.md`, and a generated
+  `firstmate:card` per task. **Decisions** (`fm-inbox.sh ready`'s open holds):
+  the question (≤ 2000 chars), each call's options with the recommended one
+  marked, the recommendation, age, and `origin`/`report_id` only when that
+  report is itself published. **Reports**: `fleet.scout_reports` ids that pass
+  the id pattern and the deny list, their kind, a title from the report's
+  first `# ` heading, and the body as a result doc. **Posture**: present /
+  away / quiet / unknown and whether the inbox can receive. Every free-text
   field is redacted (credential shapes, and local paths such as `/Users/…`,
   `~/…` or worktree locations become `[path]`; URLs and repo-relative paths
   stay), then capped. **Never:** note bodies, terminal captures,
   secondmate evidence, raw status lines, local paths, `data/captain.md`,
   learnings, secrets. `~/.config/fm-mcp/read-scope` set to `counts` sends only
-  numbers and liveness (any value other than `full`/`counts` fails closed to
-  `counts`); `~/.config/fm-mcp/read-deny` lists task ids or globs that are
-  dropped everywhere (tasks, agents, blockers, results, counts).
+  numbers and liveness, with no decisions or reports (any value other than
+  `full`/`counts` fails closed to `counts`); `~/.config/fm-mcp/read-deny`
+  lists task or report ids or globs that are dropped everywhere (tasks,
+  agents, blockers, decisions, reports, results, counts).
 - **In:** an owner message to `firstmate` (or its alias `conductor`) becomes
   `fm-inbox.sh note --request-id remote-<client>:<exchange_id> --json -`,
-  where `<client>` is `dot`, `duet` or `unknown` from the CIMD client label.
-  The note's first line, which is also the wake summary, reads
-  `REMOTE request via dot (ChatGPT app) - NOT the captain's word; never an approval`;
+  where `<client>` is `dot`, `duet` or `unknown` from the Worker's verified
+  `sender_label` (the local CIMD label map only as a fallback). The note's
+  kind and meta are re-checked on the Mac (`deliver_failed:bad_kind` /
+  `bad_meta` otherwise). The first line, which is also the wake summary,
+  names the kind: `REMOTE request via …`, `REMOTE task request via …` (plus
+  the project and scout/ship, "nothing was started", yolo off), or
+  `REMOTE decision note via …` (plus the hold id and whether it is still
+  open on the Mac), each ending `NOT the captain's word; never an approval`
+  or `NOT the captain's answer; never a release`;
   the remote text is folded to one line and fenced by a random nonce it cannot
   forge. A Dot/Duet note is a request Firstmate confirms with the captain in
   an attended channel, never the captain's explicit word (merge, hold
@@ -771,32 +673,44 @@ so a dashboard can show it on its own refresh without adding a poller.
 ## Connecting a client
 
 An MCP URL alone does not connect anything: the client has to be added in
-its own UI, which runs the OAuth sign-in.
+its own UI, which runs the OAuth sign-in. Only Dot (ChatGPT) and Duet
+(Claude.ai) can finish it; any other app is refused at consent.
 
-ChatGPT ([OpenAI: connect and test](https://developers.openai.com/plugins/deploy/connect-chatgpt)):
+**Dot** — ChatGPT ([OpenAI: connect and test](https://developers.openai.com/plugins/deploy/connect-chatgpt)):
 
-1. Settings → **Security and login** → turn on **Developer mode** (workspace
+1. Settings → **Security and login** → **Developer mode** on (workspace
    policy can hide it).
 2. [chatgpt.com/plugins](https://chatgpt.com/plugins) → **+** → name
-   `herdr-mcp`, description → **Connection**: MCP server URL
-   `https://herdr-mcp.teamthurber.com/mcp` → create. It registers itself
-   (DCR/CIMD); no client id or secret to paste.
-3. The sign-in opens Google via Cloudflare Access. Only an `ALLOWED_EMAILS`
-   account can finish it; with messaging off the consent page offers read only
-   → **Allow**.
-4. Check: the discovered tools are the eleven read tools — the original
-   seven plus `list_capabilities`, `get_task_answer`, `list_events`,
-   `wait_for_events` (always offered; they degrade gracefully when tasks are
-   off rather than disappearing, same as `get_status`'s `message_limits`) —
-   with no `send_message`/`follow_up`/`start_task`/`cancel_task`/`resume_task`.
-   In a new chat, add the connection and ask for the fleet status; it should
-   call `get_status` and report `connection.state`.
+   `Bebop` → **Connection**: MCP server URL
+   `https://bebop.teamthurber.com/mcp` → create. It identifies itself by
+   CIMD (`https://chatgpt.com/oauth/client.json`); no client id or secret to
+   paste.
+3. Sign-in opens Google via Cloudflare Access; only an `ALLOWED_EMAILS`
+   account can finish it. Consent offers dot's ceiling (all five `fm:*`);
+   tick what Dot should have → **Allow**.
+4. On the Mac: `python3 remote-mcp/scripts/issue-client.py label dot --client-id https://chatgpt.com/oauth/client.json --peer --apply`
+   (verifies the grant is exactly the dot profile, records the label).
+5. Check: in a new chat, ask for the fleet status; it should call
+   `get_status`, whose `your_client` is `dot` and `your_tools` lists no
+   `send_message`/`start_task`.
+
+**Duet** — Claude.ai: Settings → Connectors → **Add custom connector** →
+URL `https://bebop.teamthurber.com/mcp` → Connect → the same Google sign-in;
+consent offers duet's ceiling (no `fm:decide-note`). Then
+`issue-client.py label duet --client-id https://claude.ai/oauth/mcp-oauth-client-metadata --peer --apply`.
+
+**Reconfiguring an existing herdr-mcp connector** (cutover step 4 below):
+the old connector keeps working on the alias with its legacy scopes, but a
+token is bound to the host that issued it, so moving is a reconnect, not an
+edit. In the app, remove (or disconnect) the `herdr-mcp` connector, add a new
+one at `https://bebop.teamthurber.com/mcp`, sign in and consent, then rerun
+the `issue-client.py label … --peer --apply` line above (the label follows
+the client_id, so the peer inbox and history carry over). `grants.py list`
+then shows the new grant; revoke the old one with
+`grants.py revoke <old grant_id> --apply`.
 
 The grant then works unattended until the refresh token idles out (7 days
 unused, 30 days at most) or the email leaves the allowlist.
-
-Any other MCP client: point it at the same URL with OAuth discovery; it finds
-everything from the 401's `WWW-Authenticate: Bearer resource_metadata=…`.
 
 **Private alternative — Secure MCP Tunnel** ([OpenAI guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)):
 ChatGPT can also reach a private MCP server through an OpenAI-hosted tunnel,
@@ -811,80 +725,125 @@ public internet.
 
 ## Operating it
 
-- Logs: `~/Library/Logs/com.herdr-control.remote-mcp.log` (publisher),
+- Logs: `~/Library/Logs/com.firstmate.fm-mcp-publisher.log` (publisher),
   `npx wrangler tail herdr-mcp` (Worker).
-- Dry run of what would be sent: `python3 remote-mcp/publisher.py --dry-run`.
-- **Register/unregister an owning session** (a conductor, a dedicated
-  long-lived tab — never a spawned task's pane, which register-owner.sh's
-  own `require_agent_pane` check does not distinguish from one, so don't
-  point it at one): `./register-owner.sh <label> <pane>` (same pane
-  resolution as `herdr-deliver.sh`: `w1:p2`, `w1:t2`, or a herdr label),
-  `./unregister-owner.sh <label>` (idempotent). Prints the registry row;
-  re-registering the same label preserves its original `registered_at`.
-- **Change message limits** (no redeploy; takes effect on the next send):
-  `python3 remote-mcp/scripts/limits.py show`;
-  `… set --per-hour 120 --per-minute 10 --for 4h --reason "release day" --apply`
-  for a boost that lapses on its own (max 7d), or `--until-reset` for a new
-  normal; `… reset --apply` returns to 5/30. Route `/admin/limits`, signed
-  like `/admin/grants`, audited `admin_limits_*`. Values above the ceiling are
-  refused, not clamped; raising the ceiling is a code change and a review.
-- **Revoke one connection** (e.g. Zero's plugin) and nothing else:
+- Dry run of what would be sent: `python3 remote-mcp/fm_publisher.py --dry-run`.
+- **Register/unregister an owning session**: `./register-owner.sh <label> <pane>`,
+  `./unregister-owner.sh <label>` (idempotent). Bebop's notes go to
+  `firstmate` only.
+- **Revoke one connection** and nothing else:
   `python3 remote-mcp/scripts/grants.py list`, then
   `python3 remote-mcp/scripts/grants.py revoke <grant_id> --apply`. The Worker
   route `/admin/grants` is signed with `INGEST_KEY` (same HMAC, skew and
   nonce rules as `/ingest/sync`; no user token reaches it) and audits every
   call as `admin_list` / `admin_revoke`. The grant's tokens stop working at
-  once; any queued start/resume of theirs is cancelled before delivery on
-  the next sync (their own pending cancels are exempt and still go through,
-  N4), AND a task of theirs already running on the Mac is cancelled too — a
-  fresh `cancel` command is queued for it the same tick (same mechanism as
-  `cancel_task`, state `cancelling` until the Mac acks it). The one thing
-  revoke does not reach is the global `TASKS_ENABLED` kill switch below:
-  with that off, this per-sender check has nothing to revoke against, and a
-  running task rides out its own deadline backstop instead.
-- **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED`/
-  `OWNER_INBOX_ENABLED` to `"false"` and redeploy (new sends/starts/owner
-  messages are refused and every queued message/command/owner message is
-  cancelled on the next sync; a task already running on
-  the Mac keeps running until its own deadline backstop force-cancels it —
-  reads continue); unload the publisher
-  (`launchctl bootout gui/$(id -u)/com.herdr-control.remote-mcp` → clients see
-  `disconnected`, nothing is delivered, and nothing is swept either: a
-  running task just sits there with a stale state, including past its own
-  `max_minutes` deadline, until the publisher is reloaded); remove the email
-  from `ALLOWED_EMAILS` and the Access policy (its grants stop on the next
-  request, its queued messages/commands/owner messages are cancelled, and it
-  is revoked on the next refresh); rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
-- Open DCR (review I3): anyone can register a client, which costs a KV write
-  and grants nothing without an allowlisted sign-in. Add a Cloudflare
-  rate-limit rule on `/oauth/register` if it is ever abused.
+  once, and its queued notes are cancelled before delivery on the next sync.
+- **Kill switches**, least to most: `OWNER_INBOX_ENABLED="false"` and
+  redeploy (Bebop goes read-only; queued notes are cancelled on the next
+  sync); `LEGACY_HERDR_SCOPES="false"` (every pre-cutover token stops); uninstall
+  the publisher (`install-fm-publisher.sh --uninstall` → clients see
+  `disconnected`, nothing is delivered); remove the email from
+  `ALLOWED_EMAILS` and the Access policy (its grants stop on the next
+  request, its queued notes are cancelled, and it is revoked on the next
+  refresh); delete a client from `CLIENT_GRANTS` and redeploy (that app
+  holds nothing); rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
+- Open DCR: anyone can register a client, which costs a KV write and grants
+  nothing (default deny). Add a Cloudflare rate-limit rule on
+  `/oauth/register` if it is ever abused.
 
 ## Deploy (first time)
 
 All from `remote-mcp/`:
 
 1. `bash scripts/provision.sh` (dry run), then `--apply`: creates the KV
-   namespace, the path-scoped Access app, the ingest key (1Password item
-   `herdr-mcp-ingest-key`, `HERDR_MCP_INGEST_KEY` in
-   `~/.config/op/launchd-secrets.env`), and fills the KV id + Access AUD into
-   `worker/wrangler.jsonc`, then stops before deploying.
+   namespace, the path-scoped Access app (every served host's `/authorize`),
+   the ingest key (1Password item `herdr-mcp-ingest-key`,
+   `HERDR_MCP_INGEST_KEY` in `~/.config/op/launchd-secrets.env`), and fills
+   the KV id + Access AUD into `worker/wrangler.jsonc`, then stops before
+   deploying.
 2. Commit and push the filled-in `wrangler.jsonc`, then `--apply` again: it
    deploys stamped with that commit (`--var BUILD_SHA`, `--tag`), sets the
-   Worker secret, attaches `herdr-mcp.teamthurber.com`, and prints VERIFY
-   (discovery, `scopes_supported`, `/healthz` build + messaging flag, live
-   Cloudflare version, 401/302 boundaries).
-3. After merge: `./install.sh --apply --remote-mcp` (repo root) installs the
-   publisher LaunchAgent from the deployed app worktree; its registry entry is
-   thurber-os `launchd/agents.yaml`. `--remote-mcp-messaging`,
-   `--remote-mcp-tasks` and `--remote-mcp-owner-inbox` are each turned on
-   later, as their own decision (see "Turning it on" above).
+   Worker secret, attaches every host's custom domain, and prints VERIFY per
+   host (discovery, `scopes_supported`, `/healthz` build + `host_role` +
+   `scopes_offered`, 401/302 boundaries, an unknown host never 200).
+3. After merge: `install-fm-publisher.sh --apply` (see "Run it").
+
+### Bebop cutover runbook (herdr-mcp → bebop)
+
+The Worker, its Durable Object, the OAuth KV and the Access app are reused;
+only hostnames, routes and scopes change. Captain-approved, attended steps;
+nothing here runs from CI or from a worker.
+
+```mermaid
+flowchart LR
+  S1["1 merge + provision --apply<br/>bebop + alias live"] --> S2["2 VERIFY both hosts"]
+  S2 --> S3["3 Access self_hosted_domains<br/>(provision adds bebop)"]
+  S3 --> S4["4 reconnect Dot, Duet at bebop<br/>re-label"]
+  S4 --> S5["5 publisher → bebop"]
+  S5 --> S6["6 LEGACY_HERDR_SCOPES=false"]
+  S6 --> S7["7 drop alias"]
+```
+
+1. **Deploy with both hosts.** Merge, then from a clean pushed tree
+   `bash remote-mcp/scripts/provision.sh` (dry run: it reports
+   `missing host(s): bebop.teamthurber.com/authorize` on the Access app),
+   then `--apply`. `wrangler deploy` attaches both custom domains from
+   `wrangler.jsonc` `routes` (Cloudflare creates the proxied DNS record and
+   certificate for `bebop.teamthurber.com` in the `teamthurber.com` zone);
+   provision re-checks each via `/workers/domains` and attaches any missing
+   one. The Access app gains `bebop.teamthurber.com/authorize` in place —
+   same app, same AUD, so `ACCESS_AUD` does not change (provision refuses if
+   it would).
+2. **Verify.** VERIFY must show, for **both** hosts: PRM `resource` =
+   `<host>/mcp`, issuer = `<host>`, `scopes_supported` = the five `fm:*`,
+   `/healthz` OK with `host_role` canonical (bebop) / alias (herdr-mcp),
+   `/mcp` 401, `/authorize` 302 to `thurberteam.cloudflareaccess.com`,
+   `/ingest/sync` 401. Then `dig +short bebop.teamthurber.com` resolves to
+   Cloudflare. Existing Dot/Duet connectors keep working on the alias with
+   legacy scopes (`herdr:read` → read + reports, `herdr:message.owner` →
+   request + peer).
+3. **Access.** Done by step 1; confirm in Zero Trust → Access → Applications
+   → `herdr-mcp-authorize` that both `/authorize` paths are listed and the
+   policy is still the email allowlist.
+4. **Reconnect the apps** at `https://bebop.teamthurber.com/mcp` (see
+   "Reconfiguring an existing herdr-mcp connector"), re-label with
+   `issue-client.py label dot|duet … --peer --apply`, revoke the old grants
+   with `grants.py revoke`. `get_status` on the new connector shows
+   `your_client` and the fm tools.
+5. **Publisher to bebop.** Change `sync_client.py`'s default `URL` to
+   `https://bebop.teamthurber.com` (PR), merge, reinstall the publisher
+   (`install-fm-publisher.sh --apply`); `status.json` must show
+   `outcome: synced`. Ingest works on either host, so this order is safe.
+6. **Retire legacy scopes.** `LEGACY_HERDR_SCOPES` → `"false"`, deploy with
+   `provision.sh --apply`; `/healthz` shows `legacy_herdr_scopes: false`.
+   Any connector still on a pre-cutover grant now gets 403 / no tools — that
+   is the signal it was missed in step 4.
+7. **Drop the alias** in one PR: remove the herdr-mcp entry from
+   `wrangler.jsonc` `routes` and `ALIAS_URLS`, and from `ALIAS_HOSTS` in
+   `provision.sh`; deploy. Then in the dashboard delete the
+   `herdr-mcp.teamthurber.com` Workers custom domain if it remains, and
+   remove `herdr-mcp.teamthurber.com/authorize` from the Access app.
+
+**Rollback.** Each step is reversible on its own:
+
+| Failed at | Roll back |
+|---|---|
+| 1–2 (bad deploy) | `cd remote-mcp/worker && npx wrangler rollback` (previous version; DO, KV, grants untouched). If bebop itself misbehaves, delete only its Workers custom domain (dashboard → Workers → herdr-mcp → Domains); herdr-mcp keeps serving. |
+| 3 (Access) | Remove `bebop.teamthurber.com/authorize` from the app's domains; the AUD is unchanged, so the Worker needs nothing. |
+| 4 (reconnect) | Re-add the old herdr-mcp connector; the alias and legacy scopes are still on. |
+| 5 (publisher) | Revert `sync_client.py`'s URL (or set `HERDR_MCP_URL=https://herdr-mcp.teamthurber.com` in the plist) and reinstall. |
+| 6 (legacy off) | `LEGACY_HERDR_SCOPES="true"` + deploy; old grants work again (they were never deleted). |
+| 7 (alias gone) | Revert the PR and deploy; `wrangler deploy` re-attaches the custom domain and its DNS record. |
+
+Never roll back by `npx wrangler delete herdr-mcp`: that destroys the
+Durable Object (notes, audit, peer inbox) and every grant.
 
 ### Deploy order on later releases (Worker before the Mac)
 
 Once `owner_reply_results` exists (#225 review round 3 N1/N3), a release
 changing the sync response shape must land on the Worker BEFORE the Mac
 publisher that depends on it: `provision.sh --apply` (step 2 above) first,
-`./install.sh --apply --remote-mcp…` (step 3) second. Deploying the Mac
+`install-fm-publisher.sh --apply` (step 3) second. Deploying the Mac
 side first is safe but not useful -- an old Worker's `/ingest/sync`
 response simply has no `owner_reply_results` field, so a newer publisher
 treats every owner reply as "this field says nothing about it" (the
@@ -895,43 +854,21 @@ deploys. The reverse order (old Mac, new Worker) is always safe: the
 `/ingest/sync` REQUEST schema is unchanged by this field, so an old
 publisher keeps working against a new Worker without modification.
 
-Tests: `cd worker && npx vitest run` (seven projects: `read-only` = the
-first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
-and tasks both on, `owner-inbox` = messaging and the owner-inbox scope both
-on, `events` and `consumers` share owner-inbox's bindings, `client-identity`
-(`test/client-identity.test.ts`) is tasks AND owner-inbox both on — the one
-combination the others don't cover, proving the duet/zero per-client
-identity above end to end: verified sender_client distinct per connection
-under the same account, client_message_id dedupe, task.* denied to a
-peer-inbox-only token, delivered_at/replied_at recorded, and revoking one
-grant never touching another's queued message; OAuth flow, tools, scope,
-throttle, allowlist and task-lifecycle enforcement in workerd) and `python3
-remote-mcp/verify-publisher.py` (snapshot, redaction, link and envelope
-handling, delivery re-checks, lost-ack dedup, and graceful degradation
-against a genuine pre-v7 registry — the publisher's own registry read never
-triggers `lib/run-registry.sh`'s schema migration) plus `python3
-remote-mcp/verify-owner-inbox.py` (registry read, the F1 pane-identity
-re-check, symlink-refused inbox writes and reply scans, and
-`herdr-deliver.sh`'s exit-code mapping, including exit 5 →
-`owner_at_approval_prompt`, post-type rc5 handling, unsettled-reply deferral
-and reply-file suppression). Publisher regressions cover rc4 notice dedup
-across restarts and fail-closed owner identity checks. The Worker suite
-covers unconfirmed-notice expiry, within-TTL late replies, mixed rc4/rc5
-reply acceptance, expired/revoked grants, scope removal, disabled inboxes
-and grant-lookup holds. Plus `python3
-remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
-start/cancel/resume command processing, verify-research/verify-implement,
-deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/
-`registry-bridge.sh` scripts and a scratch sqlite registry, never the live
-one) and `python3 remote-mcp/verify-tasks-e2e.py` (the same command
-pipeline, but through the REAL `registry-bridge.sh`/`lib/run-registry.sh`/
-`close-done-workers.sh` against a scratch `HERDR_RUN_STATE_DIR` — only
-`spawn-task.sh`'s actual pane/tab/agent launch is stubbed, proving tasks.py's
-schema assumptions match what registry migration v7 really produces).
-CI: `.github/workflows/remote-mcp.yml`. Security review (two rounds,
-posted on PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the
-read-only first connection, N1–N4, N6, N8, N10 fixed; N5 (single-grant
-revoke) added afterwards in `scripts/grants.py` + `/admin/grants`.
+Tests: `cd worker && npx vitest run` (seven projects: `flow` = OAuth flow,
+`read-only` = owner inbox off (only `fm:read`/`fm:reports` exist),
+`owner-inbox`, `events`, `consumers`, `client-identity` (dot/duet CIMD
+identity, sender labels, peer notes) and `firstmate` (the scope matrix per
+scope, the dot/duet grant ceilings and default deny, legacy scope mapping,
+alias issuer/resource and the 421, per-tool limits, note-only semantics for
+`request_task`/`answer_decision`, typed decision/report reads), plus
+`node test/authorization-offline.cjs`. Publisher: `python3
+remote-mcp/verify-fm-publisher.py` (snapshot allow-list, redaction on every
+new field, decisions/reports/posture, note kinds, every body validated by the
+Worker's zod `SyncSchema`, and the tick speed budget). `python3
+remote-mcp/scripts/verify-issue-client.py` checks the Mac's dot/duet
+profiles against `CLIENT_GRANTS`. CI: `.github/workflows/remote-mcp.yml`.
+Security review: Phase 1 on PR #206 (two rounds) and #413; Phase 2 on its
+own PR.
 
 Dependencies: `npm ci` is warning-free and `npm audit` reports 0. The test
 pool (`@cloudflare/vitest-pool-workers` 0.22.0, latest) pins an older

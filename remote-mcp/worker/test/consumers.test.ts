@@ -7,7 +7,7 @@ import { BASE, callTool, oauthToken, signedSync, syncBody } from "./helpers";
 const e = env as unknown as Env;
 let fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
 const caller = { email: "tnt@teamthurber.com", client_id: "zero-client", client_name: "Zero" };
-const scopes = ["herdr:read"];
+const scopes = ["fm:read"];
 beforeEach(async () => {
   await reset();
   fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
@@ -98,7 +98,7 @@ describe("durable consumer positions", () => {
 
   it("scope changes are refused without rebinding; scope order and client display name do not matter", async () => {
     await seedEvents();
-    const originalScopes = ["herdr:read", "herdr:message.owner"];
+    const originalScopes = ["fm:read", "fm:request"];
     const start = await fleet.getConsumerPosition(Date.now(), caller, originalScopes, "zero");
     const before = await row();
     expect((await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero")).result).toBe("cursor_scope_mismatch");
@@ -177,7 +177,7 @@ describe("durable consumer positions", () => {
   });
 
   it("does not list consumer tools for a token without read scope", async () => {
-    const { access_token } = await oauthToken(["herdr:message"]);
+    const { access_token } = await oauthToken(["fm:reports"]);
     const response = await SELF.fetch(`${BASE}/mcp`, {
       method: "POST", headers: { authorization: `Bearer ${access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
@@ -227,7 +227,7 @@ describe("durable consumer positions", () => {
   it("[rebase] rebinds changed grants explicitly but refuses scope changes during reconciliation", async () => {
     await seedEvents();
     const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
-    const changedScopes = [...scopes, "herdr:message.owner"];
+    const changedScopes = [...scopes, "fm:request"];
     const mismatch = await fleet.getConsumerPosition(Date.now(), caller, changedScopes, "zero");
     expect(mismatch.result).toBe("cursor_scope_mismatch");
     const before = await row();

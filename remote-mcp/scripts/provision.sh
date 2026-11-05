@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# remote-mcp/scripts/provision.sh — stand up herdr-mcp end to end.
+# remote-mcp/scripts/provision.sh — stand up Bebop (the herdr-mcp Worker) end to end.
 #
 #   bash remote-mcp/scripts/provision.sh            # dry run: report state, change nothing
 #   bash remote-mcp/scripts/provision.sh --apply    # create what is missing, deploy, verify
@@ -8,15 +8,16 @@
 # re-deploys and re-prints VERIFY. Prints no secret value, ever (fingerprints only).
 #
 #   1. KV namespace "herdr-mcp-oauth" (OAuth provider storage)
-#   2. Access app "herdr-mcp-authorize" on herdr-mcp.teamthurber.com/authorize
-#      (path-scoped, Google Workspace IdP pinned, email policy) — same shape as
-#      knowledge-base scripts/provision-oauth-access-app.sh
+#   2. Access app "herdr-mcp-authorize" on <host>/authorize for bebop.teamthurber.com
+#      and every alias host (path-scoped, Google Workspace IdP pinned, email
+#      policy) — ONE app, so the Worker's single ACCESS_AUD covers every host;
+#      an existing app missing a host gets it added (same app, same AUD)
 #   3. KV id + Access AUD written into worker/wrangler.jsonc (both public ids)
 #   4. Ingest key: 1Password item herdr-mcp-ingest-key (created via op-write
 #      from a 600 template file, never argv), mirrored into
 #      ~/.config/op/launchd-secrets.env as HERDR_MCP_INGEST_KEY (backed up first)
 #   5. wrangler deploy + `wrangler secret put INGEST_KEY` (value on stdin);
-#      custom domain checked via the API, attached if the deploy did not
+#      each custom domain checked via the API, attached if the deploy did not
 set -euo pipefail
 
 APPLY=0
@@ -26,7 +27,11 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORKER="$HERE/worker"
 WRANGLER_CFG="$WORKER/wrangler.jsonc"
 ACC="0a23a3902c4f431f05d46c86c1fa7b81"
-HOST="herdr-mcp.teamthurber.com"
+HOST="bebop.teamthurber.com"
+# Served too during the hostname cutover (wrangler.jsonc ALIAS_URLS + routes).
+# Drop a host here in the same change that drops it there.
+ALIAS_HOSTS=("herdr-mcp.teamthurber.com")
+HOSTS=("$HOST" "${ALIAS_HOSTS[@]}")
 APP_PATH="authorize"
 APP_NAME="herdr-mcp-authorize"
 EMAILS="tnt@teamthurber.com"
@@ -52,7 +57,8 @@ if [[ -z "$KV_ID" && $APPLY == 1 ]]; then
 fi
 echo "   id=${KV_ID:-<missing>}"
 
-echo "== 2. Access app '$APP_NAME' on $HOST/$APP_PATH"
+DOMAINS_JSON="$(printf '%s\n' "${HOSTS[@]}" | jq -R --arg p "$APP_PATH" '. + "/" + $p' | jq -sc .)"
+echo "== 2. Access app '$APP_NAME' on $(jq -r 'join(", ")' <<<"$DOMAINS_JSON")"
 ZT="$(op read 'op://secrets/shared-cloudflare-zero-trust-key/credential')"
 API="https://api.cloudflare.com/client/v4/accounts/$ACC/access"
 # Tokens go to curl as a header FILE (-H @fd), never in argv where `ps` shows them.
@@ -63,8 +69,8 @@ IDP="$(cf "$API/identity_providers" | jq -r '[.result[]? | select(.type=="google
 APP_JSON="$(cf "$API/apps" | jq -c --arg n "$APP_NAME" 'first(.result[]? | select(.name==$n)) // empty')"
 if [[ -z "$APP_JSON" && $APPLY == 1 ]]; then
   INCLUDE="$(printf '%s\n' "${EMAILS//,/$'\n'}" | jq -R '{email: {email: .}}' | jq -sc .)"
-  BODY="$(jq -nc --arg name "$APP_NAME" --arg domain "$HOST/$APP_PATH" --argjson include "$INCLUDE" --arg idp "$IDP" '{
-    name: $name, type: "self_hosted", domain: $domain, self_hosted_domains: [$domain],
+  BODY="$(jq -nc --arg name "$APP_NAME" --arg domain "$HOST/$APP_PATH" --argjson doms "$DOMAINS_JSON" --argjson include "$INCLUDE" --arg idp "$IDP" '{
+    name: $name, type: "self_hosted", domain: $domain, self_hosted_domains: $doms,
     session_duration: "24h", app_launcher_visible: false, auto_redirect_to_identity: true,
     allowed_idps: [$idp],
     policies: [ { name: "herdr-mcp-emails", decision: "allow", precedence: 1, include: $include } ]
@@ -77,8 +83,25 @@ APP_ID=""; AUD=""
 if [[ -n "$APP_JSON" ]]; then APP_ID="$(jq -r .id <<<"$APP_JSON")"; AUD="$(jq -r .aud <<<"$APP_JSON")"; fi
 echo "   id=${APP_ID:-<missing>} aud=${AUD:-<missing>}"
 if [[ -n "$APP_JSON" ]]; then
-  got_domain="$(jq -r .domain <<<"$APP_JSON")"; got_idps="$(jq -r '(.allowed_idps // []) | join(",")' <<<"$APP_JSON")"
-  [[ "$got_domain" == "$HOST/$APP_PATH" && "$got_idps" == "$IDP" ]] || { echo "   MISMATCH: domain=$got_domain idps=$got_idps" >&2; exit 1; }
+  got_idps="$(jq -r '(.allowed_idps // []) | join(",")' <<<"$APP_JSON")"
+  [[ "$got_idps" == "$IDP" ]] || { echo "   MISMATCH: idps=$got_idps" >&2; exit 1; }
+  missing="$(jq -r --argjson want "$DOMAINS_JSON" '$want - (.self_hosted_domains // [.domain]) | join(" ")' <<<"$APP_JSON")"
+  if [[ -n "$missing" ]]; then
+    echo "   missing host(s): $missing"
+    if (( APPLY )); then
+      # Same app, same AUD: only the host list grows. Read-only fields are
+      # dropped; newer apps also carry `destinations`, kept in step.
+      UPD="$(jq -c --argjson doms "$DOMAINS_JSON" --arg domain "$HOST/$APP_PATH" '
+        del(.id, .uid, .aud, .created_at, .updated_at)
+        | .domain = $domain | .self_hosted_domains = $doms
+        | if has("destinations") then .destinations = [$doms[] | {type: "public", uri: .}] else . end' <<<"$APP_JSON")"
+      RESP="$(cf -X PUT "$API/apps/$APP_ID" --data "$UPD")"
+      jq -e .success <<<"$RESP" >/dev/null || { echo "   update FAILED: $(jq -c .errors <<<"$RESP")" >&2; exit 1; }
+      APP_JSON="$(jq -c .result <<<"$RESP")"
+      [[ "$(jq -r .aud <<<"$APP_JSON")" == "$AUD" ]] || { echo "   AUD changed on update; ACCESS_AUD must follow" >&2; exit 1; }
+      echo "   added: $missing (aud unchanged)"
+    fi
+  fi
 fi
 
 echo "== 3. ids into wrangler.jsonc"
@@ -101,7 +124,7 @@ echo "== 4. ingest key"
 KEY="$(op read "op://secrets/$ITEM/credential" 2>/dev/null || true)"
 if [[ -z "$KEY" && $APPLY == 1 ]]; then
   KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-  TPL="$(mktemp)"; chmod 600 "$TPL"
+  TPL="$(mktemp)"; chmod 600 "$TPL"; trap 'rm -f "$TPL"' EXIT   # the key never outlives a failed op-write
   KEY="$KEY" ITEM="$ITEM" python3 -c 'import json,os; print(json.dumps({"title": os.environ["ITEM"], "category": "API_CREDENTIAL",
     "fields": [{"id": "credential", "label": "credential", "type": "CONCEALED", "value": os.environ["KEY"]},
                {"id": "notesPlain", "label": "notesPlain", "type": "STRING", "purpose": "NOTES",
@@ -155,39 +178,52 @@ if (( APPLY )); then
     printf %s "$KEY" | npx wrangler secret put INGEST_KEY >/dev/null && echo "   INGEST_KEY set"
   fi
   CFK="$(op read 'op://secrets/shared-cloudflare-api-key/credential')"
-  DOM="$(authed "$CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$HOST" | jq -r '.result[0].service // empty')"
-  if [[ "$DOM" != "herdr-mcp" ]]; then
-    ZONE="$(authed "$CFK" 'https://api.cloudflare.com/client/v4/zones?name=teamthurber.com' | jq -r '.result[0].id')"
-    authed "$CFK" -X PUT \
-      "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains" \
-      -d "$(jq -nc --arg h "$HOST" --arg z "$ZONE" '{environment:"production", hostname:$h, service:"herdr-mcp", zone_id:$z}')" \
-      | jq -c '{success, errors}'
-  fi
+  ZONE=""
+  for h in "${HOSTS[@]}"; do
+    DOM="$(authed "$CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$h" | jq -r '.result[0].service // empty')"
+    if [[ "$DOM" != "herdr-mcp" ]]; then
+      [[ -n "$ZONE" ]] || ZONE="$(authed "$CFK" 'https://api.cloudflare.com/client/v4/zones?name=teamthurber.com' | jq -r '.result[0].id')"
+      echo "   attaching custom domain $h"
+      authed "$CFK" -X PUT \
+        "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains" \
+        -d "$(jq -nc --arg h "$h" --arg z "$ZONE" '{environment:"production", hostname:$h, service:"herdr-mcp", zone_id:$z}')" \
+        | jq -c '{success, errors}'
+    fi
+  done
 fi
 
 echo
 echo "===== VERIFY ====="
-B="https://$HOST"
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-echo "PRM resource:          $(curl -s "$B/.well-known/oauth-protected-resource/mcp" | jq -r '.resource // "FAIL"')   (want $B/mcp)"
-echo "AS issuer / S256 / iss: $(curl -s "$B/.well-known/oauth-authorization-server" | jq -r '"\(.issuer) / \(.code_challenge_methods_supported|index("S256")!=null) / \(.authorization_response_iss_parameter_supported)"')"
-# The expectation comes from what this deploy actually shipped (wrangler.jsonc
-# MESSAGING_ENABLED), not a hard-coded "off" from before messaging went live.
-# Non-comment lines only, any spacing, any case; an absent key means the
-# Worker's own default (off). `|| true`: no match must not abort under set -e.
-WANT_MSG="$(grep -v '^[[:space:]]*//' "$WRANGLER_CFG" | grep -oiE '"MESSAGING_ENABLED"[[:space:]]*:[[:space:]]*"[a-z]+"' | tail -1 | cut -d'"' -f4 | tr 'A-Z' 'a-z' || true)"
-[ "$WANT_MSG" = true ] && WANT_MSG=true || WANT_MSG=false
-echo "AS scopes_supported:   $(curl -s "$B/.well-known/oauth-authorization-server" | jq -c '.scopes_supported')   (want [\"herdr:read\"] only when messaging is off; messaging_enabled=$WANT_MSG)"
-HZ="$(curl -s --max-time 15 "$B/healthz" || true)"   # a network failure is a MISMATCH, not an abort
-echo "/healthz:              $(printf '%s' "$HZ" | jq -c '{build_sha, messaging_enabled, scopes_offered}' 2>/dev/null || echo "<no JSON response>")"
-echo "                       (want build_sha $SHA, messaging_enabled $WANT_MSG): $(printf '%s' "$HZ" | jq -r --arg s "$SHA" --argjson m "$WANT_MSG" 'if .build_sha==$s and .messaging_enabled==$m then "OK" else "MISMATCH" end' 2>/dev/null | grep . || echo MISMATCH)"
+# The expectation comes from what this deploy shipped (wrangler.jsonc
+# OWNER_INBOX_ENABLED): the note scopes are offered only while it is on.
+# Non-comment lines only, any spacing, any case; absent means off.
+WANT_INBOX="$(grep -v '^[[:space:]]*//' "$WRANGLER_CFG" | grep -oiE '"OWNER_INBOX_ENABLED"[[:space:]]*:[[:space:]]*"[a-z]+"' | tail -1 | cut -d'"' -f4 | tr 'A-Z' 'a-z' || true)"
+if [ "$WANT_INBOX" = true ]; then
+  WANT_SCOPES='["fm:read","fm:reports","fm:request","fm:decide-note","fm:peer"]'
+else
+  WANT_SCOPES='["fm:read","fm:reports"]'
+fi
+for h in "${HOSTS[@]}"; do
+  B="https://$h"
+  ROLE=alias; [[ "$h" == "$HOST" ]] && ROLE=canonical
+  echo "-- $B ($ROLE)"
+  echo "PRM resource:          $(curl -s "$B/.well-known/oauth-protected-resource/mcp" | jq -r '.resource // "FAIL"')   (want $B/mcp)"
+  echo "AS issuer / S256 / iss: $(curl -s "$B/.well-known/oauth-authorization-server" | jq -r '"\(.issuer) / \(.code_challenge_methods_supported|index("S256")!=null) / \(.authorization_response_iss_parameter_supported)"')   (want $B / true / true)"
+  echo "AS scopes_supported:   $(curl -s "$B/.well-known/oauth-authorization-server" | jq -c '.scopes_supported')   (want $WANT_SCOPES)"
+  HZ="$(curl -s --max-time 15 "$B/healthz" || true)"   # a network failure is a MISMATCH, not an abort
+  echo "/healthz:              $(printf '%s' "$HZ" | jq -c '{build_sha, host_role, scopes_offered, legacy_herdr_scopes, clients}' 2>/dev/null || echo "<no JSON response>")"
+  echo "                       (want build_sha $SHA, host_role $ROLE, scopes_offered $WANT_SCOPES): $(printf '%s' "$HZ" | jq -r --arg s "$SHA" --arg r "$ROLE" --argjson o "$WANT_SCOPES" 'if .build_sha==$s and .host_role==$r and .scopes_offered==$o then "OK" else "MISMATCH" end' 2>/dev/null | grep . || echo MISMATCH)"
+  echo "/mcp no token:         $(code -X POST "$B/mcp")   (want 401)"
+  echo "/authorize no session: $(curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}' "$B/authorize" | cut -c1-80)   (want 302 -> $TEAM)"
+  echo "/ingest unsigned:      $(code -X POST "$B/ingest/sync")   (want 401; 503 = INGEST_KEY not set)"
+done
+echo "unknown host (edge):   $(code -H 'Host: nope.teamthurber.com' "https://$HOST/healthz")   (want 421 or an edge refusal; never 200 -- the Worker's own 421 is proven by the test suite)"
 echo "live version:          $(npx wrangler deployments status 2>/dev/null | grep -E 'Version|Tag|Message' | tr -s ' ' | paste -sd ';' -)"
-echo "/mcp no token:         $(code -X POST "$B/mcp")   (want 401)"
-echo "/authorize no session: $(curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}' "$B/authorize" | cut -c1-80)   (want 302 -> $TEAM)"
-echo "/ingest unsigned:      $(code -X POST "$B/ingest/sync")   (want 401; 503 = INGEST_KEY not set)"
 echo
-echo "ROLLBACK:"
-echo "  npx wrangler delete herdr-mcp            # Worker, DO, custom domain route"
+echo "ROLLBACK (README \"Bebop cutover runbook\" for the staged version):"
+echo "  npx wrangler rollback                      # previous Worker version; DO, KV and grants untouched"
+echo "  npx wrangler delete herdr-mcp            # Worker, DO, custom domain routes -- last resort, loses state"
 echo "  curl -X DELETE -H @<(printf 'Authorization: Bearer %s\\n' \"\$ZT\") $API/apps/${APP_ID:-<id>}"
 echo "  npx wrangler kv namespace delete --namespace-id ${KV_ID:-<id>}"
 echo "  op-write item delete $ITEM --vault Secrets --archive; remove HERDR_MCP_INGEST_KEY from $SECRETS_FILE"

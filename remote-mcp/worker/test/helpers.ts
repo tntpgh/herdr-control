@@ -3,8 +3,17 @@ import { importJWK, SignJWT } from "jose";
 import { sign } from "../src/ingest";
 import type { Snapshot, SyncBody } from "../src/types";
 
-export const BASE = "https://herdr-mcp.teamthurber.com";
+export const BASE = "https://bebop.teamthurber.com";
+// The old hostname, still served as an alias during the cutover.
+export const ALIAS = "https://herdr-mcp.teamthurber.com";
 export const REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect";
+// CIMD client ids (vitest.config.ts serves their documents): the two
+// allow-listed apps, and a stranger that is not on the list.
+export const DOT = "https://chatgpt.com/oauth/client.json";
+export const DUET = "https://claude.ai/oauth/mcp-oauth-client-metadata";
+export const STRANGER = "https://stranger.example/oauth/client.json";
+export type ClientKind = "dot" | "duet" | "stranger" | "dcr";
+const CIMD_IDS: Record<Exclude<ClientKind, "dcr">, string> = { dot: DOT, duet: DUET, stranger: STRANGER };
 const testEnv = env as unknown as { TEST_ACCESS_PRIVATE_JWK: string; INGEST_KEY: string };
 
 export async function accessJwt(email: string, aud = "test-aud"): Promise<string> {
@@ -22,54 +31,71 @@ export async function accessJwt(email: string, aud = "test-aud"): Promise<string
 const b64url = (buf: ArrayBuffer) =>
   btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-// Full OAuth 2.1 authorization-code + PKCE flow, the way ChatGPT runs it:
-// DCR, /authorize behind Access, consent, code exchange with `resource`.
-export async function oauthToken(scopes: string[], email = "tnt@teamthurber.com", clientName = "Zero"):
-    Promise<{ access_token: string; scope: string }> {
-  const reg = await SELF.fetch(`${BASE}/oauth/register`, {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ redirect_uris: [REDIRECT], client_name: clientName, token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
-  });
-  if (reg.status !== 201) throw new Error(`register ${reg.status} ${await reg.text()}`);
-  const { client_id } = (await reg.json()) as { client_id: string };
+// Full OAuth 2.1 authorization-code + PKCE flow, the way ChatGPT and Claude
+// run it: a CIMD client_id (or, for "dcr", Dynamic Client Registration),
+// /authorize behind Access, consent, code exchange with `resource`. Throws
+// when consent refuses (a client not on the allowlist).
+export async function oauthToken(scopes: string[], email = "tnt@teamthurber.com", client: ClientKind = "dot", base = BASE):
+    Promise<{ access_token: string; scope: string; client_id: string }> {
+  let client_id: string;
+  if (client === "dcr") {
+    const reg = await SELF.fetch(`${base}/oauth/register`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: [REDIRECT], client_name: "Self-registered", token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
+    });
+    if (reg.status !== 201) throw new Error(`register ${reg.status} ${await reg.text()}`);
+    client_id = ((await reg.json()) as { client_id: string }).client_id;
+  } else {
+    client_id = CIMD_IDS[client];
+  }
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)).buffer);
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   const q = new URLSearchParams({
     response_type: "code", client_id, redirect_uri: REDIRECT, scope: scopes.join(" "), state: "st8",
-    code_challenge: challenge, code_challenge_method: "S256", resource: `${BASE}/mcp`,
+    code_challenge: challenge, code_challenge_method: "S256", resource: `${base}/mcp`,
   });
   const jwt = await accessJwt(email);
-  const page = await SELF.fetch(`${BASE}/authorize?${q}`, { headers: { "cf-access-jwt-assertion": jwt } });
+  const page = await SELF.fetch(`${base}/authorize?${q}`, { headers: { "cf-access-jwt-assertion": jwt } });
   if (page.status !== 200) throw new Error(`authorize GET ${page.status} ${await page.text()}`);
   const html = await page.text();
   const handle = /name="handle" value="([^"]+)"/.exec(html)?.[1];
   const cookie = page.headers.getSetCookie().map((c: string) => c.split(";")[0]).join("; ");
   const form = new URLSearchParams({ handle: handle!, decision: "approve" });
   for (const s of scopes) form.append("scope", s);
-  const post = await SELF.fetch(`${BASE}/authorize`, {
+  const post = await SELF.fetch(`${base}/authorize`, {
     method: "POST", redirect: "manual",
-    headers: { "cf-access-jwt-assertion": jwt, cookie, origin: BASE, "content-type": "application/x-www-form-urlencoded" },
+    headers: { "cf-access-jwt-assertion": jwt, cookie, origin: base, "content-type": "application/x-www-form-urlencoded" },
     body: form,
   });
   if (post.status !== 302) throw new Error(`authorize POST ${post.status} ${await post.text()}`);
   const loc = new URL(post.headers.get("location")!);
   const code = loc.searchParams.get("code")!;
-  const tok = await SELF.fetch(`${BASE}/oauth/token`, {
+  const tok = await SELF.fetch(`${base}/oauth/token`, {
     method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id,
-      code_verifier: verifier, resource: `${BASE}/mcp` }),
+      code_verifier: verifier, resource: `${base}/mcp` }),
   });
   if (tok.status !== 200) throw new Error(`token ${tok.status} ${await tok.text()}`);
-  return (await tok.json()) as { access_token: string; scope: string };
+  return { ...((await tok.json()) as { access_token: string; scope: string }), client_id };
+}
+
+// tools/list for a token: the names this connection was granted.
+export async function toolNames(token: string, base = BASE): Promise<string[]> {
+  const res = await SELF.fetch(`${base}/mcp`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+  });
+  return ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name).sort();
 }
 
 let rpcId = 0;
 // T is the shape the test expects; the tests then assert on it, so a wrong
 // guess fails loudly rather than reading undefined silently.
-export async function callTool<T = Record<string, unknown>>(token: string, name: string, args: Record<string, unknown> = {}):
-  Promise<{ data: T & { error?: string; connection?: { state: string; last_sync_at: string | null } }; isError: boolean }> {
-  const res = await SELF.fetch(`${BASE}/mcp`, {
+export async function callTool<T = Record<string, unknown>>(token: string, name: string, args: Record<string, unknown> = {},
+  base = BASE): Promise<{ data: T & { error?: string; connection?: { state: string; last_sync_at: string | null } }; isError: boolean }> {
+  const res = await SELF.fetch(`${base}/mcp`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }),

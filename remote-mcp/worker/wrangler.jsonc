@@ -1,8 +1,11 @@
 {
-  // herdr-mcp — authenticated remote MCP over herdr-control status.
-  // Deploy: see ../README.md "Deploy". Secrets (never committed):
+  // Bebop (formerly herdr-mcp): Firstmate's authenticated remote MCP for Dot
+  // and Duet. Deploy: see ../README.md "Bebop cutover runbook". Secrets
+  // (never committed):
   //   wrangler secret put INGEST_KEY   (same value as HERDR_MCP_INGEST_KEY in
   //                                     ~/.config/op/launchd-secrets.env)
+  // The script keeps its herdr-mcp name so the Durable Object, OAuth KV and
+  // every grant carry over the hostname change.
   "name": "herdr-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
@@ -10,27 +13,37 @@
   // before it will fetch Client ID Metadata Documents.
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": false,
-  "routes": [{ "pattern": "herdr-mcp.teamthurber.com", "custom_domain": true }],
+  // bebop is canonical; herdr-mcp stays an alias (ALIAS_URLS) until every
+  // client has reconnected at bebop. Remove it, and its ALIAS_URLS entry,
+  // in the same deploy.
+  "routes": [
+    { "pattern": "bebop.teamthurber.com", "custom_domain": true },
+    { "pattern": "herdr-mcp.teamthurber.com", "custom_domain": true }
+  ],
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "cfeae87a64f4409a99d455cfbcc224bc" }],
   "durable_objects": { "bindings": [{ "name": "HERDR_STATE", "class_name": "HerdrState" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HerdrState"] }],
   "vars": {
-    "PUBLIC_URL": "https://herdr-mcp.teamthurber.com",
+    "PUBLIC_URL": "https://bebop.teamthurber.com",
+    // Comma-separated origins also served during the cutover. A token
+    // issued for a resource works only on that origin, so old connectors
+    // keep working here until they reconnect at PUBLIC_URL.
+    "ALIAS_URLS": "https://herdr-mcp.teamthurber.com",
+    // Honour herdr:read / herdr:message.owner on tokens granted before the
+    // fm:* scopes (policy.ts LEGACY_SCOPE_MAP). Set "false" once Dot and Duet
+    // have re-consented at bebop.
+    "LEGACY_HERDR_SCOPES": "true",
     "ACCESS_TEAM_DOMAIN": "thurberteam.cloudflareaccess.com",
     // AUD of the path-scoped Access app "herdr-mcp-authorize" (scripts/provision.sh).
     "ACCESS_AUD": "8c1120f68ebc19debcb90cf85642449fa8d37064d0240d7962dc6a54c2e707eb",
     "ALLOWED_EMAILS": "tnt@teamthurber.com",
     "STALE_AFTER_S": "90",
-    // On since 2026-10-01 (Terrence, go-live form for messaging). Set "false" and
-    // redeploy to turn it off: new sends are refused and every queued message is
-    // cancelled on the next sync. The Mac has its own switch (install.sh).
-    "MESSAGING_ENABLED": "true",
-    // Remote task lifecycle (start_task/cancel_task/resume_task). On since
-    // PR #211's security review approved (round 5, 3d0ca83) and the live
-    // strict-posture repro passed. Set "false" and redeploy to turn it off;
-    // the Mac has its own switch, HERDR_MCP_TASKS (install.sh
-    // --remote-mcp-tasks), and either off refuses new starts.
-    "TASKS_ENABLED": "true",
+    // send_message and the remote task lifecycle (start/cancel/resume) are
+    // off: Bebop's tools are Firstmate's, and every write is a note to the
+    // owner inbox. Off cancels anything still queued on the next sync; the
+    // Durable Object paths stay dormant until Phase 3 removes them.
+    "MESSAGING_ENABLED": "false",
+    "TASKS_ENABLED": "false",
     // ZERO-LOOP-001 #5, design-approved only (Terrence, form
     // 20261002T142819-8748): send_owner_message/get_owner_message_status/
     // get_owner_reply, addressed to a named long-lived owning session. Ship

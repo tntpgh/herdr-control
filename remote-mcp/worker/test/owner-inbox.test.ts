@@ -26,7 +26,7 @@ beforeEach(() => reset());
 describe("send_owner_message", () => {
   it("does not offer send_owner_message to a read-only token, and audits a call to it anyway", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read"]);
+    const { access_token } = await oauthToken(["fm:read"]);
     const r = await callTool(access_token, "send_owner_message", { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
     expect(r.isError).toBe(true);
     const { audit } = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot() })));
@@ -35,7 +35,7 @@ describe("send_owner_message", () => {
 
   it("refuses an unregistered or syntactically-invalid owner label without ever queuing", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const reason = async (owner_label: string) =>
       (await callTool(access_token, "send_owner_message", { owner_label, body: "hi", client_msg_id: `cm-${owner_label}` })).data.error;
     expect(await reason("no-such-owner")).toBe("owner_not_registered");
@@ -47,7 +47,7 @@ describe("send_owner_message", () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
     const out = await runInDurableObject(fleet(), (o: HerdrState) =>
       o.sendOwnerMessage(Date.now() + 120_000, { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" },
-        ["herdr:read", "herdr:message.owner"], "conductor", "hi", "cm1"));
+        ["fm:read", "fm:request"], "conductor", "hi", "cm1"));
     expect(out.ok).toBe(false);
     if (out.ok) throw new Error("unreachable");
     expect(out.reason).toMatch(/^not_connected/);
@@ -55,7 +55,7 @@ describe("send_owner_message", () => {
 
   it("queues, leases once to the publisher, and records delivered on ack", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string; state: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "line one\nline two", client_msg_id: "cm1" });
     expect(sent.data.state).toBe("queued");
@@ -72,7 +72,7 @@ describe("send_owner_message", () => {
 
   it("dedupes a retried client_msg_id: returns the ORIGINAL exchange_id and state, even with a different body", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const first = await callTool<{ exchange_id: string; state: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "first body", client_msg_id: "same-id" });
     const retry = await callTool<{ exchange_id: string; state: string }>(access_token, "send_owner_message",
@@ -83,7 +83,7 @@ describe("send_owner_message", () => {
 
   it("rate-limits a burst at 10/minute, independent of the generic per-client throttle", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const outcomes: string[] = [];
     for (let i = 0; i < 11; i++) {
       outcomes.push((await callTool(access_token, "send_owner_message",
@@ -92,21 +92,24 @@ describe("send_owner_message", () => {
     expect(outcomes).toEqual([...Array(10).fill("ok"), "rate_limited"]);
   });
 
-  it("rate-limits at 120/hour even when no single minute is over 10", async () => {
+  it("rate-limits at 120/hour per sender across clients, even when no single minute is over 10", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    // Two connections of one sender, alternating, so neither reaches its own
+    // per-tool hourly limit: only OWNER_LIMITS (per sender) can refuse.
     const zero = { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" };
-    const scopes = ["herdr:read", "herdr:message.owner"];
+    const zero2 = { ...zero, client_id: "c2" };
+    const scopes = ["fm:read", "fm:request"];
     const now = Date.now();
     const out = await runInDurableObject(fleet(), (o: HerdrState) => {
       const r: string[] = [];
       // 119 sends 29s apart (at most 3 in any minute) ending 99s ago, then two now.
       for (let i = 0; i < 119; i++) {
         const at = now - 99_000 - (118 - i) * 29_000;
-        const s = o.sendOwnerMessage(at, zero, scopes, "conductor", `h${i}`, `ch${i}`);
+        const s = o.sendOwnerMessage(at, i % 2 ? zero2 : zero, scopes, "conductor", `h${i}`, `ch${i}`);
         r.push(s.ok ? "ok" : s.reason);
       }
-      for (const k of ["a", "b"]) {
-        const s = o.sendOwnerMessage(now, zero, scopes, "conductor", k, `cn-${k}`);
+      for (const [k, who] of [["a", zero], ["b", zero2]] as const) {
+        const s = o.sendOwnerMessage(now, who, scopes, "conductor", k, `cn-${k}`);
         r.push(s.ok ? "ok" : s.reason);
       }
       return r;
@@ -115,16 +118,9 @@ describe("send_owner_message", () => {
     expect(out[120]).toBe("rate_limited (120/hour)");
   });
 
-  it("reports the owner limits, not the send_message limits, in list_capabilities", async () => {
-    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
-    const caps = await callTool<{ owner_inbox: { limits: { per_minute: number; per_hour: number } } }>(access_token, "list_capabilities");
-    expect(caps.data.owner_inbox.limits).toEqual({ per_minute: 10, per_hour: 120 });
-  });
-
   it("cancels a queued owner message, never leasing it, once its sender's grant is revoked", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
     const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
@@ -139,7 +135,7 @@ describe("send_owner_message", () => {
 
   it("cancels a queued owner message whose sender has left the allowlist, and still delivers others", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const kept = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "kept", client_msg_id: "cm1" });
     const gone = await runInDurableObject(fleet(), (_o: HerdrState, state) => queueRawOwner(state.storage, "conductor", "former@teamthurber.com"));
@@ -156,7 +152,7 @@ describe("blocked states reported by the publisher's own ack", () => {
   for (const reason of reasons) {
     it(`finalizes blocked:${reason} on first report`, async () => {
       await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-      const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+      const { access_token } = await oauthToken(["fm:read", "fm:request"]);
       const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
         { owner_label: "conductor", body: "hi", client_msg_id: `cm-${reason}` });
       await signedSync(syncBody({ snapshot: ownerSnapshot() })); // lease it
@@ -168,7 +164,7 @@ describe("blocked states reported by the publisher's own ack", () => {
 
   it("retries owner_at_approval_prompt on later ticks, then finalizes blocked after the retry cap", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
     const id = sent.data.exchange_id;
@@ -354,7 +350,7 @@ describe("unconfirmed owner notices", () => {
     for (const failure of ["revoked", "expired", "scope-removed"] as const) {
       it(`fails closed for an ${delivery} reply with a ${failure} sender grant`, async () => {
         await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-        const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+        const { access_token } = await oauthToken(["fm:read", "fm:request"]);
         const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
           { owner_label: "conductor", body: "hi", client_msg_id: "auth-check" });
         const id = sent.data.exchange_id;
@@ -369,7 +365,7 @@ describe("unconfirmed owner notices", () => {
             const grant = await e.OAUTH_KV.get<Record<string, unknown>>(k.name, "json");
             if (!grant) throw new Error("fixture grant missing");
             if (failure === "expired") grant.expiresAt = Math.floor(Date.now() / 1000) - 1;
-            else grant.scope = ["herdr:read"];
+            else grant.scope = ["fm:read"];
             await e.OAUTH_KV.put(k.name, JSON.stringify(grant));
           }
         }
@@ -419,7 +415,7 @@ describe("get_owner_reply", () => {
 
   it("syncs a reply, readable only by the original sender", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
 
     const replyBody = { exchange_id: id, owner_label: "conductor", body: "ok, done", responded_at: new Date().toISOString(),
@@ -451,7 +447,7 @@ describe("get_owner_reply", () => {
 
   it("reports ignored:replied (not duplicate) when a resend's body differs from what was stored (REVIEW-225-r2 N3)", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
 
     await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
@@ -475,7 +471,7 @@ describe("get_owner_reply", () => {
 
   it("reports ignored:queued for a reply that arrives before the message is delivered", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "hi", client_msg_id: "cm-queued" });
     const id = sent.data.exchange_id;
@@ -495,7 +491,7 @@ describe("get_owner_reply", () => {
 
   it("ignores a reply whose own owner_label does not match the exchange's real target (header mismatch)", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot([{ label: "conductor", live: true }, { label: "other-tab", live: true }]) }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
 
     const reply = await syncJson(await signedSync(syncBody({
@@ -513,7 +509,7 @@ describe("get_owner_reply", () => {
 
   it("refuses a late reply from reviving an already-cancelled blocked:sender_revoked message (REVIEW-219 M3)", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "hi", client_msg_id: "cm-m3" });
     const id = sent.data.exchange_id;
