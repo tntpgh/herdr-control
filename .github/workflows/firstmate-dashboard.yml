@@ -1,6 +1,7 @@
 name: firstmate-dashboard
 # Renders the dashboard against fixtures: every open decision shown, hostile
-# text escaped, Bebop theme loads, answer-path guards hold.
+# text escaped, Bebop theme loads, answer-path guards hold, reports render
+# escaped and in linear time with their captain calls pinned.
 on:
   pull_request:
     paths: ["firstmate-dashboard/**", "lib/hub_ui/**", ".github/workflows/firstmate-dashboard.yml"]

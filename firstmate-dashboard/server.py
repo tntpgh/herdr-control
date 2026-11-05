@@ -14,7 +14,9 @@ text has changed since, so a stale page cannot answer a different question.
 
 Routes
   /               the ship: rooms with live crews, Big Shot's bounty board, your calls
-  /report?path=   a report file an open decision or a verified bounty names (inside data/ only)
+  /reports        every data/<id>/report.md, newest first, with the captain calls each holds
+  /report?path=   one report: a data/<id>/report.md, or a file an open decision or a verified
+                  bounty names (inside data/ only); Markdown drawn as a document
   /answer         POST: decision answer -> Firstmate captain inbox
   /api/summary    counts; the field names the omp status line reads
   /api/projects   read-only per-repo join in the shape fleet-tools.ts reads
@@ -40,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import fmdata  # noqa: E402
 import render  # noqa: E402
+import report_md  # noqa: E402
 
 BIND = "127.0.0.1"
 DEFAULT_PORT = 8600
@@ -131,6 +134,19 @@ def projects(snap: dict, home: Path) -> dict:
     return {"source": "firstmate", "generated": snap.get("generated"), "projects": sorted(by.values(), key=lambda p: p["project"])}
 
 
+def read_report(p: Path | None) -> tuple[str, bool, str | None] | None:
+    """(text up to MAX_REPORT bytes, whether the file is longer, its mtime as ISO), or None if unreadable."""
+    if p is None:
+        return None
+    try:
+        with p.open("rb") as f:
+            data = f.read(MAX_REPORT + 1)
+            mtime = os.fstat(f.fileno()).st_mtime
+    except OSError:
+        return None
+    return data[:MAX_REPORT].decode("utf-8", "replace"), len(data) > MAX_REPORT, fmdata._iso(mtime)
+
+
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -220,16 +236,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             flash = (f"Sent to the Firstmate inbox as note {sent}. Firstmate picks it up at its next check."
                      if sent else bad)
             return self._html(200, render.dashboard(snap, theme, self.server.token, nonce, flash, bool(bad)), nonce)
+        if url.path == "/reports":
+            items = []
+            for r in self.server.home.reports():
+                got = read_report(self.server.home.report_file(r["path"]))
+                title, calls = report_md.headline(got[0]) if got else ("", False)
+                items.append({**r, "title": title, "calls": calls})
+            return self._html(200, render.reports(items, snap.get("decisions", []) if snap.get("ok") else None, theme, nonce), nonce)
         if url.path == "/report":
             rel = (q.get("path") or [""])[0]
             named = {r for d in snap.get("decisions", []) for r in d["reports"]} | {
                 b["proof"]["ref"] for b in snap.get("bounties", [])
                 if b["status"] == "verified" and (b.get("proof") or {}).get("kind") == "report"}
-            p = self.server.home.report_file(rel) if rel in named else None
-            if p is None:
-                return self._html(404, render.message("Not found", "That report is not one an open decision or a verified bounty names.", theme, nonce), nonce)
-            data = p.read_bytes()[:MAX_REPORT].decode("utf-8", "replace")
-            return self._html(200, render.report(rel, data, theme, nonce), nonce)
+            got = read_report(self.server.home.report_file(rel) if rel in named or fmdata.REPORT_FILE.fullmatch(rel) else None)
+            if got is None:
+                return self._html(404, render.message("Not found", "No such report: it must be a data/<id>/report.md, "
+                                                                   "or a file an open decision or a verified bounty names.", theme, nonce), nonce)
+            text, cut, updated = got
+            return self._html(200, render.report(rel, text, theme, nonce, snap.get("decisions", []) if snap.get("ok") else None,
+                                                 updated, MAX_REPORT if cut else 0), nonce)
         return self._send(404, "text/plain", b"not found")
 
     def do_POST(self):

@@ -47,6 +47,8 @@ ATTENTION_STATES = ("blocked", "failed", "parked")
 PR_URL = re.compile(r"https://[^\s\"'<>()]+/(?:pull|merge_requests)/\d+")
 # A path a hold reason names, relative to the home: "data/<id>/report.md".
 REPORT_REF = re.compile(r"(?<![\w/.-])data/[A-Za-z0-9._/-]+\.(?:md|txt|json|log)\b")
+# A task's own report: what the Reports view lists and serves.
+REPORT_FILE = re.compile(r"data/([A-Za-z0-9][A-Za-z0-9._-]*)/report\.md")
 _TABLE_HEAD = re.compile(r"^(\w+)\[(\d+)\]\{([^}]*)\}:\s*$")
 _CELL = re.compile(r'\s*("(?:[^"\\]|\\.)*"|[^,]*?)\s*(,|$)')
 _TRUNC = re.compile(r"\n\.\.\. \(truncated.*$", re.S)
@@ -346,6 +348,20 @@ class Home:
         except (OSError, ValueError):
             return None
         return p if p.is_file() else None
+
+    def reports(self) -> list[dict]:
+        """Every data/<id>/report.md that resolves inside data/, newest first."""
+        out = []
+        for p in self.data.glob("*/report.md"):
+            rel = f"data/{p.parent.name}/report.md"
+            if not REPORT_FILE.fullmatch(rel) or self.report_file(rel) is None:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append({"path": rel, "id": p.parent.name, "mtime": st.st_mtime, "updated": _iso(st.st_mtime), "size": st.st_size})
+        return sorted(out, key=lambda r: r["mtime"], reverse=True)
 
     # ── the joined snapshot ───────────────────────────────────────────────
     def snapshot(self, fresh: bool = False) -> dict:
