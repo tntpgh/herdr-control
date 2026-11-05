@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import hmac
 import json
 import importlib.util
 import os
@@ -43,15 +42,17 @@ from pathlib import Path
 from sanitize import clean, read_single_link_regular
 import tasks as rtasks
 from authorization import AuthorizationError, canonical_json, verify_command
+from sync_client import LAUNCHD_SECRETS, REDACTIONS, URL, ingest_key, post_sync, redact, sign  # noqa: F401
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 HUB = os.environ.get("HERDR_HUB_URL", "http://127.0.0.1:8600")
-URL = os.environ.get("HERDR_MCP_URL", "https://herdr-mcp.teamthurber.com").rstrip("/")
 STATE = Path(os.environ.get("HERDR_STATE_DIR", Path.home() / ".local/state/herdr"))
 REGISTRY = Path(os.environ.get("HERDR_RUN_REGISTRY", STATE / "runs/registry.sqlite3"))
 OUT = STATE / "remote-mcp"
-LAUNCHD_SECRETS = Path.home() / ".config/op/launchd-secrets.env"
+# URL, LAUNCHD_SECRETS, REDACTIONS/redact, ingest_key, sign and post_sync live
+# in sync_client.py, shared with fm_publisher.py; re-exported here so existing
+# importers (scripts/grants.py) and test patches of pub.post_sync keep working.
 DELIVER = os.environ.get("HERDR_DELIVER", str(REPO / "herdr-deliver.sh"))
 CHROME_RELAY = os.environ.get("HERDR_CHROME_RELAY", str(REPO / "chrome-relay.py"))
 # The only browser fields that leave the Mac: booleans, enums and a count.
@@ -125,49 +126,6 @@ OWNER_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 # constrained here too since it becomes a filename.
 EXCHANGE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,100}$")
 
-# ceiling: pattern redaction catches common credential shapes, not every
-# secret or every piece of client data. Upgrade path: route text through the
-# fleet secret-scan patterns (git-hooks/secret-scan-pre-commit.sh) once they
-# are exposed as a library.
-REDACTIONS = [
-    # An unterminated block (a file cut mid-key) is redacted to the end.
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "[REDACTED:private-key]"),
-    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}"), "[REDACTED:api-key]"),
-    (re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED:api-key]"),
-    (re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"), "[REDACTED:google-api-key]"),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED:github-token]"),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED:github-token]"),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED:slack-token]"),
-    (re.compile(r"\bxapp-[A-Za-z0-9\-]{10,}"), "[REDACTED:slack-token]"),
-    (re.compile(r"\bA[KS]IA[0-9A-Z]{16}\b"), "[REDACTED:aws-key]"),
-    (re.compile(r"\bops_[A-Za-z0-9_\-]{20,}"), "[REDACTED:op-token]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED:jwt]"),
-    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-~+/=]{16,}"), r"\1 [REDACTED]"),
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s:/@]+:[^\s@/]+@"), r"\1[REDACTED]@"),
-    (re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+"), "[REDACTED:slack-webhook]"),
-    # Signed-URL and query-string secrets (Azure SAS sig=, ?token=, &api_key=).
-    (re.compile(r"(?i)([?&](?:sig|signature|token|access_token|api[_\-]?key|key|secret)=)[^&\s\"'#]{8,}"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)\b(x-api-key|api-key|x-auth-token)\s*:\s*\S{8,}"), r"\1: [REDACTED]"),
-    # "password": "…" / 'api_key': '…' (JSON, YAML flow, Python dicts).
-    (re.compile(r"(?i)([\"'][a-z0-9_.\-]*(?:secret|token|password|passwd|passphrase|pwd|api[_\-]?key|private[_\-]?key|"
-                r"access[_\-]?key|auth|credential)[a-z0-9_.\-]*[\"']\s*:\s*)([\"'])[^\"']{4,}\2"), r'\1"[REDACTED]"'),
-    # NAME=value / name: value for names that only ever hold secrets.
-    (re.compile(r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|PWD|CREDENTIALS?|API_?KEY|PRIVATE_?KEY|"
-                r"ACCESS_?KEY|DSN)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
-    # Names with KEY/AUTH in them, any case (HERDR_MCP_INGEST_KEY, ingest_key,
-    # twilio_auth) with `=`; UPPER_CASE ones with `:` too, so prose like
-    # "primary key: task_id" survives.
-    (re.compile(r"(?i)\b([a-z][a-z0-9_]*_(?:key|auth)[a-z0-9_]*|[A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*=\s*(['\"]?)[^\s'\"]{6,}\2"),
-     r"\1=[REDACTED]"),
-    (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*:\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
-]
-
-
-def redact(text: str) -> str:
-    for pat, repl in REDACTIONS:
-        text = pat.sub(repl, text)
-    return text
-
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} herdr-mcp-publisher: {msg}", flush=True)
@@ -180,30 +138,6 @@ def iso(v) -> str | None:
     if isinstance(v, (int, float)):
         return datetime.fromtimestamp(v, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return str(v)
-
-
-# ── secret: the same literal-assignment format hub.py reads ────────────────────
-def ingest_key() -> str | None:
-    v = os.environ.get("HERDR_MCP_INGEST_KEY")
-    if v:
-        return v
-    try:
-        lines = LAUNCHD_SECRETS.read_text().splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        key, _, val = line.strip().removeprefix("export ").partition("=")
-        if key.strip() == "HERDR_MCP_INGEST_KEY":
-            val = val.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
-                val = val[1:-1]
-            return val or None
-    return None
-
-
-def sign(key: str, ts: str, nonce: str, body: bytes) -> str:
-    msg = f"{ts}.{nonce}.{hashlib.sha256(body).hexdigest()}".encode()
-    return hmac.new(key.encode(), msg, hashlib.sha256).hexdigest()
 
 
 # ── reading local state ────────────────────────────────────────────────────────
@@ -1128,18 +1062,6 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
         if len(out) >= MAX_RESULTS_PER_SYNC:
             break
     return out
-
-
-# ── talking to the Worker ──────────────────────────────────────────────────────
-def post_sync(key: str, body: dict) -> dict:
-    raw = json.dumps(body, separators=(",", ":")).encode()
-    ts, nonce = str(int(time.time())), secrets.token_hex(16)
-    req = urllib.request.Request(f"{URL}/ingest/sync", data=raw, method="POST", headers={
-        "content-type": "application/json", "x-herdr-ts": ts, "x-herdr-nonce": nonce,
-        "x-herdr-sig": sign(key, ts, nonce, raw), "user-agent": "herdr-mcp-publisher/1",
-    })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
 
 
 # ── delivery ───────────────────────────────────────────────────────────────────

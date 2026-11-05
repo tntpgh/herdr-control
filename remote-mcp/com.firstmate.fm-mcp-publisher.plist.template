@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.firstmate.fm-mcp-publisher</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- The Firstmate publisher for Dot/Duet (remote-mcp/README.md
+		     "Firstmate publisher"): one long-lived process that syncs every
+		     15 s, so no interpreter starts per tick. It reads its one
+		     credential, HERDR_MCP_INGEST_KEY, from
+		     ~/.config/op/launchd-secrets.env with the same literal parser as
+		     publisher.py (sync_client.ingest_key) and never runs `op`, so no
+		     service-account file is sourced. Rendered by
+		     remote-mcp/install-fm-publisher.sh, run from the DEPLOYED app
+		     checkout so the script path survives worktree cleanup: the
+		     interpreter is an explicit, versioned, absolute python3 from
+		     launchd/resolve-hub-python.sh (never `/usr/bin/env python3`, which
+		     resolves through launchd's bare PATH), then the absolute
+		     fm_publisher.py; the log is
+		     ~/Library/Logs/com.firstmate.fm-mcp-publisher.log. -->
+		<string>__FM_MCP_PYTHON__</string>
+		<string>__FM_MCP_PY__</string>
+		<string>--loop</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- Nothing here calls `op`; if a descendant ever does it must fail
+		     fast, never paint a Touch ID prompt. -->
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
+		<key>FM_MCP_FM_HOME</key>
+		<string>__FM_HOME__</string>
+	</dict>
+	<!-- Restart after a crash, but never faster than every 30 s. A refusal
+	     (the old com.herdr-control.remote-mcp is loaded) does not exit: it
+	     keeps ticking, refusing, and saying so in status.json. -->
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- "Can not hurt speed": the snapshot rebuild is the only heavy step, and
+	     these keep it, and everything it spawns, behind interactive work. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>
