@@ -151,8 +151,8 @@ html:not([data-js]) .fm-motion{display:none}
    scanline by `top`, which repaint (and re-lay-out) every frame. Finite:
    any endless loop keeps Chrome producing 60 frames a second, about 11%
    of a core across its processes for as long as the tab is visible, so
-   the motion plays for under a minute after each load (the page reloads
-   when the work changes, so it replays as the cue) and then holds still.
+   the motion plays for under a minute after each load (the page redraws
+   the ship when the work changes, so it replays as the cue) and then holds still.
    Pauses name the pseudo-elements: animation-play-state does not inherit. */
 .fm-art .ship-ambient::before{inset:-300px -400px 0 0;animation-name:fm-starfield;animation-iteration-count:1;will-change:transform}
 @keyframes fm-starfield{to{transform:translate(-400px,300px)}}
@@ -197,13 +197,24 @@ details.fm-verified>summary{cursor:pointer;font-size:12.5px;font-weight:700;colo
 .fm-room>h2 small{text-transform:none;letter-spacing:0;margin-left:6px}
 .fm-room>p.dim{margin:0 0 8px;font-size:12.5px}
 .fm-decision{background:var(--surface);border:1px solid var(--border);border-left:6px solid var(--accent);border-radius:12px;padding:12px 16px;margin:0 0 14px}
+.fm-decision[data-answered]{border-left-color:var(--info)}
 .fm-decision h4{margin:0 0 4px;font-size:14px}
 .fm-meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center}
+.fm-chip{font-weight:700;font-size:11px;padding:0 6px;border-radius:4px;border:1px solid currentColor;color:var(--info)}
+.fm-chip[data-s=earlier]{color:var(--warn)}
 .fm-reason{white-space:pre-wrap;word-break:break-word;margin:8px 0;font-size:13.5px}
 .fm-decision form{display:grid;gap:6px;margin-top:8px}
 .fm-decision textarea{width:100%;min-height:72px;font:inherit;resize:vertical}
+.fm-act{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
 .fm-decision button{justify-self:start;font:600 12px system-ui;padding:5px 12px;border-radius:5px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer}
 .fm-decision button:hover{background:var(--accent);color:var(--bg)}
+.fm-decision form[data-busy] button{cursor:progress;background:transparent;color:var(--accent)}
+.fm-decision form[data-busy] button::before{content:"";display:inline-block;width:.8em;height:.8em;margin-right:6px;vertical-align:-1px;
+  border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:fm-spin .7s linear infinite}
+@keyframes fm-spin{to{transform:rotate(1turn)}}
+.fm-hint,.fm-count{font-size:11.5px;color:var(--muted)}
+.fm-count{margin-left:auto;font-variant-numeric:tabular-nums}
+.fm-count[data-near]{color:var(--warn);font-weight:700}
 .fm-sent{font-size:12.5px;margin:6px 0 0;padding-left:18px}
 .fm-howto{font-size:12.5px;color:var(--muted)}
 .fm-flash{border:2px solid var(--ok);border-radius:8px;padding:8px 12px;margin:10px 0}
@@ -211,7 +222,48 @@ details.fm-verified>summary{cursor:pointer;font-size:12.5px;font-weight:700;colo
 .crew-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--muted);white-space:nowrap}
 .crew-badge::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--c,var(--brass));border:1px solid var(--border)}
 td .dim,.fm-detail{font-size:12px;color:var(--muted);word-break:break-word}
+.fm-room tr[data-attn]>td:first-child{box-shadow:inset 4px 0 var(--warn)}
 .fm-empty{color:var(--muted);font-style:italic}
+.fm-unknown{color:var(--warn);font-style:normal;font-weight:600}
+/* header: section counts, filter, live indicator. The filter and the live
+   indicator need the script, so they are not drawn without it. */
+.fm-n{display:inline-block;min-width:1.5em;margin-left:4px;padding:0 5px;border-radius:9px;background:var(--surface-2);
+  color:var(--fg);font-size:11px;font-weight:700;text-align:center;font-variant-numeric:tabular-nums}
+.fm-n[data-hot]{background:var(--warn);color:var(--bg)}
+.fm-find{display:inline-flex;align-items:center;gap:6px}
+.fm-find input{width:16em;font:13px system-ui;padding:3px 8px}
+.fm-find kbd{font:11px ui-monospace,monospace;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:0 5px}
+.fm-find-n{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.fm-live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
+.fm-live-dot{position:relative;flex:none;width:8px;height:8px;border-radius:50%;background:var(--ok)}
+.fm-live-dot::after{content:"";position:absolute;inset:0;border-radius:50%;background:inherit;opacity:0}
+.fm-live.p0 .fm-live-dot::after{animation:fm-ping0 .9s ease-out 1}
+.fm-live.p1 .fm-live-dot::after{animation:fm-ping1 .9s ease-out 1}
+@keyframes fm-ping0{from{opacity:.7;transform:scale(1)}to{opacity:0;transform:scale(2.8)}}
+@keyframes fm-ping1{from{opacity:.7;transform:scale(1)}to{opacity:0;transform:scale(2.8)}}
+.fm-live[data-s=wait] .fm-live-dot{background:var(--info)}.fm-live[data-s=wait] .fm-live-txt{color:var(--info)}
+.fm-live[data-s=warn] .fm-live-dot{background:var(--warn)}.fm-live[data-s=warn] .fm-live-txt{color:var(--warn);font-weight:700}
+.fm-live[data-s=bad] .fm-live-dot{background:var(--bad)}.fm-live[data-s=bad] .fm-live-txt{color:var(--bad);font-weight:700}
+html[data-live=warn] .fm-callbar time,html[data-live=bad] .fm-callbar time{color:var(--warn);font-weight:700}
+html:not([data-js]) .fm-find,html:not([data-js]) .fm-live,html:not([data-js]) .fm-js{display:none}
+.fm-out{display:none!important}
+button.fm-bstat{font:700 12px system-ui;background:none;cursor:pointer}
+button.fm-bstat:disabled{cursor:default}
+button.fm-bstat[aria-pressed=true]{box-shadow:0 0 0 2px var(--bg),0 0 0 4px currentColor}
+button.fm-bstat[data-bounty=verified][aria-pressed=true]{box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--ok)}
+/* live update: what changed glows once, what is new slides in once; a
+   jump target glows the same way. One-shot, so nothing runs at idle, and
+   base.css's reduce-motion switch stops all of it. */
+@keyframes fm-hl{from{box-shadow:0 0 0 3px var(--accent),0 0 18px color-mix(in srgb,var(--accent) 45%,transparent)}
+  to{box-shadow:0 0 0 3px transparent,0 0 18px transparent}}
+@keyframes fm-hl-row{from{background-color:color-mix(in srgb,var(--accent) 24%,transparent)}to{background-color:transparent}}
+@keyframes fm-hl-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.fm-decision.fm-changed,.fm-bounty.fm-changed,.fm-callbar.fm-changed,.fm-slot.fm-changed>.fm-slot-link,
+.fm-decision:target,.fm-bounty:target{animation:fm-hl 1.8s ease-out 1}
+.fm-decision.fm-new,.fm-bounty.fm-new,.fm-slot.fm-new>.fm-slot-link{animation:fm-hl 1.8s ease-out 1,fm-hl-in .35s ease-out 1}
+tr.fm-changed>td,tr.fm-new>td,tr:target>td,.fm-room:target>h2{animation:fm-hl-row 1.8s ease-out 1}
+@media (prefers-reduced-motion:no-preference){html:not([data-reduce]){scroll-behavior:smooth}}
+@media (min-width:__WIDE__px){body>header{position:sticky;top:0;z-index:20}main [id]{scroll-margin-top:96px}}
 @media (max-width:__NARROW__px){
   .fm-art{display:none}
   .fm-art-on .fm-slots{position:static;display:grid;gap:12px}
@@ -228,24 +280,104 @@ td .dim,.fm-detail{font-size:12px;color:var(--muted);word-break:break-word}
   .fm-room td{border-top:0;padding:2px 10px}
   .fm-room tr{border-top:1px solid var(--border);padding:6px 0}
   .fm-room tr:first-child{border-top:0}
+  .fm-find{flex:1 1 100%}
+  .fm-find input{flex:1;width:auto}
+  .fm-hint,.fm-find kbd{display:none}
 }
-""".replace("__NARROW__", str(NARROW_PX)).replace("__SCAN__", f"{HULL[3] / HULL[2] * 100:.2f}")
+""".replace("__NARROW__", str(NARROW_PX)).replace("__WIDE__", str(NARROW_PX + 1)).replace(
+    "__SCAN__", f"{HULL[3] / HULL[2] * 100:.2f}")
 
 _BOOT = ("(function(){var d=document.documentElement;d.setAttribute('data-js','1');"
          "try{if(localStorage.getItem('fmdash.reduce'))d.setAttribute('data-reduce','1')}catch(e){}})();")
-# Reduce-motion toggle (stored per browser), pause ambient motion in a hidden
-# tab or with the art scrolled away, and reload when the snapshot changes
-# unless an answer is being typed.
-_SCRIPT = """(function(){var d=document.documentElement,b=document.getElementById('fm-motion');
+# Every page: the reduce-motion toggle (stored per browser), pausing ambient
+# motion in a hidden tab or with the art scrolled away, relative ages on
+# <time>, the filter (`/` focuses it, Esc clears), the bounty status chips,
+# and the answer form's busy state, length counter and Cmd/Ctrl+Enter.
+# The ship page (C.live) also polls /api/summary every C.poll seconds; the
+# header says live / update waiting / data old / read failing / offline, and
+# a new fingerprint swaps <main> in place (open <details>, filter and focus
+# kept) and marks what changed. It never swaps under an answer being
+# written: a decision's text must not change under the captain's reply.
+# No timer but the poll; every animation is one-shot.
+_SCRIPT = r"""(function(){var d=document.documentElement,C=__CFG__,b=document.getElementById('fm-motion');
+function $(s,r){return (r||document).querySelector(s)}
+function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
+var KEY='.fm-slot[id],.fm-decision[id],.fm-bounty[id],.fm-room tr[id],#fm-callbar';
+function sig(e){return e.outerHTML.replace(/<time\b[^>]*>[^<]*<\/time>/g,'')}
+function collect(r){var m={};$$(KEY,r).forEach(function(e){m[e.id]=sig(e)});return m}
+var sigs=collect(document);
 function set(r){if(r)d.setAttribute('data-reduce','1');else d.removeAttribute('data-reduce');if(b)b.setAttribute('aria-pressed',r?'true':'false')}
 set(d.hasAttribute('data-reduce'));
 if(b)b.addEventListener('click',function(){var r=!d.hasAttribute('data-reduce');try{localStorage.setItem('fmdash.reduce',r?'1':'')}catch(e){}set(r)});
-document.addEventListener('visibilitychange',function(){if(document.hidden)d.setAttribute('data-hidden','1');else d.removeAttribute('data-hidden')});
-var a=document.querySelector('.fm-art');if(a&&window.IntersectionObserver)new IntersectionObserver(function(es){es.forEach(function(e){a.classList.toggle('offscreen',!e.isIntersecting)})}).observe(a);
-var fp=%s;if(!fp)return;setInterval(function(){var ta=document.querySelectorAll('textarea');
-for(var i=0;i<ta.length;i++){if(ta[i].value.trim()||document.activeElement===ta[i])return}
-fetch('/api/summary',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
-if(s.fingerprint&&s.fingerprint!==fp)location.reload()}).catch(function(){})},15000)})();"""
+var io=window.IntersectionObserver?new IntersectionObserver(function(es){es.forEach(function(e){e.target.classList.toggle('offscreen',!e.isIntersecting)})}):null;
+function watchArt(){if(!io)return;io.disconnect();var a=$('.fm-art');if(a)io.observe(a)}
+watchArt();
+function rel(iso){var t=Date.parse(iso);if(isNaN(t))return '';var s=(Date.now()-t)/1000;if(s<45)return 'just now';
+var m=Math.round(s/60);if(m<60)return m+'m ago';var h=Math.round(m/60);return h<48?h+'h ago':Math.round(h/24)+'d ago'}
+function times(r){$$('time[datetime]',r).forEach(function(e){var iso=e.getAttribute('datetime'),x=rel(iso);
+if(x){e.textContent=x;e.title=new Date(iso).toLocaleString()}})}
+var q='',bs='',auto=false,fi=$('#fm-find'),fn=$('#fm-find-n');
+function apply(){var n=0;$$('.fm-decision,.fm-bounty,.fm-room tbody tr').forEach(function(e){
+var hit=!q||e.textContent.toLowerCase().indexOf(q)>=0;if(q&&hit)n++;
+if(bs&&e.classList.contains('fm-bounty')&&e.getAttribute('data-bounty')!==bs)hit=false;e.classList.toggle('fm-out',!hit)});
+$$('.fm-room table').forEach(function(t){t.classList.toggle('fm-out',!!q&&!$('tbody tr:not(.fm-out)',t))});
+var v=$('#fm-verified');if(v){var want=!!(q||bs)&&!!$('.fm-bounty:not(.fm-out)',v);
+if(want&&!v.open){v.open=true;auto=true}else if(!want&&auto){v.open=false;auto=false}}
+if(fn)fn.textContent=q?n+(n===1?' match':' matches'):'';
+$$('.fm-tally button').forEach(function(x){x.disabled=false;x.setAttribute('aria-pressed',x.getAttribute('data-bounty')===bs?'true':'false')})}
+function count(t){var c=t.form&&$('.fm-count',t.form);if(!c)return;var n=t.value.length;
+c.textContent=n?n+' / '+t.maxLength:'';if(n>t.maxLength*0.9)c.setAttribute('data-near','');else c.removeAttribute('data-near')}
+document.addEventListener('input',function(e){var t=e.target;if(t===fi){q=t.value.trim().toLowerCase();apply()}
+else if(t.matches('.fm-decision textarea'))count(t)});
+document.addEventListener('keydown',function(e){var t=e.target,tag=t.tagName;
+if(e.key==='/'&&fi&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&tag!=='INPUT'&&tag!=='TEXTAREA'&&!t.isContentEditable){e.preventDefault();fi.focus();fi.select()}
+else if(e.key==='Escape'&&t===fi){fi.value='';q='';apply();fi.blur()}
+else if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)&&tag==='TEXTAREA'&&t.form){e.preventDefault();t.form.requestSubmit()}});
+document.addEventListener('click',function(e){var x=e.target.closest&&e.target.closest('.fm-tally button');if(!x)return;
+var s=x.getAttribute('data-bounty');bs=bs===s?'':s;apply()});
+document.addEventListener('submit',function(e){var f=e.target;if(!f.closest('.fm-decision'))return;
+if(f.hasAttribute('data-busy')){e.preventDefault();return}
+f.setAttribute('data-busy','');f.setAttribute('aria-busy','true');var x=$('button[type=submit]',f);if(x)x.textContent='Sending\u2026'});
+document.addEventListener('animationend',function(e){if(e.animationName.indexOf('fm-hl')!==0)return;
+var k=e.target.closest('.fm-changed,.fm-new');if(k)k.classList.remove('fm-changed','fm-new')});
+document.addEventListener('visibilitychange',function(){if(document.hidden)d.setAttribute('data-hidden','1');
+else{d.removeAttribute('data-hidden');if(C.live)tick()}});
+if(/[?&](sent|err)=/.test(location.search)){var u=new URL(location.href);u.searchParams.delete('sent');u.searchParams.delete('err');
+history.replaceState(null,'',u.pathname+u.search+u.hash)}
+times(document);apply();$$('.fm-decision textarea').forEach(count);
+if(!C.live)return;
+var fp=C.fp,busy=false,ph=0,live=$('#fm-live'),say1=$('#fm-announce'),state=live?live.getAttribute('data-s'):'ok';
+d.setAttribute('data-live',state);
+function typing(){return $$('.fm-decision textarea').some(function(t){return t.value.trim()||document.activeElement===t})}
+function say(s,txt,tip){if(!live)return;live.setAttribute('data-s',s);d.setAttribute('data-live',s);
+$('.fm-live-txt',live).textContent=txt;live.title=tip;if(s!==state&&say1)say1.textContent='Dashboard: '+txt+'. '+tip;state=s}
+function tick(){fetch('/api/summary',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
+if(!s.ok){say('bad','read failing',s.error||'The last read of the Firstmate home failed.');return}
+var g=$('#fm-callbar time');if(g)g.setAttribute('datetime',s.generated);
+var change=!!s.fingerprint&&s.fingerprint!==fp,wait=change&&typing();
+if(Date.now()-Date.parse(s.generated)>C.stale*1000)say('warn','data '+rel(s.generated).replace(' ago','')+' old',
+'No read of the Firstmate home has finished since '+new Date(s.generated).toLocaleTimeString()+'.');
+else if(wait)say('wait','update waiting','The fleet changed. The page holds still while you write an answer: send or clear it to update.');
+else{say('ok','live','Read '+rel(s.generated)+'; checked every '+C.poll+'s.');ph=1-ph;live.classList.remove('p0','p1');live.classList.add('p'+ph)}
+if(change&&!wait)swap(s.fingerprint);times(document)
+}).catch(function(){say('bad','offline','The dashboard server is not answering; this is the last data it sent.')})}
+function swap(nfp){if(busy)return;busy=true;fetch(location.pathname+location.search,{cache:'no-store'}).then(function(r){
+if(!r.ok)throw new Error(r.status);return r.text()}).then(function(t){if(typing())return;
+var doc=new DOMParser().parseFromString(t,'text/html'),nm=doc.getElementById('main'),main=$('#main');if(!nm||!main)return;
+var ns=collect(doc),hot=Object.keys(ns).filter(function(k){return ns[k]!==sigs[k]});
+var open=$$('details[open][id]',main).map(function(e){return e.id});
+var ae=document.activeElement,fid=ae&&ae!==main&&main.contains(ae)?ae.id:'';
+main.innerHTML=nm.innerHTML;var nav=doc.getElementById('fm-nav'),on=$('#fm-nav');if(nav&&on)on.innerHTML=nav.innerHTML;
+document.title=doc.title;fp=nfp;
+open.forEach(function(i){var e=document.getElementById(i);if(e)e.open=true});
+if(fid){var f=document.getElementById(fid);if(f)f.focus({preventScroll:true})}
+hot.forEach(function(k){var e=document.getElementById(k);if(e)e.classList.add(k in sigs?'fm-changed':'fm-new')});
+sigs=ns;apply();times(main);watchArt();
+if(hot.length&&say1)say1.textContent='Dashboard updated: '+hot.length+(hot.length===1?' item changed.':' items changed.')
+}).catch(function(){}).then(function(){busy=false})}
+setInterval(tick,C.poll*1000)})();"""
+POLL_S = 15
+STALE_S = 90
 
 
 def esc(s) -> str:
@@ -310,25 +442,45 @@ def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
-def page(title: str, body: str, theme: dict, nonce: str, fingerprint: str = "") -> str:
+def _time(iso: str | None) -> str:
+    """An instant, as its ISO text; the page script rewrites it as an age ("3m ago")."""
+    return f"<time datetime='{esc(iso)}'>{esc(iso)}</time>" if iso else ""
+
+
+def page(title: str, body: str, theme: dict, nonce: str, live: dict | None = None) -> str:
+    """`live` (the ship page only): {"ok", "fp", "nav": {"decisions"|"bounties"|"rooms": (n, hot)}}.
+    It turns on the poll, the filter and the live indicator, and puts counts in the nav."""
     tid = theme["id"]
     switch = " ".join(
         f"<a href='/{_q(t)}'{' aria-current=page' if t == tid else ''}>{esc(THEMES[t].get('name') or t)}</a>"
         for t in sorted(THEMES))
     tagline = esc(theme.get("tagline") or "")
     n = esc(nonce)
+    counts = (live or {}).get("nav", {})
+
+    def nav(anchor: str, label: str, key: str = "") -> str:
+        c = counts.get(key)
+        badge = (f" <span class=fm-n{' data-hot' if c[1] else ''}>{esc(c[0])}</span>" if c else "")
+        return f"<a href='/{_q(tid)}#{anchor}'>{label}{badge}</a>"
+
+    tools = ("<label class=fm-find><span class=sr-only>Filter calls, crews and bounties</span>"
+             "<input type=search id=fm-find autocomplete=off spellcheck=false placeholder='Filter: id, repo, title'>"
+             "<kbd aria-hidden=true>/</kbd><span id=fm-find-n class=fm-find-n aria-live=polite></span></label>"
+             f"<span id=fm-live class=fm-live data-s={'ok' if live.get('ok') else 'bad'}><span class=fm-live-dot aria-hidden=true></span>"
+             f"<span class=fm-live-txt>{'live' if live.get('ok') else 'read failing'}</span></span>") if live else ""
+    cfg = json.dumps({"live": bool(live), "fp": (live or {}).get("fp", ""), "poll": POLL_S, "stale": STALE_S})
     return (f"<!doctype html><html lang=en data-theme='{esc(tid)}'><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>{esc(title)}</title><script nonce='{n}'>{_BOOT}</script>"
             f"<style>{hub_ui._theme_css()}{hub_ui.BASE_CSS}{DASH_CSS}{_art_css(theme)}</style></head><body>"
             "<a class=skip href='#main'>Skip to content</a>"
             f"<header><b class='brand fm-brand'>FIRSTMATE{f'<small>{tagline}</small>' if tagline else ''}</b>"
-            f"<nav aria-label=Sections><a href='/{_q(tid)}#ship'>Ship</a><a href='/{_q(tid)}#bounties'>Bounties</a>"
-            f"<a href='/{_q(tid)}#decisions'>Your calls</a><a href='/{_q(tid)}#rooms'>Rooms</a></nav>"
+            f"<nav id=fm-nav aria-label=Sections>{nav('ship', 'Ship')}{nav('decisions', 'Your calls', 'decisions')}"
+            f"{nav('rooms', 'Rooms', 'rooms')}{nav('bounties', 'Bounties', 'bounties')}</nav>{tools}"
             f"<span class='dim hdr-meta'>read-only · theme: {switch} · <a href='/api/summary'>json</a></span>"
             "<button type=button id=fm-motion class=fm-motion aria-pressed=false>Reduce motion</button></header>"
-            f"<main id=main tabindex=-1>{body}</main>"
-            f"<script nonce='{n}'>{_SCRIPT % json.dumps(fingerprint)}</script></body></html>")
+            f"<main id=main tabindex=-1>{body}</main><p id=fm-announce class=sr-only role=status aria-live=polite></p>"
+            f"<script nonce='{n}'>{_SCRIPT.replace('__CFG__', cfg)}</script></body></html>")
 
 
 # ── rooms ─────────────────────────────────────────────────────────────────────
@@ -348,60 +500,98 @@ def _rooms(snap: dict) -> tuple[dict, list[dict]]:
     return by, cargo
 
 
-def _slot(theme: dict, st: dict, tasks: list[dict], calls: list[dict], art: bool, tid: str) -> str:
+UNKNOWN = "Unknown: the last read of the Firstmate home failed."
+
+
+def _answer_state(d: dict) -> str:
+    """"current" when this dashboard sent an answer bound to the decision text
+    shown now, "earlier" when only to an earlier text, else ""."""
+    answers = d.get("answers") or []
+    if any(a.get("digest8") == d["digest"][:8] for a in answers):
+        return "current"
+    return "earlier" if answers else ""
+
+
+def _needs_you(calls: list[dict]) -> list[dict]:
+    return [d for d in calls if _answer_state(d) != "current"]
+
+
+def _slot(theme: dict, st: dict, tasks: list[dict], calls: list[dict], art: bool, tid: str, ok: bool = True) -> str:
     name, crew = _room_names(theme, st)
     live = any(t["crew"]["state"] == "working" for t in tasks)
-    hot = bool(calls) or any(t["attention"] for t in tasks)
-    sums = ([_plural(len(calls), "call for you", "calls for you")] if calls else []) \
+    needs = _needs_you(calls)
+    hot = bool(needs) or any(t["attention"] for t in tasks)
+    sums = ([_plural(len(needs), "call for you", "calls for you")] if needs else []) \
+        + ([f"{len(calls) - len(needs)} answered"] if len(calls) > len(needs) else []) \
         + ([_plural(len(tasks), "crew", "crews")] if tasks else [])
     ranked = sorted(tasks, key=lambda t: (not t["attention"], t["crew"]["state"] != "working"))
-    if calls:
-        top, dot, word = calls[0]["title"], "call", "waiting on you"
+    if not ok:
+        top, dot, word = "The last read failed.", "unknown", "unknown"
+    elif needs:
+        top, dot, word = needs[0]["title"], "call", "waiting on you"
+    elif calls:
+        top, dot, word = calls[0]["title"], "in_review", "answered · Firstmate to act"
     elif ranked:
         top, word = ranked[0]["title"], ranked[0]["crew"]["state"]
         dot = STATE_STYLE.get(word, "unknown")
     else:
         top, dot, word = "No crew here right now.", "quiet", "quiet"
-    return (f"<li class=fm-slot data-station='{st['id']}'{' data-live' if live else ''}{' data-hot' if hot else ''}>"
-            f"<a class=fm-slot-link href='/{_q(tid)}#room-{st['id']}'>"
+    return (f"<li class=fm-slot data-station='{st['id']}'{' data-live' if live else ''}{' data-hot' if hot else ''}"
+            f" id='slot-{st['id']}'><a class=fm-slot-link href='/{_q(tid)}#room-{st['id']}'>"
             + (f"<span class=fm-banner data-station='{st['id']}' aria-hidden=true></span>" if art else "")
             + f"<span class=fm-slot-name>{esc(name)}{f'<small class=dim>{esc(crew)}</small>' if crew else ''}</span>"
-            f"<span class=fm-slot-sum>{esc(' · '.join(sums) or 'Quiet')}</span>"
+            f"<span class=fm-slot-sum>{esc(' · '.join(sums) or ('Quiet' if ok else 'Unknown'))}</span>"
             f"<span class=fm-slot-top>{esc(top)}</span>"
             f"<span class=fm-slot-state><span class=fm-dot data-d='{dot}' aria-hidden=true></span>{esc(word)}</span></a></li>")
 
 
-def _crew_table(theme: dict, tasks: list[dict]) -> str:
+def _empty(text: str, ok: bool) -> str:
+    return f"<p class=fm-empty>{esc(text)}</p>" if ok else f"<p class='fm-empty fm-unknown'>{esc(UNKNOWN)}</p>"
+
+
+def _crew_table(theme: dict, tasks: list[dict], ok: bool = True) -> str:
     if not tasks:
-        return "<p class=fm-empty>No crew here right now.</p>"
+        return _empty("No crew here right now.", ok)
+
+    def when(t: dict) -> str:
+        parts = ([f"last report {_time(t['updated_at'])}"] if t.get("updated_at") else []) \
+            + ([f"state read {_time(t['crew']['observed_at'])}"] if t["crew"].get("observed_at") else [])
+        return f"<div class=dim>{' · '.join(parts)}</div>" if parts else ""
+
     rows = "".join(
-        f"<tr id='t-{esc(t['id'])}'><td>{_badge(theme, t['kind'])}</td><td><b>{esc(t['title'])}</b><div class=dim><code>{esc(t['id'])}</code>"
+        f"<tr id='t-{esc(t['id'])}'{' data-attn' if t['attention'] else ''}><td>{_badge(theme, t['kind'])}</td>"
+        f"<td><b>{esc(t['title'])}</b><div class=dim><code>{esc(t['id'])}</code>"
         f" · {esc(t['repo'])} · {esc(t['kind'])}{(' · ' + esc(t['mode'])) if t['mode'] else ''}</div></td>"
-        f"<td>{_state(t['crew']['state'])}<div class=fm-detail>{esc(t['crew']['detail'])}</div>"
-        + (f"<div class=dim>state read {esc(t['crew']['observed_at'])}</div>" if t["crew"].get("observed_at") else "")
-        + "</td>"
+        f"<td>{_state(t['crew']['state'])}<div class=fm-detail>{esc(t['crew']['detail'])}</div>{when(t)}</td>"
         f"<td>{_links(t['prs'])}</td><td class=dim>{esc(t['window'])}</td></tr>"
         for t in tasks)
     return ("<table><thead><tr><th><span class=sr-only>Crew</span></th><th>Task</th><th>State</th><th>PR</th><th>Window</th></tr></thead>"
             f"<tbody>{rows}</tbody></table>")
 
 
-def _decisions(snap: dict, theme: dict, token: str) -> str:
+def _decisions(snap: dict, theme: dict, token: str, flash: str = "", flash_bad: bool = False) -> str:
     tid = theme["id"]
     ds = snap.get("decisions", [])
     out = [f"<h3 id=decisions>Your calls ({len(ds)})</h3>"]
+    # The answer's outcome sits where the answer was typed: the redirect lands here.
+    if flash:
+        out.append(f"<p class='fm-flash{' bad' if flash_bad else ''}' role={'alert' if flash_bad else 'status'}>{esc(flash)}</p>")
     if not ds:
-        out.append("<p class=fm-empty>Nothing is waiting on you.</p>")
+        out.append(_empty("Nothing is waiting on you.", snap.get("ok", False)))
     for d in ds:
+        state = _answer_state(d)
         reports = " ".join(f"<a href='/report{_q(tid, path=r)}'>{esc(r)}</a>" for r in d["reports"])
         sent = "".join(
-            f"<li>sent as inbox note <code>{esc(a['note'])}</code> {esc(a['at'])} · "
+            f"<li>sent as inbox note <code>{esc(a['note'])}</code> {_time(a['at']) or ''} · "
             f"{'picked up by Firstmate' if a['acknowledged'] else 'waiting for Firstmate'}"
+            f"{'' if a.get('digest8') == d['digest'][:8] else ' · answered an earlier version of this text'}"
             f"{' · reply: ' + esc(a['reply']) if a.get('reply') else ''}</li>" for a in d.get("answers", []))
+        chip = {"current": "<span class=fm-chip>answered</span>",
+                "earlier": "<span class=fm-chip data-s=earlier>text changed since your answer</span>"}.get(state, "")
         origin = f"<span>from {esc(d['origin'])}</span>" if d.get("origin") else ""
         out.append(
-            f"<article class=fm-decision id='d-{esc(d['id'])}' data-decision='{esc(d['id'])}'>"
-            f"<h4>{esc(d['title'])}</h4><div class=fm-meta>{_badge(theme, d['kind'])}<code>{esc(d['id'])}</code>"
+            f"<article class=fm-decision id='d-{esc(d['id'])}' data-decision='{esc(d['id'])}'{' data-answered' if state == 'current' else ''}>"
+            f"<h4>{esc(d['title'])}</h4><div class=fm-meta>{chip}{_badge(theme, d['kind'])}<code>{esc(d['id'])}</code>"
             f"<span>{esc(d['repo'])}</span>{origin}"
             f"<span>held {esc(d['created'])}</span></div>"
             f"<p class=fm-reason>{esc(d['reason'])}</p>"
@@ -413,10 +603,12 @@ def _decisions(snap: dict, theme: dict, token: str) -> str:
             f"<label class=sr-only for='a-{esc(d['id'])}'>Your answer to {esc(d['title'])}</label>"
             f"<textarea id='a-{esc(d['id'])}' name=text maxlength={MAX_ANSWER_CHARS} required "
             "placeholder='Your answer. It becomes a note in the Firstmate inbox naming this decision; nothing runs from this page.'></textarea>"
-            "<button type=submit>Send to Firstmate inbox</button></form></article>")
+            "<div class=fm-act><button type=submit>Send to Firstmate inbox</button>"
+            "<span class='fm-hint fm-js'>\u2318/Ctrl+Enter sends</span><span class=fm-count aria-hidden=true></span></div></form></article>")
     out.append("<p class=fm-howto>Typing an answer adds a note to Firstmate's captain inbox (<code>fm-inbox.sh note</code>) "
                "naming the decision; Firstmate reads it and acts. An answer is tied to the decision text you saw: if that "
-               "text changed, the page asks you to look again. This page merges, approves, starts and runs nothing.</p>")
+               "text changed, the page asks you to look again, and it never redraws a call while you are writing an answer. "
+               "This page merges, approves, starts and runs nothing.</p>")
     return "".join(out)
 
 
@@ -453,6 +645,7 @@ def _bounty(b: dict, theme: dict, tid: str) -> str:
 
 def _bigshot(snap: dict, theme: dict, cargo: list[dict]) -> str:
     tid = theme["id"]
+    ok = snap.get("ok", False)
     board = snap.get("bounties", [])
     tally = {s: sum(1 for b in board if b["status"] == s) for s in BOUNTY_LABEL}
     host = _char(theme, "bigshot")
@@ -461,16 +654,18 @@ def _bigshot(snap: dict, theme: dict, cargo: list[dict]) -> str:
         out.append(f"<div class=fm-bigshot-art role=img aria-label='{esc((host.get('name') or 'Big Shot') + ' bounty board')}'></div>")
     out.append("<h2 id=bounties-h>Bounty board</h2>"
                "<p class=fm-intro>Firstmate work outside the crew rooms, and the evidence that closes it. "
-               "No money, rewards, points or revenue; a card reads Verified only when a merged PR or report is on record.</p>"
-               "<ul class=fm-tally aria-label='Bounties by status'>"
-               + "".join(f"<li><span class=fm-bstat data-bounty='{s}'><span aria-hidden=true>{BOUNTY_LABEL[s][0]}</span> "
-                         f"{BOUNTY_LABEL[s][1]} {tally[s]}</span></li>" for s in BOUNTY_LABEL) + "</ul>")
+               "No money, rewards, points or revenue; a card reads Verified only when a merged PR or report is on record.</p>")
+    # Each chip filters the board to its status (the page script enables them; without it they are a plain tally).
+    if ok:
+        out.append("<ul class=fm-tally aria-label='Bounties by status; press one to show only that status'>"
+                   + "".join(f"<li><button type=button class=fm-bstat data-bounty='{s}' aria-pressed=false disabled>"
+                             f"<span aria-hidden=true>{BOUNTY_LABEL[s][0]}</span> {BOUNTY_LABEL[s][1]} {tally[s]}</button></li>"
+                             for s in BOUNTY_LABEL) + "</ul>")
     active = [b for b in board if b["status"] != "verified"]
     verified = [b for b in board if b["status"] == "verified"]
-    out.append("".join(_bounty(b, theme, tid) for b in active) if active
-               else "<p class=fm-empty>No open bounties.</p>")
+    out.append("".join(_bounty(b, theme, tid) for b in active) if active else _empty("No open bounties.", ok))
     if verified:
-        out.append(f"<details class=fm-verified><summary>Verified ({len(verified)})</summary>"
+        out.append(f"<details class=fm-verified id=fm-verified><summary>Verified ({len(verified)})</summary>"
                    + "".join(_bounty(b, theme, tid) for b in verified) + "</details>")
     if cargo:
         guys = _char(theme, FALLBACK_CREW)
@@ -481,50 +676,67 @@ def _bigshot(snap: dict, theme: dict, cargo: list[dict]) -> str:
     return "".join(out)
 
 
+def _callbar(snap: dict, tid: str) -> str:
+    q = _q(tid)
+    c = snap.get("counts", {})
+    when = f"<span class='dim fm-meta'>as of {_time(snap.get('generated'))} · <a href='/{q}'>refresh</a></span>"
+    if not snap.get("ok"):
+        # Never zeros for a failed read: that would read as "nothing needs you".
+        return (f"<p class='fm-callbar hot' id=fm-callbar><span>Needs your call: <strong>?</strong></span>"
+                f"<span class=fm-unknown>{esc(UNKNOWN)} Counts are unknown until a read succeeds.</span>{when}</p>")
+    calls = snap.get("decisions", [])
+    needs = len(_needs_you(calls))
+    answered = len(calls) - needs
+    attn = [t for t in snap.get("in_flight", []) if t["attention"]]
+    look = esc(_plural(len(attn), "crew needs", "crews need")) + " a look"
+    if attn:
+        look = f"<a href='/{q}#t-{esc(attn[0]['id'])}'>{look}</a>"
+    return (f"<p class='fm-callbar{' hot' if needs else ''}' id=fm-callbar><span>Needs your call: <strong>{needs}</strong>"
+            + (f" <span class=dim>· {answered} answered, waiting for Firstmate</span>" if answered else "") + "</span>"
+            f"<a href='/{q}#decisions'>Answer on the Bridge</a>"
+            f"<span>{look} · {esc(c.get('in_flight', 0))} in flight · {esc(c.get('queued', 0))} queued</span>{when}</p>")
+
+
 def dashboard(snap: dict, theme: dict, token: str, nonce: str, flash: str = "", flash_bad: bool = False) -> str:
     tid = theme["id"]
     art = bool(theme.get("ship_image"))
+    ok = snap.get("ok", False)
     c = snap.get("counts", {})
-    parts = []
-    if flash:
-        parts.append(f"<p class='fm-flash{' bad' if flash_bad else ''}' role=status>{esc(flash)}</p>")
-    for e in snap.get("errors", []):
-        parts.append(f"<p class='fm-flash bad' role=alert>Read problem: {esc(e)}</p>")
+    parts = [f"<p class='fm-flash bad' role=alert>Read problem: {esc(e)}</p>" for e in snap.get("errors", [])]
     by, cargo = _rooms(snap)
     calls = snap.get("decisions", [])
-    slots = "".join(_slot(theme, st, by[st["id"]], calls if st["id"] == "bridge" else [], art, tid) for st in STATIONS)
+    slots = "".join(_slot(theme, st, by[st["id"]], calls if st["id"] == "bridge" else [], art, tid, ok) for st in STATIONS)
     ship_label = f"{theme.get('name') or 'Ship'} cutaway: " + ", ".join(_room_names(theme, st)[0] for st in STATIONS)
-    n_calls = c.get("open_decisions", 0)
-    callbar = (
-        f"<p class='fm-callbar{' hot' if n_calls else ''}'><span>Needs your call: <strong>{esc(n_calls)}</strong></span>"
-        f"<a href='/{_q(tid)}#decisions'>Answer on the Bridge</a>"
-        f"<span>{esc(_plural(c.get('attention_tasks', 0), 'crew needs', 'crews need'))} a look · "
-        f"{esc(c.get('in_flight', 0))} in flight · {esc(c.get('queued', 0))} queued</span>"
-        f"<span class='dim fm-meta'>as of {esc(snap.get('generated'))} · <a href='/{_q(tid)}'>refresh</a></span></p>")
 
     def room(st: dict, tasks: list[dict]) -> str:
         name, crew = _room_names(theme, st)
         return (f"<section class=fm-room id='room-{st['id']}' aria-labelledby='rh-{st['id']}'>"
                 f"<h2 id='rh-{st['id']}'>{esc(name)}{f'<small>{esc(crew)}</small>' if crew else ''}</h2>"
                 f"<p class=dim>{esc(st['what'])}</p>"
-                + (_decisions(snap, theme, token) + "<h3>Captain-kind crews</h3>" if st["id"] == "bridge" else "")
-                + _crew_table(theme, tasks) + "</section>")
+                + (_decisions(snap, theme, token, flash, flash_bad) + "<h3>Captain-kind crews</h3>" if st["id"] == "bridge" else "")
+                + _crew_table(theme, tasks, ok) + "</section>")
 
-    # The Bridge (your calls) sits right under the ship; Big Shot's screen
-    # runs beside both; the other rooms' full crew lists follow.
+    # One column of work under the ship: the Bridge (your calls), then every
+    # other room's crews. Big Shot's screen runs beside it when wide and
+    # follows it when narrow, so on a phone the rooms come before the board.
     parts.append(
         "<section id=ship class=fm-stage aria-label=Ship><div class=fm-deck>"
         f"<div class='fm-ship{' fm-art-on' if art else ''}'>"
         + (f"<div class=fm-art role=img aria-label='{esc(ship_label)}'>"
            "<div class=ship-ambient aria-hidden=true></div><div class=ship-scanline aria-hidden=true></div></div>" if art else "")
         + f"<ol class=fm-slots aria-label='Rooms, live'>{slots}</ol></div>"
-        + callbar + room(STATIONS[0], by["bridge"]) + "</div>"
-        + _bigshot(snap, theme, cargo) + "</section>")
-    parts.append("<section id=rooms aria-label='Crew rooms'>"
-                 + "".join(room(st, by[st["id"]]) for st in STATIONS[1:])
-                 + (room(CARGO, cargo) if cargo else "") + "</section>"
-                 f"<p class=dim>Firstmate home <code>{esc(snap.get('home'))}</code></p>")
-    return page("Firstmate", "".join(parts), theme, nonce, snap.get("fingerprint", ""))
+        + _callbar(snap, tid) + room(STATIONS[0], by["bridge"])
+        + "<section id=rooms aria-label='Crew rooms'>"
+        + "".join(room(st, by[st["id"]]) for st in STATIONS[1:])
+        + (room(CARGO, cargo) if cargo else "") + "</section></div>"
+        + _bigshot(snap, theme, cargo) + "</section>"
+        f"<p class=dim>Firstmate home <code>{esc(snap.get('home'))}</code></p>")
+    needs = len(_needs_you(calls))
+    active = sum(1 for b in snap.get("bounties", []) if b["status"] != "verified")
+    nav = ({"decisions": (needs, needs > 0), "rooms": (c.get("in_flight", 0), c.get("attention_tasks", 0) > 0),
+            "bounties": (active, False)} if ok else {"decisions": ("?", True)})
+    title = ("(!) " if not ok else f"({needs}) " if needs else "") + "Firstmate"
+    return page(title, "".join(parts), theme, nonce, {"ok": ok, "fp": snap.get("fingerprint", ""), "nav": nav})
 
 
 def report(rel: str, text: str, theme: dict, nonce: str) -> str:
