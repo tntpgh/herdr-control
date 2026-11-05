@@ -4,8 +4,9 @@ import { sign } from "../src/ingest";
 import type { Snapshot, SyncBody } from "../src/types";
 
 export const BASE = "https://bebop.teamthurber.com";
-// The old hostname, still served as an alias during the cutover.
-export const ALIAS = "https://herdr-mcp.teamthurber.com";
+// A test-only alias host: the firstmate project binds it as ALIAS_URLS
+// (vitest.config.ts); the shipped config serves no alias.
+export const ALIAS = "https://old.teamthurber.com";
 export const REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect";
 // CIMD client ids (vitest.config.ts serves their documents): the two
 // allow-listed apps, and a stranger that is not on the list.

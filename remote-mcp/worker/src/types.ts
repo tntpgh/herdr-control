@@ -13,14 +13,14 @@ export interface Env {
   // and metadata URLs follow the request's host (index.ts serves one OAuth
   // provider per origin), so this is the name clients are told to use.
   PUBLIC_URL: string;
-  // Comma-separated extra origins served during a hostname cutover (the old
-  // https://herdr-mcp.teamthurber.com). Tokens are bound to the origin that
-  // issued them, so a client keeps working on its old host until it
+  // Comma-separated extra origins served during a hostname cutover (empty
+  // since the herdr-mcp alias was dropped). Tokens are bound to the origin
+  // that issued them, so a client keeps working on its old host until it
   // reconnects at PUBLIC_URL. Any other host is refused.
   ALIAS_URLS?: string;
   // "true" maps herdr:* scopes on tokens granted before the fm:* cutover to
   // their fm:* equivalents (policy.ts LEGACY_SCOPE_MAP); anything else honors
-  // fm:* only. Turn off once every client has re-consented.
+  // fm:* only. Off since every client re-consented at bebop.
   LEGACY_HERDR_SCOPES?: string;
   ACCESS_TEAM_DOMAIN: string; // thurberteam.cloudflareaccess.com
   ACCESS_AUD: string; // AUD of the path-scoped Access app on /authorize

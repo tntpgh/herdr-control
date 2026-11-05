@@ -114,21 +114,23 @@ describe("per-client grants", () => {
     expect(effectiveScopes(e, DUET, ALL)).toEqual(ALL);
     // A Duet grant consented before parity does not silently gain fm:decide-note.
     expect(effectiveScopes(e, DUET, PRE_PARITY_DUET)).toEqual(PRE_PARITY_DUET);
-    expect(effectiveScopes(e, DOT, ["herdr:read", "herdr:message.owner", "herdr:message", "herdr:task.start"]))
+    // Shipped off; "true" is the rollback.
+    expect(effectiveScopes(e, DOT, ["herdr:read", "herdr:message.owner"])).toEqual([]);
+    expect(effectiveScopes({ ...e, LEGACY_HERDR_SCOPES: "true" }, DOT,
+      ["herdr:read", "herdr:message.owner", "herdr:message", "herdr:task.start"]))
       .toEqual(["fm:read", "fm:reports", "fm:request", "fm:peer"]);
-    expect(effectiveScopes({ ...e, LEGACY_HERDR_SCOPES: "false" }, DOT, ["herdr:read", "herdr:message.owner"])).toEqual([]);
     expect(effectiveScopes({ ...e, OWNER_INBOX_ENABLED: "false" }, DOT, ALL)).toEqual(["fm:read", "fm:reports"]);
     expect(effectiveScopes(e, STRANGER, ALL)).toEqual([]);
   });
 
-  it("a legacy herdr-mcp token keeps its read and note tools, never answer_decision, and stops at the switch", async () => {
-    const legacy = await rawMcp(DOT, ["herdr:read", "herdr:message.owner"]);
+  it("a legacy herdr-mcp token is refused, and with the switch back on gets read and note tools, never answer_decision", async () => {
+    expect((await rawMcp(DOT, ["herdr:read", "herdr:message.owner"])).status).toBe(403);
+    const legacy = await rawMcp(DOT, ["herdr:read", "herdr:message.owner"], { LEGACY_HERDR_SCOPES: "true" });
     expect(legacy.status).toBe(200);
     const names = ((await legacy.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining(["list_decisions", "get_report", "send_owner_message", "request_task",
       "send_peer_message"]));
     expect(names).not.toContain("answer_decision");
-    expect((await rawMcp(DOT, ["herdr:read"], { LEGACY_HERDR_SCOPES: "false" })).status).toBe(403);
   });
 });
 

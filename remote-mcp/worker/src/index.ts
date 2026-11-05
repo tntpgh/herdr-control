@@ -9,8 +9,8 @@
 //   /.well-known/*           RFC 9728 / RFC 8414 discovery (provider)
 //   /ingest/sync             the Mac publisher's HMAC-signed push
 //
-// Served at PUBLIC_URL (bebop.teamthurber.com) and, during the hostname
-// cutover, at each ALIAS_URLS origin (herdr-mcp.teamthurber.com). Each
+// Served at PUBLIC_URL (bebop.teamthurber.com) and, during a hostname
+// cutover, at each ALIAS_URLS origin (none since herdr-mcp's was dropped). Each
 // origin gets its own provider: issuer, resource and metadata URLs follow
 // the request's origin, and a token is only valid at the origin that issued
 // it. Any other host is refused.

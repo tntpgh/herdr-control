@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """fm-mcp publisher: serve Firstmate to Dot (ChatGPT) and Duet (Claude.ai)
-through the Bebop Worker (bebop.teamthurber.com, also its sync URL;
-herdr-mcp.teamthurber.com is its alias during the hostname cutover).
+through the Bebop Worker (bebop.teamthurber.com, also its sync URL).
 
 It replaces only the Mac half (publisher.py, which read the herdr hub and run
 registry). The Worker owns OAuth/Access, the fm:* scopes, per-client grants,

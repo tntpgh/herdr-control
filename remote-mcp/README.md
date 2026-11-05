@@ -14,8 +14,9 @@ or reaches the loopback hub.
 
 Bebop is the herdr-mcp Worker renamed and narrowed (Phase 2). The Worker
 script keeps its `herdr-mcp` name, so the Durable Object, the OAuth KV and
-every grant carry over. `herdr-mcp.teamthurber.com` is still served as an
-**alias** during the cutover (see "Bebop cutover runbook").
+every grant carried over. The cutover is finished: `herdr-mcp.teamthurber.com`
+is no longer served and pre-cutover `herdr:*` grants are no longer honoured
+(see "Bebop cutover runbook").
 
 ```mermaid
 flowchart LR
@@ -39,14 +40,16 @@ stays loopback-only.
 | Human consent → `/authorize` | Path-scoped Cloudflare Access app `herdr-mcp-authorize` covering `<host>/authorize` for every served host (Google Workspace IdP pinned, policy = `ALLOWED_EMAILS`). The Worker **also** verifies the `Cf-Access-Jwt-Assertion` (RS256 against the team JWKS, issuer- and AUD-pinned, email allowlisted), so a removed or widened Access app fails closed. Consent is CSRF-bound to the browser by the provider's `__Host-` cookie + handle, and refuses any client outside `CLIENT_GRANTS` before the page renders. |
 | Mac → `/ingest/sync` | HMAC-SHA256 over `ts.nonce.sha256(body)` with `INGEST_KEY`; ±300 s skew; nonces single-use. Never an OAuth token. |
 
-**Hosts.** `PUBLIC_URL` (bebop) is canonical; each origin in `ALIAS_URLS`
-(herdr-mcp, during the cutover) is a full second OAuth front door with its own
-issuer, resource and metadata — the provider is built per origin. A token
-issued with a resource is audience-bound to that origin, so it never works on
-the other host; a stored token with no audience resolves to whichever host it
-is presented at, which grants nothing extra (effective scopes do not depend on
-the host). Any other `Host` gets `421 Misdirected Request`.
-`/healthz` reports `host_role` (`canonical`/`alias`) and `canonical_mcp`.
+**Hosts.** `PUBLIC_URL` (bebop) is the only host served; `ALIAS_URLS` is
+empty. For a future hostname cutover, each origin listed there becomes a full
+second OAuth front door with its own issuer, resource and metadata — the
+provider is built per origin. A token issued with a resource is
+audience-bound to that origin, so it never works on another host; a stored
+token with no audience resolves to whichever host it is presented at, which
+grants nothing extra (effective scopes do not depend on the host). Any other
+`Host` (including the dropped `herdr-mcp.teamthurber.com`) gets
+`421 Misdirected Request`. `/healthz` reports `host_role`
+(`canonical`/`alias`) and `canonical_mcp`.
 
 ### Scopes (`fm:*`), least privilege
 
@@ -89,11 +92,12 @@ Widening a client is a change to `CLIENT_GRANTS` and a
 security review; `scripts/issue-client.py`'s `dot`/`duet` profiles must equal
 these ceilings (`verify-issue-client.py` parses `policy.ts` to enforce it).
 
-**Legacy tokens.** While `LEGACY_HERDR_SCOPES` is `"true"`, a token granted
-before the cutover keeps working: `herdr:read` → `fm:read fm:reports`,
-`herdr:message.owner` → `fm:request fm:peer` (never `fm:decide-note`: that
-needs a fresh consent). Every other herdr scope maps to nothing. Set it to
-`"false"` once Dot and Duet have re-consented at bebop.
+**Legacy tokens.** `LEGACY_HERDR_SCOPES` is `"false"`: a token granted before
+the cutover (`herdr:*` scopes only) gets 403 / no tools. Setting it back to
+`"true"` and redeploying (rollback only) maps `herdr:read` →
+`fm:read fm:reports` and `herdr:message.owner` → `fm:request fm:peer` (never
+`fm:decide-note`: that needs a fresh consent); every other herdr scope maps to
+nothing.
 
 ### Per-tool rate limits
 
@@ -134,7 +138,7 @@ inbox.
 | Peer notes | under `herdr:message.owner` | own scope `fm:peer` |
 | Limits | global per client; messages 5/30 (adjustable); owner notes 10/120 | global per client + a fixed limit per tool |
 | Audit | every call | every call, with `client_label` (dot/duet/unknown) on each row |
-| Host | `herdr-mcp.teamthurber.com` | `bebop.teamthurber.com` (herdr-mcp alias during cutover) |
+| Host | `herdr-mcp.teamthurber.com` | `bebop.teamthurber.com` only (herdr-mcp no longer served) |
 
 **Notes are never orders.** `request_task`, `answer_decision` and
 `send_owner_message` all queue an owner message to `firstmate`; the Mac
@@ -174,7 +178,7 @@ Public and unauthenticated, so it can be checked before anyone connects:
 curl -s https://bebop.teamthurber.com/healthz
 {"service":"bebop","mcp":"https://bebop.teamthurber.com/mcp","canonical_mcp":"https://bebop.teamthurber.com/mcp",
  "host_role":"canonical","auth":"OAuth 2.1 + PKCE","build_sha":"<commit>","owner_inbox_enabled":true,
- "legacy_herdr_scopes":true,"scopes_offered":["fm:read","fm:reports","fm:request","fm:decide-note","fm:peer"],
+ "legacy_herdr_scopes":false,"scopes_offered":["fm:read","fm:reports","fm:request","fm:decide-note","fm:peer"],
  "clients":{"dot":[…all five…],"duet":[…all five…]}}
 ```
 
@@ -704,14 +708,14 @@ URL `https://bebop.teamthurber.com/mcp` → Connect → the same Google sign-in;
 consent offers duet's ceiling (the same five scopes as Dot). Then
 `issue-client.py label duet --client-id https://claude.ai/oauth/mcp-oauth-client-metadata --peer --apply`.
 
-**Reconfiguring an existing herdr-mcp connector** (cutover step 4 below):
-the old connector keeps working on the alias with its legacy scopes, but a
-token is bound to the host that issued it, so moving is a reconnect, not an
-edit. In the app, remove (or disconnect) the `herdr-mcp` connector, add a new
-one at `https://bebop.teamthurber.com/mcp`, sign in and consent, then rerun
-the `issue-client.py label … --peer --apply` line above (the label follows
-the client_id, so the peer inbox and history carry over). `grants.py list`
-then shows the new grant; revoke the old one with
+**Reconfiguring an old herdr-mcp connector:** it no longer works (its host
+is gone and its `herdr:*` grant is no longer honoured), and a token is bound
+to the host that issued it, so moving is a reconnect, not an edit. In the
+app, remove the `herdr-mcp` connector, add a new one at
+`https://bebop.teamthurber.com/mcp`, sign in and consent, then rerun the
+`issue-client.py label … --peer --apply` line above (the label follows the
+client_id, so the peer inbox and history carry over). `grants.py list` then
+shows the new grant; revoke the old one with
 `grants.py revoke <old grant_id> --apply`.
 
 The grant then works unattended until the refresh token idles out (7 days
@@ -745,8 +749,7 @@ public internet.
   once, and its queued notes are cancelled before delivery on the next sync.
 - **Kill switches**, least to most: `OWNER_INBOX_ENABLED="false"` and
   redeploy (Bebop goes read-only; queued notes are cancelled on the next
-  sync); `LEGACY_HERDR_SCOPES="false"` (every pre-cutover token stops); uninstall
-  the publisher (`install-fm-publisher.sh --uninstall` → clients see
+  sync); uninstall the publisher (`install-fm-publisher.sh --uninstall` → clients see
   `disconnected`, nothing is delivered); remove the email from
   `ALLOWED_EMAILS` and the Access policy (its grants stop on the next
   request, its queued notes are cancelled, and it is revoked on the next
@@ -777,7 +780,9 @@ All from `remote-mcp/`:
 
 The Worker, its Durable Object, the OAuth KV and the Access app are reused;
 only hostnames, routes and scopes change. Captain-approved, attended steps;
-nothing here runs from CI or from a worker.
+nothing here runs from CI or from a worker. Status: steps 1–5 done; 6 and 7
+ship together in one PR (Dot and Duet both re-consented at bebop and the last
+pre-cutover grant was revoked first).
 
 ```mermaid
 flowchart LR
@@ -811,7 +816,7 @@ flowchart LR
    → `herdr-mcp-authorize` that both `/authorize` paths are listed and the
    policy is still the email allowlist.
 4. **Reconnect the apps** at `https://bebop.teamthurber.com/mcp` (see
-   "Reconfiguring an existing herdr-mcp connector"), re-label with
+   "Reconfiguring an old herdr-mcp connector"), re-label with
    `issue-client.py label dot|duet … --peer --apply`, revoke the old grants
    with `grants.py revoke`. `get_status` on the new connector shows
    `your_client` and the fm tools.
@@ -820,15 +825,19 @@ flowchart LR
    `verify-fm-publisher.py` checks they match). After that PR merges,
    reinstall the publisher (`install-fm-publisher.sh --apply`); `status.json`
    must show `outcome: synced`. Ingest works on either host, so this order is safe.
-6. **Retire legacy scopes.** `LEGACY_HERDR_SCOPES` → `"false"`, deploy with
-   `provision.sh --apply`; `/healthz` shows `legacy_herdr_scopes: false`.
-   Any connector still on a pre-cutover grant now gets 403 / no tools — that
-   is the signal it was missed in step 4.
-7. **Drop the alias** in one PR: remove the herdr-mcp entry from
-   `wrangler.jsonc` `routes` and `ALIAS_URLS`, and from `ALIAS_HOSTS` in
-   `provision.sh`; deploy. Then in the dashboard delete the
-   `herdr-mcp.teamthurber.com` Workers custom domain if it remains, and
-   remove `herdr-mcp.teamthurber.com/authorize` from the Access app.
+6. **Retire legacy scopes** and 7. **drop the alias**, in one PR:
+   `LEGACY_HERDR_SCOPES` → `"false"`; the herdr-mcp entry removed from
+   `wrangler.jsonc` `routes` and `ALIAS_URLS` and from `ALIAS_HOSTS` in
+   `provision.sh`. Deploy with `provision.sh --apply`; VERIFY lists bebop
+   only, `/healthz` shows `legacy_herdr_scopes: false`. Any connector still on
+   a pre-cutover grant now gets 403 / no tools — that is the signal it was
+   missed in step 4. Then in the dashboard (provision never removes a host):
+   delete the `herdr-mcp.teamthurber.com` Workers custom domain if it remains
+   (Workers → herdr-mcp → Domains; that also removes its DNS record), and
+   remove `herdr-mcp.teamthurber.com/authorize` from the `herdr-mcp-authorize`
+   Access app (same app, so `ACCESS_AUD` is unchanged).
+   `curl -s -o /dev/null -w '%{http_code}' https://herdr-mcp.teamthurber.com/healthz`
+   is then 421 (domain still attached) or a connection failure (removed).
 
 **Rollback.** Each step is reversible on its own:
 
@@ -836,10 +845,9 @@ flowchart LR
 |---|---|
 | 1–2 (bad deploy) | `cd remote-mcp/worker && npx wrangler rollback` (previous version; DO, KV, grants untouched). If bebop itself misbehaves, delete only its Workers custom domain (dashboard → Workers → herdr-mcp → Domains); herdr-mcp keeps serving. |
 | 3 (Access) | Remove `bebop.teamthurber.com/authorize` from the app's domains; the AUD is unchanged, so the Worker needs nothing. |
-| 4 (reconnect) | Re-add the old herdr-mcp connector; the alias and legacy scopes are still on. |
-| 5 (publisher) | Revert `sync_client.py`'s URL (or set `HERDR_MCP_URL=https://herdr-mcp.teamthurber.com` in the plist) and reinstall. |
-| 6 (legacy off) | `LEGACY_HERDR_SCOPES="true"` + deploy; old grants work again (they were never deleted). |
-| 7 (alias gone) | Revert the PR and deploy; `wrangler deploy` re-attaches the custom domain and its DNS record. |
+| 4 (reconnect) | Re-add the old herdr-mcp connector; until steps 6–7 deploy, the alias and legacy scopes are still on. |
+| 5 (publisher) | Revert `sync_client.py`'s URL and reinstall (only while the herdr-mcp alias is still served). |
+| 6–7 (legacy off, alias gone) | Legacy only: `LEGACY_HERDR_SCOPES="true"` + deploy; old grants work again only if not revoked (Dot's and Duet's were). Both: revert the PR and deploy; `wrangler deploy` re-attaches the herdr-mcp custom domain and its DNS record, and provision re-adds `herdr-mcp.teamthurber.com/authorize` to the Access app. |
 
 Never roll back by `npx wrangler delete herdr-mcp`: that destroys the
 Durable Object (notes, audit, peer inbox) and every grant.

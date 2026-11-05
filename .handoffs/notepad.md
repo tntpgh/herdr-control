@@ -29,7 +29,7 @@
 - Verified: tsc clean, vitest 133/133, authorization-offline 35, verify-fm-publisher 41, verify-issue-client 10, live --dry-run OK. Security review: 0 high/critical; lows fixed.
 
 ## Recommended next steps
-- Attended cutover per remote-mcp/README.md "Bebop cutover runbook" (deploy, Access, reconnect Dot/Duet, sync_client URL -> bebop, LEGACY_HERDR_SCOPES=false, drop alias).
+- Bebop cutover steps 1–5 done; 6+7 (LEGACY_HERDR_SCOPES=false, drop herdr-mcp alias) in branch fm/bebop-finish. After merge: provision.sh --apply, then dashboard cleanup (herdr-mcp Workers custom domain if left, herdr-mcp.teamthurber.com/authorize off the Access app).
 - Phase 3: delete dormant herdr message/task DO paths, publisher.py, tasks.py.
 
 ## Key decisions

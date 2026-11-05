@@ -11,7 +11,8 @@
 #   2. Access app "herdr-mcp-authorize" on <host>/authorize for bebop.teamthurber.com
 #      and every alias host (path-scoped, Google Workspace IdP pinned, email
 #      policy) — ONE app, so the Worker's single ACCESS_AUD covers every host;
-#      an existing app missing a host gets it added (same app, same AUD)
+#      an existing app missing a host gets it added (same app, same AUD); a
+#      host no longer listed is never removed (that is a dashboard step)
 #   3. KV id + Access AUD written into worker/wrangler.jsonc (both public ids)
 #   4. Ingest key: 1Password item herdr-mcp-ingest-key (created via op-write
 #      from a 600 template file, never argv), mirrored into
@@ -28,10 +29,12 @@ WORKER="$HERE/worker"
 WRANGLER_CFG="$WORKER/wrangler.jsonc"
 ACC="0a23a3902c4f431f05d46c86c1fa7b81"
 HOST="bebop.teamthurber.com"
-# Served too during the hostname cutover (wrangler.jsonc ALIAS_URLS + routes).
-# Drop a host here in the same change that drops it there.
-ALIAS_HOSTS=("herdr-mcp.teamthurber.com")
-HOSTS=("$HOST" "${ALIAS_HOSTS[@]}")
+# Extra hosts served during a hostname cutover (wrangler.jsonc ALIAS_URLS +
+# routes). Add or drop a host here in the same change that does it there.
+# Empty since the herdr-mcp alias was dropped (README cutover step 7).
+ALIAS_HOSTS=()
+# ${a[@]+...}: an empty array is "unbound" under set -u before bash 4.4.
+HOSTS=("$HOST" ${ALIAS_HOSTS[@]+"${ALIAS_HOSTS[@]}"})
 APP_PATH="authorize"
 APP_NAME="herdr-mcp-authorize"
 EMAILS="tnt@teamthurber.com"

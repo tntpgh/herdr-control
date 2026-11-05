@@ -19,8 +19,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-# The canonical host (wrangler.jsonc PUBLIC_URL). Ingest is served on the
-# herdr-mcp alias too while it exists, so HERDR_MCP_URL can roll this back.
+# The canonical host (wrangler.jsonc PUBLIC_URL); HERDR_MCP_URL overrides it.
+# The herdr-mcp alias is gone, so it is no rollback target any more.
 URL = os.environ.get("HERDR_MCP_URL", "https://bebop.teamthurber.com").rstrip("/")
 LAUNCHD_SECRETS = Path.home() / ".config/op/launchd-secrets.env"
 

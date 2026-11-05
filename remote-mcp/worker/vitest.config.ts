@@ -19,8 +19,10 @@ const CIMD: Record<string, string> = {
   "https://stranger.example/oauth/client.json": "Stranger",
 };
 
-// Bindings are fixed per isolate, so each feature mode is a project.
-const worker = (ownerInbox: "true" | "false", consumers: "true" | "false" = "false", messaging: "true" | "false" = "false") =>
+// Bindings are fixed per isolate, so each feature mode is a project. `extra`
+// adds bindings on top of wrangler.jsonc for one project.
+const worker = (ownerInbox: "true" | "false", consumers: "true" | "false" = "false", messaging: "true" | "false" = "false",
+  extra: Record<string, string> = {}) =>
   cloudflareTest({
     wrangler: { configPath: "./wrangler.jsonc" },
     miniflare: {
@@ -32,6 +34,7 @@ const worker = (ownerInbox: "true" | "false", consumers: "true" | "false" = "fal
         OWNER_INBOX_ENABLED: ownerInbox,
         EVENT_CONSUMERS_ENABLED: consumers,
         TEST_ACCESS_PRIVATE_JWK: JSON.stringify(priv),
+        ...extra,
       },
       outboundService: (request: Request) => {
         const url = new URL(request.url);
@@ -59,7 +62,10 @@ export default defineConfig({
       { plugins: [worker("true")], test: { name: "events", include: ["test/events.test.ts"] } },
       { plugins: [worker("true", "true")], test: { name: "consumers", include: ["test/consumers.test.ts"] } },
       { plugins: [worker("true")], test: { name: "client-identity", include: ["test/client-identity.test.ts"] } },
-      { plugins: [worker("true")], test: { name: "firstmate", include: ["test/firstmate.test.ts"] } },
+      // The shipped config serves no alias; this project adds one so the
+      // multi-origin path (a future hostname cutover) stays covered.
+      { plugins: [worker("true", "false", "false", { ALIAS_URLS: "https://old.teamthurber.com" })],
+        test: { name: "firstmate", include: ["test/firstmate.test.ts"] } },
     ],
   },
 });
