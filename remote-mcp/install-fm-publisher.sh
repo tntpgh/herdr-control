@@ -43,8 +43,8 @@ render() {  # <out-file>
   local out=$1 py v
   py="$(resolve_hub_python)" || { echo "no pinned python3.11+ found; refusing to render" >&2; return 1; }
   [ -d "$fm_home" ] || { echo "Firstmate home not found: $fm_home" >&2; return 1; }
-  [ -x "$fm_home/bin/fm-inbox.sh" ] && [ -x "$fm_home/bin/fm-fleet-snapshot.sh" ] \
-    || { echo "$fm_home/bin lacks fm-inbox.sh / fm-fleet-snapshot.sh" >&2; return 1; }
+  [ -x "$fm_home/bin/fm-inbox.sh" ] && [ -x "$fm_home/bin/fm-fleet-snapshot.sh" ] && [ -x "$fm_home/bin/fm-crew-state.sh" ] \
+    || { echo "$fm_home/bin lacks fm-inbox.sh / fm-fleet-snapshot.sh / fm-crew-state.sh" >&2; return 1; }
   for v in "$py" "$HERE/fm_publisher.py" "$fm_home" "$LOG_PATH"; do
     case "$v" in *[\&\<\>]*) echo "refusing a path that would need XML escaping: $v" >&2; return 1 ;; esac
   done

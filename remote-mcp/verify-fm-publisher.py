@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -44,7 +45,8 @@ HOME, BIN, HERDR = TMP / "home", TMP / "bin", TMP / "herdr-remote-mcp"
 for d in (HOME / "state", HOME / "data", BIN, HERDR):
     d.mkdir(parents=True)
 (HOME / "data/backlog.md").write_text("# backlog\n")
-for tid in ("t-run", "t-review", "t-secret"):
+FIXTURE_TASKS = ("t-run", "t-review", "t-blocked", "t-parked", "t-paused", "t-failed", "t-unknown", "t-secret")
+for tid in FIXTURE_TASKS:
     (HOME / f"state/{tid}.meta").write_text(f"id={tid}\n")
 (HOME / "data/t-review").mkdir()
 LEAK_PATHS = ["/Users/LEAKUSER/proj/notes.txt", "~/LEAKHOME/file", "~/.treehouse/LEAKTREE/wt",
@@ -160,7 +162,23 @@ if mode == "fail":
 if mode == "badschema":
     print(json.dumps({"schema": "fm-fleet-snapshot.v2"}))
     sys.exit(0)
-print((TMP / "fleet.json").read_text())
+fleet = (TMP / "fleet.json").read_text()
+if sys.argv[1:] == ["--contribution-input"]:  # the real shape: the backlog, one row per state/*.meta
+    doc = json.loads(fleet)
+    kinds = {t["id"]: t["kind"] for t in doc["tasks"]}
+    rows = []
+    for p in sorted((TMP / "home/state").glob("*.meta")):
+        m = dict(ln.split("=", 1) for ln in p.read_text().splitlines() if "=" in ln)
+        rows.append({"id": p.stem, "kind": m.get("kind") or kinds.get(p.stem, "ship"),
+                     "pr": {"url": m.get("pr", ""), "head": ""}, "merge_authority": "attended"})
+    print(json.dumps({"backlog": doc["backlog"], "tasks": rows}))
+    sys.exit(0)
+print(fleet)
+''')
+# fm-crew-state.sh's one-line contract; TMP/crew/<id> overrides the default.
+(BIN / "fm-crew-state.sh").write_text(STUB_COMMON + '''
+line = TMP / "crew" / sys.argv[1]
+print(line.read_text().strip() if line.exists() else "state: working · source: pane · harness busy (stub)")
 ''')
 # A stand-in for fm-inbox.sh with the real one's note/announce/receipts/ready
 # contract: request-id idempotency, one wake per announced note, exit 3 for a
@@ -304,8 +322,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp(dir=TMP, prefix="state-"))
         fm.STATE_DIR = self.state
-        # every tick rebuilds unless a test says otherwise
-        fm.MAX_SNAPSHOT_AGE_S, fm.MIN_REBUILD_S, fm.REBUILD_CPU_BUDGET = 0, 0, float("inf")
+        # every tick is a full read unless a test says otherwise
+        fm.FULL_MIN_S, fm.MIN_REBUILD_S, fm.REBUILD_CPU_BUDGET = 0, 0, float("inf")
         for f in ("fleet-mode", "note-unannounced", "old-loaded", "wakes.log"):
             (TMP / f).unlink(missing_ok=True)
         for p in (TMP / "inbox").rglob("*") if (TMP / "inbox").exists() else []:
@@ -483,6 +501,9 @@ class Commands(Base):
             fm.run_cli(["fm-send.sh", "t-run", "merge"])
         with self.assertRaises(PermissionError):
             fm.run_cli(["fm-inbox.sh", "reply", "x", "-"])
+        for argv in (["fm-crew-state.sh", "--help"], ["fm-crew-state.sh", "t-run", "x"], ["fm-crew-state.sh", "../t"]):
+            with self.assertRaises(PermissionError, msg=argv):
+                fm.run_cli(argv)
 
     def test_refuses_to_run_while_the_old_publisher_is_loaded(self):
         (TMP / "old-loaded").write_text("1")
@@ -611,9 +632,23 @@ class Resilience(Base):
             self.assertEqual(snap["tasks"], good["tasks"], mode)
         self.assertEqual(fm.read_status()["outcome"], "synced_degraded")
 
-    def test_a_deny_change_that_cannot_be_rebuilt_never_resends_the_wider_snapshot(self):
+    def test_a_deny_change_applies_to_the_last_read_without_any_command(self):
         self.tick()
         self.assertIn("t-hold", json.dumps(self.sent()[0]))
+        (TMP / "fleet-mode").write_text("fail")
+        (TMP / "config/read-deny").write_text("t-hold\n")
+        STUB_LOG.unlink()
+        try:
+            self.tick()
+        finally:
+            (TMP / "config/read-deny").unlink()
+        self.assertEqual([r for r in argv_log() if r["argv"][0] == "fm-fleet-snapshot.sh"], [])
+        last = self.sent()[-1]
+        self.assertNotIn("t-hold", json.dumps(last))
+        self.assertIn("t-run", [t["task_id"] for t in last["snapshot"]["tasks"]])
+        self.assertEqual(fm.read_status()["refresh"], "config")
+
+    def test_a_deny_change_with_no_read_yet_sends_an_empty_snapshot(self):
         (TMP / "fleet-mode").write_text("fail")
         (TMP / "config/read-deny").write_text("t-hold\n")
         try:
@@ -622,7 +657,6 @@ class Resilience(Base):
             (TMP / "config/read-deny").unlink()
         last = self.sent()[-1]
         self.assertEqual((last["snapshot"]["tasks"], last["results"]), ([], []))
-        self.assertNotIn("t-hold", json.dumps(last))
 
     def test_a_hung_snapshot_times_out_and_still_syncs(self):
         fm.SNAPSHOT_TIMEOUT_S = 1
@@ -633,53 +667,6 @@ class Resilience(Base):
             fm.SNAPSHOT_TIMEOUT_S = 12
         snap = self.sent()[-1]["snapshot"]
         self.assertEqual((snap["tasks"], snap["hub"]["live_connected"]), ([], False))
-
-    def test_the_snapshot_is_rebuilt_only_when_its_inputs_change(self):
-        fm.MAX_SNAPSHOT_AGE_S, fm.MIN_REBUILD_S = 3600, 0
-        try:
-            pub = fm.Publisher()
-            with contextlib.redirect_stdout(io.StringIO()):
-                pub.tick()
-                pub.tick()
-                builds = sum(1 for r in argv_log() if r["argv"][0] == "fm-fleet-snapshot.sh")
-                self.assertEqual(builds, 1)
-                (HOME / "state/t-run.status").write_text("done [at=3]: x\n")
-                pub.tick()
-        finally:
-            fm.MAX_SNAPSHOT_AGE_S, fm.MIN_REBUILD_S = 0, 0
-            (HOME / "state/t-run.status").unlink()
-        self.assertEqual(sum(1 for r in argv_log() if r["argv"][0] == "fm-fleet-snapshot.sh"), 2)
-        self.assertEqual(len(self.sent()), 3)  # every tick still syncs, from the cached snapshot
-
-    def test_rebuilds_stay_inside_the_cpu_budget_but_a_deny_change_applies_at_once(self):
-        fm.MAX_SNAPSHOT_AGE_S, fm.MIN_REBUILD_S, fm.REBUILD_CPU_BUDGET = 900, 0, 0.01
-        builds = lambda: sum(1 for r in argv_log() if r["argv"][0] == "fm-fleet-snapshot.sh")  # noqa: E731
-        deny = TMP / "config/read-deny"
-        try:
-            pub = fm.Publisher()
-            with contextlib.redirect_stdout(io.StringIO()):
-                pub.tick()
-                pub.rebuild_cpu_s = 10.0  # a 10 s rebuild at 1% -> at most one per 1000 s
-                (HOME / "state/t-run.status").write_text("done [at=3]: x\n")
-                pub.tick()
-                self.assertEqual(builds(), 1)
-                pub.built_at -= 950  # past MAX_SNAPSHOT_AGE_S, still inside the budget gap
-                pub.tick()
-                self.assertEqual(builds(), 1)
-                deny.write_text("t-hold\n")
-                pub.tick()
-                self.assertEqual(builds(), 2)
-                pub.rebuild_cpu_s = 10.0
-                pub.built_at -= 1001
-                pub.tick()
-                self.assertEqual(builds(), 3)
-        finally:
-            fm.MAX_SNAPSHOT_AGE_S, fm.MIN_REBUILD_S, fm.REBUILD_CPU_BUDGET = 0, 0, float("inf")
-            (HOME / "state/t-run.status").unlink()
-            deny.unlink(missing_ok=True)
-        self.assertIn("t-hold", json.dumps(self.sent()[2]))
-        self.assertNotIn("t-hold", json.dumps(self.sent()[3]))
-        self.assertEqual(len(self.sent()), 5)
 
     def test_status_file_is_the_dashboard_field(self):
         self.tick()
@@ -708,6 +695,233 @@ class Resilience(Base):
         self.assertEqual(list(self.state.iterdir()), [])
         self.assertEqual(self.sent(), [])
         self.assertFalse((TMP / "inbox/requests").exists() and any((TMP / "inbox/requests").iterdir()))
+
+
+class Incremental(Base):
+    """Between full reads a delta re-reads only what changed and merges it
+    onto the last full read."""
+
+    def setUp(self):
+        super().setUp()
+        fm.FULL_MIN_S = 3600  # one full read, then deltas
+        stale, fm.STALE_TASK_S = fm.STALE_TASK_S, 10**9  # the fixture's observed_at is fixed in the past
+        self.addCleanup(setattr, fm, "STALE_TASK_S", stale)
+        self.crew = TMP / "crew"
+        self.crew.mkdir(exist_ok=True)
+        self.addCleanup(self.cleanup)
+        self.pub = fm.Publisher()
+        self.run_tick()
+        self.full = self.sent()[-1]["snapshot"]
+        STUB_LOG.unlink()
+
+    def cleanup(self):
+        for p in self.crew.iterdir():
+            p.unlink()
+        for p in (HOME / "state").iterdir():
+            if p.suffix == ".status" or (p.suffix == ".meta" and p.stem not in FIXTURE_TASKS):
+                p.unlink()
+        for tid in FIXTURE_TASKS:
+            (HOME / f"state/{tid}.meta").write_text(f"id={tid}\n")
+
+    def run_tick(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.pub.tick(), 0)
+
+    def change(self, tid: str, crew: str | None = None):
+        p = HOME / f"state/{tid}.status"
+        with p.open("a") as f:
+            f.write(f"working [at={len(p.read_text()) if p.exists() else 0}]: x\n")
+        if crew is not None:
+            (self.crew / tid).write_text(crew + "\n")
+
+    def ran(self) -> list[list[str]]:
+        return [r["argv"] for r in argv_log() if r["argv"][0] in ("fm-fleet-snapshot.sh", "fm-crew-state.sh")]
+
+    def tasks(self, body=None) -> dict:
+        return {t["task_id"]: t for t in (body or self.sent()[-1])["snapshot"]["tasks"]}
+
+    def test_a_changed_task_is_reread_and_every_unchanged_one_reused(self):
+        self.change("t-run", "state: done · source: run-step · checks green https://github.com/tntpgh/x/pull/11")
+        self.run_tick()
+        self.assertEqual(self.ran(), [["fm-fleet-snapshot.sh", "--contribution-input"], ["fm-crew-state.sh", "t-run"]])
+        self.assertEqual(fm.read_status()["refresh"], "delta")
+        now, before = self.tasks(), {t["task_id"]: t for t in self.full["tasks"]}
+        self.assertEqual((now["t-run"]["state"], now["t-run"]["state_source"]), ("ready_review", "run-step"))
+        for tid in set(before) - {"t-run"}:  # created_at falls back to generated_at when the backlog has no date
+            self.assertEqual({**now[tid], "created_at": None}, {**before[tid], "created_at": None}, tid)
+        self.assertGreaterEqual(now["t-run"]["updated_at"], before["t-run"]["updated_at"])
+        [card] = [r for r in self.sent()[-1]["results"] if r["task_id"] == "t-run"]
+        self.assertIn("crew: done via run-step", card["text"])
+        self.assertIn("state observed: ", card["text"])
+
+    def test_a_new_task_appears_and_a_removed_one_drops(self):
+        (HOME / "state/t-new.meta").write_text("id=t-new\n")
+        (HOME / "state/t-parked.meta").unlink()
+        self.run_tick()
+        self.assertEqual(self.ran(), [["fm-fleet-snapshot.sh", "--contribution-input"], ["fm-crew-state.sh", "t-new"]])
+        snap = self.sent()[-1]["snapshot"]
+        tasks = self.tasks()
+        self.assertEqual((tasks["t-new"]["state"], tasks["t-new"]["state_source"]), ("running", "pane"))
+        self.assertNotIn("t-parked", tasks)
+        self.assertNotIn("fm:t-parked", [a["agent_id"] for a in snap["agents"]])
+        self.assertNotIn("t-parked", self.pub.local)
+        self.assertIn("t-new", self.pub.local)
+
+    def test_a_delta_is_redacted_like_a_full_read(self):
+        self.change("t-run", f"state: blocked · source: status-log · key {AWS_KEY} token {GH_TOKEN} in {PATH_TEXT}")
+        self.run_tick()
+        body = self.sent()[-1]
+        text = json.dumps(body)
+        for leak in (AWS_KEY, GH_TOKEN, "LEAKUSER", "LEAKHOME", "LEAKTREE", "LEAKSPACE", "SENTINEL-PATH"):
+            self.assertNotIn(leak, text, leak)
+        [blocker] = [b for b in body["snapshot"]["blockers"] if b["task_id"] == "t-run"]
+        self.assertIn("[REDACTED:aws-key]", blocker["summary"])
+        [card] = [r for r in body["results"] if r["task_id"] == "t-run"]
+        self.assertIn("[REDACTED:github-token]", card["text"])
+
+    def test_a_needs_decision_line_opens_a_blocker_until_the_crew_moves_on(self):
+        self.change("t-run", "state: parked · source: status-log · needs a call: merge now?")
+        self.run_tick()
+        self.assertIn("t-run", [b["task_id"] for b in self.sent()[-1]["snapshot"]["blockers"]])
+        self.change("t-run", "state: working · source: run-step · validating (running)")
+        self.run_tick()
+        self.assertNotIn("t-run", [b["task_id"] for b in self.sent()[-1]["snapshot"]["blockers"]])
+
+    def test_nothing_changed_runs_no_command_and_keeps_every_task_dated(self):
+        earlier = datetime.now(timezone.utc) - timedelta(seconds=600)
+        self.pub.raw = fm.reage(self.pub.raw, earlier)
+        expect = {t["task_id"]: t["updated_at"] for t in fm.build_snapshot(self.pub.raw, "full", [], earlier)[0]["tasks"]}
+        self.run_tick()
+        self.assertEqual(self.ran(), [])
+        self.assertEqual(fm.read_status()["refresh"], "confirm")
+        snap = self.sent()[-1]["snapshot"]
+        self.assertGreater(snap["generated_at"], fm.z(earlier))
+        self.assertEqual({t["task_id"]: t["updated_at"] for t in snap["tasks"]}, expect)
+
+    def test_when_nothing_changed_the_stalest_task_is_reread(self):
+        fm.STALE_TASK_S = 900
+        for t in self.pub.raw["tasks"]:
+            t["current_state"]["observed_at"] = fm.z(datetime.now(timezone.utc))
+        [t] = [t for t in self.pub.raw["tasks"] if t["id"] == "t-failed"]
+        t["current_state"]["observed_at"] = "2026-01-01T00:00:00Z"
+        self.run_tick()
+        self.assertEqual(self.ran(), [["fm-crew-state.sh", "t-failed"]])
+
+    def test_a_delta_with_a_spare_slot_also_rereads_the_stalest_task(self):
+        fm.STALE_TASK_S = 900
+        for t in self.pub.raw["tasks"]:
+            t["current_state"]["observed_at"] = fm.z(datetime.now(timezone.utc))
+        for tid, at in (("t-failed", "2026-01-02T00:00:00Z"), ("t-paused", "2026-01-01T00:00:00Z")):
+            [t] = [t for t in self.pub.raw["tasks"] if t["id"] == tid]
+            t["current_state"]["observed_at"] = at
+        self.change("t-run")
+        self.run_tick()
+        self.assertEqual(sorted(a[1] for a in self.ran() if a[0] == "fm-crew-state.sh"), ["t-paused", "t-run"])
+
+    def test_a_burst_of_changes_is_spread_over_deltas(self):
+        for tid in ("t-run", "t-review", "t-paused"):
+            self.change(tid)
+        self.run_tick()
+        self.assertEqual(len([a for a in self.ran() if a[0] == "fm-crew-state.sh"]), fm.MAX_OBSERVE_PER_DELTA)
+        first = {a[1] for a in self.ran() if a[0] == "fm-crew-state.sh"}
+        STUB_LOG.unlink()
+        self.run_tick()
+        self.assertEqual({a[1] for a in self.ran() if a[0] == "fm-crew-state.sh"},
+                         {"t-run", "t-review", "t-paused"} - first)
+
+    def test_each_kind_waits_its_own_cpu_over_its_share_of_the_budget(self):
+        fm.FULL_MIN_S, fm.MIN_REBUILD_S, fm.REBUILD_CPU_BUDGET = 0, 0, 0.01
+        self.pub.full_cpu_s, self.pub.delta_cpu_s = 10.0, 1.0  # gaps: 10/(0.01/3) = 3000 s, 1/(0.01*2/3) = 150 s
+        self.change("t-run")
+        self.run_tick()
+        self.assertEqual(self.ran(), [])
+        self.pub.built_at -= 151
+        self.run_tick()
+        self.assertEqual(self.ran()[0], ["fm-fleet-snapshot.sh", "--contribution-input"])
+        STUB_LOG.unlink()
+        self.pub.delta_cpu_s, self.pub.full_at, self.pub.full_try_at = 1.0, self.pub.full_at - 3001, self.pub.full_try_at - 3001
+        self.run_tick()
+        self.assertEqual(self.ran(), [["fm-fleet-snapshot.sh", "--json"]])
+        STUB_LOG.unlink()
+        (TMP / "config/read-deny").write_text("t-hold\n")  # inside both gaps, and still applied at once
+        self.run_tick()
+        self.assertEqual(self.ran(), [])
+        self.assertNotIn("t-hold", json.dumps(self.sent()[-1]))
+        self.assertIn("t-hold", json.dumps(self.sent()[-2]))
+
+    def test_a_failed_delta_is_retried_and_never_dates_the_old_snapshot_fresh(self):
+        self.change("t-run", "state: done · source: run-step · x")
+        (TMP / "fleet-mode").write_text("fail")
+        self.run_tick()
+        snap = self.sent()[-1]["snapshot"]
+        self.assertEqual(snap["generated_at"], self.full["generated_at"])
+        self.assertFalse(snap["hub"]["live_connected"])
+        (TMP / "fleet-mode").unlink()
+        self.run_tick()
+        self.assertEqual(self.tasks()["t-run"]["state"], "ready_review")
+        self.assertTrue(self.sent()[-1]["snapshot"]["hub"]["live_connected"])
+
+    def test_a_restart_carries_the_merged_read_over(self):
+        self.change("t-run", "state: done · source: run-step · x")
+        self.run_tick()
+        STUB_LOG.unlink()
+        self.pub = fm.Publisher()
+        self.run_tick()
+        self.assertEqual(self.ran(), [])
+        self.assertEqual(self.tasks()["t-run"]["state"], "ready_review")
+
+    def test_a_failed_full_read_stays_pending_and_a_confirm_cannot_clear_it(self):
+        before = self.pub.full_at
+        fm.FULL_MIN_S = 0
+        (TMP / "fleet-mode").write_text("fail")
+        self.run_tick()
+        self.assertEqual(self.pub.full_at, before)
+        self.assertFalse(self.sent()[-1]["snapshot"]["hub"]["live_connected"])
+        fm.FULL_MIN_S = 3600  # the failed attempt waits a gap; the next refresh is a confirm
+        self.run_tick()
+        self.assertEqual(fm.read_status()["refresh"], "confirm")
+        self.assertFalse(self.sent()[-1]["snapshot"]["hub"]["live_connected"])
+        (TMP / "fleet-mode").unlink()
+        self.pub.full_at -= 3601
+        self.pub.full_try_at -= 3601
+        self.run_tick()
+        self.assertEqual(fm.read_status()["refresh"], "full")
+        self.assertTrue(self.sent()[-1]["snapshot"]["hub"]["live_connected"])
+        self.assertGreater(self.pub.full_at, before - 3601)
+
+    def test_a_deny_change_runs_no_read_even_with_a_stale_task(self):
+        fm.STALE_TASK_S = 900
+        [t] = [t for t in self.pub.raw["tasks"] if t["id"] == "t-secret"]
+        t["current_state"]["observed_at"] = "2026-01-01T00:00:00Z"
+        (TMP / "config/read-deny").write_text("t-secret\n")
+        self.run_tick()
+        self.assertEqual(self.ran(), [])
+        self.assertNotIn("t-secret", json.dumps(self.sent()[-1]))
+
+    def test_inventory_pr_and_kind_reach_tasks_still_waiting_for_a_read(self):
+        for n, tid in enumerate(("t-run", "t-paused", "t-failed")):
+            (HOME / f"state/{tid}.meta").write_text(f"id={tid}\nkind=scout\npr=https://github.com/tntpgh/x/pull/2{n}\n")
+        self.run_tick()
+        self.assertEqual(len([a for a in self.ran() if a[0] == "fm-crew-state.sh"]), fm.MAX_OBSERVE_PER_DELTA)
+        tasks = self.tasks()
+        for n, tid in enumerate(("t-run", "t-paused", "t-failed")):
+            self.assertEqual((tasks[tid]["pr_url"], tasks[tid]["kind"]), (f"https://github.com/tntpgh/x/pull/2{n}", "scout"))
+
+    def test_a_pr_the_meta_drops_is_dropped_and_a_status_one_kept(self):
+        (HOME / "state/t-run.meta").write_text("id=t-run\npr=https://github.com/tntpgh/x/pull/30\n")
+        self.run_tick()
+        self.assertEqual(self.tasks()["t-run"]["pr_url"], "https://github.com/tntpgh/x/pull/30")
+        (HOME / "state/t-run.meta").write_text("id=t-run\n")
+        self.run_tick()
+        tasks = self.tasks()
+        self.assertIsNone(tasks["t-run"]["pr_url"])
+        self.assertEqual(tasks["t-review"]["pr_url"], "https://github.com/tntpgh/x/pull/10")  # from its status log
+
+    def test_a_task_that_becomes_a_secondmate_is_never_crew_read(self):
+        (HOME / "state/t-run.meta").write_text("id=t-run\nkind=secondmate\n")
+        self.change("t-run")
+        self.run_tick()
+        self.assertEqual(self.ran(), [["fm-fleet-snapshot.sh", "--contribution-input"]])
 
 
 class FirstmateFields(Base):
