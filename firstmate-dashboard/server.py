@@ -6,18 +6,19 @@
 Binds 127.0.0.1 only. Reads the home through its own CLIs (fmdata.py) on a
 background refresh; requests are served from the last snapshot.
 
-The single write is POST /answer: the captain's text becomes one
-`fm-inbox.sh note` naming the decision. Nothing here merges, approves, spawns
+The single write is POST /answer: each typed answer becomes one
+`fm-inbox.sh note` naming its decision. Nothing here merges, approves, spawns
 or runs anything; Firstmate reads the note and decides. An answer is bound to
 the exact decision text the page showed (its digest) and refused if that
 text has changed since, so a stale page cannot answer a different question.
+Answer all sends every typed answer, each bound and checked on its own.
 
 Routes
   /               the ship: rooms with live crews, Big Shot's bounty board, your calls
   /reports        every data/<id>/report.md, newest first, with the captain calls each holds
   /report?path=   one report: a data/<id>/report.md, or a file an open decision or a verified
                   bounty names (inside data/ only); Markdown drawn as a document
-  /answer         POST: decision answer -> Firstmate captain inbox
+  /answer         POST: one call's answer, or every typed answer -> Firstmate captain inbox
   /api/summary    counts; the field names the omp status line reads
   /api/projects   read-only per-repo join in the shape fleet-tools.ts reads
   /healthz        ok
@@ -47,7 +48,7 @@ import report_md  # noqa: E402
 BIND = "127.0.0.1"
 DEFAULT_PORT = 8600
 REFRESH_S = 10
-MAX_BODY = 16 * 1024
+MAX_BODY = 256 * 1024  # Answer all: several answers of up to MAX_ANSWER_CHARS each, percent-encoded
 MAX_REPORT = 512 * 1024
 
 
@@ -245,11 +246,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(503, {"error": "; ".join(snap.get("errors", [])) or "no snapshot"})
             return self._json(200, projects(snap, self.server.home.home))
         if url.path == "/":
-            sent, bad = (q.get("sent") or [""])[0], (q.get("err") or [""])[0]
-            flash = (f"Sent to the Firstmate inbox as note {sent}. Firstmate picks it up at its next check."
-                     if sent else bad)
+            sent = [s for s in (q.get("sent") or [""])[0].split(",") if s]
+            bad = (q.get("err") or [""])[0]
+            flashes = ([(f"Sent to the Firstmate inbox as note {sent[0]}. Firstmate picks it up at its next check."
+                         if len(sent) == 1 else
+                         f"Sent {len(sent)} answers to the Firstmate inbox as notes {', '.join(sent)}. "
+                         "Firstmate picks them up at its next check.", False)] if sent else []) \
+                + ([(bad, True)] if bad else [])
             token = self.server.token if self._can_answer(via) else ""
-            return self._html(200, render.dashboard(snap, theme, token, nonce, flash, bool(bad)), nonce)
+            return self._html(200, render.dashboard(snap, theme, token, nonce, flashes), nonce)
         if url.path == "/reports":
             items = []
             for r in self.server.home.reports():
@@ -295,29 +300,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(12)
         if not hmac.compare_digest(get("token").encode(), self.server.token.encode()):
             return self._html(403, render.message("Refused", "This form is from an older dashboard session. Reload and send again.", theme, nonce), nonce)
-        text = get("text").replace("\r\n", "\n").strip()
-        if not text or len(text) > render.MAX_ANSWER_CHARS:
-            return self._redirect(theme, err=f"Answer must be 1-{render.MAX_ANSWER_CHARS} characters.")
+        # A row's Send names its decision; Answer all names none and takes every typed answer.
+        texts = {k[len("text-"):]: v[0].replace("\r\n", "\n").strip() for k, v in form.items() if k.startswith("text-")}
+        one = get("decision")
+        want = [(one, texts.get(one, ""))] if one else [(i, t) for i, t in texts.items() if t]
+        if not want or not all(t for _, t in want):
+            return self._redirect(theme, err="Type an answer first; nothing was sent.")
+        long = [i for i, t in want if len(t) > render.MAX_ANSWER_CHARS]
+        if long:
+            return self._redirect(theme, err=f"Answer must be 1-{render.MAX_ANSWER_CHARS} characters "
+                                             f"({', '.join(long)}); nothing was sent.")
         # Re-read, not the cached snapshot, and every decision's `show` uncached:
         # the binding check is only as fresh as this read.
         snap = self.server.snaps.refresh(fresh=True)
-        decision = next((d for d in snap.get("decisions", []) if d["id"] == get("decision")), None)
-        if decision is None:
-            return self._redirect(theme, err=f"Decision {get('decision')} is no longer open; nothing was sent.")
-        if not hmac.compare_digest(decision["digest"].encode(), get("digest").encode()):
-            return self._redirect(theme, err=f"Decision {decision['id']} changed since this page loaded; nothing was sent. "
-                                             "Read it again and resend.")
+        open_ = {d["id"]: d for d in snap.get("decisions", [])}
         who = f" via the tailnet as {self.headers.get('Tailscale-User-Login')}" if via == "tailnet" else ""
-        body = (f"Captain answer from the dashboard{who} for decision {decision['id']} ({decision['title']}).\n"
-                f"Decision text shown (digest {decision['digest']}):\n{decision['reason']}\n\nAnswer:\n{text}\n")
-        rid = fmdata.request_id(decision["id"], decision["digest"], text)
-        try:
-            out = self.server.home.run("fm-inbox.sh", "note", "--request-id", rid, "--json", "-", stdin=body)
-            note = json.loads(out.strip().splitlines()[-1]).get("id", "?")
-        except (fmdata.CommandError, ValueError, IndexError) as e:
-            return self._redirect(theme, err=f"Inbox did not take the answer: {e}")
-        self.server.snaps.refresh()
-        return self._redirect(theme, sent=note)
+        sent, errs = [], []
+        for did, text in want:
+            decision = open_.get(did)
+            if decision is None:
+                errs.append(f"Decision {did} is no longer open; that answer was not sent.")
+                continue
+            if not hmac.compare_digest(decision["digest"].encode(), get(f"digest-{did}").encode()):
+                errs.append(f"Decision {did} changed since this page loaded; that answer was not sent. Read it again and resend.")
+                continue
+            body = (f"Captain answer from the dashboard{who} for decision {decision['id']} ({decision['title']}).\n"
+                    f"Decision text shown (digest {decision['digest']}):\n{decision['reason']}\n\nAnswer:\n{text}\n")
+            rid = fmdata.request_id(decision["id"], decision["digest"], text)
+            try:
+                out = self.server.home.run("fm-inbox.sh", "note", "--request-id", rid, "--json", "-", stdin=body)
+                sent.append(json.loads(out.strip().splitlines()[-1]).get("id", "?"))
+            except (fmdata.CommandError, ValueError, IndexError) as e:
+                errs.append(f"Inbox did not take the answer to {did}: {e}")
+        if sent:
+            self.server.snaps.refresh()
+        return self._redirect(theme, sent=",".join(sent), err=" ".join(errs))
 
     def _redirect(self, theme: dict, **params) -> None:
         q = {k: v for k, v in params.items() if v}
