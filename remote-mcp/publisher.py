@@ -9,7 +9,7 @@ One run = one tick (launchd StartInterval, com.herdr-control.remote-mcp.plist.te
      input_required events). The hub stays loopback-only; nothing listens here.
   2. Build a minimised, redacted snapshot (no cwd, no screen text, no prompt
      ids) plus changed task results (.handoffs/PROOF.md, bounded).
-  3. POST it, HMAC-signed, to https://herdr-mcp.teamthurber.com/ingest/sync.
+  3. POST it, HMAC-signed, to <sync_client.URL>/ingest/sync (bebop.teamthurber.com).
      The reply carries the outbox (queued messages) and new audit rows.
   4. Re-check every outbox message against THIS tick's local state, frame it,
      and deliver it with herdr-deliver.sh (never --force, so a pane showing a

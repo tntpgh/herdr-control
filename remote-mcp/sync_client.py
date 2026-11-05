@@ -19,7 +19,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-URL = os.environ.get("HERDR_MCP_URL", "https://herdr-mcp.teamthurber.com").rstrip("/")
+# The canonical host (wrangler.jsonc PUBLIC_URL). Ingest is served on the
+# herdr-mcp alias too while it exists, so HERDR_MCP_URL can roll this back.
+URL = os.environ.get("HERDR_MCP_URL", "https://bebop.teamthurber.com").rstrip("/")
 LAUNCHD_SECRETS = Path.home() / ".config/op/launchd-secrets.env"
 
 # ceiling: pattern redaction catches common credential shapes, not every

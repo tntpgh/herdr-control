@@ -58,7 +58,6 @@ class ScopeProfiles(unittest.TestCase):
         got = worker_grants()
         self.assertEqual(got, {CHATGPT_CLIENT_ID: ("dot", issue_client.SCOPE_PROFILES["dot"]),
                                CLAUDE_CLIENT_ID: ("duet", issue_client.SCOPE_PROFILES["duet"])})
-        self.assertNotIn("fm:decide-note", issue_client.SCOPE_PROFILES["duet"])
 
 
 LEGACY = ["herdr:read", "herdr:message.owner"]
@@ -84,8 +83,8 @@ class LabelCli(unittest.TestCase):
         self.assertEqual(self.run_main(grants, ["label", "dot", "--client-id", CHATGPT_CLIENT_ID]), 0)
         self.assertFalse(self.labels_path.exists())
 
-    def test_duet_refuses_a_grant_holding_decide_note(self):
-        grants = [grant(CLAUDE_CLIENT_ID, sorted(issue_client.SCOPE_PROFILES["dot"]))]
+    def test_duet_refuses_a_pre_parity_grant_without_decide_note(self):
+        grants = [grant(CLAUDE_CLIENT_ID, ["fm:read", "fm:reports", "fm:request", "fm:peer"])]
         self.assertEqual(self.run_main(grants, ["label", "duet", "--client-id", CLAUDE_CLIENT_ID]), 1)
 
     def test_a_missing_scope_is_refused(self):

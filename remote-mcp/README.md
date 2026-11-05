@@ -76,11 +76,16 @@ runs.
 | Client | CIMD client_id | Ceiling |
 |---|---|---|
 | **dot** (ChatGPT) | `https://chatgpt.com/oauth/client.json` | `fm:read fm:reports fm:request fm:decide-note fm:peer` |
-| **duet** (Claude.ai) | `https://claude.ai/oauth/mcp-oauth-client-metadata` | `fm:read fm:reports fm:request fm:peer` |
+| **duet** (Claude.ai) | `https://claude.ai/oauth/mcp-oauth-client-metadata` | `fm:read fm:reports fm:request fm:decide-note fm:peer` |
 | anything else (any DCR registration, any other CIMD URL) | — | nothing: consent refused, `/mcp` returns `403 client_not_allowed` |
 
-Dot relays the captain's decisions, so it may file decision notes; Duet never
-did, so it may not. Widening a client is a change to `CLIENT_GRANTS` and a
+Dot and Duet share one ceiling: they are the same assistant reached from
+different tools, so either may relay the captain's decisions as a decision
+note (a note Firstmate judges, never the captain's answer). A Duet grant
+consented before parity holds only `fm:read fm:reports fm:request fm:peer`
+and does not gain `fm:decide-note` by itself: reconnect Duet to re-consent
+(and re-label; `issue-client.py label duet` refuses the old four-scope grant).
+Widening a client is a change to `CLIENT_GRANTS` and a
 security review; `scripts/issue-client.py`'s `dot`/`duet` profiles must equal
 these ceilings (`verify-issue-client.py` parses `policy.ts` to enforce it).
 
@@ -125,7 +130,7 @@ inbox.
 | Read | `herdr:read` — everything, including report bodies | `fm:read` (fleet, decisions) split from `fm:reports` (report and result bodies) |
 | Type into a pane | `herdr:message` (`send_message`, `follow_up`) | removed |
 | Start/cancel/resume work | `herdr:task.start`, `herdr:task.implement`, `herdr:task.cancel` | removed; `request_task` files a request NOTE (`fm:request`) |
-| Decisions | free text to the owner inbox | typed `list_decisions`/`get_decision`; `answer_decision` (`fm:decide-note`, dot only) is a note, never a release |
+| Decisions | free text to the owner inbox | typed `list_decisions`/`get_decision`; `answer_decision` (`fm:decide-note`, dot and duet) is a note, never a release |
 | Peer notes | under `herdr:message.owner` | own scope `fm:peer` |
 | Limits | global per client; messages 5/30 (adjustable); owner notes 10/120 | global per client + a fixed limit per tool |
 | Audit | every call | every call, with `client_label` (dot/duet/unknown) on each row |
@@ -170,7 +175,7 @@ curl -s https://bebop.teamthurber.com/healthz
 {"service":"bebop","mcp":"https://bebop.teamthurber.com/mcp","canonical_mcp":"https://bebop.teamthurber.com/mcp",
  "host_role":"canonical","auth":"OAuth 2.1 + PKCE","build_sha":"<commit>","owner_inbox_enabled":true,
  "legacy_herdr_scopes":true,"scopes_offered":["fm:read","fm:reports","fm:request","fm:decide-note","fm:peer"],
- "clients":{"dot":[…all five…],"duet":[…all but fm:decide-note…]}}
+ "clients":{"dot":[…all five…],"duet":[…all five…]}}
 ```
 
 `build_sha` is the commit `provision.sh` deployed; it refuses to deploy from a
@@ -696,7 +701,7 @@ its own UI, which runs the OAuth sign-in. Only Dot (ChatGPT) and Duet
 
 **Duet** — Claude.ai: Settings → Connectors → **Add custom connector** →
 URL `https://bebop.teamthurber.com/mcp` → Connect → the same Google sign-in;
-consent offers duet's ceiling (no `fm:decide-note`). Then
+consent offers duet's ceiling (the same five scopes as Dot). Then
 `issue-client.py label duet --client-id https://claude.ai/oauth/mcp-oauth-client-metadata --peer --apply`.
 
 **Reconfiguring an existing herdr-mcp connector** (cutover step 4 below):
@@ -810,10 +815,11 @@ flowchart LR
    `issue-client.py label dot|duet … --peer --apply`, revoke the old grants
    with `grants.py revoke`. `get_status` on the new connector shows
    `your_client` and the fm tools.
-5. **Publisher to bebop.** Change `sync_client.py`'s default `URL` to
-   `https://bebop.teamthurber.com` (PR), merge, reinstall the publisher
-   (`install-fm-publisher.sh --apply`); `status.json` must show
-   `outcome: synced`. Ingest works on either host, so this order is safe.
+5. **Publisher to bebop.** `sync_client.py`'s default `URL` is
+   `https://bebop.teamthurber.com` (the Worker's `PUBLIC_URL`;
+   `verify-fm-publisher.py` checks they match). After that PR merges,
+   reinstall the publisher (`install-fm-publisher.sh --apply`); `status.json`
+   must show `outcome: synced`. Ingest works on either host, so this order is safe.
 6. **Retire legacy scopes.** `LEGACY_HERDR_SCOPES` → `"false"`, deploy with
    `provision.sh --apply`; `/healthz` shows `legacy_herdr_scopes: false`.
    Any connector still on a pre-cutover grant now gets 403 / no tools — that
