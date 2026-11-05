@@ -138,8 +138,62 @@ def main() -> int:
             srv.server_close()
     with tempfile.TemporaryDirectory(prefix="fmdash-check-") as t:
         incremental(build_home(Path(t)))
+    with tempfile.TemporaryDirectory(prefix="fmdash-check-") as t:
+        tailnet(build_home(Path(t)))
     print(f"\n{len(FAILS)} failure(s)" if FAILS else "\nall checks passed")
     return 1 if FAILS else 0
+
+
+TAILNET = "mac.example.ts.net:8600"
+LOGIN = "captain@example.com"
+
+
+def tailnet(root: Path) -> None:
+    """The Tailscale Serve view: admitted only for its Host with Serve's one
+    vouched login, read-only unless --tailnet-answers, never cross-origin."""
+    home = fmdata.Home(root, gh=str(root / "bin" / "gh"))
+    snaps = server.Snapshots(home)
+    snaps.refresh()
+    note = Path(home.home) / "note-args"
+    for answers in (False, True):
+        srv = server.Server(0, home, snaps, TAILNET, LOGIN, answers)
+        port = srv.port
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            ts = {"Host": TAILNET, "Tailscale-User-Login": LOGIN}
+            for bad, why in (({"Tailscale-User-Login": "other@example.com"}, "another tailnet login"),
+                             ({"Tailscale-User-Login": LOGIN.upper()}, "a login matching only case-insensitively"),
+                             ({"Tailscale-User-Login": ""}, "empty login"),
+                             ({"Host": "other.example.ts.net:8600"}, "another tailnet host")):
+                code, _, _ = request(port, "GET", "/api/summary", headers={**ts, **bad})
+                check(code == 421, f"tailnet view refused: {why} (answers={answers})")
+            code, _, _ = request(port, "GET", "/api/summary", headers={"Host": TAILNET})
+            check(code == 421, f"tailnet view refused: no Tailscale-User-Login header (tagged device or direct hit) (answers={answers})")
+            code, _, page = request(port, "GET", "/", headers=ts)
+            page = page.decode()
+            check(code == 200 and ("name=token" in page) == answers and ("Read-only view" in page) != answers,
+                  f"tailnet page {'carries' if answers else 'omits'} the answer form (answers={answers})")
+            code, _, _ = request(port, "GET", "/", headers={"Host": f"127.0.0.1:{port}"})
+            check(code == 200, f"loopback still served alongside the tailnet view (answers={answers})")
+            d = next(x for x in snaps.get()["decisions"] if x["id"] == "cap-xss")
+            _, _, local = request(port, "GET", "/")
+            form = urllib.parse.urlencode({"token": request_token(local.decode()), "decision": "cap-xss",
+                                           "digest": d["digest"], "text": "Go with (a)."})
+            origin = {"Origin": f"https://{TAILNET}"}
+            code, _, _ = request(port, "POST", "/answer", form, {**ts, "Origin": "https://evil.example"})
+            check(code == 421 and not note.exists(), f"tailnet cross-site Origin refused (answers={answers})")
+            code, _, _ = request(port, "POST", "/answer", form, ts)
+            check(code == 403 and not note.exists(), f"tailnet answer without an Origin refused (answers={answers})")
+            code, h, _ = request(port, "POST", "/answer", form, {**ts, **origin})
+            if answers:
+                sent = (Path(home.home) / "note-body").read_text() if note.exists() else ""
+                check(code == 303 and "sent=" in h.get("Location", "") and f"via the tailnet as {LOGIN}" in sent,
+                      "tailnet answer (when enabled) lands as a note naming the tailnet login")
+            else:
+                check(code == 403 and not note.exists(), "tailnet answer refused while the view is read-only")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 def incremental(root: Path) -> None:

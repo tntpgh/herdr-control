@@ -135,10 +135,15 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port: int, home: fmdata.Home, snaps: Snapshots):
+    def __init__(self, port: int, home: fmdata.Home, snaps: Snapshots,
+                 tailnet_host: str = "", tailnet_login: str = "", tailnet_answers: bool = False):
         super().__init__((BIND, port), Handler)
         self.home, self.snaps = home, snaps
         self.token = secrets.token_urlsafe(24)
+        # Tailscale Serve proxies https://<tailnet_host>/ to this loopback port
+        # with the browser's Host intact and its own Tailscale-User-Login
+        # (stripped from the incoming request, absent for tagged devices).
+        self.tailnet_host, self.tailnet_login, self.tailnet_answers = tailnet_host, tailnet_login, tailnet_answers
 
     @property
     def port(self) -> int:
@@ -153,15 +158,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write(f"{self.log_date_time_string()} {self.command} {self.path.split('?')[0]} {args[1] if len(args) > 1 else ''}\n")
 
     # ── guards ───────────────────────────────────────────────────────────
-    def _host_ok(self) -> bool:
-        """Only our own origin. A page on any other site can still make the
-        browser send a request here; Host (DNS rebinding) and Origin (cross-site
-        POST) say who is asking."""
-        allowed = {f"127.0.0.1:{self.server.port}", f"localhost:{self.server.port}"}
-        if self.headers.get("Host", "") not in allowed:
-            return False
-        origin = self.headers.get("Origin")
-        return origin is None or origin in {f"http://{h}" for h in allowed}
+    def _via(self) -> str:
+        """'local', 'tailnet', or '' (refuse). Only our own origin: a page on
+        any other site can still make the browser send a request here; Host
+        (DNS rebinding) and Origin (cross-site POST) say who is asking. The
+        tailnet origin additionally needs the one login Serve vouched for."""
+        host, origin = self.headers.get("Host", ""), self.headers.get("Origin")
+        local = {f"127.0.0.1:{self.server.port}", f"localhost:{self.server.port}"}
+        if host in local:
+            return "local" if origin is None or origin in {f"http://{h}" for h in local} else ""
+        th, login = self.server.tailnet_host, self.server.tailnet_login
+        if th and login and host == th and self.headers.get("Tailscale-User-Login", "") == login:
+            return "tailnet" if origin is None or origin == f"https://{th}" else ""
+        return ""
+
+    def _can_answer(self, via: str) -> bool:
+        return via == "local" or (via == "tailnet" and self.server.tailnet_answers)
 
     def _send(self, code: int, ctype: str, body: bytes, extra: dict | None = None, nonce: str = "") -> None:
         self.send_response(code)
@@ -169,7 +181,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         # same-origin, not no-referrer: under no-referrer Chrome sends
-        # `Origin: null` on our own form POST, which _host_ok() must refuse.
+        # `Origin: null` on our own form POST, which _via() must refuse.
         # Off-site links still carry nothing (and are rel=noreferrer too).
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
@@ -195,7 +207,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
-        if not self._host_ok():
+        via = self._via()
+        if not via:
             return self._send(421, "text/plain", b"wrong host")
         url = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(url.query)
@@ -219,7 +232,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sent, bad = (q.get("sent") or [""])[0], (q.get("err") or [""])[0]
             flash = (f"Sent to the Firstmate inbox as note {sent}. Firstmate picks it up at its next check."
                      if sent else bad)
-            return self._html(200, render.dashboard(snap, theme, self.server.token, nonce, flash, bool(bad)), nonce)
+            token = self.server.token if self._can_answer(via) else ""
+            return self._html(200, render.dashboard(snap, theme, token, nonce, flash, bool(bad)), nonce)
         if url.path == "/report":
             rel = (q.get("path") or [""])[0]
             named = {r for d in snap.get("decisions", []) for r in d["reports"]} | {
@@ -243,8 +257,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return self._send(413, "text/plain", b"body too large or empty")
         raw = self.rfile.read(length)
-        if not self._host_ok():
+        via = self._via()
+        if not via:
             return self._send(421, "text/plain", b"wrong host")
+        if not self._can_answer(via) or (via == "tailnet" and not self.headers.get("Origin")):
+            return self._send(403, "text/plain", b"answers are off on the tailnet view; answer on the Mac")
         if urllib.parse.urlsplit(self.path).path != "/answer":
             return self._send(404, "text/plain", b"not found")
         form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
@@ -265,7 +282,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not hmac.compare_digest(decision["digest"].encode(), get("digest").encode()):
             return self._redirect(theme, err=f"Decision {decision['id']} changed since this page loaded; nothing was sent. "
                                              "Read it again and resend.")
-        body = (f"Captain answer from the dashboard for decision {decision['id']} ({decision['title']}).\n"
+        who = f" via the tailnet as {self.headers.get('Tailscale-User-Login')}" if via == "tailnet" else ""
+        body = (f"Captain answer from the dashboard{who} for decision {decision['id']} ({decision['title']}).\n"
                 f"Decision text shown (digest {decision['digest']}):\n{decision['reason']}\n\nAnswer:\n{text}\n")
         rid = fmdata.request_id(decision["id"], decision["digest"], text)
         try:
@@ -288,15 +306,20 @@ def main(argv=None) -> int:
     ap.add_argument("--home", default=os.environ.get("FM_HOME"), help="Firstmate home (FM_HOME); state/ and data/ live here")
     ap.add_argument("--fm-root", help="Firstmate code root holding bin/ (default: --home)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--tailnet-host", default="", help="also serve Tailscale Serve's proxied Host, e.g. mac.tailnet.ts.net:8600")
+    ap.add_argument("--tailnet-login", default="", help="the one Tailscale-User-Login the tailnet view admits (required with --tailnet-host)")
+    ap.add_argument("--tailnet-answers", action="store_true", help="let the tailnet view send answers (default: read-only)")
     a = ap.parse_args(argv)
     if not a.home:
         ap.error("--home (or FM_HOME) is required")
+    if bool(a.tailnet_host) != bool(a.tailnet_login) or (a.tailnet_answers and not a.tailnet_host):
+        ap.error("--tailnet-host and --tailnet-login go together; --tailnet-answers needs both")
     home = fmdata.Home(Path(a.home).expanduser(), Path(a.fm_root).expanduser() if a.fm_root else None)
     for tool in ("fm-tasks-axi.sh", "fm-crew-state.sh", "fm-inbox.sh"):
         if not os.access(home.root / "bin" / tool, os.X_OK):
             ap.error(f"{home.root / 'bin' / tool} is missing or not executable")
     snaps = Snapshots(home)
-    srv = Server(a.port, home, snaps)
+    srv = Server(a.port, home, snaps, a.tailnet_host, a.tailnet_login, a.tailnet_answers)
     snaps.start()
     print(f"firstmate-dashboard: http://{BIND}:{srv.port}/ (home {home.home})", flush=True)
     try:

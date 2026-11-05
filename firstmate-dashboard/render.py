@@ -598,14 +598,16 @@ def _decisions(snap: dict, theme: dict, token: str, flash: str = "", flash_bad: 
             f"<p class=fm-reason>{esc(d['reason'])}</p>"
             + (f"<div class=fm-meta>Report: {reports}</div>" if reports else "")
             + (f"<ul class=fm-sent>{sent}</ul>" if sent else "")
-            + f"<form method=post action='/answer'><input type=hidden name=token value='{esc(token)}'>"
-            f"<input type=hidden name=decision value='{esc(d['id'])}'><input type=hidden name=digest value='{esc(d['digest'])}'>"
-            f"<input type=hidden name=theme value='{esc(tid)}'>"
-            f"<label class=sr-only for='a-{esc(d['id'])}'>Your answer to {esc(d['title'])}</label>"
-            f"<textarea id='a-{esc(d['id'])}' name=text maxlength={MAX_ANSWER_CHARS} required "
-            "placeholder='Your answer. It becomes a note in the Firstmate inbox naming this decision; nothing runs from this page.'></textarea>"
-            "<div class=fm-act><button type=submit>Send to Firstmate inbox</button>"
-            "<span class='fm-hint fm-js'>\u2318/Ctrl+Enter sends</span><span class=fm-count aria-hidden=true></span></div></form></article>")
+            + (f"<form method=post action='/answer'><input type=hidden name=token value='{esc(token)}'>"
+               f"<input type=hidden name=decision value='{esc(d['id'])}'><input type=hidden name=digest value='{esc(d['digest'])}'>"
+               f"<input type=hidden name=theme value='{esc(tid)}'>"
+               f"<label class=sr-only for='a-{esc(d['id'])}'>Your answer to {esc(d['title'])}</label>"
+               f"<textarea id='a-{esc(d['id'])}' name=text maxlength={MAX_ANSWER_CHARS} required "
+               "placeholder='Your answer. It becomes a note in the Firstmate inbox naming this decision; nothing runs from this page.'></textarea>"
+               "<div class=fm-act><button type=submit>Send to Firstmate inbox</button>"
+               "<span class='fm-hint fm-js'>\u2318/Ctrl+Enter sends</span><span class=fm-count aria-hidden=true></span></div></form>"
+               if token else "<p class='fm-hint fm-readonly'>Read-only view: answer this on the Mac.</p>")
+            + "</article>")
     out.append("<p class=fm-howto>Typing an answer adds a note to Firstmate's captain inbox (<code>fm-inbox.sh note</code>) "
                "naming the decision; Firstmate reads it and acts. An answer is tied to the decision text you saw: if that "
                "text changed, the page asks you to look again, and it never redraws a call while you are writing an answer. "

@@ -2,13 +2,17 @@
 # firstmate-dashboard/launchd.sh — render, install or remove the dashboard's
 # launchd agent (com.firstmate.dashboard).
 #
-#   launchd.sh render    [--home DIR] [--port N]   print the plist, change nothing
-#   launchd.sh install   [--home DIR] [--port N]   write ~/Library/LaunchAgents/… and load it
-#   launchd.sh uninstall                           unload it and remove the plist
-#   launchd.sh status                              is it loaded, does the port answer
+#   launchd.sh render    [--home DIR] [--port N] [TAILNET]   print the plist, change nothing
+#   launchd.sh install   [--home DIR] [--port N] [TAILNET]   write ~/Library/LaunchAgents/… and load it
+#   launchd.sh uninstall                                     unload it and remove the plist
+#   launchd.sh status                                        is it loaded, does the port answer
 #
 # --home defaults to $FM_HOME, then ~/Code/firstmate. --port defaults to 8600,
 # the port the omp status line and fleet-tools.ts read.
+#
+# TAILNET is `--tailnet-host HOST:PORT --tailnet-login LOGIN [--tailnet-answers]`,
+# passed through to server.py: also admit Tailscale Serve's proxied Host for
+# that one Tailscale-User-Login, read-only unless --tailnet-answers.
 #
 # install refuses while herdr-control's hub agent is loaded or the port is
 # taken: two servers cannot share 8600, and the herdr hub is not ours to stop.
@@ -25,18 +29,28 @@ DOMAIN="gui/$(id -u)"
 die() { printf 'launchd.sh: %s\n' "$*" >&2; exit 1; }
 
 cmd=${1:-}
-[ -n "$cmd" ] || die "usage: launchd.sh render|install|uninstall|status [--home DIR] [--port N]"
+[ -n "$cmd" ] || die "usage: launchd.sh render|install|uninstall|status [--home DIR] [--port N] [--tailnet-host HOST:PORT --tailnet-login LOGIN [--tailnet-answers]]"
 shift
 fm_home=${FM_HOME:-$HOME/Code/firstmate}
 port=8600
+tailnet_host="" tailnet_login="" tailnet_answers=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --home) [ "$#" -ge 2 ] || die "--home needs a value"; fm_home=$2; shift 2 ;;
     --port) [ "$#" -ge 2 ] || die "--port needs a value"; port=$2; shift 2 ;;
+    --tailnet-host) [ "$#" -ge 2 ] || die "--tailnet-host needs a value"; tailnet_host=$2; shift 2 ;;
+    --tailnet-login) [ "$#" -ge 2 ] || die "--tailnet-login needs a value"; tailnet_login=$2; shift 2 ;;
+    --tailnet-answers) tailnet_answers=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 case "$port" in ''|*[!0-9]*) die "--port must be a number" ;; esac
+# Same rule server.py enforces, checked here so install fails before launchd
+# loads an agent that would exit on its first start.
+case "${tailnet_host:+h}${tailnet_login:+l}${tailnet_answers:+a}" in
+  ''|hl|hla) ;;
+  *) die "--tailnet-host and --tailnet-login go together; --tailnet-answers needs both" ;;
+esac
 
 render() {
   local python tasks_axi path_dirs="" d nm
@@ -51,14 +65,21 @@ render() {
   done
   # Substitution in python, not sed/awk: both treat `&` in a replacement as
   # "the matched text", and XML-escaping a path is exactly what produces one.
-  "$python" - "$TEMPLATE" "$python" "$HERE/server.py" "$fm_home" "$port" "$path_dirs" "$LOG" <<'PY'
+  "$python" - "$TEMPLATE" "$python" "$HERE/server.py" "$fm_home" "$port" "$path_dirs" "$LOG" \
+    "$tailnet_host" "$tailnet_login" "$tailnet_answers" <<'PY'
 import sys
 from xml.sax.saxutils import escape
 tpl, *vals = sys.argv[1:]
+vals, (host, login, answers) = vals[:6], vals[6:]
 text = open(tpl).read()
 for key, val in zip(("__PYTHON__", "__SERVER__", "__FM_HOME__", "__PORT__", "__PATH__", "__LOG_PATH__"), vals):
     text = text.replace(key, escape(val))
-sys.stdout.write(text)
+args = (["--tailnet-host", host, "--tailnet-login", login] if host else []) + (["--tailnet-answers"] if answers else [])
+lines = text.splitlines(keepends=True)
+mark = next(i for i, ln in enumerate(lines) if "__TAILNET_ARGS__" in ln)
+indent = lines[mark][: len(lines[mark]) - len(lines[mark].lstrip())]
+lines[mark : mark + 1] = [f"{indent}<string>{escape(a)}</string>\n" for a in args]
+sys.stdout.write("".join(lines))
 PY
 }
 
