@@ -12,7 +12,8 @@ right status for each source and reads Verified only with a merged PR or
 report on record, both palettes keep AA contrast, the summary counts the omp
 status line reads, the answer path's guards (token, Host/Origin, stale
 decision text), that an accepted answer reaches the inbox CLI naming its
-decision and its confirmation shows under Your calls, that a call counts as
+decision and its confirmation shows under Your calls, that Answer all sends
+each typed answer as its own note and a row's Send only its own, that a call counts as
 answered only for the text the answer was bound to, that the Reports view
 lists only data/<id>/report.md inside data/, escapes every report, pins its
 captain calls linked to the held decision and makes its tables sortable,
@@ -77,7 +78,7 @@ cat "{h}/crew/$1.txt" 2>/dev/null || cat "{fx}/$1.txt" 2>/dev/null || echo 'stat
 """)
     tool(home / "bin" / "fm-inbox.sh", f"""case "$1" in
   receipts) cat "{h}/receipts.json" 2>/dev/null || cat "{fx}/receipts.json" ;;
-  note) shift; printf '%s\\n' "$@" > "{h}/note-args"; cat > "{h}/note-body"
+  note) shift; printf '%s\\n' "$@" > "{h}/note-args"; cat > "{h}/note-body"; cat "{h}/note-body" >> "{h}/note-log"
         echo '{{"schema":"fm-inbox-note.v1","outcome":"created","id":"1700000000-TEST01"}}' ;;
   *) exit 2 ;;
 esac
@@ -182,7 +183,7 @@ def tailnet(root: Path) -> None:
             d = next(x for x in snaps.get()["decisions"] if x["id"] == "cap-xss")
             _, _, local = request(port, "GET", "/")
             form = urllib.parse.urlencode({"token": request_token(local.decode()), "decision": "cap-xss",
-                                           "digest": d["digest"], "text": "Go with (a)."})
+                                           "digest-cap-xss": d["digest"], "text-cap-xss": "Go with (a)."})
             origin = {"Origin": f"https://{TAILNET}"}
             code, _, _ = request(port, "POST", "/answer", form, {**ts, "Origin": "https://evil.example"})
             check(code == 421 and not note.exists(), f"tailnet cross-site Origin refused (answers={answers})")
@@ -287,7 +288,8 @@ def incremental(root: Path) -> None:
         _, _, page = request(srv.port, "GET", "/")
         d = next(x for x in shown["decisions"] if x["id"] == "cap-xss")
         (root / "show-cap-xss.txt").write_text((FIX / "show-cap-xss.txt").read_text().replace("Two calls", "Three calls"))
-        form = {"token": request_token(page.decode()), "decision": "cap-xss", "digest": d["digest"], "text": "Go with (a)."}
+        form = {"token": request_token(page.decode()), "decision": "cap-xss", "digest-cap-xss": d["digest"],
+                "text-cap-xss": "Go with (a)."}
         code, h, _ = request(srv.port, "POST", "/answer", urllib.parse.urlencode(form))
         check(code == 303 and "changed+since" in h.get("Location", "") and not (root / "note-args").exists(),
               "an answer to decision text changed since it was shown is refused, even with the show cached")
@@ -301,11 +303,15 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     page = body.decode()
     check(code == 200, "GET / renders")
 
-    # every open decision appears, each with its own answer form
+    # every open decision appears as a row of one table, each with its own answer field and Send
     ids = open_decision_ids()
     check(sorted(ids) == ["cap-long", "cap-xss"], f"fixture has the two open captain holds ({ids})")
     for i in ids:
-        check(f"data-decision='{i}'" in page and f"name=decision value='{i}'" in page, f"decision {i} shown with an answer form")
+        check(f"<tr class=fm-decision id='d-{i}' data-decision='{i}'" in page and f"name='text-{i}'" in page
+              and f"name='digest-{i}'" in page and f"name=decision value='{i}'>Send</button>" in page,
+              f"decision {i} is a table row with its own answer field and Send")
+    check(page.count("<form method=post action='/answer' class=fm-calls>") == 1 and page.count("class=fm-all>Answer all") == 1,
+          "one form holds every call, with one Answer all button")
     check("data-decision='wait-dep'" not in page, "a non-captain hold is queued, not a decision")
     check("cuts it off right here at the end" in page, "truncated list title replaced by the full `show` title")
     check("sent as inbox note <code>1700000000-PREV01</code>" in page, "an earlier dashboard answer is shown on its decision")
@@ -427,7 +433,7 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
 
     # answer guards
     d = next(x for x in snaps.get()["decisions"] if x["id"] == "cap-xss")
-    good = {"token": request_token(page), "decision": "cap-xss", "digest": d["digest"], "text": "Go with (a)."}
+    good = {"token": request_token(page), "decision": "cap-xss", "digest-cap-xss": d["digest"], "text-cap-xss": "Go with (a)."}
     note = Path(home.home) / "note-args"
     code, _, _ = request(port, "GET", "/api/summary", headers={"Host": f"evil.example:{port}"})
     check(code == 421, "foreign Host refused (DNS rebinding)")
@@ -451,12 +457,13 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     c.close()
     code, _, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "token": "wrong"}))
     check(code == 403 and not note.exists(), "bad token refused, nothing sent")
-    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "digest": "0" * 16}))
+    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "digest-cap-xss": "0" * 16}))
     check(code == 303 and "changed+since" in h.get("Location", "") and not note.exists(), "stale decision text refused, nothing sent")
-    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "decision": "wait-dep"}))
+    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "decision": "wait-dep", "text-wait-dep": "Go."}))
     check(code == 303 and "no+longer+open" in h.get("Location", "") and not note.exists(), "non-decision id refused, nothing sent")
-    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "text": "   "}))
-    check(code == 303 and "err=" in h.get("Location", "") and not note.exists(), "empty answer refused")
+    code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**good, "text-cap-xss": "   ", "text-cap-long": "Ship it."}))
+    check(code == 303 and "err=" in h.get("Location", "") and not note.exists(),
+          "a row's Send with its own answer blank is refused, and never sends another row's answer")
 
     code, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode(good), {"Origin": f"http://127.0.0.1:{port}"})
     check(code == 303 and "sent=1700000000-TEST01" in h.get("Location", ""), "accepted answer redirects with the note id")
@@ -471,6 +478,38 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     check(code == 200 and bridge.find("id=decisions") < bridge.find("Sent to the Firstmate inbox as note 1700000000-TEST01") > 0,
           "the sent confirmation is drawn under Your calls, where the redirect lands")
 
+    # Answer all: every typed answer goes as its own note, bound to its own text.
+    log = Path(home.home) / "note-log"
+    long_d = next(x for x in snaps.get()["decisions"] if x["id"] == "cap-long")
+    both = {"token": good["token"], "digest-cap-xss": d["digest"], "digest-cap-long": long_d["digest"],
+            "text-cap-xss": "Go with (a).", "text-cap-long": "Ship it."}
+
+    def answer_all(**f) -> tuple[str, list[str]]:
+        log.unlink(missing_ok=True)
+        _, h, _ = request(port, "POST", "/answer", urllib.parse.urlencode({**both, **f}))
+        return h.get("Location", ""), sorted(re.findall(r"for decision (\S+) \(", log.read_text() if log.exists() else ""))
+
+    loc, went = answer_all()
+    check(went == ["cap-long", "cap-xss"] and "sent=1700000000-TEST01%2C1700000000-TEST01" in loc and "err=" not in loc,
+          f"Answer all sends every typed answer, one inbox note per call ({went})")
+    _, _, landed = request(port, "GET", loc.split("#")[0])
+    check("Sent 2 answers to the Firstmate inbox as notes 1700000000-TEST01, 1700000000-TEST01" in section(landed.decode(), "bridge"),
+          "Answer all's confirmation names every note sent")
+    loc, went = answer_all(**{"text-cap-long": "  "})
+    check(went == ["cap-xss"] and "sent=" in loc and "err=" not in loc, f"Answer all skips a row left blank ({went})")
+    loc, went = answer_all(decision="cap-long")
+    check(went == ["cap-long"], f"a row's Send sends only that row, even with other answers typed ({went})")
+    loc, went = answer_all(**{"digest-cap-long": "0" * 16})
+    check(went == ["cap-xss"] and "sent=" in loc and "cap-long+changed+since" in loc,
+          f"Answer all with one stale call sends the others and names the one refused ({went})")
+    _, _, landed = request(port, "GET", loc.split("#")[0])
+    bridge = section(landed.decode(), "bridge")
+    check("class='fm-flash' role=status>Sent to the Firstmate inbox as note" in bridge
+          and "class='fm-flash bad' role=alert>Decision cap-long changed since" in bridge,
+          "a partly refused Answer all shows both what was sent and what was not")
+    loc, went = answer_all(**{"text-cap-xss": " ", "text-cap-long": ""})
+    check(went == [] and "err=Type+an+answer" in loc, "Answer all with nothing typed sends nothing")
+
     # An answer counts as answered only for the decision text it was bound to.
     receipts = json.loads((FIX / "receipts.json").read_text())
     receipts["pending"].append({"id": "1700000000-TEST01", "at": "2026-11-05T09:00:00Z", "acknowledged": False,
@@ -479,10 +518,11 @@ def run(port: int, home: fmdata.Home, snaps: server.Snapshots) -> None:
     snaps.refresh()
     _, _, page = request(port, "GET", "/")
     page = page.decode()
-    card = lambda i: page[page.find(f"id='d-{i}'"):page.find("</article>", page.find(f"id='d-{i}'"))]  # noqa: E731
-    check("data-answered>" in card("cap-xss") and "class=fm-chip>answered<" in card("cap-xss"),
-          "a call answered at its current text is marked answered")
-    check("data-answered" not in card("cap-long") and "text changed since your answer" in card("cap-long"),
+    card = lambda i: page[page.find(f"id='d-{i}'"):page.find("</tr>", page.find(f"id='d-{i}'"))]  # noqa: E731
+    check("data-answered>" in card("cap-xss") and "class=fm-chip>answered<" in card("cap-xss") and "class=fm-tick" in card("cap-xss"),
+          "a call answered at its current text is marked answered, with a check mark")
+    check("data-answered" not in card("cap-long") and "text changed since your answer" in card("cap-long")
+          and "class=fm-tick" not in card("cap-long"),
           "a call answered only at an earlier text still needs you, and says its text changed")
     check("Needs your call: <strong>1</strong> <span class=dim>· 1 answered" in page and "<title>(1) Firstmate</title>" in page,
           "the call bar and tab title count only calls that still need you")

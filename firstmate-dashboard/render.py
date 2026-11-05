@@ -197,25 +197,35 @@ details.fm-verified>summary{cursor:pointer;font-size:12.5px;font-weight:700;colo
 .fm-room{margin-top:6px}
 .fm-room>h2 small{text-transform:none;letter-spacing:0;margin-left:6px}
 .fm-room>p.dim{margin:0 0 8px;font-size:12.5px}
-.fm-decision{background:var(--surface);border:1px solid var(--border);border-left:6px solid var(--accent);border-radius:12px;padding:12px 16px;margin:0 0 14px}
-.fm-decision[data-answered]{border-left-color:var(--info)}
-.fm-decision h4{margin:0 0 4px;font-size:14px}
+/* Your calls: one table, # | the call | your answer. One form around it, so
+   Answer all sends every typed answer and each row's Send sends just that row. */
+.fm-calls-bar{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin:4px 0 8px}
+.fm-calls table{display:table;table-layout:fixed;width:100%}
+.fm-calls th.fm-num,.fm-calls td.fm-num{width:3.4em;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.fm-calls th.fm-ans{width:38%}
+.fm-decision>td.fm-num{box-shadow:inset 4px 0 var(--accent);font-weight:700}
+.fm-decision[data-answered]>td.fm-num{box-shadow:inset 4px 0 var(--info)}
+.fm-decision[data-answered] .fm-ctitle,.fm-decision[data-answered] .fm-reason{color:var(--muted)}
+.fm-tick{color:var(--info);margin-left:4px}
+.fm-ctitle{font-weight:700;font-size:14px;margin:0 0 2px}
 .fm-meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center}
 .fm-chip{font-weight:700;font-size:11px;padding:0 6px;border-radius:4px;border:1px solid currentColor;color:var(--info)}
 .fm-chip[data-s=earlier]{color:var(--warn)}
-.fm-reason{white-space:pre-wrap;word-break:break-word;margin:8px 0;font-size:13.5px}
-.fm-decision form{display:grid;gap:6px;margin-top:8px}
-.fm-decision textarea{width:100%;min-height:72px;font:inherit;resize:vertical}
-.fm-act{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
-.fm-decision button{justify-self:start;font:600 12px system-ui;padding:5px 12px;border-radius:5px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer}
-.fm-decision button:hover{background:var(--accent);color:var(--bg)}
-.fm-decision form[data-busy] button{cursor:progress;background:transparent;color:var(--accent)}
-.fm-decision form[data-busy] button::before{content:"";display:inline-block;width:.8em;height:.8em;margin-right:6px;vertical-align:-1px;
+.fm-reason{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-size:13.5px}
+.fm-arow{display:flex;gap:6px;align-items:center}
+.fm-arow input{flex:1;min-width:0;font:inherit;padding:6px 8px}
+.fm-calls button{font:600 12px system-ui;padding:6px 12px;border-radius:5px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;white-space:nowrap}
+.fm-calls button:hover,.fm-calls button.fm-all{background:var(--accent);color:var(--bg)}
+.fm-calls button.fm-all:hover{background:transparent;color:var(--accent)}
+.fm-calls[data-busy] button{cursor:progress}
+.fm-calls[data-busy] button[data-sending]::before{content:"";display:inline-block;width:.8em;height:.8em;margin-right:6px;vertical-align:-1px;
   border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:fm-spin .7s linear infinite}
 @keyframes fm-spin{to{transform:rotate(1turn)}}
 .fm-hint,.fm-count{font-size:11.5px;color:var(--muted)}
-.fm-count{margin-left:auto;font-variant-numeric:tabular-nums}
+.fm-count{display:block;text-align:right;font-variant-numeric:tabular-nums}
+.fm-count:empty{display:none}
 .fm-count[data-near]{color:var(--warn);font-weight:700}
+.fm-readonly{font-size:12px;color:var(--muted)}
 .fm-sent{font-size:12.5px;margin:6px 0 0;padding-left:18px}
 .fm-howto{font-size:12.5px;color:var(--muted)}
 .fm-flash{border:2px solid var(--ok);border-radius:8px;padding:8px 12px;margin:10px 0}
@@ -259,9 +269,9 @@ button.fm-bstat[data-bounty=verified][aria-pressed=true]{box-shadow:0 0 0 2px va
   to{box-shadow:0 0 0 3px transparent,0 0 18px transparent}}
 @keyframes fm-hl-row{from{background-color:color-mix(in srgb,var(--accent) 24%,transparent)}to{background-color:transparent}}
 @keyframes fm-hl-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-.fm-decision.fm-changed,.fm-bounty.fm-changed,.fm-callbar.fm-changed,.fm-slot.fm-changed>.fm-slot-link,
-.fm-decision:target,.fm-bounty:target{animation:fm-hl 1.8s ease-out 1}
-.fm-decision.fm-new,.fm-bounty.fm-new,.fm-slot.fm-new>.fm-slot-link{animation:fm-hl 1.8s ease-out 1,fm-hl-in .35s ease-out 1}
+.fm-bounty.fm-changed,.fm-callbar.fm-changed,.fm-slot.fm-changed>.fm-slot-link,
+.fm-bounty:target{animation:fm-hl 1.8s ease-out 1}
+.fm-bounty.fm-new,.fm-slot.fm-new>.fm-slot-link{animation:fm-hl 1.8s ease-out 1,fm-hl-in .35s ease-out 1}
 tr.fm-changed>td,tr.fm-new>td,tr:target>td,.fm-room:target>h2{animation:fm-hl-row 1.8s ease-out 1}
 header nav a[aria-current=page]{color:var(--fg);border-bottom-color:var(--accent)}
 /* reports: a list of data/<id>/report.md, and one report as a document */
@@ -323,6 +333,11 @@ html:not([data-js]) .fm-sort{cursor:text}html:not([data-js]) .fm-sort::after{con
   .fm-room td{border-top:0;padding:2px 10px}
   .fm-room tr{border-top:1px solid var(--border);padding:6px 0}
   .fm-room tr:first-child{border-top:0}
+  .fm-calls td.fm-num{width:auto;text-align:left}
+  .fm-calls tr.fm-decision{box-shadow:inset 4px 0 var(--accent)}
+  .fm-calls tr.fm-decision[data-answered]{box-shadow:inset 4px 0 var(--info)}
+  .fm-decision>td.fm-num,.fm-decision[data-answered]>td.fm-num{box-shadow:none}
+  .fm-calls td.fm-ans{padding:6px 10px}
   .fm-find{flex:1 1 100%}
   .fm-find input{flex:1;width:auto}
   .fm-hint,.fm-find kbd{display:none}
@@ -345,7 +360,10 @@ _BOOT = ("(function(){var d=document.documentElement;d.setAttribute('data-js','1
 # Every page: the reduce-motion toggle (stored per browser), pausing ambient
 # motion in a hidden tab or with the art scrolled away, relative ages on
 # <time>, the filter (`/` focuses it, Esc clears), the bounty status chips,
-# and the answer form's busy state, length counter and Cmd/Ctrl+Enter.
+# and the calls table: Enter sends that row, Cmd/Ctrl+Enter answers all,
+# Answer all counts the typed answers, a busy state on the button pressed,
+# a length warning near the limit, and typed answers in other rows kept
+# (sessionStorage, per decision text) across a one-row send's reload.
 # Report pages: a table header sorts its column (again: the other way), a
 # facet menu narrows a table to one value, and a row's copy button puts its
 # one-line reference on the clipboard; the filter narrows table rows.
@@ -401,32 +419,46 @@ function copy(x){var s=x.getAttribute('data-ref');function old(){var a=document.
 a.setAttribute('readonly','');a.className='sr-only';document.body.appendChild(a);a.select();try{ok=document.execCommand('copy')}catch(e){}
 a.remove();x.focus();copied(x,ok)}
 if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(s).then(function(){copied(x,true)},old);else old()}
-function count(t){var c=t.form&&$('.fm-count',t.form);if(!c)return;var n=t.value.length;
-c.textContent=n?n+' / '+t.maxLength:'';if(n>t.maxLength*0.9)c.setAttribute('data-near','');else c.removeAttribute('data-near')}
+var DK='fmdash.draft:';
+function crows(){return $$('.fm-calls tr.fm-decision')}
+function fld(r){return $('input[type=text]',r)}
+function filled(r){var t=fld(r);return !!(t&&t.value.trim())}
+function dkey(r){var h=$('input[type=hidden]',r);return DK+r.getAttribute('data-decision')+':'+(h?h.value:'')}
+function count(t){var r=t.closest('tr'),c=r&&$('.fm-count',r);if(!c)return;var n=t.value.length,near=n>t.maxLength*0.9;
+c.textContent=near?n+' / '+t.maxLength:'';if(near)c.setAttribute('data-near','');else c.removeAttribute('data-near')}
+function tally(){var c=$('.fm-alln');if(c){var n=crows().filter(filled).length;c.textContent=n?' ('+n+')':''}}
+function drafts(){try{var s=sessionStorage;crows().forEach(function(r){var t=fld(r),v=s.getItem(dkey(r));if(t&&v&&!t.value){t.value=v;count(t)}});
+for(var i=s.length-1;i>=0;i--){var k=s.key(i);if(k&&k.indexOf(DK)===0)s.removeItem(k)}}catch(e){}tally()}
 document.addEventListener('input',function(e){var t=e.target;if(t===fi){q=t.value.trim().toLowerCase();apply()}
-else if(t.matches('.fm-decision textarea'))count(t)});
+else if(t.matches('.fm-calls input[type=text]')){count(t);tally()}});
 document.addEventListener('keydown',function(e){var t=e.target,tag=t.tagName;
 if(e.key==='/'&&fi&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&tag!=='INPUT'&&tag!=='TEXTAREA'&&!t.isContentEditable){e.preventDefault();fi.focus();fi.select()}
 else if(e.key==='Escape'&&t===fi){fi.value='';q='';apply();fi.blur()}
-else if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)&&tag==='TEXTAREA'&&t.form){e.preventDefault();t.form.requestSubmit()}});
+else if(e.key==='Enter'&&!e.shiftKey&&!e.altKey&&!e.isComposing&&tag==='INPUT'&&t.form&&t.form.matches('.fm-calls')){e.preventDefault();
+t.form.requestSubmit(e.metaKey||e.ctrlKey?$('.fm-all',t.form):$('button[name=decision]',t.closest('tr')))}});
 document.addEventListener('click',function(e){var x=e.target.closest&&e.target.closest('.fm-tally button,.fm-sort,.fm-cp');if(!x)return;
 if(x.classList.contains('fm-sort'))return sortBy(x.closest('th'));if(x.classList.contains('fm-cp'))return copy(x);
 var s=x.getAttribute('data-bounty');bs=bs===s?'':s;apply()});
 document.addEventListener('change',function(e){if(e.target.matches('.fm-tbar select'))apply()});
-document.addEventListener('submit',function(e){var f=e.target;if(!f.closest('.fm-decision'))return;
+document.addEventListener('submit',function(e){var f=e.target;if(!f.matches('.fm-calls'))return;
 if(f.hasAttribute('data-busy')){e.preventDefault();return}
-f.setAttribute('data-busy','');f.setAttribute('aria-busy','true');var x=$('button[type=submit]',f);if(x)x.textContent='Sending\u2026'});
+var x=e.submitter,one=x&&x.name==='decision'?x.value:'',rs=crows(),
+go=rs.filter(function(r){return filled(r)&&(!one||r.getAttribute('data-decision')===one)});
+if(!go.length){e.preventDefault();var r=one?rs.filter(function(r){return r.getAttribute('data-decision')===one})[0]:rs[0],t=r&&fld(r),a=$('#fm-announce');
+if(t)t.focus();if(a)a.textContent='Type an answer first; nothing was sent.';return}
+try{if(one)rs.forEach(function(r){if(filled(r)&&go.indexOf(r)<0)sessionStorage.setItem(dkey(r),fld(r).value)})}catch(_){}
+f.setAttribute('data-busy','');f.setAttribute('aria-busy','true');if(x){x.setAttribute('data-sending','');x.textContent='Sending\u2026'}});
 document.addEventListener('animationend',function(e){if(e.animationName.indexOf('fm-hl')!==0)return;
 var k=e.target.closest('.fm-changed,.fm-new');if(k)k.classList.remove('fm-changed','fm-new')});
 document.addEventListener('visibilitychange',function(){if(document.hidden)d.setAttribute('data-hidden','1');
 else{d.removeAttribute('data-hidden');if(C.live)tick()}});
 if(/[?&](sent|err)=/.test(location.search)){var u=new URL(location.href);u.searchParams.delete('sent');u.searchParams.delete('err');
 history.replaceState(null,'',u.pathname+u.search+u.hash)}
-times(document);apply();$$('.fm-decision textarea').forEach(count);
+times(document);apply();drafts();
 if(!C.live)return;
 var fp=C.fp,busy=false,ph=0,live=$('#fm-live'),say1=$('#fm-announce'),state=live?live.getAttribute('data-s'):'ok';
 d.setAttribute('data-live',state);
-function typing(){return $$('.fm-decision textarea').some(function(t){return t.value.trim()||document.activeElement===t})}
+function typing(){return $$('.fm-calls input[type=text]').some(function(t){return t.value.trim()||document.activeElement===t})}
 function say(s,txt,tip){if(!live)return;live.setAttribute('data-s',s);d.setAttribute('data-live',s);
 $('.fm-live-txt',live).textContent=txt;live.title=tip;if(s!==state&&say1)say1.textContent='Dashboard: '+txt+'. '+tip;state=s}
 function tick(){fetch('/api/summary',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
@@ -651,17 +683,24 @@ def _crew_table(theme: dict, tasks: list[dict], ok: bool = True) -> str:
             f"<tbody>{rows}</tbody></table>")
 
 
-def _decisions(snap: dict, theme: dict, token: str, flash: str = "", flash_bad: bool = False) -> str:
+def _decisions(snap: dict, theme: dict, token: str, flashes: list[tuple[str, bool]] = ()) -> str:
+    """Your calls as one table: # | the call | your answer. One form wraps it:
+    a row's Send posts `decision=<id>` (that row only); Answer all posts no
+    `decision`, so every row with a typed answer goes. Each row carries its own
+    `digest-<id>` and `text-<id>`, so every answer stays bound to the text shown."""
     tid = theme["id"]
     ds = snap.get("decisions", [])
     out = [f"<h3 id=decisions>Your calls ({len(ds)})</h3>"]
     # The answer's outcome sits where the answer was typed: the redirect lands here.
-    if flash:
-        out.append(f"<p class='fm-flash{' bad' if flash_bad else ''}' role={'alert' if flash_bad else 'status'}>{esc(flash)}</p>")
+    out += [f"<p class='fm-flash{' bad' if bad else ''}' role={'alert' if bad else 'status'}>{esc(text)}</p>"
+            for text, bad in flashes]
     if not ds:
         out.append(_empty("Nothing is waiting on you.", snap.get("ok", False)))
-    for d in ds:
+        return "".join(out)
+    rows = []
+    for n, d in enumerate(ds, 1):
         state = _answer_state(d)
+        i = esc(d["id"])
         reports = " ".join(f"<a href='/report{_q(tid, path=r)}'>{esc(r)}</a>" for r in d["reports"])
         sent = "".join(
             f"<li>sent as inbox note <code>{esc(a['note'])}</code> {_time(a['at']) or ''} · "
@@ -670,29 +709,41 @@ def _decisions(snap: dict, theme: dict, token: str, flash: str = "", flash_bad: 
             f"{' · reply: ' + esc(a['reply']) if a.get('reply') else ''}</li>" for a in d.get("answers", []))
         chip = {"current": "<span class=fm-chip>answered</span>",
                 "earlier": "<span class=fm-chip data-s=earlier>text changed since your answer</span>"}.get(state, "")
+        tick = "<span class=fm-tick title='Answered at this text'>\u2713</span>" if state == "current" else ""
         origin = f"<span>from {esc(d['origin'])}</span>" if d.get("origin") else ""
-        out.append(
-            f"<article class=fm-decision id='d-{esc(d['id'])}' data-decision='{esc(d['id'])}'{' data-answered' if state == 'current' else ''}>"
-            f"<h4>{esc(d['title'])}</h4><div class=fm-meta>{chip}{_badge(theme, d['kind'])}<code>{esc(d['id'])}</code>"
-            f"<span>{esc(d['repo'])}</span>{origin}"
-            f"<span>held {esc(d['created'])}</span></div>"
+        answer = (f"<td class=fm-ans><input type=hidden name='digest-{i}' value='{esc(d['digest'])}'>"
+                  f"<label class=sr-only for='a-{i}'>Your answer to call {n}: {esc(d['title'])}</label>"
+                  f"<div class=fm-arow><input type=text id='a-{i}' name='text-{i}' maxlength={MAX_ANSWER_CHARS} "
+                  f"autocomplete=off placeholder='{'Answered · type to change' if state == 'current' else 'Your answer'}'>"
+                  f"<button type=submit name=decision value='{i}'>Send</button></div>"
+                  "<span class=fm-count aria-hidden=true></span></td>") if token else ""
+        rows.append(
+            f"<tr class=fm-decision id='d-{i}' data-decision='{i}'{' data-answered' if state == 'current' else ''}>"
+            f"<td class=fm-num>{n}{tick}</td>"
+            f"<td class=fm-call><div class=fm-ctitle>{esc(d['title'])}</div>"
+            f"<div class=fm-meta>{chip}{_badge(theme, d['kind'])}<code>{i}</code>"
+            f"<span>{esc(d['repo'])}</span>{origin}<span>held {esc(d['created'])}</span></div>"
             f"<p class=fm-reason>{esc(d['reason'])}</p>"
             + (f"<div class=fm-meta>Report: {reports}</div>" if reports else "")
             + (f"<ul class=fm-sent>{sent}</ul>" if sent else "")
-            + (f"<form method=post action='/answer'><input type=hidden name=token value='{esc(token)}'>"
-               f"<input type=hidden name=decision value='{esc(d['id'])}'><input type=hidden name=digest value='{esc(d['digest'])}'>"
-               f"<input type=hidden name=theme value='{esc(tid)}'>"
-               f"<label class=sr-only for='a-{esc(d['id'])}'>Your answer to {esc(d['title'])}</label>"
-               f"<textarea id='a-{esc(d['id'])}' name=text maxlength={MAX_ANSWER_CHARS} required "
-               "placeholder='Your answer. It becomes a note in the Firstmate inbox naming this decision; nothing runs from this page.'></textarea>"
-               "<div class=fm-act><button type=submit>Send to Firstmate inbox</button>"
-               "<span class='fm-hint fm-js'>\u2318/Ctrl+Enter sends</span><span class=fm-count aria-hidden=true></span></div></form>"
-               if token else "<p class='fm-hint fm-readonly'>Read-only view: answer this on the Mac.</p>")
-            + "</article>")
-    out.append("<p class=fm-howto>Typing an answer adds a note to Firstmate's captain inbox (<code>fm-inbox.sh note</code>) "
-               "naming the decision; Firstmate reads it and acts. An answer is tied to the decision text you saw: if that "
-               "text changed, the page asks you to look again, and it never redraws a call while you are writing an answer. "
-               "This page merges, approves, starts and runs nothing.</p>")
+            + f"</td>{answer}</tr>")
+    needs = len(_needs_you(ds))
+    head = ("<thead><tr><th class=fm-num>#</th><th>Call</th>"
+            + ("<th class=fm-ans>Your answer</th>" if token else "") + "</tr></thead>")
+    table = f"<table>{head}<tbody>{''.join(rows)}</tbody></table>"
+    if token:
+        out.append(f"<form method=post action='/answer' class=fm-calls><input type=hidden name=token value='{esc(token)}'>"
+                   f"<input type=hidden name=theme value='{esc(tid)}'>"
+                   f"<div class=fm-calls-bar><button type=submit class=fm-all>Answer all<span class=fm-alln></span></button>"
+                   f"<span class=fm-hint>{needs} waiting on you. Answer all sends every answer you typed, one inbox note "
+                   "per call; rows left blank are skipped.<span class=fm-js> Enter sends that row; \u2318/Ctrl+Enter answers all.</span>"
+                   f"</span></div>{table}</form>")
+    else:
+        out.append(f"<div class=fm-calls><p class=fm-readonly>Read-only view: answer these on the Mac.</p>{table}</div>")
+    out.append("<p class=fm-howto>Each answer adds a note to Firstmate's captain inbox (<code>fm-inbox.sh note</code>) "
+               "naming its decision; Firstmate reads it and acts. An answer is tied to the decision text you saw: if that "
+               "text changed, that answer is refused and the page asks you to look again, and it never redraws a call while "
+               "you are writing an answer. This page merges, approves, starts and runs nothing.</p>")
     return "".join(out)
 
 
@@ -781,7 +832,8 @@ def _callbar(snap: dict, tid: str) -> str:
             f"<span>{look} · {esc(c.get('in_flight', 0))} in flight · {esc(c.get('queued', 0))} queued</span>{when}</p>")
 
 
-def dashboard(snap: dict, theme: dict, token: str, nonce: str, flash: str = "", flash_bad: bool = False) -> str:
+def dashboard(snap: dict, theme: dict, token: str, nonce: str, flashes: list[tuple[str, bool]] = ()) -> str:
+    """`flashes`: (text, is_error) outcomes of the last answer, drawn under Your calls."""
     tid = theme["id"]
     art = bool(theme.get("ship_image"))
     ok = snap.get("ok", False)
@@ -797,7 +849,7 @@ def dashboard(snap: dict, theme: dict, token: str, nonce: str, flash: str = "", 
         return (f"<section class=fm-room id='room-{st['id']}' aria-labelledby='rh-{st['id']}'>"
                 f"<h2 id='rh-{st['id']}'>{esc(name)}{f'<small>{esc(crew)}</small>' if crew else ''}</h2>"
                 f"<p class=dim>{esc(st['what'])}</p>"
-                + (_decisions(snap, theme, token, flash, flash_bad) + "<h3>Captain-kind crews</h3>" if st["id"] == "bridge" else "")
+                + (_decisions(snap, theme, token, flashes) + "<h3>Captain-kind crews</h3>" if st["id"] == "bridge" else "")
                 + _crew_table(theme, tasks, ok) + "</section>")
 
     # One column of work under the ship: the Bridge (your calls), then every
