@@ -147,36 +147,33 @@ rel_pid=$(prompt_id "$PANE")
 append_event "$rel_run" "$rel_task" wake_held \
   "$(jq -nc --arg p w9:p9 --arg pid "$rel_pid" --arg k "wake_${rel_run}_${rel_task}_${rel_pid}" \
      '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
-RELNOTIFY="$WORK/rel-notify.sh"; RELLOG="$WORK/rel-notify.log"
-cat > "$RELNOTIFY" <<'EOS'
+RELREC="$WORK/rel-rec.sh"; RELLOG="$WORK/rel-rec.log"
+cat > "$RELREC" <<'EOS'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$RELLOG"
 exit 0
 EOS
-chmod +x "$RELNOTIFY"
+chmod +x "$RELREC"
 export RELLOG
 : > "$RELLOG"
-# cpane deliberately empty: this pins the Slack-notify half of release_wake_hold
-# (MEDIUM-1), which is unconditional on the conductor-wake delivery — no
-# conductor pane is registered in this file, and the notify call must still
-# fire exactly once regardless.
-HERDR_NOTIFY="$RELNOTIFY" release_wake_hold "$PANE" "$rel_pid" "$rel_run" "$rel_task" "" "" "test msg" "" "" "peer refused: reserved"
-rel_calls=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ -s "$RELLOG" ] && { rel_calls=$(wc -l < "$RELLOG" | tr -d ' '); break; }
-  sleep 0.2
-done
-[ "$rel_calls" = "1" ] && ok "release_wake_hold delivered the Slack alert exactly once" || bad "notify calls after release: $rel_calls"
-# The would-be duplicate: omp-notify.sh's OWN Slack grace_realert call site
-# (agent-hooks/omp-notify.sh) uses this SAME run/task/pid, hence the SAME
-# key, and would have spawned concurrently with the hold. It must find the
-# key already claimed and deliver nothing more.
-HERDR_ALERT_GRACE_S=1 HERDR_NOTIFY="$RELNOTIFY" grace_realert "$PANE" "$rel_pid" "$rel_run" "$rel_task" \
-  bash "$RELNOTIFY" --choices --pane "$PANE" "test msg"
+rel_released() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE type='wake_hold_released' AND task_id='$rel_task';" 2>/dev/null; }
+# cpane deliberately empty: no conductor pane is registered in this file; the
+# release must still claim the shared grace_realert_* key exactly once.
+release_wake_hold "$PANE" "$rel_pid" "$rel_run" "$rel_task" "" "" "test msg" "" "" "peer refused: reserved" \
+  && [ "$(rel_released)" = 1 ] && ok "release_wake_hold released the held wake once" \
+  || bad "release_wake_hold: released=$(rel_released)"
+release_wake_hold "$PANE" "$rel_pid" "$rel_run" "$rel_task" "" "" "test msg" "" "" "peer refused: reserved" \
+  && bad "a second release for the same prompt acted again" \
+  || ok "a second release for the same prompt finds the key claimed"
+# The would-be duplicate: the held path's own grace_realert timer uses this
+# SAME run/task/pid, hence the SAME key, and would have spawned concurrently
+# with the hold. It must find the key already claimed and deliver nothing.
+HERDR_ALERT_GRACE_S=1 grace_realert "$PANE" "$rel_pid" "$rel_run" "$rel_task" \
+  bash "$RELREC" --pane "$PANE" "test msg"
 sleep 3
-rel_calls2="$(wc -l < "$RELLOG" | tr -d ' ')"
-[ "$rel_calls2" = "1" ] && ok "the late grace timer found the key already claimed and delivered nothing more" \
-  || bad "grace timer delivered again after release_wake_hold: $rel_calls2 total calls"
+[ ! -s "$RELLOG" ] && ok "the late grace timer found the key already claimed and delivered nothing" \
+  || bad "grace timer delivered after release_wake_hold: $(cat "$RELLOG")"
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

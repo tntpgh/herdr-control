@@ -1,32 +1,15 @@
 #!/usr/bin/env bash
-# Notification event -> herdrbot DM. Fires when Claude needs input / hits a
-# permission prompt / goes idle.
-#
-# The old one-way webhook is gone, and with it the .omc-config.json lookup that
-# gated this whole hook: keeping `[ -n "$url" ] || exit 0` after removing the
-# only use of $url would have made every alert depend on a webhook nothing sends
-# to — a config change would then kill notifications silently. herdr-notify owns
-# its own credentials (the bridge env file), so there is nothing to read here.
+# Notification event -> conductor push wake. Fires when Claude needs input /
+# hits a permission prompt / goes idle.
 set -uo pipefail
 _hook_dir=$(cd "$(dirname "$0")" && pwd)
 
 input="$(cat)"
 msg="$(printf '%s' "$input" | jq -r '.message // .title // "Claude needs your attention"')"
 
-# Decide what is worth a Slack ping.
-#
-# This used to be `grep -qi permission || exit 0` — pass ONLY messages containing
-# the literal word "permission". That silently dropped every question-shaped
-# notification ("Claude is waiting for your input", an AskUserQuestion prompt,
-# anything the agent actually asked), which is the case you most want to answer
-# from your phone. It went fully silent once sessions ran in auto /
-# bypass-permissions mode: there, permission prompts stop being raised at all, so
-# the one message shape that passed the gate stopped occurring — and the bridge
-# looked dead while every part of it was healthy (process up for 7 days, tokens
-# valid, hooks registered, outbound path posting fine).
-#
-# Inverted: drop the known-noisy idle nag, pass everything else. A false ping is
-# cheap; a swallowed question stalls an agent until someone happens to look.
+# Decide what is worth a wake: drop the known-noisy idle nag, pass everything
+# else (permission prompts, questions, errors). A false wake is cheap; a
+# swallowed question stalls an agent until someone happens to look.
 lower="$(printf '%s' "$msg" | tr '[:upper:]' '[:lower:]')"
 case "$lower" in
   *permission*)                ;;          # permission prompt — always alert
@@ -40,7 +23,7 @@ where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
 
 # --- surface WHAT is being approved, not just THAT something needs approval.
-# Notification's own payload has no tool_name/tool_input (see header) — read
+# Notification's own payload has no tool_name/tool_input — read
 # the cache claude-pretooluse-cache.sh's PreToolUse hook just wrote for this
 # same session_id instead. Freshness-gated to ~10s: PreToolUse and a
 # permission-triggered Notification fire back-to-back for the SAME call, so a
@@ -67,67 +50,7 @@ if [ -n "$session_id" ]; then
   fi
 fi
 
-# --- 2-way: also alert through herdrbot (tagged with the pane so a threaded
-# reply routes back). Runs ALONGSIDE the webhook for now. Best-effort. ---
-# Find herdr-notify in whichever layout is installed. Checked in order:
-#   1. $HERDR_NOTIFY            — explicit override, wins over everything
-#   2. ../slack-bridge/...      — this repo, when the hook runs from the checkout
-#   3. ~/.claude/skills/...     — an APM-deployed herdr-ops skill
-# Resolving rather than hardcoding is what lets the same hook serve a plain
-# clone and a packaged install without editing.
-for notify in \
-  "${HERDR_NOTIFY:-}" \
-  "$_hook_dir/../slack-bridge/herdr-notify.sh" \
-  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"
-do
-  [ -n "$notify" ] && [ -f "$notify" ] && break
-done
-if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
-  # --choices: this fires on permission prompts, which is exactly when the agent
-  # is showing a numbered list. Send the actual options so the alert can be
-  # answered from Slack instead of only announcing that something is stuck.
-  # Do NOT resolve the pane here. This used to take the FIRST pane matching the
-  # hook's cwd, which picks at random between agents sharing a repo (several
-  # panes can share one repo's cwd) — and the tagged pane is where a
-  # threaded Slack reply gets injected and submitted, so a wrong guess delivers
-  # your instructions to a different agent. herdr-notify now resolves the pane
-  # exactly (tmux-session match) and declines to tag when it cannot; pass the
-  # hook's cwd only as a last-resort hint it may use if it is UNAMBIGUOUS.
-  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
-  # push_wake): an allow-class, unreserved prompt is one an automated peer takes
-  # in seconds, and paging for it is the noise that teaches its reader to ignore
-  # the channel (2026-09-12). Held, never dropped. With no HERDR_PANE_ID there is
-  # nothing to classify and the gate says "tell a person", so a hand-started
-  # Claude session alerts exactly as it always did.
-  . "$_hook_dir/../lib/prompt-parse.sh"
-  . "$_hook_dir/../lib/run-registry.sh"   # append_event, for alert_grace_expired
-  . "$_hook_dir/../lib/alert-gate.sh"
-  # Classified for lib/slack-level.sh (2026-09-26) — same split as
-  # omp-notify.sh: the immediate and held sends are suppressed at the default
-  # level, a human-only prompt still open after HERDR_HUMAN_ALERT_S escalates as
-  # `human-stale`, and a session with no HERDR_PANE_ID posts at once as
-  # `unwatched` (nothing automated can see it). The escalation timer is armed after
-  # push_wake below, for the reason omp-notify.sh gives.
-  . "$_hook_dir/../lib/slack-level.sh"
-  human_stale=0
-  if [ -z "${HERDR_PANE_ID:-}" ]; then
-    # No herdr pane: nothing in the automation can see this session — no
-    # conductor to wake, no edge watching it, no pane to re-check. A person is
-    # the only resolver, so it is an error class and posts now, as before.
-    bash "$notify" --class unwatched --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
-  elif human_must_answer "${HERDR_PANE_ID}"; then
-    bash "$notify" --class needs-input --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
-    [ "$(slack_level)" = errors ] && human_stale=1
-  elif slack_should_send held; then
-    # Only when it could post — see omp-notify.sh for why an always-suppressed
-    # held timer is harmful (it wins the conductor re-wake's claim).
-    grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
-      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --class held --choices ${cwd:+--cwd "$cwd"} "$msg"
-  fi
-fi
-
-# --- push wake: also alert the CONDUCTOR pane directly (control-plane Edge 1,
+# --- push wake: alert the CONDUCTOR pane directly (control-plane Edge 1,
 # docs/control-plane-design.md).
 #
 # Every guard — the agent-pane gate, the conductor pane-birth revalidation that
@@ -137,9 +60,8 @@ fi
 # copies of a safety check is two places for it to rot, which is the same reason
 # lib/agent-profiles.sh exists.
 #
-# Best-effort and fully additive: the Slack path above is unaffected whether or
-# not a conductor was stamped. A worker only has HERDR_CONDUCTOR_PANE_ID when
-# spawn-task.sh launched it from inside a herdr pane.
+# A worker only has HERDR_CONDUCTOR_PANE_ID when spawn-task.sh launched it
+# from inside a herdr pane.
 #
 # stderr stays silenced here on purpose — a hook must not narrate into the
 # session transcript. A failed wake is not lost by that: push_wake records
@@ -168,18 +90,4 @@ if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
     push_wake "$msg" "$where" "" "" record-only >/dev/null 2>&1 || true
   fi
 fi
-
-if [ "${human_stale:-0}" = 1 ]; then
-  # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
-  # re-wake takes grace_realert_*, and must not silence this ERROR post.
-  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-  grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
-    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-    bash "$notify" --class human-stale --choices ${cwd:+--cwd "$cwd"} \
-    "$msg"$'\n'"only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
-fi
-
-# The legacy one-way webhook is GONE. It posted the same text to a bot you could
-# not reply to, so every alert arrived twice and only one of them was actionable.
-# herdrbot is the single outbound path now.
 exit 0

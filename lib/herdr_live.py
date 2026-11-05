@@ -205,9 +205,8 @@ class LiveState:
         self,
         on_transition: Callable[[str, str | None, str | None, dict], None] | None = None,
         # Fires ONLY on a genuine connected<->disconnected flip (never on a
-        # same-state resubscribe or a redundant re-affirm), so a caller can
-        # page once per real outage instead of once per reconnect attempt.
-        # `err` is the exception text on a disconnect, None on a reconnect.
+        # same-state resubscribe or a redundant re-affirm). `err` is the
+        # exception text on a disconnect, None on a reconnect.
         on_connection_change: Callable[[bool, str | None], None] | None = None,
         log: Callable[[str], None] | None = None,
         resync_every_s: float = 10.0,
@@ -340,7 +339,7 @@ class LiveState:
         }
 
     def cwd_of(self, pane_id: str) -> str:
-        """The pane's cwd, for a caller that needs it (the edge script's Slack
+        """The pane's cwd, for a caller that needs it (hub.py's per-pane
         text). Deliberately not part of the served record — see _pane_record."""
         with self._lock:
             return self._cwd.get(pane_id, "")
@@ -586,8 +585,8 @@ class LiveState:
         the caller returns True (resubscribe): no backoff, and no connected
         flip. Before this, a mid-stream one was skipped as a stray reply and
         the EOF behind it — or a setup-time one, raised as "subscribe not
-        acknowledged" — reached the stream-lost handler, which pages a herdr
-        outage (hub-connection-alert.sh) for what is a slow reader.
+        acknowledged" — reached the stream-lost handler, which reports a herdr
+        outage (a connected flip) for what is a slow reader.
         """
         err = (msg or {}).get("error") or {}
         if err.get("code") != "events_lost":

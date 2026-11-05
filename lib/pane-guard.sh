@@ -22,9 +22,9 @@ _MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
 # anything unrecognised is refused.
 #
 # HERDR_AGENT_PROCS only ever WIDENS this gate — HERDR_AGENT_PROCS='.*' disables
-# it entirely, and the bridge subprocess inherits the daemon's environment, so a
-# value set in herdr-bridge.env or the launchd plist silently applies to input
-# arriving from Slack. Treat it as security configuration, not convenience.
+# it entirely, and every daemon descendant inherits the daemon's environment, so
+# a value set in the launchd plist silently applies to every automated answer.
+# Treat it as security configuration, not convenience.
 # (A malformed regex makes grep error, which denies — that direction is safe.)
 # lib/agent-profiles.sh is the single source of truth for known agent binary
 # names — add a new agent there, not here.

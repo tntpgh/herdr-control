@@ -163,7 +163,7 @@ attention_probe() {
 # also bypass their OWN claim under HERDR_WAKE_LEGACY=1 (lib/attention-key.sh
 # attn_track_claim) and call push_wake on every firing. To disable the
 # controller ENTIRELY instead — no tracking, no escalation, no form, hooks
-# and Slack exactly as before this file existed — start the hub with
+# exactly as before this file existed — start the hub with
 # `--no-attention`; that is the full rollback, HERDR_WAKE_LEGACY=1 is a
 # narrower one (delivery only).
 _attn_track_and_wake() {                # run_id task_id pane conductor_pane_id label pid key pane_birth -> since (ISO), stdout

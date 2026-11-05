@@ -40,7 +40,7 @@ cat > "$work/bin/send" <<'EOF'
 printf '%s\n' "$*" >> "$SENDS"
 EOF
 chmod +x "$work/bin/send"
-export HERDR_ACTION_SEND="$work/bin/send" HERDR_ACTION_NOTIFY="$work/bin/send"
+export HERDR_ACTION_SEND="$work/bin/send"
 export HERDR_ACTION_FORMSERVE="$work/bin/send"
 . "$here/lib/pretool-shadow.sh"
 . "$here/lib/prompt-parse.sh"

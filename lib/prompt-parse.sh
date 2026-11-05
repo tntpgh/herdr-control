@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # prompt-parse.sh — read the choices an agent is currently offering.
 #
-# Sourced by herdr-notify.sh (to show them in Slack) and herdr-select.sh (to
-# validate a selection before pressing anything). Both must agree on what
-# "option 2" means, or Slack would show one list and the keypress would answer a
-# different one — so the parse lives in exactly one place.
+# Sourced by herdr-select.sh (to validate a selection before pressing
+# anything) and every caller that reports or answers a prompt. All must agree
+# on what "option 2" means, or a report would show one list and the keypress
+# would answer a different one — so the parse lives in exactly one place.
 #
 # Provides: prompt_options <pane_id>   -> "N<TAB>text" per line, empty if none
 #           prompt_question <pane_id>  -> the question line, if identifiable
@@ -169,9 +169,9 @@ prompt_options() {
   # number ANYWHERE in it, so an already-answered list — or omp's steering
   # queue painted above a panel — was served as the current choice. That has
   # hurt twice: numbered-only parsing made every omp alert unanswerable
-  # (2026-08-01), and the numbered-FIRST fix then matched the queue, so a Slack
-  # click on "1" pressed Approve on a command the operator never saw
-  # (slack-bridge/herdr-notify.sh:205-219 carries both). Menu-first ordering
+  # (2026-08-01), and the numbered-FIRST fix then matched the queue, so a
+  # click on "1" pressed Approve on a command the operator never saw.
+  # Menu-first ordering
   # and prompt fingerprints closed the wrong-panel half; this closes the stale
   # half, in the direction that cannot block a human.
   #
@@ -304,58 +304,13 @@ prompt_options() {
     | awk -F'\t' '!seen[$1]++'   # first occurrence of each number wins
 }
 
-# What is on screen, when there is no numbered list to parse.
-#
-# Without this you get "Claude needs your permission to use Bash" and answer
-# BLIND — the alert names the pane but not the question. Options are the better
-# signal when they exist; this is the fallback for everything else: a
-# non-numbered prompt, a plan approval, or a prompt auto-mode already dismissed
-# before the hook could read it.
-#
-# Strips the furniture so what is left is the agent's own words: box-drawing
-# rules, the `❯` composer line, the OMC status lines (branch:, [OMC#, ⏵⏵ mode),
-# the tmux status bar, and the spinner.
-#
-# NOTE this puts pane content in Slack. herdr-notify posts to the allowlisted
-# user's DM only (channel = their user id), so it does not reach a channel —
-# but it IS your screen contents leaving the machine, which is why it is behind
-# --choices rather than on by default.
-prompt_context() {
-  local win
-  # Same window as every other scrape. This is the ALERT BODY — the only text
-  # describing what the agent is asking — and it was reading the clipped
-  # `--lines 40` slice, so the question itself could be missing from the very
-  # message sent to get it answered. The filters below strip furniture and the
-  # closing `tail -n 8` bounds the result, so a taller window costs nothing.
-  win=$(_pane_visible "$1") || return 1
-  # The TUI pads with NON-BREAKING spaces, which [[:space:]] does not match —
-  # without normalising them first, "blank" lines and a bare composer arrow
-  # survive every filter below and end up in the alert.
-  # BSD sed (macOS) does not understand \xNN, so the non-breaking space must be
-  # written as real bytes via $'...' — with a literal "\xc2\xa0" pattern the
-  # substitution silently does nothing and every "blank" padding line survives.
-  printf '%s\n' "$win" \
-    | sed $'s/\xc2\xa0/ /g' \
-    | grep -vE '^[[:space:]]*[─═│┌┐└┘├┤┬┴┼╭╮╰╯]+[[:space:]]*$' \
-    | grep -vE '^[[:space:]]*[❯>]([[:space:]]|$)' \
-    | grep -vE '^[[:space:]]*(branch:|\[OMC#|⏵)' \
-    | grep -vE '^\[[a-z0-9-]+:' \
-    | grep -vE '^[[:space:]]*[✻✳✽✶✢✷✸✹✺·*][[:space:]]' \
-    | sed -E 's/[[:space:]]+$//' \
-    | awk '{ s=$0; gsub(/[[:space:]]/,"",s); if (length(s)) print }' \
-    | tail -n 8 \
-    | cut -c1-200
-}
-
 # ---- submit confirmation (send-to-agent.sh) ---------------------------------
 #
 # A snapshot of the bottom of the pane, filtered to strip volatile furniture
 # that changes independent of whether anything was actually submitted — the
 # OMC/tmux status bar's live elapsed-time and context-percentage counters,
-# the spinner glyph — but DELIBERATELY KEEPING `❯`-prefixed lines. That is the
-# opposite choice from prompt_context above: prompt_context strips them
-# because it wants the agent's own words; this wants exactly the composer's
-# own line, since "unsent text still sitting there" is the whole signal.
+# the spinner glyph — but DELIBERATELY KEEPING `❯`-prefixed lines, since
+# "unsent text still sitting there" is the whole signal.
 #
 # Why this exists: send-to-agent.sh's Enter-retry loop used to detect
 # "submitted" by grepping for ONE specific artifact (Claude's "[Pasted text"
@@ -1571,7 +1526,7 @@ prompt_content() {
 # open must not step that prompt's id (PR #168 review). Unregistered panes (a
 # hand-started session) have no transitions: 0.
 # Read in a subshell so run-registry.sh's shell options never leak into a
-# caller that did not source it (herdr-notify.sh, sweep-approvals.sh, …).
+# caller that did not source it (sweep-approvals.sh, …).
 _PP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 prompt_period() {                      # <pane_id>
   (
@@ -1606,7 +1561,7 @@ prompt_question() {
 # the pending git-status request. Unknown/numbered layouts retain the whole
 # visible-region fallback because their command boundaries are not known.
 #
-# Never reuse prompt_context's display trimming (8 lines, 200 columns).
+# Never trim this for display (line or column caps).
 # Selection separately refuses explicit elision markers. This is still only
 # a visible-text guard, not proof about an indirect script or a sandbox.
 # Does the RAW capture behind prompt_command_text below contain a byte that

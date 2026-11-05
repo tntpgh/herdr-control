@@ -1030,13 +1030,13 @@ pretool_enforce() {                     # payload-json (after pretool_decide) ->
       PS_WORKER_REASON="herdr: not run — still waiting on request $AR_REQUEST_ID (${PS_REASON}). Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID." ;;
     new)
       if [ "$route" = human ]; then
-        PS_WORKER_REASON="herdr: not run — ${PS_REASON}. This is human-only: requested as $AR_REQUEST_ID for Terrence (Slack + hub decision form). Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID; if approved, re-issue the IDENTICAL call."
+        PS_WORKER_REASON="herdr: not run — ${PS_REASON}. This is human-only: requested as $AR_REQUEST_ID for Terrence (hub decision form). Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID; if approved, re-issue the IDENTICAL call."
       else
         PS_WORKER_REASON="herdr: not run — ${PS_REASON}. Requested as $AR_REQUEST_ID for your conductor. Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID; if approved, re-issue the IDENTICAL call (same command and arguments, byte for byte)."
       fi
       # Wake the conductor now (detached, every fd closed so the hook's
       # spawnSync is not held open); the hub's tick is the backstop and
-      # owns the human route (it holds the Slack credential).
+      # owns the human route (the hub decision form).
       here_root="$(cd "$_ps_dir/.." && pwd)"
       if [ "$route" = conductor ] && [ -z "${HERDR_ACTION_NO_SURFACE:-}" ]; then
         ( nohup bash "$here_root/herdr-action.sh" surface "$AR_REQUEST_ID" </dev/null >/dev/null 2>&1 & ) 2>/dev/null

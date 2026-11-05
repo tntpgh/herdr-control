@@ -35,17 +35,16 @@
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 		<!-- NEVER let this daemon's descendants reach a Touch ID prompt.
-		     agent-edge.sh -> herdr-notify.sh sources ~/.config/herdr-bridge.env,
-		     whose Slack tokens are `${SLACK_BOT_TOKEN:-$(op read …)}`. launchd
+		     The (since removed) Slack notifier this daemon's agent-edge.sh used
+		     to call sourced tokens as `$(op read …)`. launchd
 		     does not read ~/.zshenv, so that `op` ran with NO service-account
 		     token, and 1Password fell back to biometrics: on 2026-09-20 every
 		     burst of worker state changes painted a thumbprint prompt on
 		     Terrence's screen (81 unlock events, client pid = this daemon).
 		     A stale or revoked token does NOT do this — it returns 403 and
 		     exits. Only the ABSENCE of a token falls through to the GUI.
-		     The flag is the guarantee: with it, `op` fails fast instead of
-		     asking a human who may not be at the machine. The token below is
-		     the read-only identity, so the notify path resolves for real. -->
+		     The flag is the guarantee: with it, any descendant `op` fails fast
+		     instead of asking a human who may not be at the machine. -->
 		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
 		<string>false</string>
 		<!-- Standing authority for agent-edge.sh to call peer-answer.sh, granted

@@ -43,7 +43,6 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 export HERDR_RUN_STATE_DIR="$WORK/runs"
-export HERDR_SLACK_LEVEL=all
 # herdr-control: approval friction fix (2026-10-16). lib/push-wake.sh's pid
 # capture now retries (prompt_id_settled, lib/prompt-parse.sh) so a
 # genuinely settling panel gets a second look before the write-time
@@ -177,12 +176,9 @@ export -f herdr
 ps() { printf '1\n'; }
 export -f ps
 
-# A no-op Slack notifier and no conductor pane — push_wake's own
-# missing-conductor guard (lib/push-wake.sh) makes the rest of the alert
-# path a no-op without needing a second stubbed pane.
-NOOP="$WORK/noop-notify.sh"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$NOOP"
-chmod +x "$NOOP"
+# No conductor pane — push_wake's own missing-conductor guard
+# (lib/push-wake.sh) makes the wake half a no-op without needing a second
+# stubbed pane.
 
 RUN_ID="runN"; TASK_ID="taskN"
 
@@ -190,7 +186,7 @@ run_notify() {                          # <extra jq fields...>
   local extra="$1"
   printf '{"tool":"bash","message":"omp needs your permission","cwd":"/tmp/repo"%s}' "$extra" \
     | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
-               HERDR_NOTIFY="$NOOP" HERDR_CONDUCTOR_PANE_ID=""
+               HERDR_CONDUCTOR_PANE_ID=""
         bash "$here/agent-hooks/omp-notify.sh" >"$WORK/n.out" 2>"$WORK/n.err" )
 }
 
@@ -403,30 +399,6 @@ sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 keyhint_cmd_panel "rm -rf /tmp/new-prompt" > "$WORK/new.txt"
 keyhint_cmd_panel "rm -rf /tmp/new-prompt" > "$WORKER_SCREEN"; NEW_PID="$(screen_pid)"
 keyhint_cmd_panel "rm -rf /tmp/old-prompt" > "$WORKER_SCREEN"; OLD_PID="$(screen_pid)"
-seen call-20 sess-20
-RACE_NOTIFY="$WORK/race-notify.sh"
-cat > "$RACE_NOTIFY" <<EOS
-#!/usr/bin/env bash
-echo called >> "$WORK/race-called"
-python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-20 --call-id call-20 >/dev/null 2>&1
-python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-20 --call-id call-21 --tool bash --source test >/dev/null 2>&1
-cp "$WORK/new.txt" "$WORKER_SCREEN"
-sleep 1
-EOS
-chmod +x "$RACE_NOTIFY"
-rm -f "$WORK/race-called"
-printf '{"tool":"bash","message":"m","cwd":"/tmp/repo","command":"rm -rf /tmp/old-prompt","call_id":"call-20","native_session":"sess-20"}' \
-  | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
-             HERDR_NOTIFY="$RACE_NOTIFY" HERDR_CONDUCTOR_PANE_ID="" HERDR_SLACK_LEVEL=all HERDR_ALERT_GRACE_S=0
-      bash "$here/agent-hooks/omp-notify.sh" >"$WORK/n.out" 2>"$WORK/n.err" )
-sleep 1.5
-[ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] && [ -f "$WORK/race-called" ] \
-  && [ "$(pid_rows "$NEW_PID")" = 0 ] && [ "$(pid_rows "$OLD_PID")" = 1 ] \
-  && ok "notifier-blocked race: old prompt keeps its row, new prompt gets no old tool row" \
-  || bad "notifier race: called=$([ -f "$WORK/race-called" ] && echo y || echo n) new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID")"
-
 # -- push_wake refuses when the screen is no longer the expected prompt -----
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 cp "$WORK/new.txt" "$WORKER_SCREEN"
@@ -744,71 +716,6 @@ case "$pid" in
 esac
 : > "$WORKER_SCREEN"
 
-# ---- integrated: the REAL hook → human-stale timer → notifier, two concurrent
-# deferred requests in one turn (review r5 HIGH + its sibling-supersession and
-# --choices-drop companions). Nothing painted; production Slack level.
-printf '\n== deferred integrated: two concurrent requests, human-stale per exact id ==\n'
-sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
-: > "$WORKER_SCREEN"
-REC_NOTIFY="$WORK/rec-notify.sh"; REC_LOG="$WORK/rec-notify.log"; : > "$REC_LOG"
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$REC_LOG" > "$REC_NOTIFY"
-chmod +x "$REC_NOTIFY"
-fire_deferred() {   # <call_id> <session> <req> <digest>
-  printf '{"tool":"write","message":"omp needs your permission","cwd":"/tmp/repo"%s}' "$(deferred_json "$@")" \
-    | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
-               HERDR_NOTIFY="$REC_NOTIFY" HERDR_CONDUCTOR_PANE_ID="" \
-               HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=4
-        bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
-}
-stale_posts() { grep -- '--class human-stale' "$REC_LOG" | grep -c -- "$1"; }
-seed_deferred call-i1 sess-i sess-req-i1 digest-i1
-seed_deferred call-i2 sess-i sess-req-i2 digest-i2
-seed_deferred call-i3 sess-i sess-req-i3 digest-i3
-fire_deferred call-i1 sess-i sess-req-i1 digest-i1
-fire_deferred call-i2 sess-i sess-req-i2 digest-i2
-fire_deferred call-i2 sess-i sess-req-i2 digest-i2   # duplicate hook firing, same request
-fire_deferred call-i3 sess-i sess-req-i3 digest-i3
-# Resolved before its timer: call-i3 is answered now, inside the 4s window.
-python3 "$here/lib/prompt-occurrence.py" authorized --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-i --call-id call-i3 \
-  --decided-by test --choice Approve >/dev/null 2>&1
-sleep 7
-[ "$(stale_posts sess-req-i1)" = 1 ] \
-  && ok "integrated: request 1 gets its own human-stale post although request 2 fired after it" \
-  || bad "integrated: request 1 human-stale posts=$(stale_posts sess-req-i1): $(cat "$REC_LOG")"
-[ "$(stale_posts sess-req-i2)" = 1 ] \
-  && ok "integrated: request 2 gets exactly one human-stale post despite a duplicate hook firing" \
-  || bad "integrated: request 2 human-stale posts=$(stale_posts sess-req-i2)"
-[ "$(stale_posts sess-req-i3)" = 0 ] \
-  && ok "integrated: a request resolved before its timer stands down (no post)" \
-  || bad "integrated: resolved request 3 still posted $(stale_posts sess-req-i3)"
-grep -- '--class human-stale' "$REC_LOG" | grep -q -- '--choices' \
-  && bad "integrated: a deferred human-stale post used --choices (droppable)" \
-  || ok "integrated: deferred human-stale posts never use --choices"
-grep -- '--class human-stale' "$REC_LOG" | grep -q -- 'herdr-select.sh' \
-  && ok "integrated: the human-stale post carries the exact-id answer command" \
-  || bad "integrated: human-stale post lacks the answer hint: $(cat "$REC_LOG")"
-# The generated answer hint must use only flags its two commands accept
-# (v13 canary: --approval-arguments-digest etc. were refused as unknown).
-# Parsed against each command's own argument list; nothing is executed.
-hs_post="$(grep -- '--class human-stale' "$REC_LOG" | grep -- 'sess-req-i1' | head -1)"
-sel_part="${hs_post#*herdr-select.sh }"
-prop_part="${hs_post#*prompt-occurrence.py proposal }"; prop_part="${prop_part%%  ·  then*}"
-sel_known="$(grep -oE '^ +--[a-z-]+\)' "$here/herdr-select.sh" | tr -d ' )' | sort -u)"
-prop_known="$(python3 "$here/lib/prompt-occurrence.py" proposal --help 2>/dev/null | grep -oE -- '--[a-z-]+' | sort -u)"
-bad_flags=""
-for f in $(printf '%s\n' "$sel_part" | grep -oE -- '--[a-z-]+' | sort -u); do
-  printf '%s\n' "$sel_known" | grep -qx -- "$f" || bad_flags="$bad_flags herdr-select:$f"
-done
-for f in $(printf '%s\n' "$prop_part" | grep -oE -- '--[a-z-]+' | sort -u); do
-  printf '%s\n' "$prop_known" | grep -qx -- "$f" || bad_flags="$bad_flags proposal:$f"
-done
-for req in --db --worktree; do printf '%s' "$prop_part" | grep -q -- "$req " || bad_flags="$bad_flags proposal-missing:$req"; done
-printf '%s' "$sel_part" | grep -q -- '--expect-payload-sha ' || bad_flags="$bad_flags select-missing:--expect-payload-sha"
-[ -n "$hs_post" ] && [ -z "$bad_flags" ] \
-  && ok "integrated: the answer hint uses only flags herdr-select.sh and proposal accept" \
-  || bad "integrated: answer hint flags not accepted:${bad_flags:- (no post)}"
-
 # ---- herdr-control fix/binding-fixture: F1/F2/F3/F2b -- binding CONTROLS --
 # proof3's trace (.handoffs/PLAN.md §2): A/B (two parallel calls) bound
 # correctly; the break was C, whose panel OMP's key-hint overlay clipped to
@@ -855,7 +762,7 @@ run_notify_sel() {                      # <extra jq fields...> -- SELPANE's own 
   local extra="$1"
   printf '{"tool":"bash","message":"omp needs your permission","cwd":"/tmp/repo"%s}' "$extra" \
     | ( export HERDR_PANE_ID="$SELPANE" HERDR_RUN_ID="$SRUN" HERDR_TASK_ID="$STASK" \
-               HERDR_NOTIFY="$NOOP" HERDR_CONDUCTOR_PANE_ID=""
+               HERDR_CONDUCTOR_PANE_ID=""
         bash "$here/agent-hooks/omp-notify.sh" >"$WORK/sn.out" 2>"$WORK/sn.err" )
 }
 reset_sel_keys()   { : > "$SEL_KEYS"; }

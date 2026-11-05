@@ -5,8 +5,7 @@
 # hook-output JSON envelope.
 #
 # Stubs herdr as an exported bash function (see verify-select-policy.sh for why
-# a PATH stub is not good enough) and stubs the Slack notifier via $HERDR_NOTIFY
-# so nothing leaves the machine.
+# a PATH stub is not good enough), so nothing leaves the machine.
 #
 #   bash verify-omp-hooks.sh
 set -uo pipefail
@@ -15,21 +14,16 @@ here=$(cd "$(dirname "$0")" && pwd)
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
+# herdr-select.sh's selections.jsonl audit log lands here, not in ~/.config.
 export HERDR_BRIDGE_STATE="$WORK/bridge"
 # herdr-control: approval friction fix (2026-10-16). Every fixture here is a
 # STATIC screen; pin lib/push-wake.sh's new settle-retry (prompt_id_settled)
 # to 0 so it stays a single read, same speed/outcome as before the fix.
 export HERDR_PROMPT_SETTLE_WAIT_S=0
-# Pinned to HERDR_SLACK_LEVEL=all: this suite proves what a post CONTAINS and
-# how it is deduped, which is downstream of the errors-only level filter
-# (lib/slack-level.sh; its own cases are in verify-slack-symptoms.sh). The
-# state dir keeps the filter's suppressed-alert log out of the real one.
-export HERDR_SLACK_LEVEL=all
 export HERDR_STATE_DIR="$WORK/state"
 export WORKER_SCREEN="$WORK/worker.txt"
 export COND_SCREEN="$WORK/cond.txt"
 export SENT="$WORK/sent.log"
-export NOTIFIED="$WORK/notified.log"
 # Must be EXPORTED, not just set: the herdr stub is an exported bash function, but
 # it runs inside child shells (send-to-agent.sh is invoked as `bash <script>`), and
 # a plain shell variable does not cross that boundary — the redirect would go to
@@ -39,24 +33,7 @@ export WAKE="$WORK/wake.txt"
 # the stub runs inside child shells.
 export HERDR_CALLS="$WORK/herdr.calls"
 
-# Belt and braces against a biometric prompt. herdr-notify.sh no longer sources
-# the bridge env on the --dry-run path, but this suite dry-runs it, and a future
-# test could easily reach a path that does. The real ~/.config/herdr-bridge.env
-# resolves both tokens through `op read`, which falls back to a 1Password Touch ID
-# prompt in any shell without OP_SERVICE_ACCOUNT_TOKEN — so an unguarded suite
-# demanded a thumbprint per run. A test suite must never need a human finger.
-#
-# The values are deliberately NOT shaped like real Slack tokens (no xoxb-/xapp-
-# prefix): the shared pre-commit secret scanner matches on those shapes, and a
-# realistic-looking dummy would trip it on every commit. Do not "fix" them.
-export HERDR_BRIDGE_ENV="$WORK/bridge.env"
-cat > "$HERDR_BRIDGE_ENV" <<'EOS'
-SLACK_BOT_TOKEN=DUMMY-NOT-A-REAL-TOKEN
-SLACK_APP_TOKEN=DUMMY-NOT-A-REAL-TOKEN
-HERDR_BRIDGE_ALLOW_USERS=UDUMMYUSER
-HERDR_BRIDGE_TEAM=TDUMMYTEAM
-EOS
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 
 WPANE="w1:p1"; WBIRTH="wterm-1"
 CPANE="w2:p1"; CBIRTH="cterm-1"
@@ -100,15 +77,6 @@ herdr() {
   esac
 }
 export -f herdr
-
-# Slack notifier stub — records that it was called, sends nothing.
-cat > "$WORK/notify.sh" <<'EOS'
-#!/usr/bin/env bash
-printf 'notified %s\n' "$*" >> "$NOTIFIED"
-exit 0
-EOS
-chmod +x "$WORK/notify.sh"
-export HERDR_NOTIFY="$WORK/notify.sh"
 
 pass=0 fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
@@ -215,263 +183,8 @@ printf '╭─ Allow tool: bash ─╮\n│ Command: rm -r build │\n│ Approv
   && ok "a composer line is not a footer continuation" || bad "composer text completed the footer"
 
 
-printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'
-# Reported live: "I see the message, but no buttons show on slack for me to
-# select". herdr-notify.sh built its option list with prompt_options only — the
-# NUMBERED parser — so for omp (a highlight menu with no numbers on screen) it
-# always came back empty, the alert fell through to the plain-context branch, and
-# with no options there were no buttons, no "reply with 1/2" line, and no
-# pending.jsonl entry for herdr-resolve.sh to retract. The alert arrived and could
-# only be read.
-omp_menu_screen "rm -rf /tmp/x" > "$WORKER_SCREEN"
-alert_body="$(HERDR_BRIDGE_STATE="$WORK/nb" bash "$here/slack-bridge/herdr-notify.sh" \
-  --dry-run --choices --pane "$WPANE" "omp needs your permission" 2>&1 || true)"
-printf '%s' "$alert_body" | grep -q 'with buttons' \
-  && ok "alert carries Slack buttons" || bad "no buttons built: $alert_body"
-printf '%s' "$alert_body" | grep -qE '\*1\.\* Approve' \
-  && ok "option 1 Approve rendered" || bad "option 1 missing"
-printf '%s' "$alert_body" | grep -qE '\*2\.\* Deny' \
-  && ok "option 2 Deny rendered" || bad "option 2 missing"
-printf '%s' "$alert_body" | grep -q 'Reply in thread with 1, 2' \
-  && ok "threaded-number reply hint present (works with no Slack config)" || bad "no reply hint"
-# The question must come from the MENU extractor. prompt_question returns "the
-# last non-empty line above the first numbered option"; with no numbered option
-# on screen it never stops early and yields the pane's last line, which for omp
-# is a box-drawing rule — so choosing it by "is prompt_question empty" silently
-# led the alert with a row of ─── where the command should be.
-printf '%s' "$alert_body" | grep -q 'Allow tool: bash' \
-  && ok "question names the tool and command" || bad "question wrong: $alert_body"
-printf '%s' "$alert_body" | grep -qE '^[[:space:]]*─+[[:space:]]*$' \
-  && bad "a box-drawing rule leaked in as the question" || ok "no TUI furniture as the question"
-
-printf '== the alert LIFECYCLE: an answered alert is retracted, a live one is not ==\n'
-# The failure this pins, observed 2026-09-06: 85 alerts from two overnight
-# workers still sat in Slack the next morning with live Approve/Deny buttons,
-# every one already answered in the terminal (approvals.decided_by='cli') and
-# both panes long closed. herdr-select untracked each alert from pending.jsonl
-# the moment it pressed a key, and herdr-resolve only ever looks at
-# pending.jsonl — so the retraction it exists to perform could never happen.
-LC="$WORK/lifecycle"; mkdir -p "$LC"
-lc_pending() { printf '%s\n' "$@" > "$LC/pending.jsonl"; }
-lc_ts() { jq -r .ts < "$LC/pending.jsonl" | tr '\n' ' '; }
-# Slack message ts values are epoch-seconds.micros, and herdr-resolve gives up
-# on an alert older than HERDR_RESOLVE_MAX_AGE_D — so fixtures must be dated
-# like the real thing or every one of them ages out mid-test.
-NOW=$(date +%s)
-T1="$NOW.1"; T2="$NOW.2"; TG="$NOW.3"; T5="$NOW.5"
-# An alert older than the age cap, for the give-up test further down.
-TOLD=$(( NOW - 30 * 86400 )).9
-A1='{"ts":"'"$T1"'","pane":"'"$WPANE"'"}'
-A2='{"ts":"'"$T2"'","pane":"'"$WPANE"'"}'
-GONE='{"ts":"'"$TG"'","pane":"wZ:p9"}'
-
+printf '== a stale prompt fingerprint presses nothing ==\n'
 omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
-lc_pending "$A1" "$GONE"
-dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
-printf '%s' "$dry" | grep -q "$T1" \
-  && bad "retracted an alert whose omp menu is still on screen: $dry" \
-  || ok "a live menu-shape prompt keeps its alert"
-printf '%s' "$dry" | grep -q "ts=$TG pane=wZ:p9 (pane gone)" \
-  && ok "an alert for a pane herdr no longer lists is retracted" \
-  || bad "orphaned alert kept forever: $dry"
-[ "$(lc_ts)" = "$T1 $TG " ] \
-  && ok "a dry run reports without rewriting the queue" || bad "dry run mutated pending.jsonl"
-
-clean_screen > "$WORKER_SCREEN"
-dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
-printf '%s' "$dry" | grep -q "ts=$T1 .* (prompt answered)" \
-  && ok "the prompt going away retracts its alert" || bad "answered alert kept: $dry"
-
-# What Slack ANSWERED decides whether the entry may leave the queue. Provoked
-# for real 2026-09-06: sweeping the 85-alert backlog at ~5/s, the last two
-# deletes came back `ratelimited` and were dropped as though they had
-# succeeded — both messages were still sitting in Slack afterwards.
-CURLSTUB="$WORK/curl-stub.sh"
-cat > "$CURLSTUB" <<'EOS'
-#!/usr/bin/env bash
-cat >/dev/null                      # swallow the --config token on stdin
-printf 'stub\n' >> "$CURL_CALLS"
-# Simulate herdr-notify appending a NEW alert while the sweep is mid-flight:
-# this runs at exactly the moment the real curl would be talking to Slack.
-[ -n "${CURL_APPEND:-}" ] && printf '%s\n' "$CURL_APPEND" >> "$HERDR_BRIDGE_STATE/pending.jsonl"
-printf '%s' "$CURL_REPLY"
-EOS
-chmod +x "$CURLSTUB"
-export CURL_CALLS="$WORK/curl.calls"
-resolve_stubbed() {                 # <reply-json> [max] -> run with a fake Slack
-  : > "$CURL_CALLS"
-  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
-    HERDR_RESOLVE_MAX_PER_RUN="${2:-8}" HERDR_BRIDGE_STATE="$LC" \
-    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
-}
-resolve_stubbed_appending() {       # <reply-json> -> ... and append CURL_APPEND mid-sweep
-  : > "$CURL_CALLS"
-  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
-    HERDR_RESOLVE_MAX_PER_RUN=8 HERDR_BRIDGE_STATE="$LC" CURL_APPEND="${CURL_APPEND:-}" \
-    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
-}
-
-lc_pending "$GONE"
-resolve_stubbed '{"ok":false,"error":"ratelimited"}'
-[ "$(lc_ts)" = "$TG " ] \
-  && ok "a rate-limited delete stays queued (retried next pass)" \
-  || bad "rate-limited retraction dropped: $(lc_ts)"
-
-lc_pending "$GONE"
-resolve_stubbed ''
-[ "$(lc_ts)" = "$TG " ] \
-  && ok "an unreachable Slack stays queued" || bad "lost the alert offline: $(lc_ts)"
-
-lc_pending "$GONE"
-resolve_stubbed '{"ok":false,"error":"message_not_found"}'
-[ -z "$(lc_ts)" ] \
-  && ok "a refusal that will refuse again leaves the queue" \
-  || bad "definitive error kept forever: $(lc_ts)"
-
-lc_pending "$GONE"
-resolve_stubbed '{"ok":true}'
-[ -z "$(lc_ts)" ] && ok "a deleted alert leaves the queue" || bad "deleted alert still queued"
-
-# A hook has ~10s. A backlog must drain across passes, not be cut off mid-sweep.
-lc_pending '{"ts":"'"$NOW"'.901","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.902","pane":"wZ:p9"}' \
-           '{"ts":"'"$NOW"'.903","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.904","pane":"wZ:p9"}'
-resolve_stubbed '{"ok":true}' 2
-[ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "$NOW.903 $NOW.904 " ] \
-  && ok "the per-run delete budget is honoured and the rest stays queued" \
-  || bad "budget ignored: calls=$(grep -c stub "$CURL_CALLS") left=$(lc_ts)"
-
-# --- the three defects an independent review pass found in the first draft ---
-
-# 1. The retryable list was an ALLOWLIST, so every unlisted `ok:false` dropped
-#    the entry with the message still in Slack. `invalid_auth` is the one that
-#    matters: rotate the bot token with a backlog queued and the hook (which
-#    fires on every tool call in every session) would drain the whole queue in
-#    seconds, leaving armed alerts with no ts->pane record — un-retractable
-#    forever. The rule is now "keep unless the answer is definitive".
-lc_pending "$GONE"
-resolve_stubbed '{"ok":false,"error":"invalid_auth"}'
-[ "$(lc_ts)" = "$TG " ] \
-  && ok "a rejected token keeps the alert queued (re-auth fixes it, dropping does not)" \
-  || bad "auth failure dropped the alert: $(lc_ts)"
-
-# 2. The sweep used to end in `cat snapshot > pending.jsonl`. With paced deletes
-#    that window is seconds long, and herdr-notify appends the moment any worker
-#    hits a prompt — so a live alert arriving mid-sweep was erased, leaving an
-#    armed Slack message with no record. Settling by ts against the LIVE file
-#    makes concurrent appends survive by construction.
-lc_pending "$GONE"
-CURL_APPEND='{"ts":"'"$T5"'","pane":"wZ:p9"}' resolve_stubbed_appending '{"ok":true}'
-printf '%s' "$(lc_ts)" | grep -q "$T5" \
-  && ok "an alert appended mid-sweep survives the sweep" \
-  || bad "concurrent alert erased by the sweep: $(lc_ts)"
-printf '%s' "$(lc_ts)" | grep -q "$TG" \
-  && bad "the settled alert was not removed: $(lc_ts)" \
-  || ok "the settled alert is still removed"
-
-# 3. Two hooks firing together would both snapshot and both delete. All three
-#    writers take one mutex, with a bounded wait — see 4-7 for why the first
-#    draft's non-blocking version was a live defect.
-lc_pending "$GONE"
-mkdir -p "$LC/.pending.lock"
-PENDING_LOCK_WAIT_S=0 resolve_stubbed '{"ok":true}'
-# wc, not `grep -c`: grep exits 1 on zero matches, so a `|| echo 0` fallback
-# emits a SECOND zero and the comparison never matches.
-[ "$(wc -l < "$CURL_CALLS" | tr -d ' ')" = 0 ] && [ "$(lc_ts)" = "$TG " ] \
-  && ok "a second concurrent sweep does nothing while the lock is held" \
-  || bad "lock ignored: calls=$(wc -l < "$CURL_CALLS" | tr -d ' ') left=$(lc_ts)"
-rmdir "$LC/.pending.lock"
-
-# --- and the four the RE-review found in the fix itself ---------------------
-
-# 4. THE defect: herdr-select took the lock non-blocking and skipped its untrack
-#    when the sweep held it, on the theory that "retracted later" is safe. It is
-#    not: that message carries the operator's choice and the bridge's
-#    confirmation. Worse, the collision is caused BY the keypress — the Enter
-#    unblocks the worker, whose next tool call starts a sweep microseconds
-#    later. So the untrack must WAIT for the lock.
-omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
-lc_pending "$A1" "$A2"
-mkdir -p "$LC/.pending.lock"
-( sleep 1; rmdir "$LC/.pending.lock" ) &        # a sweep holding it, then done
-HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority human \
-  >/dev/null 2>&1
-wait
-[ "$(lc_ts)" = "$T2 " ] \
-  && ok "a Slack answer waits for the lock instead of leaving its own message retractable" \
-  || bad "untrack skipped under contention: $(lc_ts)"
-
-# 5. A SIGKILL at the hook timeout leaves the lockdir with no trap to remove it.
-#    Without reclaim that disables retraction permanently and silently.
-lc_pending "$GONE"
-mkdir -p "$LC/.pending.lock"
-touch -t 202001010000 "$LC/.pending.lock"       # ancient => stale
-PENDING_LOCK_STALE_S=60 resolve_stubbed '{"ok":true}'
-[ -z "$(lc_ts)" ] \
-  && ok "a stale lock is reclaimed rather than blocking retraction forever" \
-  || bad "stale lock not reclaimed: $(lc_ts)"
-rmdir "$LC/.pending.lock" 2>/dev/null
-
-# 6. Slack has permanent refusals this cannot enumerate (missing_scope,
-#    compliance_exports_prevent_deletion, ...). Keeping on uncertain is right,
-#    but unbounded: nothing trims this file, and a pinned entry burns the
-#    per-run budget on every pass forever.
-lc_pending '{"ts":"'"$TOLD"'","pane":"wZ:p9"}'
-resolve_stubbed '{"ok":false,"error":"missing_scope"}'
-[ -z "$(lc_ts)" ] \
-  && ok "an alert Slack has refused for weeks is finally given up on" \
-  || bad "queue grows without bound: $(lc_ts)"
-
-# 7. The budget was checked AFTER the per-entry pane RPCs, so a run cost
-#    O(queue) rather than O(MAX) — and a stuck queue then pushed every hook
-#    past the same 10s timeout the lock's safety depends on. One entry
-#    legitimately costs several reads (the explicit probe plus both prompt
-#    parsers), so the property is that the cost tracks the BUDGET: a queue of
-#    three must cost no more than a queue of one at the same budget.
-clean_screen > "$WORKER_SCREEN"
-: > "$HERDR_CALLS"
-lc_pending "$A1"
-resolve_stubbed '{"ok":true}' 1
-one=$(grep -c 'pane read' "$HERDR_CALLS")
-: > "$HERDR_CALLS"
-lc_pending "$A1" "$A2" '{"ts":"'"$NOW"'.7","pane":"'"$WPANE"'"}'
-resolve_stubbed '{"ok":true}' 1
-three=$(grep -c 'pane read' "$HERDR_CALLS")
-[ "$three" = "$one" ] \
-  && ok "per-run RPC cost tracks the delete budget, not the queue length" \
-  || bad "run cost is O(queue): $one pane reads for 1 queued, $three for 3, same budget"
-
-# Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
-# TRACKED for herdr-resolve to delete. This is the exact line that produced the
-# 85-alert backlog.
-omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
-lc_pending "$A1" "$A2"
-HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
-  >/dev/null 2>&1
-[ "$(lc_ts)" = "$T1 $T2 " ] \
-  && ok "a terminal answer leaves the alert tracked for retraction" \
-  || bad "terminal answer orphaned the alert: $(lc_ts)"
-
-# Answered in SLACK: the bridge posts the confirmation under that message, so
-# retracting it would delete the operator's own decision. Untrack THAT alert —
-# and only that one, because a pane can have several queued.
-HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  bash "$here/herdr-select.sh" "$WPANE" 1 --authority human >/dev/null 2>&1
-[ "$(lc_ts)" = "$T2 " ] \
-  && ok "a Slack answer untracks only the alert that carried it" \
-  || bad "wrong alerts untracked: $(lc_ts)"
-
-# A Slack message is permanent, so its buttons are too. The value must pin the
-# QUESTION, not just the pane: herdr recycles pane ids, and a click on last
-# night's alert would otherwise land on whatever prompt lives there now.
-omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
-want_pid="$(prompt_id "$WPANE")"
-vals="$(HERDR_BRIDGE_STATE="$WORK/nb2" bash "$here/slack-bridge/herdr-notify.sh" \
-  --dry-run --choices --pane "$WPANE" "omp needs your permission" 2>&1 \
-  | sed -n '/--- button values ---/,$p')"
-printf '%s' "$vals" | grep -qxF "$WPANE|1|$want_pid" \
-  && ok "button value pins pane, option AND prompt fingerprint" \
-  || bad "button value cannot survive pane reuse: $vals"
 : > "$SENT"
 bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
   --expect-prompt-id "deadbeef-not-this-question" >/dev/null 2>&1; rc=$?
@@ -502,19 +215,16 @@ q_state() {
 printf '== no prompt on screen -> SILENT, no alert, no wake (storm prevention) ==\n'
 clean_screen > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 run_notify bash
-[ ! -s "$NOTIFIED" ] && ok "no Slack alert for an auto-approved tool call" || bad "alerted with no prompt on screen"
 [ ! -s "$SENT" ] && ok "no wake delivered" || bad "wake sent with no prompt: $(cat "$SENT")"
 [ "$(q_event wake_attempted)" = "0" ] && ok "no wake_attempted event" || bad "wake_attempted recorded spuriously"
 
-printf '== prompt visible, conductor clean -> alert + wake, outcome submitted ==\n'
+printf '== prompt visible, conductor clean -> wake, outcome submitted ==\n'
 omp_menu_screen "rm -rf /tmp/x" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 run_notify bash
-grep -q 'notified' "$NOTIFIED" && ok "Slack alert fired" || bad "no Slack alert"
-grep -q -- "--pane $WPANE" "$NOTIFIED" && ok "alert tagged the exact worker pane" || bad "alert did not pass --pane: $(cat "$NOTIFIED")"
 grep -q 'send-text' "$SENT" && ok "wake text delivered to the conductor" || bad "no wake text sent"
 grep -q "send-text $CPANE" "$SENT" && ok "delivered to the CONDUCTOR pane" || bad "wrong target: $(cat "$SENT")"
 [ "$(q_event wake_attempted)" -ge 1 ] && ok "wake_attempted recorded BEFORE the send" || bad "no wake_attempted"
@@ -703,30 +413,25 @@ set_task_state run1 task1 running >/dev/null 2>&1
 
 printf '== the hook and push_wake classify a mismatched recorded command the same way ==\n'
 # PR #158 round 2: the hook judged the RAW recorded command (mismatch -> a
-# human must answer: needs-input sent, human-stale armed) while push_wake
-# judged the panel alone and HELD the wake, so one prompt was both "a human's"
-# and "a peer's". human_must_answer now drops a mismatched command itself, so
-# both judge the panel: held, and no human-only alert for an allow-class panel.
+# human must answer) while push_wake judged the panel alone and HELD the wake,
+# so one prompt was both "a human's" and "a peer's". human_must_answer now
+# drops a mismatched command itself, so both judge the panel: held.
 accept_local_task_authorization runHS-taskHS-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
 register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" main '' '' '{}' hook runHS-taskHS-claim >/dev/null 2>&1
 mark_authorization_launch runHS-taskHS-claim taskHS runHS launch_claimed >/dev/null 2>&1
 mark_authorization_launch runHS-taskHS-claim taskHS runHS launched >/dev/null 2>&1
 omp_menu_screen "git fetch origin --prune" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$NOTIFIED"
 jq -nc '{tool:"bash", message:"omp needs permission", cwd:"/tmp/repo", command:"gh pr merge 99 --squash"}' \
   | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
              HERDR_RUN_ID=runHS HERDR_TASK_ID=taskHS HERDR_TASK_LABEL="impl:human-stale" \
-             HERDR_SLACK_LEVEL=errors HERDR_ALERT_GRACE_S=60 HERDR_HUMAN_ALERT_S=60
+             HERDR_ALERT_GRACE_S=60
       bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
 hs_pid="$(prompt_id "$WPANE")"
 hs_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE task_id='taskHS' AND type='$1';" 2>/dev/null; }
 [ "$(hs_ev wake_held)" = 1 ] && ok "push_wake held the wake (panel judged alone)" \
   || bad "wake_held=$(hs_ev wake_held)"
-grep -q -- '--class needs-input' "$NOTIFIED" \
-  && bad "the hook treated the same prompt as human-only: $(cat "$NOTIFIED")" \
-  || ok "the hook did not call the held prompt human-only (no needs-input send)"
 ( . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
   release_wake_hold "$WPANE" "$hs_pid" runHS taskHS "$CPANE" "impl:human-stale" \
     "a peer refused this prompt" "impl:human-stale" "" "peer refused: escalate" ) \
@@ -764,46 +469,6 @@ df_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
 [ "$(df_ev wake_attempted)" = 2 ] && ok "a losing (record-only) deferred occurrence still gets its own wake" \
   || bad "record-only deferred wake_attempted total: $(df_ev wake_attempted) (expected 2)"
 [ "$(df_ev wake_held)" = 0 ] && ok "and is never held" || bad "record-only deferred wake HELD"
-# The human-stale ERROR timer keeps its own claim namespace, so a release or a
-# re-wake that took grace_realert_* for this prompt can never silence it.
-hs_trace="$WORK/hs-trace.log"; : > "$hs_trace"
-( export HERDR_ALERT_TRACE="$hs_trace"
-  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  HERDR_ALERT_GRACE_S=1 HERDR_GRACE_CLAIM_KIND=human_stale \
-    grace_realert "$WPANE" "$hs_pid" runHS taskHS true )
-i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$hs_trace"; do sleep 0.1; i=$((i + 1)); done
-grep -q "^done human_stale $hs_pid fired$" "$hs_trace" \
-  && ok "a human-stale timer still fires after grace_realert_* was claimed" \
-  || bad "human-stale timer: $(cat "$hs_trace")"
-clean_screen > "$WORKER_SCREEN"
-# Review r5 HIGH: for a deferred request (no panel ever painted) the
-# human-stale timer must decide from the request's own occurrence, not the
-# screen, and a SIBLING deferred request's later input_required on the same
-# task must not stand it down (two writes in one turn).
-dhs_trace="$WORK/dhs-trace.log"; : > "$dhs_trace"
-still_open() { return 0; }
-( export HERDR_ALERT_TRACE="$dhs_trace"
-  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  HERDR_ALERT_GRACE_S=2 HERDR_GRACE_CLAIM_KIND=human_stale \
-    HERDR_DEFERRED_PID="deferred:hs-1" HERDR_GRACE_STILL_OPEN=still_open \
-    grace_realert "$WPANE" "deferred:hs-1" runHS taskHS true
-  sleep 1.2
-  append_event runHS taskHS input_required '{"prompt_id":"deferred:hs-2"}' >/dev/null 2>&1 )
-i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$dhs_trace"; do sleep 0.1; i=$((i + 1)); done
-grep -q "^done human_stale deferred:hs-1 fired$" "$dhs_trace" \
-  && ok "a deferred human-stale timer fires panel-less despite a sibling's later input_required" \
-  || bad "deferred human-stale stood down: $(cat "$dhs_trace")"
-: > "$dhs_trace"
-still_closed() { return 1; }
-( export HERDR_ALERT_TRACE="$dhs_trace"
-  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  HERDR_ALERT_GRACE_S=1 HERDR_GRACE_CLAIM_KIND=human_stale \
-    HERDR_DEFERRED_PID="deferred:hs-3" HERDR_GRACE_STILL_OPEN=still_closed \
-    grace_realert "$WPANE" "deferred:hs-3" runHS taskHS true )
-i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$dhs_trace"; do sleep 0.1; i=$((i + 1)); done
-grep -q "^done human_stale deferred:hs-3 stood_down$" "$dhs_trace" \
-  && ok "a resolved deferred request's human-stale timer stands down" \
-  || bad "resolved deferred human-stale: $(cat "$dhs_trace")"
 set_task_state runHS taskHS completed no-follow-on >/dev/null 2>&1
 
 printf '== conductorless worker still persists its verified input request ==\n'
@@ -825,9 +490,9 @@ CPANE="w2:p1"
 printf '== unknown menu remains alertable but not auto-selectable ==\n'
 printf 'Allow tool: bash\n\nApprove\nAlways allow\nDeny\nup/down navigate  enter select  esc cancel\n' > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$NOTIFIED"
+n_in_before="$(q_event input_required)"
 run_notify bash
-[ -s "$NOTIFIED" ] && ok "unrecognized choices still produce an alert" || bad "strict selection parser hid a real prompt"
+[ "$(q_event input_required)" -gt "$n_in_before" ] && ok "unrecognized choices still record an input request" || bad "strict selection parser hid a real prompt"
 
 printf '== approval event with NO menu up -> silent, even if a numbered list is on screen ==\n'
 # 2026-09-24: a worker streaming a Write preview of a numbered markdown list
@@ -837,19 +502,19 @@ printf '== approval event with NO menu up -> silent, even if a numbered list is 
 # escalate and woke the conductor for a prompt that did not exist.
 printf ' Write tmp/geo/REPORT.md\n\n 1. Fix robots.txt\n 2. Remove stale pages: rm -rf tmp/geo/old\n 3. Add sameAs links\n' > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 n_in_before="$(q_event input_required)"
 run_notify write
-[ ! -s "$NOTIFIED" ] && [ ! -s "$SENT" ] && [ "$(q_event input_required)" = "$n_in_before" ] \
+[ ! -s "$SENT" ] && [ "$(q_event input_required)" = "$n_in_before" ] \
   && ok "numbered transcript text is not an approval prompt (no alert, no wake, no input_required)" \
-  || bad "false peer signal on a numbered list with no menu: notified=$(cat "$NOTIFIED") sent=$(cat "$SENT")"
+  || bad "false peer signal on a numbered list with no menu: sent=$(cat "$SENT")"
 
 printf '== no HERDR_PANE_ID -> silent (cannot verify a prompt, so must not alert) ==\n'
 omp_menu_screen "rm -rf /" > "$WORKER_SCREEN"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 printf '{"tool":"bash","message":"x","cwd":"/tmp"}' \
   | ( unset HERDR_PANE_ID; bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
-[ ! -s "$NOTIFIED" ] && ok "no alert without a resolvable pane" || bad "alerted blind"
+[ ! -s "$SENT" ] && ok "no wake without a resolvable pane" || bad "woke blind"
 
 printf '== omp-reconcile.sh session: human report, NO hook-output JSON ==\n'
 out="$(bash "$here/agent-hooks/omp-reconcile.sh" session 2>/dev/null)"
@@ -981,11 +646,7 @@ printf 'RECONCILE mode=%s\n' "$1" >> "$REC"
 [ "$1" = session ] && printf 'wake-persistence: 1 task changed\n'
 exit 0
 EOS
-  cat > "$SHIM/herdr-resolve.sh" <<'EOS'
-#!/usr/bin/env bash
-printf 'RESOLVE\n' >> "$REC"
-EOS
-  chmod +x "$SHIM/agent-hooks/"*.sh "$SHIM/herdr-resolve.sh"
+  chmod +x "$SHIM/agent-hooks/"*.sh
   export REC="$SHIM/rec.log"; : > "$REC"
   # Round 9 review (Main): HERDR_CONTROL_DIR="$SHIM" moves ROOT itself to this
   # shim tree, so promptOccurrenceAvailable/RESOLVE_HUB_PYTHON_SH resolved
@@ -1078,7 +739,6 @@ handlers["tool_execution_start"]({ toolName: "read", args: { path: "/x" } });   
 await new Promise(r => setTimeout(r, 800));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["tool_approval_resolved"]({ approved: true });
-handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
 // #277 v2.2: once the handler returns defer, an unexpected failure in its
 // detached workflow must resolve the exact binding as denied, never strand it.
@@ -1101,7 +761,7 @@ process.cwd = realCwd;
 console.log("BOUND_FAILURE:" + JSON.stringify(boundResolutions));
 ' 2>&1)"
   printf '%s' "$shim_out" \
-    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_execution_validate,tool_result' \
+    | grep -q 'EVENTS:before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_execution_validate,tool_result' \
     && ok "every event is registered, including tool_call cache and pre-tool guard" || bad "events: $shim_out"
   printf '%s' "$shim_out" | grep -q 'AUTHORITY_REGISTRATIONS:1' \
     && ok "the Herdr control hook uses the one explicit approval-authority registration" \
@@ -1138,7 +798,6 @@ console.log("BOUND_FAILURE:" + JSON.stringify(boundResolutions));
     && ok "the alert carries the command a human has to judge" || bad "notify message lost the command: $(cat "$REC.notify" 2>/dev/null)"
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
-  grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
 
 
   printf '== TS shim: bound-bash boundTool gate (HERDR_BOUND_BASH, slice b) ==\n'
@@ -1584,11 +1243,7 @@ case "$1" in
 esac
 exit 0
 EOS
-  cat > "$SHIM2/herdr-resolve.sh" <<'EOS'
-#!/usr/bin/env bash
-exit 0
-EOS
-  chmod +x "$SHIM2/agent-hooks/"*.sh "$SHIM2/herdr-resolve.sh"
+  chmod +x "$SHIM2/agent-hooks/"*.sh
   export REC2="$SHIM2/rec.log"; : > "$REC2"; : > "$REC2.ack"
   shim2_out="$(HERDR_CONTROL_DIR="$SHIM2" HERDR_RUN_STATE_DIR="$SHIM2/state" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
@@ -1645,8 +1300,7 @@ await new Promise(r => setTimeout(r, 800));
   # talks only to the stub below.
   SHIM3="$WORK/shim3"; mkdir -p "$SHIM3/agent-hooks"
   for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM3/agent-hooks/$s"; done
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM3/herdr-resolve.sh"
-  chmod +x "$SHIM3/agent-hooks/"*.sh "$SHIM3/herdr-resolve.sh"
+  chmod +x "$SHIM3/agent-hooks/"*.sh
   # The stub is a FILE, not `python3 - <<EOS`: with a heredoc, stdin is the
   # program text and is already at EOF, so anything waiting on stdin to stay
   # alive exits the instant it starts serving.
@@ -1748,8 +1402,7 @@ console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
   # fetch has had time to land, is the one that actually announces.
   SHIM4="$WORK/shim4"; mkdir -p "$SHIM4/agent-hooks"
   for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/agent-hooks/$s"; done
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/herdr-resolve.sh"
-  chmod +x "$SHIM4/agent-hooks/"*.sh "$SHIM4/herdr-resolve.sh"
+  chmod +x "$SHIM4/agent-hooks/"*.sh
   cp "$SHIM3/stub-hub.py" "$SHIM4/stub-hub.py"
   : > "$SHIM4/port"
   python3 "$SHIM4/stub-hub.py" '{"attention":3,"handoff_debt":0,"open_decisions":0}' > "$SHIM4/port" &
@@ -1794,13 +1447,12 @@ console.log("SECOND:" + (second && second.message ? second.message.content : "no
   # bound, so it does not also wait out the 10s sleep.)
   SHIM5="$WORK/shim5"; mkdir -p "$SHIM5/agent-hooks"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM5/agent-hooks/omp-notify.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM5/herdr-resolve.sh"
   cat > "$SHIM5/agent-hooks/omp-reconcile.sh" <<'EOS'
 #!/usr/bin/env bash
 sleep 10
 exit 0
 EOS
-  chmod +x "$SHIM5/agent-hooks/"*.sh "$SHIM5/herdr-resolve.sh"
+  chmod +x "$SHIM5/agent-hooks/"*.sh
   shim5_out="$(HERDR_CONTROL_DIR="$SHIM5" HERDR_RUN_STATE_DIR="$SHIM5/state" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
@@ -1830,8 +1482,7 @@ console.log("ELAPSED_MS:" + (performance.now() - t0).toFixed(1));
   # see the project card recover instead of staying wedged.
   SHIM6="$WORK/shim6"; mkdir -p "$SHIM6/agent-hooks" "$WORK/fakegit"
   for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM6/agent-hooks/$s"; done
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM6/herdr-resolve.sh"
-  chmod +x "$SHIM6/agent-hooks/"*.sh "$SHIM6/herdr-resolve.sh"
+  chmod +x "$SHIM6/agent-hooks/"*.sh
   # A fake `git` that hangs well past captureOutput's 2s bound, modelling
   # lock contention / a flaky networked worktree / a corrupted .git.
   printf '#!/usr/bin/env bash\nsleep 120\n' > "$WORK/fakegit/git"
@@ -1922,7 +1573,6 @@ console.log("WRAPPER_PID:" + wpid);
   # must free up again once that sweep finishes, not stay stuck forever.
   SHIM7="$WORK/shim7"; mkdir -p "$SHIM7/agent-hooks"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM7/agent-hooks/omp-notify.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM7/herdr-resolve.sh"
   RUNLOG="$WORK/shim7-runs.log"; : > "$RUNLOG"
   cat > "$SHIM7/agent-hooks/omp-reconcile.sh" <<EOS
 #!/usr/bin/env bash
@@ -1930,7 +1580,7 @@ printf 'RUN mode=%s\n' "\$1" >> "$RUNLOG"
 if [ "\$1" = session ]; then sleep 1; fi
 exit 0
 EOS
-  chmod +x "$SHIM7/agent-hooks/"*.sh "$SHIM7/herdr-resolve.sh"
+  chmod +x "$SHIM7/agent-hooks/"*.sh
   shim7_out="$(HERDR_CONTROL_DIR="$SHIM7" HERDR_RUN_STATE_DIR="$SHIM7/state" bun -e '
 const fs = await import("node:fs");
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
@@ -2324,40 +1974,6 @@ f7_wake grace HERDR_ALERT_FORCE=1
 [ "$(f7_n wake_attempted)" = 3 ] && ok "a forced re-delivery still delivers past the owner claim" \
   || bad "forced re-delivery blocked: wake_attempted=$(f7_n wake_attempted) (want 3)"
 
-# The wake-fail page is for a conductor nobody reached. An attempt for this
-# same occurrence was submitted above, so a later failed attempt's timer must
-# not page (live 2026-09-26, event 37775 paged on a redundant failed attempt).
-: > "$NOTIFIED"; f7_trace="$WORK/f7-alert-trace.log"; : > "$f7_trace"
-( export HERDR_ALERT_TRACE="$f7_trace" HERDR_WAKE_FAIL_ALERT_S=1
-  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  _pw_wake_fail_realert "$WPANE" "$f7_pid2" runF7 taskF7 unsubmitted )
-i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep 0.1; i=$((i + 1)); done
-grep -q "^done wakefail $f7_pid2 conductor_reached$" "$f7_trace" && ! grep -q 'wake-fail' "$NOTIFIED" \
-  && ok "no wake-fail page when an attempt for the same prompt was submitted" \
-  || bad "wake-fail timer: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
-# Review r3 HIGH: a deferred prompt paints no panel, so the wake-fail backstop
-# must not use the screen to decide it was answered. Blocked task, no landed
-# attempt for this deferred pid, clean screen -> it still pages.
-set_task_state runF7 taskF7 blocked >/dev/null 2>&1
-clean_screen > "$WORKER_SCREEN"
-: > "$NOTIFIED"; : > "$f7_trace"
-( export HERDR_ALERT_TRACE="$f7_trace" HERDR_WAKE_FAIL_ALERT_S=1 HERDR_DEFERRED_PID="deferred:req-wf-1"
-  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  _pw_wake_fail_realert "$WPANE" "deferred:req-wf-1" runF7 taskF7 unsubmitted )
-i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep 0.1; i=$((i + 1)); done
-grep -q "^done wakefail deferred:req-wf-1 fired$" "$f7_trace" && grep -q 'wake-fail' "$NOTIFIED" \
-  && ok "a failed wake for a deferred (panel-less) prompt still pages" \
-  || bad "deferred wake-fail stood down: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
-# Review r4 HIGH (row 7b): herdr-notify.sh --choices re-scrapes the worker pane
-# and silently drops the page when nothing survives its filters, which a
-# panel-less deferred prompt can hit. The deferred page must not use
-# --choices, and must name the exact request.
-grep 'wake-fail' "$NOTIFIED" | grep -q -- '--choices' \
-  && bad "deferred wake-fail page used --choices (droppable): $(cat "$NOTIFIED")" \
-  || ok "the deferred wake-fail page is posted without --choices"
-grep -q 'deferred request deferred:req-wf-1' "$NOTIFIED" \
-  && ok "the deferred wake-fail page names the exact request" \
-  || bad "deferred wake-fail page lacks the request id: $(cat "$NOTIFIED")"
 set_task_state runF7 taskF7 completed no-follow-on >/dev/null 2>&1
 clean_screen > "$WORKER_SCREEN"
 
@@ -2378,7 +1994,6 @@ d2_n() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE task_id='taskD2' AND type='$1';" 2>/dev/null; }
 omp_menu_screen "git status --short" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-: > "$NOTIFIED"
 ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runD2 HERDR_TASK_ID=taskD2 \
          HERDR_TASK_LABEL="impl:d2" HERDR_ALERT_GRACE_S=1
   . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"

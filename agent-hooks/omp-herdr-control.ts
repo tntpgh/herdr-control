@@ -1,10 +1,10 @@
-// omp-herdr-control.ts — the same four herdr-control jobs Claude Code gets via
+// omp-herdr-control.ts — the same herdr-control jobs Claude Code gets via
 // ~/.claude/settings.json hooks (agent-hooks/claude-notify.sh,
-// agent-hooks/session-reconcile.sh, agent-hooks/interval-reconcile.sh,
-// herdr-resolve.sh), wired into omp's extension system instead. Both
+// agent-hooks/session-reconcile.sh, agent-hooks/interval-reconcile.sh),
+// wired into omp's extension system instead. Both
 // integrations call the SAME shell scripts — Claude via `bash <script>` hook
 // commands in settings.json, omp via this file's default-exported factory —
-// so there is exactly one place that knows how to notify/reconcile/retract,
+// so there is exactly one place that knows how to notify/reconcile,
 // not two drifting copies that can disagree.
 //
 // install.sh SYMLINKS this file into ~/.omp/agent/extensions/herdr-control.ts
@@ -52,7 +52,6 @@ const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const PRETOOL_REGISTRATION_SH = path.join(ROOT, "lib", "pretool-registration.sh");
 const BASH_WRITE_TARGETS_SH = path.join(ROOT, "lib", "bash-write-targets.sh");
-const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const FACTORY_CLEANUP_SH = path.join(ROOT, "factory-cleanup.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
 const RESOLVE_HUB_PYTHON_SH = path.join(ROOT, "launchd", "resolve-hub-python.sh");
@@ -98,12 +97,11 @@ function safeExists(p: string): boolean {
 // shelling out to a path that doesn't exist.
 const notifyAvailable = safeExists(NOTIFY_SH);
 const reconcileAvailable = safeExists(RECONCILE_SH);
-const resolveAvailable = safeExists(RESOLVE_SH);
 const hubAvailable = safeExists(HUB_PY);
 
 // ---- fire-and-forget spawn --------------------------------------------------
-// Every non-blocking call in this file (Notification, interval reconcile,
-// both retraction call sites) goes through here. `detached: true` + unref()
+// Every non-blocking call in this file (Notification, the pretool shadow
+// record, reconcile acks) goes through here. `detached: true` + unref()
 // means the child outlives this handler and is never awaited; stdio is
 // "ignore" on stdout/stderr and piped on stdin ONLY when there is input to
 // send, so neither the child's output nor a broken pipe on ITS side can
@@ -233,11 +231,11 @@ function captureOutput(
 // this event — `event.toolName: string` and `event.input: Record<string,
 // unknown>` — so this reads those fields directly instead of guessing across
 // plausible names. It is still defensive (typeof checks, never asserts),
-// because the result only feeds Slack message text — cosmetic, not anything
+// because the result only feeds the conductor wake text — cosmetic, not anything
 // gating behavior — so "best effort, never throw" is still the contract.
 //
 // The bug this replaces: the old version only ever sent the tool's NAME
-// ("omp tool call: bash") with no arguments at all, so a Slack approval
+// ("omp tool call: bash") with no arguments at all, so an approval
 // alert could not be acted on without switching to the pane — you were
 // asked to approve "bash" with no idea which command. describeToolCall
 // pulls the part of `input` a human actually needs to decide: the command
@@ -2031,9 +2029,8 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
 }
 
 // The `ask` tool is not an approval, so it emits no approval event — it just
-// paints a numbered question and waits. Same alert path, same retraction path
-// (tool_execution_end), and the same shape omp's herdr integration uses to
-// report `blocked` for it.
+// paints a numbered question and waits. Same alert path, and the same shape
+// omp's herdr integration uses to report `blocked` for it.
 function onExecutionStart(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
@@ -2063,16 +2060,6 @@ function onExecutionStart(event: unknown): undefined {
 // runs here: never replay tool_call handlers that revise input or emit effects.
 function onExecutionValidate(event: unknown, ctx?: unknown): Block | undefined {
   return workerWriteScopeBlock(event, ctx);
-}
-
-// Retraction is now edge-triggered too: the prompt was answered (in the
-// terminal, from Slack, or by a peer), so the alert for it is stale THE
-// MOMENT omp says so. It used to run on every tool_result, which meant a
-// pane-list, a pane read, two prompt parses and — until this branch — an
-// `op read` for the Slack token, on every tool call of every session, for as
-// long as any worker anywhere sat blocked.
-function retract(): void {
-  if (resolveAvailable) spawnDetached([RESOLVE_SH]);
 }
 
 function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
@@ -2106,7 +2093,6 @@ function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
         "--choice", approved ? "approve" : "deny",
       ]);
     }
-    retract();
   } catch {
     // see onApprovalRequested().
   }
@@ -2116,10 +2102,6 @@ function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
 function onExecutionEnd(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
-    // Only `ask` was ever alerted from tool_execution_start, so only `ask`
-    // needs the matching retraction; any other tool ending is not a prompt
-    // being answered and must not cost a sweep.
-    if (e.toolName === "ask") retract();
     const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
     const occ = callId !== undefined ? occurrenceByCallId.get(callId) : undefined;
     if (callId !== undefined && occ) {
@@ -2751,20 +2733,6 @@ function onToolResult(event?: unknown): undefined {
   return undefined;
 }
 
-// ---- Stop: agent_end ---------------------------------------------------------
-// Backstop retraction. tool_approval_resolved / tool_execution_end already
-// retract at the moment a prompt is answered, but a turn can end with an
-// alert still queued — a pane killed mid-prompt, or a resolve that lost its
-// race — so the turn boundary sweeps once more.
-function onAgentEnd(): undefined {
-  try {
-    if (resolveAvailable) spawnDetached([RESOLVE_SH]);
-  } catch {
-    // see onToolResult() above.
-  }
-  return undefined;
-}
-
 // Shift cleanup. A conductor that saves its session and lessons then stops
 // used to leave every worker's pane open and its registry row `running`
 // (2026-09-24: a closed conductor tab left four merged workers; 2026-11-03:
@@ -2815,6 +2783,5 @@ export default function (pi: HookAPI): void {
   pi.on("tool_execution_end", onExecutionEnd);
   pi.on("before_agent_start", onBeforeAgentStart);
   pi.on("tool_result", onToolResult);
-  pi.on("agent_end", onAgentEnd);
   pi.on("session_stop", onSessionStop);
 }

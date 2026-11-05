@@ -49,8 +49,7 @@ WORK="$(mktemp -d)"
 export WORK
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export SENT="$WORK/sent.log"
-export NOTIFIED="$WORK/notified.log"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"
 
 COND="w9:p1"; CONDB="w9term"
 export COND CONDB
@@ -88,20 +87,16 @@ herdr() {
 }
 export -f herdr
 
-# A fake herdr-notify.sh: logs the class/pane/message it was called with,
-# standing in for the "real alert path" (slack-bridge/herdr-notify.sh) so
-# this suite never touches a Slack token.
-NOTIFY_STUB="$WORK/herdr-notify-stub.sh"
-cat > "$NOTIFY_STUB" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$NOTIFIED"
-EOF
-chmod +x "$NOTIFY_STUB"
-export HERDR_STALL_WATCHDOG_NOTIFY="$NOTIFY_STUB"
-
 . "$here/lib/run-registry.sh"
 registry_init
 _q() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "$1" 2>/dev/null; }
+# An escalation is a stall_escalated registry event. esc_mark starts a case;
+# esc_log/esc_n read only the escalations recorded since.
+esc_mark() { ESC_MARK="$(_q "SELECT COALESCE(max(sequence),0) FROM events;")"; }
+esc_log() { _q "SELECT task_id||' '||json_extract(payload,'\$.signal')||' '||json_extract(payload,'\$.artifact')||' '||json_extract(payload,'\$.reason')
+  FROM events WHERE type='stall_escalated' AND sequence > ${ESC_MARK:-0};"; }
+esc_n() { esc_log | grep -c . ; }
+esc_mark
 
 if _on A; then
 echo "== A1: a reachable conductor — first wake sends once and records stall_wake =="
@@ -113,17 +108,17 @@ n_wake=$(_q "SELECT count(*) FROM events WHERE type='stall_wake' AND task_id='ta
 [ "$n_wake" = "1" ] && ok "one stall_wake claimed" || bad "expected 1 stall_wake event, got $n_wake"
 
 echo "== A2: the identical fingerprint again, inside the owner's window — no repeat =="
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 bash "$here/stall-watchdog.sh" wake taskA artifact "tmp/commit-msg.txt:1000" "ready 20m" "tmp/commit-msg.txt"
 [ "$(_lc "$SENT")" = "0" ] && ok "no second send for the unchanged fingerprint" || bad "sent again: $(cat "$SENT")"
-[ "$(_lc "$NOTIFIED")" = "0" ] && ok "no escalation yet (still inside the owner's window)" || bad "escalated too early"
+[ "$(esc_n)" = "0" ] && ok "no escalation yet (still inside the owner's window)" || bad "escalated too early"
 
 echo "== A3: acknowledged — stays silent even once the escalate window has passed =="
 bash "$here/stall-ack.sh" taskA artifact >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskA artifact "tmp/commit-msg.txt:1000" "ready 20m" "tmp/commit-msg.txt"
 [ "$(_lc "$SENT")" = "0" ] && ok "acked: no re-wake" || bad "re-woke after ack"
-[ "$(_lc "$NOTIFIED")" = "0" ] && ok "acked: no escalation — 'an acknowledged wake stops repeating'" || bad "escalated after ack"
+[ "$(esc_n)" = "0" ] && ok "acked: no escalation — 'an acknowledged wake stops repeating'" || bad "escalated after ack"
 
 echo "== A4: a genuinely NEW fingerprint (the artifact was rewritten) re-arms =="
 : > "$SENT"
@@ -132,68 +127,68 @@ n_sent4=$(grep -c "send-text $COND" "$SENT" || true)
 [ "$n_sent4" = "1" ] && ok "a new fingerprint for the same (task,signal) gets its own wake" || bad "expected 1 send, got $n_sent4"
 
 echo "== A5: NOT acked, past the escalate window — escalates exactly once =="
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskA artifact "tmp/commit-msg.txt:2000" "ready 5m" "tmp/commit-msg.txt"
-n_notified=$(_lc "$NOTIFIED")
-[ "$n_notified" = "1" ] && ok "exactly one real alert past the escalate window" || bad "expected 1 alert, got $n_notified"
-grep -q "taskA" "$NOTIFIED" && grep -q "artifact" "$NOTIFIED" && grep -q "tmp/commit-msg.txt" "$NOTIFIED" \
-  && ok "the alert names the task, the signal, and the exact artifact path" \
-  || bad "alert text missing task/signal/artifact: $(cat "$NOTIFIED")"
-: > "$NOTIFIED"
+n_notified=$(esc_n)
+[ "$n_notified" = "1" ] && ok "exactly one stall_escalated past the escalate window" || bad "expected 1 escalation, got $n_notified"
+esc_log | grep -q "^taskA artifact tmp/commit-msg.txt " \
+  && ok "the escalation names the task, the signal, and the exact artifact path" \
+  || bad "escalation missing task/signal/artifact: $(esc_log)"
+esc_mark
 HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskA artifact "tmp/commit-msg.txt:2000" "ready 5m" "tmp/commit-msg.txt"
-[ "$(_lc "$NOTIFIED")" = "0" ] && ok "no second escalation for the same fingerprint" || bad "escalated twice"
+[ "$(esc_n)" = "0" ] && ok "no second escalation for the same fingerprint" || bad "escalated twice"
 
 echo "== A6: owner UNKNOWN (no conductor pane recorded) — escalates immediately, never waits =="
 register_task runB taskB workerB "" "" "" paneB paneBbirth repo/y "$WORK/wtB" labelB >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 bash "$here/stall-watchdog.sh" wake taskB handoff taskB-closed "closed handed_off_to:conductor"
 [ "$(_lc "$SENT")" = "0" ] && ok "unknown owner: never attempts a wake (no pane to send to)" || bad "sent to no one: $(cat "$SENT")"
-n_notB=$(_lc "$NOTIFIED")
+n_notB=$(esc_n)
 [ "$n_notB" = "1" ] && ok "unknown owner: escalates on the same call — 'wake only' has nothing to wake" \
   || bad "expected 1 escalation for an unknown owner, got $n_notB"
-grep -qi "unknown or unreachable" "$NOTIFIED" && ok "the escalation names why (no conductor configured)" \
+esc_log | grep -qi "unknown or unreachable" && ok "the escalation names why (no conductor configured)" \
   || bad "escalation text does not explain the unknown-owner reason"
 
 echo "== A7: owner DEAD (registered conductor birth disagrees with the live one) — escalates too =="
 register_task runC taskC workerC condC "$COND" "a-stale-birth-not-$CONDB" paneC paneCbirth repo/z "$WORK/wtC" labelC >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 bash "$here/stall-watchdog.sh" wake taskC denied approvalX "a deny was never followed up"
 [ "$(_lc "$SENT")" = "0" ] && ok "recycled conductor pane: never sends into the wrong occupant" || bad "sent to a recycled pane"
-[ "$(_lc "$NOTIFIED")" = "1" ] && ok "recycled conductor pane: escalates instead" || bad "did not escalate for a dead owner"
+[ "$(esc_n)" = "1" ] && ok "recycled conductor pane: escalates instead" || bad "did not escalate for a dead owner"
 
 echo "== A8 (review H2): the owner acted (messaged the worker) but never ran stall-ack — must not escalate =="
 register_task runD taskD workerD condD "$COND" "$CONDB" paneD paneDbirth repo/d "$WORK/wtD" labelD >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 bash "$here/stall-watchdog.sh" wake taskD artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
 sleep 1.2
 _sql_runD() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "$1" 2>/dev/null; }
 _sql_runD "INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
   VALUES ('ev_ownerD','runD','taskD','owner_acted','$(date -u +%Y-%m-%dT%H:%M:%SZ)','{}');"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
-[ "$(_lc "$NOTIFIED")" = "0" ] && ok "H2: owner_acted after the wake counts as handled — no escalation without stall-ack" \
-  || bad "H2 REGRESSION: escalated despite owner_acted — $(cat "$NOTIFIED")"
+[ "$(esc_n)" = "0" ] && ok "H2: owner_acted after the wake counts as handled — no escalation without stall-ack" \
+  || bad "H2 REGRESSION: escalated despite owner_acted — $(esc_log)"
 
 echo "== A9 (review H3): an ack survives the conductor pane later going away — no re-escalation =="
 register_task runE taskE workerE condE "$COND" "$CONDB" paneE paneEbirth repo/e "$WORK/wtE" labelE >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 bash "$here/stall-watchdog.sh" wake taskE artifact "tmp/commit-msg.txt:999" "ready" "tmp/commit-msg.txt"
 first_sentE=$(grep -c "send-text $COND" "$SENT" || true)
 sleep 1.2
 bash "$here/stall-ack.sh" taskE artifact >/dev/null
 touch "$WORK/cond_pane_gone"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskE artifact "tmp/commit-msg.txt:999" "ready" "tmp/commit-msg.txt"
 rm -f "$WORK/cond_pane_gone"
-[ "$first_sentE" = "1" ] && [ "$(_lc "$NOTIFIED")" = "0" ] && ok "H3: acked wake stays silent even once the conductor pane is gone" \
-  || bad "H3 REGRESSION: first_sent=$first_sentE notified=$(_lc "$NOTIFIED") — acked wake re-escalated after the pane vanished"
+[ "$first_sentE" = "1" ] && [ "$(esc_n)" = "0" ] && ok "H3: acked wake stays silent even once the conductor pane is gone" \
+  || bad "H3 REGRESSION: first_sent=$first_sentE escalated=$(esc_n) — acked wake re-escalated after the pane vanished"
 
 echo "== A10 (review H3): a transient herdr outage on first sighting must SKIP, not escalate =="
 register_task runF taskF workerF condF "$COND" "$CONDB" paneF paneFbirth repo/f "$WORK/wtF" labelF >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 touch "$WORK/herdr_down"
 bash "$here/stall-watchdog.sh" wake taskF handoff fpF "closed handed_off_to:conductor"
-a1=$(_lc "$NOTIFIED"); s1=$(_lc "$SENT")
+a1=$(esc_n); s1=$(_lc "$SENT")
 rm -f "$WORK/herdr_down"
 bash "$here/stall-watchdog.sh" wake taskF handoff fpF "closed handed_off_to:conductor"
 [ "$a1" = "0" ] && [ "$s1" = "0" ] && [ "$(grep -c "send-text $COND" "$SENT" || true)" = "1" ] \
@@ -210,7 +205,7 @@ echo "UNSUBMITTED: $1 composer looked unchanged after 6 Enters — the text was 
 exit 4
 EOF
 chmod +x "$UNSUB_STUB"
-: > "$SENT"; : > "$NOTIFIED"
+: > "$SENT"; esc_mark
 HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
 HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
 HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
@@ -1165,7 +1160,7 @@ fi
 # register_task / set_task_state / append_event (lib/run-registry.sh),
 # send-to-agent.sh, stall-watchdog.sh wake, stall-ack.sh, herdr-action.sh —
 # under a stub `herdr` and a `date` pinned to the simulated second.
-# Assertions read only outcomes (registry rows, candidates, Slack log), so a
+# Assertions read only outcomes (registry rows, candidates, escalations), so a
 # same-signature revert of hub.py fails by result, not by a crash.
 if ! _on C; then
   :
@@ -1366,9 +1361,6 @@ class World:
         (self.simd / "box_top").write_text(BOX_TOP + "\n")
         (self.simd / "box_mid").write_text(BOX_MID)
         (self.simd / "box_bot").write_text(BOX_BOT + "\n")
-        notify = self.simd / "notify.sh"
-        notify.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$SIMD/notified.log\"\n")
-        notify.chmod(0o755)
         self.registry = self.dir / "runs" / "registry.sqlite3"
         self.run = f"run_{name}"
         self.now, self.next_tick = float(start), BASE
@@ -1388,8 +1380,6 @@ class World:
                  HERDR_STATE_ROOT=str(self.dir / "state"), HERDR_STATE_DIR=str(self.dir / "hstate"),
                  SIMD=str(self.simd), SIM_SH=str(self.simd / "sim.sh"), SC_HERE=str(HERE),
                  SIM_NOW=str(int(self.now)), HERDR_PANE_ID="",
-                 HERDR_STALL_WATCHDOG_NOTIFY=str(self.simd / "notify.sh"),
-                 HERDR_ACTION_NOTIFY=str(self.simd / "notify.sh"),
                  HERDR_STALL_WATCHDOG_THRESHOLD_S=str(int(THRESH)))
         e.update({k: str(v) for k, v in extra.items()})
         return e
@@ -1631,10 +1621,9 @@ class World:
     def silent(self, tid, after=float("-inf")):
         return not self.cands_for(tid, after) and not [e for e in self.cp_events(tid) if e[1] > after]
 
-    def slack(self, tid):
-        f = self.simd / "notified.log"
-        return [ln for ln in (f.read_text().splitlines() if f.exists() else [])
-                if tid in ln and "conductor_prompt" in ln]
+    def escalations(self, tid):
+        return [p for _, _, p, _ in self.rows(tid, "stall_escalated")
+                if p.get("signal") == "conductor_prompt"]
 
     def dump(self, tid):
         rel = lambda x: None if x is None else int(x - BASE)
@@ -1952,7 +1941,7 @@ def _():
     marker = w.q("SELECT 1 FROM events WHERE event_id='stall_watchdog_epoch_cprompt_seeded'")
     check("R13c_a_minted_but_unconfirmed_epoch_is_seeded_on_the_confirming_tick_and_R20_stays_silent",
           not seeded_early and len(seeds) == 1 and seeds[0][1] == BASE + 15 and bool(marker)
-          and w.silent(t) and not w.slack(t), w, t)
+          and w.silent(t) and not w.escalations(t), w, t)
     # (d) tick 1 seeds A and fails on B; A then writes a new F; tick 2 seeds only B.
     w = World("r13d", start=BASE - 4000)
     ta, tb = w.add_task("a"), w.add_task("b")
@@ -2098,8 +2087,8 @@ def _():
     w, t = predeploy_answered("r20", cond_alive=False)
     w.run_to(BASE + 2400)
     seeds = [p for _, _, p, _ in w.rows(t, "stall_request_seed") if p.get("fp")]
-    check("R20_an_answered_predeploy_line_with_a_dead_conductor_is_seeded_with_no_wake_and_no_slack",
-          len(seeds) == 1 and w.silent(t) and not w.slack(t), w, t)
+    check("R20_an_answered_predeploy_line_with_a_dead_conductor_is_seeded_with_no_wake_and_no_escalation",
+          len(seeds) == 1 and w.silent(t) and not w.escalations(t), w, t)
 
 @scen("R20b")
 def _():
@@ -2389,15 +2378,15 @@ def _():
     esc = [e for e in w.cp_events(t) if e[0] == "stall_escalate_claim" and e[2] == 1]
     check("R29a_escalated_then_typed_answer_then_same_F_new_C_claims_g2_and_wakes",
           len(esc) == 1 and w.woke(t, 2), w, t)
-    # (b) conductor dead: K_unowned + Slack, ack, output, then the same F under a new C.
+    # (b) conductor dead: K_unowned + escalation, ack, output, then the same F under a new C.
     w, t = typed_then_woken("r29b", below=(), cond_alive=False)
     w.run_to(BASE + 800); w.ack(t)
     w.run_to(BASE + 810); w.show(t, ask(A1, A2))
     w.run_to(BASE + 898); w.show(t, ask(A1, A2, CTX_B, REQ_A))
     w.run_to(BASE + 905 + THRESH + 30)
     un = [g for typ, _, g in w.cp_events(t) if typ == "stall_wake_unowned"]
-    check("R29b_unowned_then_ack_then_same_F_new_C_claims_g2_and_posts_a_g2_unowned_slack",
-          un == [1, 2] and w.woke(t, 2) and len(w.slack(t)) == 2, w, t)
+    check("R29b_unowned_then_ack_then_same_F_new_C_claims_g2_and_records_a_g2_unowned_escalation",
+          un == [1, 2] and w.woke(t, 2) and len(w.escalations(t)) == 2, w, t)
     # (c) an owner row in the same second as K's stall_wake, then a same-C re-ask with P < pre.
     w, t = std("r29c")
     w.run_to(BASE + 118); w.show(t, ask(X1, X2))

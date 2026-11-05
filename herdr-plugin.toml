@@ -16,10 +16,10 @@
 #     open-project.sh, quick-action.sh, sort-tabs.sh, smart-name.sh,
 #     attention.sh, mark-tab.sh.
 #   - Outside-Herdr Layer   — spawn-agent.sh/spawn-task.sh's run registry,
-#     push-wake, approval posture, command policy, the Slack bridge. Reacts
-#     to CLAUDE CODE's own hook events (Notification, PostToolUse, Stop,
+#     push-wake, approval posture, command policy. Reacts
+#     to CLAUDE CODE's own hook events (Notification, PostToolUse,
 #     SessionStart) or omp's extension events (tool_call, before_agent_start,
-#     tool_result, agent_end) — signals herdr's plugin manifest cannot see.
+#     tool_result) — signals herdr's plugin manifest cannot see.
 # herdr's plugin event vocabulary (worktree.created/worktree.opened, per
 # herdr's own docs) is about HERDR's state transitions, not an agent CLI's
 # internal reasoning loop — there is no herdr event that means "Claude is

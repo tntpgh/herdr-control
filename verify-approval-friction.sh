@@ -258,65 +258,6 @@ grep -c '^poll ' "$TRACE" | grep -qE '^[2-9]|^[1-9][0-9]+$' \
   || bad "trace shows too few polls: $(cat "$TRACE")"
 grep -q '^settled$' "$TRACE" && ok "trace ends with 'settled'" || bad "trace missing 'settled': $(cat "$TRACE")"
 
-printf '== 8. REVIEW finding 1 (HIGH): the real omp-notify.sh chain stays bound after a settle that advances the identity ==\n'
-# agent-hooks/omp-notify.sh binds _bound_pid BEFORE calling push_wake
-# (:384), then re-checks it in _still_bound() (:391-402) to gate the
-# outbound Slack alert (:524ish). In the exact race this fix targets,
-# push_wake's prompt_id_settled can settle onto a DIFFERENT, LATER prompt
-# than the one _bound_pid named before the call (the screen genuinely
-# repainted mid-call, including the case where push_wake's own quick gate
-# already sees the settled screen and refuses the write outright) --
-# without the caller refreshing _bound_pid afterward from
-# PROMPT_SETTLE_PID, _still_bound's post-call re-read (now correctly
-# showing the settled prompt) no longer matches the STALE _bound_pid,
-# silently skipping the Slack alert. Drives the REAL
-# agent-hooks/omp-notify.sh script end to end (stubbed herdr), not
-# push_wake directly -- sections 1-7 already prove push_wake's own settle
-# mechanism; this section's unique job is the CALLER-side refresh.
-NOTIFIED8="$WORK/notified8.log"; : > "$NOTIFIED8"
-cat > "$WORK/notify8.sh" <<EOS
-#!/usr/bin/env bash
-printf 'notified %s\n' "\$*" >> "$NOTIFIED8"
-exit 0
-EOS
-chmod +x "$WORK/notify8.sh"
-omp_menu_screen "git log --oneline -3" > "$STALE_SCREEN_FILE"      # the call this hook's fire first sees
-omp_menu_screen "git fetch --all --prune" > "$SETTLED_SCREEN_FILE" # the real, later panel it settles onto
-# A wall-clock arm_settle is unreliable here: the real omp-notify.sh chain
-# costs several of its OWN `herdr pane read` calls (found-loop, _bound_pid's
-# capture, the pre-push _still_bound check) before push_wake's own quick
-# gate even runs. A fixed per-process READ COUNT instead makes the first 4
-# reads (everything up through push_wake's own quick gate) land stale --
-# matching the _bound_pid captured from those same early reads -- and every
-# read after that land on the real, later panel, so the SLACK GATE's
-# post-push_wake re-read (lib/attention-key.sh _still_bound, called fresh
-# from agent-hooks/omp-notify.sh:535) is the first one to see the identity
-# has moved: exactly the drift finding 1 is about.
-PANE_READ_COUNT_FILE="$WORK/pane_read_count"; printf '0' > "$PANE_READ_COUNT_FILE"
-export PANE_READ_COUNT_FILE
-herdr() {
-  local sub="$1 $2"
-  case "$sub" in
-    "pane read")
-      local n
-      n=$(( $(cat "$PANE_READ_COUNT_FILE" 2>/dev/null || printf 0) + 1 ))
-      printf '%s' "$n" > "$PANE_READ_COUNT_FILE"
-      if [ "$n" -le 4 ]; then cat "$STALE_SCREEN_FILE"; else cat "$SETTLED_SCREEN_FILE"; fi
-      ;;
-    "pane process-info")
-      printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
-    *) return 0 ;;
-  esac
-}
-export -f herdr
-clear_events
-printf '{"tool":"bash","message":"needs review","cwd":"/tmp","command":"git fetch --all --prune"}' \
-  | ( export HERDR_PROMPT_SETTLE_WAIT_S=2 HERDR_NOTIFY="$WORK/notify8.sh"
-      bash "$here/agent-hooks/omp-notify.sh" ) >/dev/null 2>&1
-[ -s "$NOTIFIED8" ] \
-  && ok "Slack alert fired despite the identity advancing mid-call (finding 1: _bound_pid was refreshed)" \
-  || bad "Slack alert silently skipped — _bound_pid was NOT refreshed after push_wake's identity advanced (finding 1 regressed)"
-
 printf '== 9. fix/offline-launch-profile (2026-10-17): EXPECT_PROMPT_ID + full_cmd settles instead of refusing on a still-painting SAME prompt ==\n'
 # herdr-select.sh "the hook recorded '<none>' for this prompt" (observed
 # 2026-10-17, review workers w7Y:p7/p8 in ~/Code/tourguide, both long
@@ -328,8 +269,7 @@ printf '== 9. fix/offline-launch-profile (2026-10-17): EXPECT_PROMPT_ID + full_c
 # single disagreeing read refused instantly (rc=1, nothing written at all,
 # not even an uncorroborated row), discarding a real hook record for a
 # prompt that was never actually different, only not finished painting yet.
-# Restore the original arm_settle-driven herdr() stub (section 8 above
-# replaced it with its own read-counting one).
+# The arm_settle-driven herdr() stub.
 herdr() {
   local sub="$1 $2"
   case "$sub" in

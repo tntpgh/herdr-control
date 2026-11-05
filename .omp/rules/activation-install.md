@@ -61,9 +61,9 @@ The JSON must still parse. If it does not, restore the `.bak-herdr-*` backup
 
 The same `./install.sh --apply` above also symlinks `agent-hooks/omp-herdr-control.ts`
 into `~/.omp/agent/extensions/herdr-control.ts` (or `$PI_CODING_AGENT_DIR/extensions`
-when set) — no separate command to run. It gives an omp session the same four jobs
+when set) — no separate command to run. It gives an omp session the same three jobs
 the Claude hooks above give a Claude session (push-wake, session reconciliation,
-mid-session reconciliation, alert retraction), through omp's own extension events
+mid-session reconciliation), through omp's own extension events
 instead of `settings.json`.
 
 Verify the symlink exists and resolves into THIS checkout:
@@ -100,7 +100,7 @@ only if something resolves to them:
    existing wiring). If that was the long-lived `~/Code/herdr-control`
    checkout on `main`, PR bytes that only exist on a branch/worktree are not
    live anywhere, merged or not — the bash hooks (`claude-notify.sh`,
-   `claude-pretooluse-cache.sh`, `herdr-resolve.sh`,
+   `claude-pretooluse-cache.sh`,
    `interval-reconcile.sh`, `session-reconcile.sh`) read straight off disk
    at call time, so whichever checkout the command path resolves into is
    what runs, even without a daemon restart.

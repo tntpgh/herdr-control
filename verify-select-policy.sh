@@ -607,28 +607,19 @@ sel 3 --authority peer >/dev/null 2>&1
 [ "$(q_task_state)" = "blocked" ] && ok "typed-answer decline stays blocked" || bad "state=$(q_task_state) (expected blocked)"
 set_task_state run1 task1 running >/dev/null 2>&1
 
-printf '== the Slack alert describes the PANEL, not omp queued messages ==\n'
-# herdr-notify.sh polled numbered-first, so on this exact pane Slack rendered
-# "1. Conductor: …" as the choices while the button carried the panel's id —
-# a click on 1 pressed Approve on a command the operator never saw, under
-# human authority (the bridge sets HERDR_SELECT_VIA, so no policy gate).
+printf '== the PANEL is described, not omp queued messages ==\n'
+# Polling numbered-first rendered "1. Conductor: …" as the choices on this
+# exact pane while the answer carried the panel's id — a press on 1 approved
+# a command the operator never saw.
 menu_with_queue "git status --short"
 first_opt=$(prompt_menu_options "$PANE" | head -1)
 printf '%s' "$first_opt" | grep -qi 'approve' && ok "menu-first yields the panel's own first option" || bad "first option is '$first_opt'"
-# (An earlier version of this asserted the SOURCE TEXT of herdr-notify.sh with
-# grep. That passes for a different reason than the one claimed: it proves a
-# string exists in a file, not that any alert describes the panel — reformatting
-# the line fails it while the behaviour is intact, and it would still pass if the
-# loop below it were unreachable. The behavioural assertion above, that the
-# panel's own first option wins on a pane showing a steering queue, is the real
-# property; verify-notify-pinning.sh covers what herdr-notify actually posts.)
 
 printf '== a DECLINE is answerable from any authority, on BOTH prompt shapes ==\n'
 # A decline approves nothing, so it is safe from any authority. The exemption
-# used to be menu-shape only, which was invisible while the Slack reply route
-# counted as human; demoting it to peer turned that omission into a regression —
-# replying "3" to "No, and tell Claude what to do differently" under an rm -rf
-# alert got REFUSED, leaving the worker blocked with the dangerous prompt up.
+# used to be menu-shape only; a peer replying "3" to "No, and tell Claude what
+# to do differently" under an rm -rf prompt got REFUSED, leaving the worker
+# blocked with the dangerous prompt up.
 set_screen "rm -rf /tmp/scratch"; reset_keys
 sel 2 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "menu Deny still allowed for peer" || bad "menu deny exit $rc"
@@ -653,38 +644,16 @@ sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "the APPROVE option on the same prompt is still refused" || bad "approve leaked: rc=$rc keys=$(keys_pressed)"
 
 
-printf '== a Slack BUTTON is demonstrably human; a threaded REPLY is not ==\n'
-# The button carries the prompt fingerprint by construction, so a click is proof
-# a person read THIS question. A threaded reply is not: it is a number typed
-# under a message that may be hours old, and until 2026-09-12 it claimed human
-# authority — skipping the classifier AND the human-only list — so a "1" in an
-# old thread pressed Approve on whatever the pane had moved on to. Terrence's
-# call (2026-09-12 decision form): the reply route gets peer authority.
-set_screen "rm -rf /tmp/scratch"; reset_keys
-( export HERDR_SELECT_VIA=slack-button; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "via=slack-button -> human, destructive approval allowed" || bad "via=slack-button exit $rc (expected 0)"
-[ "$(q_appr authority)" = "human" ] && ok "via=slack-button recorded as human" || bad "authority=$(q_appr authority)"
-[ "$(q_appr policy_verdict)" = "escalate" ] && ok "via=slack-button verdict still recorded for attribution" || bad "verdict=$(q_appr policy_verdict)"
-
-set_screen "rm -rf /tmp/scratch"; reset_keys
-( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 8 ] && ok "via=slack-reply REFUSED a destructive prompt (peer)" || bad "via=slack-reply exit $rc (expected 8)"
-[ "$(keys_pressed)" = "0" ] && ok "no key pressed on the reply route" || bad "keys pressed=$(keys_pressed)!"
-
-set_screen "gh pr merge 5 --squash"; reset_keys
-( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "via=slack-reply cannot merge from a phone" || bad "reply route merged: rc=$rc keys=$(keys_pressed)"
-
-printf '== a Slack reply still answers ordinary work (else the route is useless) ==\n'
-set_screen "ls -la /tmp"; reset_keys
-( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "allow-class reply still pressed" || bad "rc=$rc keys=$(keys_pressed)"
-[ "$(q_appr authority)" = "peer" ] && ok "recorded authority=peer, not human" || bad "authority=$(q_appr authority)"
-
-printf '== an unrecognised via is NOT human ==\n'
-set_screen "rm -rf /tmp/scratch"; reset_keys
-( export HERDR_SELECT_VIA=totally-made-up; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 8 ] && ok "unknown via falls through to peer" || bad "exit $rc (expected 8)"
+printf '== no HERDR_SELECT_VIA value grants human authority ==\n'
+# The retired Slack button route used to map via=slack-button to human. With
+# the bridge gone, every via (including that one) is a label only: the
+# authority is the default peer, so a destructive approval is refused.
+for via in slack-button slack-reply totally-made-up; do
+  set_screen "rm -rf /tmp/scratch"; reset_keys
+  ( export HERDR_SELECT_VIA="$via"; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "via=$via is peer: destructive approval refused" \
+    || bad "via=$via rc=$rc keys=$(keys_pressed) (expected 8, 0)"
+done
 
 printf '== an explicit --authority human still overrides the default ==\n'
 set_screen "rm -rf /tmp/scratch"; reset_keys
@@ -2166,7 +2135,7 @@ esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   && ok "approval_escalated carries run_id=runR task_id=taskR prompt_id=$expect_pid, not the empty HERDR_RUN_ID/HERDR_TASK_ID" \
   || bad "approval_escalated row mismatch: got '$esc_row', want 'runR|taskR|$expect_pid'"
 
-printf '== change 3 + MEDIUM-1: a wake HELD before the refusal is released at refusal time, once, with its Slack alert ==\n'
+printf '== change 3 + MEDIUM-1: a wake HELD before the refusal is released at refusal time, once ==\n'
 HOLD_TEXT="git push origin main"
 set_menu "$HOLD_TEXT"; reset_keys
 seed_input_required runR taskR "$HOLD_TEXT"
@@ -2174,18 +2143,9 @@ hold_pid="$(prompt_id "$PANE")"
 append_event runR taskR wake_held \
   "$(jq -nc --arg p w9:p9 --arg pid "$hold_pid" --arg k "wake_runR_taskR_${hold_pid}" \
      '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
-NOTIFY_STUB="$WORK/notify-stub.sh"; NOTIFY_LOG="$WORK/notify.log"
-cat > "$NOTIFY_STUB" <<'EOS'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$NOTIFY_LOG"
-exit 0
-EOS
-chmod +x "$NOTIFY_STUB"
-export NOTIFY_LOG
-: > "$NOTIFY_LOG"
 before_released=$(count_events wake_hold_released)
 before_attempted=$(count_events wake_attempted)
-( export HERDR_NOTIFY="$NOTIFY_STUB"; sel 1 --authority peer ); rc=$?
+sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && ok "the reserved push to main is still refused" || bad "rc=$rc (expected 8)"
 released=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -2213,16 +2173,6 @@ claimed="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE type='grace_realert_claim' AND event_id='grace_realert_runR_taskR_${hold_pid}';")"
 [ "${claimed:-0}" -ge 1 ] && ok "claimed the SAME idempotency key grace_realert's own 90s re-check would use" \
   || bad "the grace_realert_* claim was never taken"
-notify_calls=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ -s "$NOTIFY_LOG" ] && { notify_calls=$(wc -l < "$NOTIFY_LOG" | tr -d ' '); break; }
-  sleep 0.2
-done
-[ "$notify_calls" = "1" ] && ok "MEDIUM-1: the held Slack alert was sent exactly once on release" \
-  || bad "MEDIUM-1: notify calls on release: $notify_calls (want exactly 1)"
-grep -q -- "--class held --choices --pane $PANE" "$NOTIFY_LOG" \
-  && ok "the Slack call is class held (errors-only level suppresses it like the held timer's own) and names the pane" \
-  || bad "notify call malformed: $(cat "$NOTIFY_LOG")"
 
 printf '== MEDIUM-2: a wrap-corroboration-mismatch refusal ALSO releases a held wake (not just peer_decide) ==\n'
 set_task_state runR taskR running >/dev/null 2>&1

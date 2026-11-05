@@ -17,7 +17,7 @@
 #   - menu (omp): an up/down + Enter list with no numbers on screen at all —
 #     verified live 2026-07-31 against `omp --approval-mode always-ask`.
 #     lib/prompt-parse.sh's prompt_menu_options still numbers the rows 1..N
-#     top-to-bottom so the external contract (a Slack "reply 1/2/3") stays
+#     top-to-bottom so the external contract ("option 1/2/3") stays
 #     identical; this script translates that number into "press Down/Up
 #     until the target row is highlighted, then Enter" instead of a digit.
 #     herdr-select.sh's own audit log records the mechanism used.
@@ -72,8 +72,6 @@
 # and a keypress.
 #
 # A caller is treated as human only when it is DEMONSTRABLY human:
-#   * HERDR_SELECT_VIA=slack-button — the bridge sets it only after its own
-#     user allowlist check, and the button is bound to one prompt fingerprint.
 #   * an explicit `--authority human` / HERDR_SELECT_AUTHORITY=human.
 # Everything else is `peer`, INCLUDING a terminal-attached stdin. `[ -t 0 ]`
 # used to count as human, but an agent's own bash tool can run with a PTY
@@ -133,27 +131,8 @@ bound_arguments_digest=""
 bound_tool_call_id=""
 bound_payload_sha=""
 # Demonstrably-human callers only; see the header. Explicit
-# HERDR_SELECT_AUTHORITY or --authority still wins over this.
-#
-# `slack-reply` was here until 2026-09-12 and is not. A detonation pass showed
-# the threaded-number route carries NO prompt fingerprint — the registry record
-# herdr-notify wrote held only {ts,pane}, so there was nothing to pass — while
-# claiming human authority, which skips the classifier AND the human-only list.
-# A "1" typed into an older alert thread therefore landed on whatever prompt
-# occupied that pane by then: the alert you answered could say "run the suite"
-# while the pane showed a push to the default branch. Terrence's call
-# (2026-09-12 decision form): a reply is not proof a human read THIS prompt, so
-# it gets peer authority — allow-class work goes through, anything reserved
-# comes back and needs a terminal or a form. The button route stays human: it
-# is bound to one fingerprint by construction.
-_default_authority() {
-  case "${HERDR_SELECT_VIA:-}" in
-    slack-button) printf 'human\n'; return 0 ;;
-    slack-reply)  printf 'peer\n';  return 0 ;;
-  esac
-  printf 'peer\n'
-}
-authority="${HERDR_SELECT_AUTHORITY:-$(_default_authority)}"
+# HERDR_SELECT_AUTHORITY or --authority is the only way to claim more.
+authority="${HERDR_SELECT_AUTHORITY:-peer}"
 case "$authority" in
   peer|human|conductor) ;;
   *) echo "herdr-select: authority must be peer, human, or conductor, got '$authority'" >&2; exit 2 ;;
@@ -180,21 +159,16 @@ done
 
 # Durable, caller-asserted actor provenance is distinct from authority. It is
 # audit attribution, not authentication. `peer` says which
-# policy ceiling applied; it does not say whether peer-answer, the sweep, a
-# Slack reply, or an interactive CLI invoked the selector. Resolve this only
-# after argv has finalized authority.
+# policy ceiling applied; it does not say whether peer-answer, the sweep, or
+# an interactive CLI invoked the selector. Resolve this only after argv has
+# finalized authority.
 decision_actor="${HERDR_SELECT_ACTOR:-}"
 if [ -z "$decision_actor" ]; then
-  case "${HERDR_SELECT_VIA:-cli}" in
-    slack-*) decision_actor="${HERDR_SELECT_VIA}" ;;
-    *)
-      if [ "$authority" = conductor ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-        decision_actor="conductor:${HERDR_PANE_ID}"
-      else
-        decision_actor="${HERDR_SELECT_VIA:-cli}"
-      fi
-      ;;
-  esac
+  if [ "$authority" = conductor ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    decision_actor="conductor:${HERDR_PANE_ID}"
+  else
+    decision_actor="${HERDR_SELECT_VIA:-cli}"
+  fi
 fi
 
 case "$choice" in
@@ -255,42 +229,6 @@ if [ -n "$bound_request_id" ]; then
     echo "herdr-select: bound request requires the exact tool call id." >&2; exit 2;
   }
   if [ "$authority" != conductor ]; then
-    # SOURCE ONLY, default OFF (HERDR_BOUND_CLEARANCE_SLACK=1 required).
-    # Design: thurber-os .handoffs/frozen/approval-classification-repair-
-    # 5d6e094a.md Part B. A non-conductor bound request used to be a bare
-    # dead end (exit 8, nothing else reachable). Behind the flag, file a
-    # human-route action_requests row instead, reusing the existing
-    # action_request_create/herdr-action.sh CAS machinery unchanged — so the
-    # request becomes answerable (Slack button or the hub form) rather than
-    # only refused. action_sha256 binds ALL FOUR bound identity fields (not
-    # just request_id): a re-issued call with a changed digest makes a
-    # different row, and an answer computed against the old digest is
-    # refused downstream by herdr-action.sh's exact-match check.
-    #
-    # No real tool name reaches this script for a bound request (only
-    # request_id/tool_call_id/digest/payload_sha are passed) — `tool` is
-    # recorded as the literal string "bound", a known gap, not a claim of
-    # the actual tool.
-    if [ "${HERDR_BOUND_CLEARANCE_SLACK:-0}" = 1 ]; then
-      bound_task_json="$(task_for_pane "$pane" 2>/dev/null)"
-      bound_run=$(printf '%s' "$bound_task_json" | jq -r '.run_id // empty')
-      bound_task=$(printf '%s' "$bound_task_json" | jq -r '.task_id // empty')
-      if [ -n "$bound_run" ] && [ -n "$bound_task" ]; then
-        bound_action_sha="$(printf '%s\n%s\n%s\n%s' "$bound_request_id" "$bound_tool_call_id" "$bound_arguments_digest" "$bound_payload_sha" | shasum -a 256 | cut -d' ' -f1)"
-        bound_ar_id="$(action_request_create "$bound_run" "$bound_task" bound "$bound_action_sha" \
-          "bound request $bound_request_id (tool_call $bound_tool_call_id)" reserved \
-          "OMP deferred bound resolver: no live conductor authority" human once "" "" 2>/dev/null)" || true
-        if [ -n "$bound_ar_id" ]; then
-          bash "$(dirname "$0")/slack-bridge/herdr-notify.sh" --class human-action --pane "$pane" \
-            --bound-request "$bound_ar_id" --bound-sha "$bound_action_sha" \
-            "bound request $bound_ar_id needs YOUR Approve/Deny — decide in Slack or at http://127.0.0.1:8600/decisions" \
-            >/dev/null 2>&1 || true
-          echo "herdr-select: bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance." >&2
-          _refuse_bound "bound requests require registered conductor authority — filed as $bound_ar_id for Slack/hub clearance"
-          exit 8
-        fi
-      fi
-    fi
     echo "herdr-select: bound requests require registered conductor authority." >&2
     _refuse_bound "bound requests require registered conductor authority"
     exit 8
@@ -1160,11 +1098,9 @@ _require_current_authority || {
 log_dir="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
 mkdir -p "$log_dir" || { echo "herdr-select: cannot create $log_dir — refusing to answer without an audit trail." >&2; exit 2; }
 # selections.jsonl is the authorization audit trail — command text, verdict,
-# and authority for every peer/human approval. Whichever of herdr-select.sh /
-# herdr-notify.sh / the Slack bridge happens to create this shared directory
-# FIRST decides its mode under a plain mkdir -p, so force 0700 here too
-# rather than relying on that race — same fix, same reasoning as
-# herdr-notify.sh's reg_dir chmod a few lines of that file up.
+# and authority for every peer/human approval. Whichever process happens to
+# create this shared directory FIRST decides its mode under a plain mkdir -p,
+# so force 0700 here rather than relying on that race.
 chmod 700 "$log_dir" 2>/dev/null || true
 [ -e "$log_dir/selections.jsonl" ] || : > "$log_dir/selections.jsonl"
 chmod 600 "$log_dir/selections.jsonl" 2>/dev/null || true
@@ -1181,8 +1117,8 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
 }
 
 # ---- the same decision, in the durable registry ----------------------------
-# selections.jsonl above stays the operator-facing audit file (the Slack bridge
-# and herdr-resolve.sh both read that directory). These records add the part
+# selections.jsonl above stays the operator-facing audit file. These records
+# add the part
 # review correction 6 said was missing: "decision recorded / delivery attempted
 # / delivery confirmed-or-timed-out. Recording a choice before pressing must not
 # imply it was delivered." Three separate writes, so "we decided and typed
@@ -1236,7 +1172,7 @@ approval_attempted "$approval_id" >/dev/null 2>&1 || {
 # `blocked` forever, and hub's "N task(s) need attention" counted live workers
 # as stalled — six pages for three tasks that were all fine (2026-09-12).
 # Scoped to the task registered for THIS pane, taken from the registry rather
-# than the caller's environment: a conductor or the Slack bridge answering a
+# than the caller's environment: a conductor answering a
 # worker's prompt is not running inside that worker's HERDR_TASK_ID.
 # Best-effort and last: a bookkeeping write must never fail an answer that has
 # already landed, and set_task_state refuses a terminal->running transition on
@@ -1483,11 +1419,7 @@ fi
 # The outcome is recorded on the answered task as `deny_reason_delivered`
 # (delivered | send_failed | menu_never_cleared) — only when this pane has a
 # registered task to hang it on; the line itself does not need one.
-# A Slack reply or button is a PERSON answering, even though it runs at peer
-# authority (_default_authority): their Deny is theirs to explain, so no line
-# (PR #168 review).
-case "${HERDR_SELECT_VIA:-cli}" in slack-*) _deny_from_person=1 ;; *) _deny_from_person=0 ;; esac
-if [ "$declining" = 1 ] && [ "$_deny_from_person" = 0 ] && { [ "$authority" = conductor ] || [ "$authority" = peer ]; }; then
+if [ "$declining" = 1 ] && { [ "$authority" = conductor ] || [ "$authority" = peer ]; }; then
   _deny_reason="$review_reason"
   [ -n "${_deny_reason//[[:space:]]/}" ] || _deny_reason="$policy_reason"
   # One line, bounded: CR/LF and runs of whitespace collapse to one space.
@@ -1524,60 +1456,5 @@ if [ "$declining" = 1 ] && [ "$_deny_from_person" = 0 ] && { [ "$authority" = co
     disown 2>/dev/null || true
   fi
 fi
-
-
-# Stop tracking the alert as pending ONLY when the answer came from Slack. That
-# is the case the untrack exists for: the message carrying your choice also
-# carries the confirmation the bridge posts under it, so herdr-resolve deleting
-# it would erase your own decision.
-#
-# Answered in the TERMINAL (cli/conductor/peer), nothing is posted to Slack — so
-# the alert sits there with live buttons, looking pending, forever. Untracking it
-# was what made that permanent: herdr-resolve only ever looks at pending.jsonl.
-# Observed 2026-09-06: 85 alerts from two overnight workers, every one already
-# answered via this script (approvals.decided_by='cli'), still armed in Slack the
-# next morning. Leave them TRACKED and herdr-resolve retracts each one on its
-# next pass — which is exactly the lie-prevention it was written for.
-#
-# Scope the untrack to the answered message when the caller told us which one
-# (the bridge passes the alert's ts). A pane can have several alerts queued; a
-# pane-wide drop disarmed the answered one and orphaned the rest.
-case "${HERDR_SELECT_VIA:-cli}" in slack-*)
-  pending="$log_dir/pending.jsonl"
-  if [ -s "$pending" ]; then
-    # WAIT for the mutex; never skip. The first draft took it non-blocking and
-    # called skipping "safe because the alert gets retracted later" — but for a
-    # Slack-answered alert, retracted later IS the failure: that message carries
-    # the operator's choice and the bridge threads its confirmation under it.
-    #
-    # And the collision is CAUSED by this keypress, not coincidental: the Enter
-    # sent above unblocks the worker, the worker's very next tool call fires its
-    # PostToolUse hook, that hook starts a sweep and takes this lock — all within
-    # milliseconds of arriving here. So the non-blocking version lost the race
-    # routinely and the next sweep deleted the decision. Any other session's
-    # tool call does it too.
-    #
-    # Waiting costs nothing: the keystroke has already landed.
-    . "$(cd "$(dirname "$0")" && pwd)/lib/pending-queue.sh"
-    lockdir="$log_dir/.pending.lock"
-    if pending_lock "$lockdir"; then
-      trap 'pending_unlock "$lockdir"' EXIT HUP INT TERM
-      if [ -n "${HERDR_SELECT_TS:-}" ]; then
-        pending_drop "$pending" ts "$HERDR_SELECT_TS" \
-          || echo "herdr-select: could not untrack alert ts=$HERDR_SELECT_TS — the next sweep may retract the message carrying this choice" >&2
-      else
-        pending_drop "$pending" pane "$pane" \
-          || echo "herdr-select: could not untrack alerts for $pane" >&2
-      fi
-      pending_unlock "$lockdir"
-      trap - EXIT HUP INT TERM
-    else
-      # Bounded wait exhausted. Say so: this is the one case where the operator's
-      # own message can still be retracted, and it must not be silent.
-      echo "herdr-select: pending queue locked for ${PENDING_LOCK_WAIT_S}s — alert not untracked;" \
-           "a sweep may delete the Slack message carrying this decision" >&2
-    fi
-  fi
-;; esac
 
 echo "selected $choice ($label) in $pane via $mechanism"

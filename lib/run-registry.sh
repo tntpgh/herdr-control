@@ -193,8 +193,7 @@ registry_init() {
     return 1
   }
   # Task/run/worker/conductor identity plus every reconciliation event lives
-  # here — same "force 0700, don't trust a first-runner's umask" reasoning
-  # as the Slack bridge's state dir (see herdr-notify.sh's reg_dir comment).
+  # here — "force 0700, don't trust a first-runner's umask".
   chmod 700 "$root" 2>/dev/null || true
 
   # Set persistent journal mode before ordinary DDL, with a bounded transition

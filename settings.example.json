@@ -11,13 +11,13 @@
     "install.sh does this substitution for you.",
     "",
     "async:true matters — these run on every tool call and must never block the",
-    "agent. herdr-resolve exits in ~4ms when there is nothing pending.",
+    "agent.",
     "",
     "SessionStart is deliberately async:false — its whole job is to inject",
     "additionalContext before the session's first turn, which an async",
     "('deferred') hook is not guaranteed to do in time.",
     "",
-    "The second PostToolUse entry (interval-reconcile.sh) is throttled",
+    "The PostToolUse entry (interval-reconcile.sh) is throttled",
     "internally (HERDR_RECONCILE_INTERVAL_S, default 300s) via the",
     "checkpoint file's own mtime, so it costs ~one stat call on every tool",
     "call and only does real work once per interval."
@@ -43,32 +43,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash __HERDR_CONTROL__/herdr-resolve.sh",
-            "timeout": 10,
-            "async": true
-          }
-        ]
-      },
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
             "command": "bash __HERDR_CONTROL__/agent-hooks/interval-reconcile.sh",
             "timeout": 20,
-            "async": true
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash __HERDR_CONTROL__/herdr-resolve.sh",
-            "timeout": 10,
             "async": true
           }
         ]
@@ -95,7 +71,7 @@
     "silently degrades. Add to sandbox.network.allowUnixSockets:",
     "  ~/.config/herdr/herdr.sock",
     "  /tmp/tmux-$UID/default        (and /private/tmp/... on macOS)",
-    "Without the tmux socket the alert can still be sent, but it cannot work out",
-    "WHICH pane asked, so replies have nowhere to go."
+    "Without the tmux socket the conductor can still be woken, but it cannot work",
+    "out WHICH pane asked, so answers have nowhere to go."
   ]
 }

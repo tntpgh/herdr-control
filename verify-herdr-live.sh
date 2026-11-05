@@ -550,14 +550,10 @@ echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/verify-edge.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/bin" "$tmp/state" "$tmp/bridge"
-# These cases pin the backstop MECHANISM, so they run at HERDR_SLACK_LEVEL=all
-# (every class posts, as before 2026-09-26). The errors-only policy — what the
-# default level escalates and when — has its own cases below, which override it.
-export HERDR_SLACK_LEVEL=all
+mkdir -p "$tmp/bin" "$tmp/state"
 
 # Stubs via the script's documented seams (config.sh exports its own PATH, so
-# PATH shadowing does not work here). Nothing real is reachable: no Slack, no
+# PATH shadowing does not work here). Nothing real is reachable: no
 # keypress, no hub.
 # The probe reads the hub, so the stub must answer the way the hub does:
 # `connected` plus a panes ARRAY. STUB_DOWN makes it unreachable (the
@@ -568,12 +564,6 @@ echo "curl $*" >> "$STUB_LOG"
 [ -n "${STUB_DOWN:-}" ] && exit 7
 [ -n "${STUB_MISSING:-}" ] && { echo '{"connected":true,"panes":[{"pane_id":"w1:p9","agent_status":"idle"}]}'; exit 0; }
 [ -n "${STUB_WRONG_BIRTH:-}" ] && { echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"idle","birth":"other-birth"}]}'; exit 0; }
-# STUB_CLEAR_FROM_CALL=N: blocked for the first N-1 probes, cleared after —
-# a block that outlives the backstop grace but clears before escalation.
-if [ -n "${STUB_CLEAR_FROM_CALL:-}" ]; then
-  n=$(( $(cat "$STUB_LOG.probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_LOG.probes"
-  [ "$n" -ge "$STUB_CLEAR_FROM_CALL" ] && STUB_CLEARED=1
-fi
 if [ -n "${STUB_CLEARED:-}" ]; then echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"idle"},{"pane_id":"w1:p9","agent_status":"idle"}]}'
 else echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"blocked"},{"pane_id":"w1:p9","agent_status":"blocked"}]}'; fi
 STUB
@@ -582,31 +572,8 @@ cat > "$tmp/bin/record" <<'STUB'
 echo "$(basename "$0") $*" >> "$STUB_LOG"
 exit 0
 STUB
-# The real herdr-notify appends {ts,pane} to pending.jsonl when it is given
-# --choices (that is what makes the alert retractable). The stub models that,
-# so the suite can tell a queued backstop from an un-queued one — the HIGH
-# finding this branch fixes. STUB_NOTIFY_NOQUEUE models the broken case.
-cat > "$tmp/bin/notify" <<'STUB'
-#!/usr/bin/env bash
-echo "notify $*" >> "$STUB_LOG"
-case " $* " in *" --choices "*) ;; *) exit 0 ;; esac
-[ -n "${STUB_NOTIFY_NOQUEUE:-}" ] && exit 0
-printf '{"ts":"%s","pane":"w1:p1"}\n' "$(date +%s)" >> "$STUB_PENDING"
-exit 0
-STUB
-# Only on PATH for the errors-level cases (via HERDR_EXTRA_PATH, which
-# config.sh puts first): the escalation asks human_must_answer about the pane,
-# and that must read this fixture, never a live herdr pane.
-cat > "$tmp/bin/herdr" <<'STUB'
-#!/usr/bin/env bash
-case "$1 $2" in
-  "pane read") [ -n "${STUB_SCREEN:-}" ] && cat "$STUB_SCREEN" ;;
-  *) echo '{}' ;;
-esac
-exit 0
-STUB
-chmod +x "$tmp/bin/curl" "$tmp/bin/record" "$tmp/bin/notify" "$tmp/bin/herdr"
-for name in resolve peer-answer; do cp "$tmp/bin/record" "$tmp/bin/$name"; done
+chmod +x "$tmp/bin/curl" "$tmp/bin/record"
+cp "$tmp/bin/record" "$tmp/bin/peer-answer"
 
 run_edge() {                            # <status> <previous> [env assignments...]
   : > "$tmp/log"
@@ -615,12 +582,10 @@ run_edge() {                            # <status> <previous> [env assignments..
   # ~/.local/state/herdr/runs registry, and a suite that mutates live
   # control-plane state is one nobody can run on a working machine. Callers may
   # still override it (the registry section points it at its own root).
-  env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
+  env STUB_LOG="$tmp/log" \
       HERDR_RUN_STATE_DIR="$tmp/runs-isolated" \
-      HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" \
-      HERDR_EDGE_ALERT_GRACE_S=0 \
-      HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
-      HERDR_EDGE_RESOLVE="$tmp/bin/resolve" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+      HERDR_STATE_DIR="$tmp/state" \
+      HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
       "${@:3}" \
       bash "$HERE/agent-edge.sh" w1:p1 "$1" "$2" omp /repo >/dev/null 2>&1
   tail -1 "$tmp/state/agent-edges.jsonl" 2>/dev/null
@@ -633,15 +598,14 @@ case "$(did "$line")" in "registry-follow-only (first observation) reg="*) true 
   && ok "first observation of a blocked pane records state and alerts nothing" \
   || no "first observation" "$line"
 
-# ...and with standing authority it ANSWERS that prompt while still alerting
-# nothing. A pane that was already blocked when the hub started produces no
-# further transition, so this is the only chance to clear it; three review
-# lanes sat stranded through exactly this gap on 2026-09-18.
+# ...and with standing authority it ANSWERS that prompt. A pane that was
+# already blocked when the hub started produces no further transition, so
+# this is the only chance to clear it; three review lanes sat stranded through
+# exactly this gap on 2026-09-18.
 line=$(run_edge blocked "" HERDR_EDGE_PEER_ANSWER=1)
 case "$(did "$line")" in "peer-answer(first observation, 3 rounds) reg="*) true ;; *) false ;; esac \
   && grep -q "^peer-answer --interval 1 --max-rounds 3 --agent omp w1:p1" "$tmp/log" \
-  && ! grep -q "^notify" "$tmp/log" \
-  && ok "first observation answers an allow-class prompt and still alerts nothing" \
+  && ok "first observation answers an allow-class prompt" \
   || no "first-observation peer-answer" "$line $(cat "$tmp/log")"
 # Without the grant it must stay exactly as before: record, answer nothing.
 : > "$tmp/log"
@@ -656,94 +620,9 @@ case "$(did "$line")" in "registry-heal (first observation) reg="*) [ ! -s "$tmp
   || no "registry heal" "$line $(cat "$tmp/log")"
 
 line=$(run_edge blocked working)
-case "$(did "$line")" in "backstop alert (queued for retraction) reg="*) true ;; *) false ;; esac \
-  && grep -q "^notify --class needs-input --choices --pane w1:p1" "$tmp/log" \
-  && ok "the backstop alerts WITH --choices, so the alert is queued and answerable" \
-  || no "backstop" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
-
-# The HIGH finding this replaced: an alert posted with no pending entry is
-# un-retractable, invisible to the dedupe, and button-less. If that ever
-# happens again the audit line must SAY so instead of reading like a success.
-line=$(run_edge blocked working STUB_NOTIFY_NOQUEUE=1)
-case "$(did "$line")" in *"NOT QUEUED"*) true ;; *) false ;; esac \
-  && ok "an alert that failed to queue is recorded as NOT QUEUED, not as success" \
-  || no "unqueued alert" "$line"
-rm -f "$tmp/bridge/pending.jsonl"
-
-line=$(run_edge blocked working STUB_CLEARED=1)
-[ "$(did "$line")" = "cleared within grace, no alert" ] && ! grep -q "^notify" "$tmp/log" \
-  && ok "a prompt answered inside the grace window is not alerted" || no "grace" "$line"
-
-# "Could not look" must never read as "cleared": that suppressed the page in
-# exactly the conditions where the control plane is least healthy, and wrote
-# `cleared within grace` into the audit file while doing it.
-line=$(run_edge blocked working STUB_DOWN=1)
-case "$(did "$line")" in *"probe unreachable"*|*"NOT QUEUED"*|*"queued for retraction"*) true ;; *) false ;; esac \
-  && grep -q "^notify --class needs-input --choices" "$tmp/log" \
-  && ok "an unreachable probe alerts anyway, and says the probe failed" \
-  || no "probe unknown" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
-
-printf '{"ts":"1","pane":"w1:p1"}\n' > "$tmp/bridge/pending.jsonl"
-line=$(run_edge blocked working)
-[ "$(did "$line")" = "already alerted by the worker's own hook" ] && ! grep -q "^notify" "$tmp/log" \
-  && ok "no double alert when the hook already queued one" || no "dedupe" "$line"
-rm -f "$tmp/bridge/pending.jsonl"
-
-echo "== errors-only Slack policy at the backstop (HERDR_SLACK_LEVEL=errors) =="
-# A human-only prompt (nothing the peer path can parse) still blocked at the
-# threshold escalates as human-stale; the grace-time backstop is needs-input.
-printf ' \n' > "$tmp/screen"
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 HERDR_STUCK_ALERT_S=1 \
-         HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
-[ "$(did "$line")" = "escalated to Slack as human-stale after 1s" ] \
-  && grep -q "^notify --class needs-input --choices --pane w1:p1" "$tmp/log" \
-  && grep -q "^notify --class human-stale --choices --pane w1:p1" "$tmp/log" \
-  && ok "errors level: a human-only prompt still blocked at the threshold escalates as human-stale" \
-  || no "human-stale escalation" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
-
-# An allow-class prompt (a peer could take it) that is STILL blocked escalates
-# as stuck — the automation had its turn and did not clear it.
-printf ' Allow tool: bash\n   run: git status --short\n\n\033[48;2;40;40;40m  Approve\033[0m\n   Deny\n\n up/down navigate  enter select  esc cancel\n' > "$tmp/screen"
-env HERDR_RUN_STATE_DIR="$tmp/runs-esc" bash -c '
-  . "'"$HERE"'/lib/run-registry.sh"
-  register_task run_s task_s w1 cond1 c:p1 cb w1:p1 wb /repo /wt "impl:s" >/dev/null' 2>/dev/null
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_STUCK_ALERT_S=1 HERDR_HUMAN_ALERT_S=1 \
-         HERDR_RUN_STATE_DIR="$tmp/runs-esc" HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
-[ "$(did "$line")" = "escalated to Slack as stuck after 1s" ] \
-  && grep -q "^notify --class stuck --choices --pane w1:p1" "$tmp/log" \
-  && ok "errors level: an allow-class prompt still blocked at the threshold escalates as stuck" \
-  || no "stuck escalation" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
-
-# A leftover pending entry for the pane (an earlier prompt's error alert) must
-# not end the handler at errors: the escalation is this prompt's only path.
-printf '{"ts":"1","pane":"w1:p1"}\n' > "$tmp/bridge/pending.jsonl"
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_STUCK_ALERT_S=1 HERDR_HUMAN_ALERT_S=1 \
-         HERDR_RUN_STATE_DIR="$tmp/runs-esc" HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
-[ "$(did "$line")" = "escalated to Slack as stuck after 1s" ] \
-  && ok "errors level: a stale pending entry for the pane does not swallow the escalation" \
-  || no "pending entry vs escalation" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
-
-# Blocked past the backstop grace, cleared before the threshold: no error.
-rm -f "$tmp/log.probes"
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 HERDR_STUCK_ALERT_S=1 \
-         HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen" STUB_CLEAR_FROM_CALL=2)
-[ "$(did "$line")" = "cleared before human-stale escalation" ] || [ "$(did "$line")" = "cleared before stuck escalation" ]
-[ $? = 0 ] && ! grep -q -- "--class human-stale\|--class stuck" "$tmp/log" \
-  && ok "errors level: a block that clears before the threshold escalates nothing" \
-  || no "cleared before escalation" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl" "$tmp/log.probes"
-
-# At level all the backstop already posted; no second, escalation message.
-line=$(run_edge blocked working HERDR_HUMAN_ALERT_S=1 HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
-! grep -q -- "--class human-stale\|--class stuck" "$tmp/log" \
-  && ok "level all: the backstop posts as before and arms no escalation" \
-  || no "all-level escalation" "$line $(cat "$tmp/log")"
-rm -f "$tmp/bridge/pending.jsonl"
+case "$(did "$line")" in "registry-follow-only reg="*) [ ! -s "$tmp/log" ] ;; *) false ;; esac \
+  && ok "a blocked edge follows the registry and touches nothing else" \
+  || no "blocked edge" "$line $(cat "$tmp/log")"
 
 line=$(run_edge blocked working)
 grep -q "^peer-answer" "$tmp/log" \
@@ -752,13 +631,13 @@ grep -q "^peer-answer" "$tmp/log" \
 
 line=$(run_edge blocked working HERDR_EDGE_PEER_ANSWER=1)
 grep -q "^peer-answer --interval 1 --max-rounds 3 --agent omp w1:p1" "$tmp/log" \
+  && case "$(did "$line")" in "peer-answer(3 rounds) reg="*) true ;; *) false ;; esac \
   && ok "opting in answers three short rounds, for that pane only" \
   || no "peer-answer opt-in" "$(cat "$tmp/log")"
 
 line=$(run_edge working blocked STUB_CLEARED=1)
 [ "$(did "$line")" = "ignored unbound unblocked edge: no blocked registry occurrence" ] \
-  && ! grep -q "^resolve" "$tmp/log" \
-  && ok "an unbound clear cannot retract an alert" || no "unbound clear" "$line $(cat "$tmp/log")"
+  && ok "an unbound clear changes nothing" || no "unbound clear" "$line $(cat "$tmp/log")"
 
 line=$(run_edge working idle)
 [ "$(did "$line")" = "noop" ] && [ ! -s "$tmp/log" ] \
@@ -796,16 +675,16 @@ before_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/p
 line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot")
 after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
 after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
-[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] \
   && ok "a delayed working edge cannot close a newer blocked occurrence" \
   || no "delayed edge occurrence guard" "after=$after period=$before_period->$after_period did=$(did "$line") log=$(cat "$tmp/log")"
 
 # An unreachable hub is not evidence that the prompt cleared. Preserve the
-# same occurrence and alert, exactly as for an explicitly blocked current view.
+# same occurrence, exactly as for an explicitly blocked current view.
 line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_DOWN=1)
 after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
 after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
-[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] \
   && ok "an unavailable hub cannot clear a blocked occurrence" \
   || no "unavailable hub clear guard" "after=$after period=$before_period->$after_period did=$(did "$line")"
 
@@ -814,28 +693,26 @@ after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/pr
 line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_MISSING=1)
 after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
 after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
-[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] \
   && ok "a current pane list missing the target cannot clear its occurrence" \
   || no "missing target clear guard" "after=$after period=$before_period->$after_period did=$(did "$line")"
 
 : > "$tmp/log"
-env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" STUB_WRONG_BIRTH=1 \
-    HERDR_RUN_STATE_DIR="$stale_regroot" HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" \
-    HERDR_EDGE_ALERT_GRACE_S=0 HERDR_EDGE_CURL="$tmp/bin/curl" \
-    HERDR_EDGE_NOTIFY="$tmp/bin/notify" HERDR_EDGE_RESOLVE="$tmp/bin/resolve" \
-    HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+env STUB_LOG="$tmp/log" STUB_WRONG_BIRTH=1 \
+    HERDR_RUN_STATE_DIR="$stale_regroot" HERDR_STATE_DIR="$tmp/state" \
+    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
     bash "$HERE/agent-edge.sh" w1:p1 working blocked omp /repo birth2 >/dev/null 2>&1
 after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
-[ "$after" = "blocked" ] && ! grep -q '^resolve' "$tmp/log" \
+[ "$after" = "blocked" ] \
   && ok "a recycled target birth cannot clear the registered occurrence" \
   || no "probe birth guard" "after=$after log=$(cat "$tmp/log")"
 
-# A current cleared view still performs the intended transition and retracts.
+# A current cleared view still performs the intended transition.
 line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_CLEARED=1)
 after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
-[ "$after" = "running" ] && grep -q '^resolve' "$tmp/log" \
-  && [ "$(did "$line")" = "unblocked: registry running + retract reg=running" ] \
-  && ok "a verified current clear advances the registry and retracts" \
+[ "$after" = "running" ] \
+  && [ "$(did "$line")" = "unblocked: registry running reg=running" ] \
+  && ok "a verified current clear advances the registry" \
   || no "verified clear" "after=$after did=$(did "$line") log=$(cat "$tmp/log")"
 
 # Reproduce the TOCTOU/ABA shape directly against the actual registry writer:
@@ -864,7 +741,6 @@ fi
 env HERDR_RUN_STATE_DIR="$regroot" bash -c '
   . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
   set_task_state run_v task_v completed no-follow-on >/dev/null' 2>/dev/null
-rm -f "$tmp/bridge/pending.jsonl"   # or the dedupe exits before the audit line
 line=$(run_edge blocked working HERDR_RUN_STATE_DIR="$regroot")
 after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_v';" 2>/dev/null)
 [ "$after" = "completed" ] && case "$(did "$line")" in *"reg=refused("*) true ;; *) false ;; esac \
@@ -878,12 +754,10 @@ env HERDR_RUN_STATE_DIR="$regroot" bash -c '
   . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
   register_task run_b task_b worker_b conductor_b c:p1 birth1 w1:p9 REGISTERED-BIRTH /repo /wt lane >/dev/null
   set_task_state run_b task_b running >/dev/null' 2>/dev/null
-rm -f "$tmp/bridge/pending.jsonl"
 : > "$tmp/log"
-env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
-    HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" HERDR_EDGE_ALERT_GRACE_S=0 \
-    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
-    HERDR_EDGE_RESOLVE="$tmp/bin/resolve" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+env STUB_LOG="$tmp/log" \
+    HERDR_STATE_DIR="$tmp/state" \
+    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
     HERDR_RUN_STATE_DIR="$regroot" \
     bash "$HERE/agent-edge.sh" w1:p9 blocked working omp /repo LIVE-BIRTH-DIFFERENT >/dev/null 2>&1
 after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_b';" 2>/dev/null)
@@ -893,11 +767,9 @@ line=$(tail -1 "$tmp/state/agent-edges.jsonl" 2>/dev/null)
   || no "birth guard" "after=$after did=$(did "$line")"
 
 # ...and a MATCHING birth still heals, so the guard is not just "always refuse".
-rm -f "$tmp/bridge/pending.jsonl"
-env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
-    HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" HERDR_EDGE_ALERT_GRACE_S=0 \
-    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
-    HERDR_EDGE_RESOLVE="$tmp/bin/resolve" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+env STUB_LOG="$tmp/log" \
+    HERDR_STATE_DIR="$tmp/state" \
+    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
     HERDR_RUN_STATE_DIR="$regroot" \
     bash "$HERE/agent-edge.sh" w1:p9 blocked working omp /repo REGISTERED-BIRTH >/dev/null 2>&1
 after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_b';" 2>/dev/null)

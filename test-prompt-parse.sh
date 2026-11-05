@@ -266,8 +266,8 @@ SCREEN=$'1. Yes\n2. No\n I have applied the change and moved on to the tests.\n'
   || no "stale numbered list" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
 
 # The steering-queue case is guarded by ORDER, not by this parser: every caller
-# tries prompt_menu_options FIRST (slack-bridge/herdr-notify.sh:229,
-# herdr-select.sh:166), so on a screen with a real approval panel the menu
+# tries prompt_menu_options FIRST (herdr-select.sh:166), so on a screen with
+# a real approval panel the menu
 # parse consumes it and the queue is never consulted. `prompt_options` cannot
 # distinguish them itself — the panel below the queue is box furniture, and
 # rejecting box furniture would refuse every live prompt painted above a status

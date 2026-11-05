@@ -20,10 +20,8 @@
 #
 # Isolation: HOME, HERDR_STATE_ROOT, HERDR_RUN_STATE_DIR and TMPDIR all
 # point inside one mktemp -d; never the live ~/.local/state/herdr.
-# HERDR_ACTION_NOTIFY and HERDR_ACTION_SEND are stubbed to local recorder
-# scripts, because the suite's route=human action request makes it past
-# claim_once's slack-notify gate on its very first herdr-action.sh tick —
-# without a stub, that is a REAL Slack post (herdr-action.sh:534-536).
+# HERDR_ACTION_SEND is stubbed to a local recorder script, so a conductor
+# wake from the suite's herdr-action.sh ticks never reaches a real pane.
 #
 # REVIEW-FORMFIX-R2-510269d.md: the suite's own live-dir check must snapshot
 # the REAL root, not whatever HOME happens to be once this launcher has
@@ -67,32 +65,24 @@ S="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$S")" \
 
 mkdir -p "$S/home" "$S/state" "$S/runs" "$S/tmp" "$S/bin" || { echo "isolated-run: mkdir -p scratch dirs failed" >&2; exit 1; }
 
-cat > "$S/bin/notify-stub.sh" <<'EOF'
-#!/bin/bash
-printf '%s\n' "$*" >> "${HERDR_TEST_NOTIFIED:-/dev/null}"
-EOF
 cat > "$S/bin/send-stub.sh" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "${HERDR_TEST_SENT:-/dev/null}"
 EOF
-chmod +x "$S/bin/notify-stub.sh" "$S/bin/send-stub.sh" || { echo "isolated-run: could not write/chmod stub scripts" >&2; exit 1; }
+chmod +x "$S/bin/send-stub.sh" || { echo "isolated-run: could not write/chmod stub scripts" >&2; exit 1; }
 
 export HOME="$S/home" HERDR_STATE_ROOT="$S/state" HERDR_RUN_STATE_DIR="$S/runs" TMPDIR="$S/tmp"
 export HERDR_GUARD_LIVE_ROOT="$HERDR_GUARD_LIVE_ROOT" HERDR_GUARD_SANDBOX_ROOT="$S"
-export HERDR_ACTION_NOTIFY="$S/bin/notify-stub.sh" HERDR_ACTION_SEND="$S/bin/send-stub.sh"
-export HERDR_TEST_NOTIFIED="$S/notified.log" HERDR_TEST_SENT="$S/sent.log"
-: > "$HERDR_TEST_NOTIFIED"
+export HERDR_ACTION_SEND="$S/bin/send-stub.sh"
+export HERDR_TEST_SENT="$S/sent.log"
 : > "$HERDR_TEST_SENT"
 
 rc=0
 bash "$here/verify-formserve-action-forms-guard.sh" || rc=$?
 
 echo
-echo "== isolated-run: stubbed side channels (informational -- a notify call"
-echo "   here is EXPECTED, the request's one human-route Slack post; real"
-echo "   herdr-notify.sh/send never ran) =="
-echo "notify-stub.sh calls:"
-cat "$HERDR_TEST_NOTIFIED"
+echo "== isolated-run: stubbed side channel (informational -- the real send"
+echo "   never ran) =="
 echo "send-stub.sh calls:"
 cat "$HERDR_TEST_SENT"
 
