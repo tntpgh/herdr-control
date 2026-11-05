@@ -48,9 +48,10 @@ for tid in ("t-run", "t-review", "t-secret"):
 (HOME / "data/t-review").mkdir()
 LEAK_PATHS = ["/Users/LEAKUSER/proj/notes.txt", "~/LEAKHOME/file", "~/.treehouse/LEAKTREE/wt",
               "/opt/x/.herdr/worktrees/LEAKWT/kb", "cwd:/Users/LEAKCOLON/x", "worktree=/Users/LEAKEQ/x",
-              "file:///Users/LEAKFILE/x", "/Users/t/Library/Application Support/LEAKSPACE/x"]
+              "file:///Users/LEAKFILE/x", "/Users/t/Library/Application Support/LEAKSPACE/x",
+              "/Users/thurbs/Code/my LEAKLOWER/src/x.py"]
 KEEP_TEXT = ["https://github.com/tntpgh/x/pull/7", "remote-mcp/fm_publisher.py", "run /review", "GET /api/v1/tasks"]
-PATH_TEXT = " ".join(LEAK_PATHS + KEEP_TEXT)
+PATH_TEXT = " ".join(LEAK_PATHS) + "\n" + " ".join(KEEP_TEXT)
 (HOME / "data/t-review/report.md").write_text(f"# Report\nverdict: ship it\nleaked {GH_TOKEN} here\n{PEM}\n{PATH_TEXT}\n")
 (HOME / "data/t-secret").mkdir()
 (HOME / "data/t-secret/report.md").write_text("DENIED-REPORT-TEXT\n")
@@ -364,7 +365,8 @@ class Egress(Base):
         self.tick()
         body = self.sent()[0]
         text = json.dumps(body)
-        for leak in ("LEAKUSER", "LEAKHOME", "LEAKTREE", "LEAKWT", "LEAKCOLON", "LEAKEQ", "LEAKFILE", "LEAKSPACE", "Support"):
+        for leak in ("LEAKUSER", "LEAKHOME", "LEAKTREE", "LEAKWT", "LEAKCOLON", "LEAKEQ", "LEAKFILE", "LEAKSPACE", "Support",
+                     "LEAKLOWER", "src/x.py"):
             self.assertNotIn(leak, text)
         report = [r for r in body["results"] if r["task_id"] == "t-review" and r["source"] == "report.md"][0]["text"]
         hold = {b["task_id"]: b for b in body["snapshot"]["blockers"]}["t-hold"]["summary"]

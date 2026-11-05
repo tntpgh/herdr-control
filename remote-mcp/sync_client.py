@@ -59,7 +59,7 @@ REDACTIONS = [
     (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*:\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
     # Local filesystem paths under real roots (any prefix, file:// too, spaces inside a segment) and worktrees.
     (re.compile(r"(?:file://)?(?:~|(?<![\w.\-])/(?:Users|home|private|var|tmp|opt|Volumes))/[^\s\"'<>()\[\]]*"
-                r"(?: [A-Z][^\s/]*/[^\s\"'<>()\[\]]*)*"), "[path]"),
+                r"(?: [^\s/]+/[^\s\"'<>()\[\]]*)*"), "[path]"),
     (re.compile(r"\S*\.(?:treehouse|herdr/worktrees)/\S*"), "[path]"),
 ]
 
