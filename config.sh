@@ -224,17 +224,6 @@ HERDR_OMP_LAUNCHER_SHA256="cabdc6cd5487fdea4de7338e74694fb5f6bfd489d06b45fca7f8d
 # the prompt changes/resolves — this file's own value never resets the clock.
 : "${HERDR_WAKE_RESPONSE_S:=600}"
 
-# ---- what reaches Slack (lib/slack-level.sh) ---------------------------------
-#   errors  only what the automation cannot fix itself: a human-only prompt
-#           still open after HERDR_HUMAN_ALERT_S (300s), a worker blocked on the
-#           same prompt after HERDR_STUCK_ALERT_S (900s), a failed conductor
-#           wake, the hub's subscription down, an overdue deploy
-#   all     every alert, the pre-2026-09-26 behaviour
-#   off     nothing
-# Suppressed alerts are logged one line each to
-# $HERDR_STATE_DIR/slack-suppressed.jsonl and stay visible on the hub.
-: "${HERDR_SLACK_LEVEL:=errors}"
-
 # Pane id of the top-level operator session ("Main") that receives an
 # escalation when a task's own conductor does not act in time, plus its birth
 # fingerprint (herdr's terminal_id) for the recycled-pane refusal every other
@@ -306,8 +295,8 @@ unset _herdr_main_db _herdr_main_row
 #
 # How long a signal may sit idle before the owner is woken.
 : "${HERDR_STALL_WATCHDOG_THRESHOLD_S:=600}"
-# How long the owner then has, unacknowledged (stall-ack.sh), before a real
-# Slack alert goes out instead of just a wake in their pane. Unset means
+# How long the owner then has, unacknowledged (stall-ack.sh), before the
+# signal is escalated (a stall_escalated registry event). Unset means
 # 2x the detect threshold, the same ladder shape as HERDR_WAKE_RESPONSE_S.
 : "${HERDR_STALL_WATCHDOG_ESCALATE_S:=}"
 
@@ -320,6 +309,6 @@ export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES HERDR_BOUND_BASH
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
-export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_SLACK_LEVEL HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
+export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
 export HERDR_STALL_WATCHDOG_THRESHOLD_S HERDR_STALL_WATCHDOG_ESCALATE_S
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

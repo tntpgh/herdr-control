@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # stall-watchdog.sh — wake the owner of a task whose pane has gone idle or
 # finished while it still owes the conductor an action, with a bounded
-# second-window escalation to a REAL human-visible alert when the owner is
-# unknown, dead, or does not act.
+# second-window escalation (a durable `stall_escalated` registry event) when
+# the owner is unknown, dead, or does not act.
 #
 # .handoffs/SPEC.md (feat/stall-watchdog): three real incidents, 8-14h each
 # (2026-10-02/03), where a finished/idle worker's pane carried a signal — a
@@ -45,7 +45,7 @@
 # HERDR_STALL_WATCHDOG_ESCALATE_S (default 2x the detect threshold):
 # escalate exactly once (a SECOND claim_once, `${key}_escalate`) — the same
 # two-rung shape attention-tick.sh's own _attn_maybe_escalate uses (the
-# owner's window, then a real alert).
+# owner's window, then an escalation record).
 #
 # A fingerprint that CHANGES (a rewritten artifact, a fresh denial, a new
 # handoff) re-arms on its own: it is simply a different claim_once key, so
@@ -63,14 +63,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/config.sh" 2>/dev/null || true
 . "$here/lib/run-registry.sh"
 . "$here/lib/pane-guard.sh"
-. "$here/lib/alert-gate.sh"       # alert_claim — the escalation post-dedupe
 . "$here/lib/escalation.sh"       # feat/no-progress-model-escalation R2:
                                    # same resident watchdog feeds the
                                    # stronger-model detector every real
                                    # cycle — no second daemon.
 
 SW_SEND="${HERDR_STALL_WATCHDOG_SEND:-$here/send-to-agent.sh}"
-SW_NOTIFY="${HERDR_STALL_WATCHDOG_NOTIFY:-$here/slack-bridge/herdr-notify.sh}"
 
 _sw_digest() {                          # <text> -> short stable digest
   if command -v shasum >/dev/null 2>&1; then
@@ -210,7 +208,7 @@ _sw_acked_since() {                     # task_id signal since_iso -> 0 if acked
 # (owner_acted/brief_delivered/reply_delivered) or reviews an approval
 # (approval_reviewed). ANY of those after the wake's own claim counts the
 # same as an explicit ack; otherwise every wake the conductor handles the
-# NORMAL way still escalates to Slack 2x the threshold later regardless.
+# NORMAL way still escalates 2x the threshold later regardless.
 _sw_owner_acted_since() {               # task_id since_iso -> 0 if owner activity happened after
   local n
   n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1")
@@ -223,7 +221,7 @@ _sw_owner_acted_since() {               # task_id since_iso -> 0 if owner activi
 # to wake for this fingerprint", not "the conductor received it" —
 # send-to-agent.sh can refuse a live prompt (exit 5/6) or report
 # UNSUBMITTED (exit 4), and the first cut here never retried; the only
-# fallback was a Slack alert a full escalate-window later. A confirmed
+# fallback was an escalation a full escalate-window later. A confirmed
 # delivery is a stall_wake_result for this exact key with exit_code 0 —
 # append-only per attempt, same precedent as lib/push-wake.sh's own
 # wake_attempted/wake_result rows, so a retry's outcome is a new fact.
@@ -234,7 +232,7 @@ _sw_wake_confirmed() {                  # task_id key -> 0 if delivered (rc=0) a
   [ "${n:-0}" -gt 0 ]
 }
 
-# Review N4: `claim_once`'s 2x-threshold Slack escalation window retries
+# Review N4: `claim_once`'s 2x-threshold escalation window retries
 # every tick while a wake sits unconfirmed — but `send-to-agent.sh` exit 4
 # (UNSUBMITTED) and the mid-submit exit 5 ("the text was delivered but NOT
 # submitted") both mean text ALREADY SAT in the composer; retrying typed a
@@ -244,7 +242,7 @@ _sw_wake_confirmed() {                  # task_id key -> 0 if delivered (rc=0) a
 # (rc=4, or any REFUSED/UNCONFIRMED message containing "delivered" — the
 # two pre-type refusals never say that) so a later tick can tell "nothing
 # landed yet, safe to retry" from "something is already sitting there,
-# stop typing and let it ride to the window's own Slack fallback instead".
+# stop typing and let it ride to the window's own escalation instead".
 _sw_wake_typed() {                      # task_id key -> 0 if an attempt already typed text
   local n
   n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1") AND type='stall_wake_result'
@@ -302,25 +300,13 @@ _sw_owner_status() {                    # conductor_pane conductor_birth -> ok|d
   printf 'ok\n'
 }
 
-# alert_claim's event_id length budget: keep the dedupe key short (SQLite
-# TEXT has no hard limit, but a stable short id is easier to grep in the
-# registry and matches _ag_claim_id's own 'slack_alert_<pane>_<key>' shape).
-_sw_escalate() {                        # task_id run_id signal label pane conductor detail artifact reason digest
-  local task_id="$1" run_id="$2" signal="$3" label="$4" pane="$5" conductor="$6" detail="$7" artifact="$8" reason="$9" digest="${10:-}"
-  local alert_pane="${conductor:-_none}" key="${signal}_${task_id}_${digest}"
-  alert_claim "$alert_pane" "$key" || return 0   # already posted for this (task,signal) within the TTL
-  local art_note=""
-  [ -n "$artifact" ] && art_note=" ($artifact)"
-  local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. ${reason}. Nothing answers prompts or acts on the worker's behalf here — a human looks. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
-  local rc=0
-  if [ -n "$conductor" ]; then
-    bash "$SW_NOTIFY" --pane "$conductor" --class stall-watchdog "$msg" >/dev/null 2>&1 || rc=$?
-  else
-    bash "$SW_NOTIFY" --class stall-watchdog "$msg" >/dev/null 2>&1 || rc=$?
-  fi
+# The escalation is the durable record of a stall nobody acted on; the
+# caller's `${key}_escalate` / `${key}_unowned` claim_once already makes it
+# one per (task, signal, fingerprint).
+_sw_escalate() {                        # task_id run_id signal artifact reason
+  local task_id="$1" run_id="$2" signal="$3" artifact="$4" reason="$5"
   append_event "$run_id" "$task_id" stall_escalated \
-    "$(jq -nc --arg s "$signal" --arg r "$reason" --argjson rc "$rc" \
-       '{signal:$s, reason:$r, notify_exit:$rc}')" >/dev/null 2>&1 || true
+    "$(jq -nc --arg s "$signal" --arg a "$artifact" --arg r "$reason" '{signal:$s, artifact:$a, reason:$r}')" >/dev/null 2>&1 || true
 }
 
 # _sw_escalation_tick <run_id> <task_id> <signal> <fingerprint> <detail> —
@@ -430,11 +416,11 @@ cmd_wake() {
       # Review M3: claim_once means "we decided to wake", never "the
       # conductor received it" — retry delivery within the owner's own
       # window instead of silently leaving an unconfirmed send to time out
-      # into a 2x-threshold Slack escalation regardless of what happened.
+      # into a 2x-threshold escalation regardless of what happened.
       # Review N4: only while NOTHING has typed yet — once an attempt
       # landed text in the composer (`_sw_wake_typed`), retrying would type
       # another copy on top of it every tick; let that one ride to the
-      # window's own Slack fallback instead of compounding it.
+      # window's own escalation instead of compounding it.
       if ! _sw_wake_confirmed "$task_id" "$key" && ! _sw_wake_typed "$task_id" "$key"; then
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
           local art_note="" harvest_note
@@ -454,8 +440,7 @@ cmd_wake() {
     claim_once "${key}_escalate" "$run_id" "$task_id" stall_escalate_claim "$payload" || return 0
     local reason="the owner did not act within ${window}s of the wake"
     [ "$status" = dead ] && reason="the conductor pane is gone or unreachable, and the owner never acted"
-    _sw_escalate "$task_id" "$run_id" "$signal" "$label" "$pane" "$conductor" "$detail" "$artifact" \
-      "$reason" "$digest"
+    _sw_escalate "$task_id" "$run_id" "$signal" "$artifact" "$reason"
     return 0
   fi
 
@@ -468,8 +453,7 @@ cmd_wake() {
   if [ "$status" = dead ]; then
     claim_once "${key}_unowned" "$run_id" "$task_id" stall_wake_unowned \
       "$(jq -nc --arg s "$signal" --arg c "$conductor" '{signal:$s, conductor:$c}')" >/dev/null 2>&1 || return 0
-    _sw_escalate "$task_id" "$run_id" "$signal" "$label" "$pane" "$conductor" "$detail" "$artifact" \
-      "owner unknown or unreachable — no conductor pane to wake" "$digest"
+    _sw_escalate "$task_id" "$run_id" "$signal" "$artifact" "owner unknown or unreachable — no conductor pane to wake"
     return 0
   fi
 

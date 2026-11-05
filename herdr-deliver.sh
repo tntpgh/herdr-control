@@ -2,7 +2,7 @@
 # herdr-deliver.sh <target> <text...>
 #
 # Deliver a message (a reply / an instruction) to a herdr agent and submit it.
-# This is the delivery leaf the Slack bridge calls — but it's useful on its own
+# This is the delivery leaf the hub, publisher and owner dispatch call — but it's useful on its own
 # for answering whichever agent is waiting on you.
 #
 #   <target> is one of:
@@ -25,11 +25,10 @@ set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 
-# --force must come FIRST, before the target. The Slack bridge always passes the
-# target as its own first argv element, so attacker-controlled message text can
-# never land in this position — the override stays a human-at-a-terminal act and
-# is deliberately NOT reachable from Slack, which is the whole point of the
-# permission-prompt guard it overrides.
+# --force must come FIRST, before the target. Every automated caller passes the
+# target as its own first argv element, so caller-supplied message text can
+# never land in this position — the override stays a human-at-a-terminal act,
+# which is the whole point of the permission-prompt guard it overrides.
 force=""
 if [ "${1:-}" = "--force" ]; then force="--force"; shift; fi
 

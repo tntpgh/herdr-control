@@ -7,7 +7,6 @@
 #
 #   ./install.sh              # show what would change, touch nothing
 #   ./install.sh --apply      # make the changes
-#   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
 #   ./install.sh --apply --hub        # also install the launchd agent for hub.py (localhost:8600)
 #   ./install.sh --apply --auth       # also install the bounded-autonomy auth pair (macOS)
 #   ./install.sh --apply --remote-mcp # also install the herdr-mcp publisher (remote-mcp/README.md)
@@ -38,14 +37,12 @@
 #                                      # the omp extension symlink
 #
 # What it registers in ~/.claude/settings.json:
-#   Notification -> agent-hooks/claude-notify.sh       alert you when an agent needs input
+#   Notification -> agent-hooks/claude-notify.sh       wake the conductor when an agent needs input
 #   PreToolUse   -> agent-hooks/claude-pretooluse-cache.sh  cache the tool+command so
 #                                                       the Notification alert above can
 #                                                       show what is being approved, not
 #                                                       just that something needs approval
-#   PostToolUse  -> herdr-resolve.sh                   retract alerts answered in the terminal
 #   PostToolUse  -> agent-hooks/interval-reconcile.sh  throttled mid-session reconciliation
-#   Stop         -> herdr-resolve.sh                   backstop for the same
 #   SessionStart -> agent-hooks/session-reconcile.sh   report task-state changes missed while
 #                                                       no conductor was watching (wake persistence)
 #
@@ -77,12 +74,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/pane-guard.sh
 . "$here/lib/pane-guard.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; REMOTE_MCP_RA_SENDER=0; CHROME=0
+APPLY=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; REMOTE_MCP_RA_SENDER=0; CHROME=0
 REMOTE_MCP_CONDUCTOR_PANE=""
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
-    --bridge)  BRIDGE=1 ;;
     --hub)     HUB=1 ;;
     --auth)    AUTH=1 ;;
     --remote-mcp) REMOTE_MCP=1 ;;
@@ -93,7 +89,7 @@ for a in "$@"; do
     --remote-mcp-ra-sender) REMOTE_MCP_RA_SENDER=1 ;;
     --chrome)  CHROME=1 ;;
     --repoint) REPOINT=1 ;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -160,10 +156,8 @@ wanted = [
         ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh"), True, 10),
     ("PreToolUse",   f'bash {here}/agent-hooks/claude-pretooluse-cache.sh',
         ("claude-pretooluse-cache.sh",), True, 10),
-    ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True, 10),
     ("PostToolUse",  f'bash {here}/agent-hooks/interval-reconcile.sh',
         ("interval-reconcile.sh",), True, 20),
-    ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True, 10),
     ("SessionStart", f'bash {here}/agent-hooks/session-reconcile.sh',
         ("session-reconcile.sh",), False, 20),
 ]
@@ -372,51 +366,6 @@ else
   echo "  + omp extension $OMP_LINK -> $OMP_TARGET"
 fi
 
-# ---- bridge daemon (optional, macOS) ---------------------------------------
-if [ "$BRIDGE" = 1 ]; then
-  PLIST="$HOME/Library/LaunchAgents/com.herdr-control.bridge.plist"
-
-  # A bridge daemon may already be installed under a DIFFERENT label — one
-  # machine had it under a different reverse-DNS label, pointed at an
-  # ~/.claude/skills/herdr-ops copy. Writing our own label on top of that does not
-  # replace it, it ADDS a second daemon: two Socket-Mode clients on one Slack app,
-  # so every reply is delivered twice and both race to press keys at the same
-  # prompt. Same "detect, do not duplicate" rule the hook wiring above follows.
-  #
-  # Not auto-fixed, because which copy should own the daemon is an operator
-  # decision and the other plist may be hand-maintained: repointing an existing
-  # plist's ProgramArguments at this checkout is usually right, but that is a
-  # choice, not a default.
-  OTHER_BRIDGE=""
-  for p in "$HOME/Library/LaunchAgents"/*.plist; do
-    [ -f "$p" ] || continue
-    [ "$p" = "$PLIST" ] && continue
-    if grep -q 'slack-bridge/run-bridge.sh' "$p" 2>/dev/null; then
-      OTHER_BRIDGE="$p"
-      break
-    fi
-  done
-  if [ -n "$OTHER_BRIDGE" ]; then
-    echo "  ! another bridge LaunchAgent already exists: $OTHER_BRIDGE" >&2
-    echo "  ! installing $PLIST too would run TWO daemons — every Slack reply delivered twice." >&2
-    echo "  ! repoint that plist's ProgramArguments at $here/slack-bridge/run-bridge.sh instead," >&2
-    echo "  ! or remove it first. Skipping the bridge step." >&2
-  elif [ "$APPLY" = 1 ]; then
-    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-    # _sed_rhs (agent-lib.sh) escapes `&`, `|` and `\` before substituting.
-    sed -e "s|__RUN_BRIDGE__|$(_sed_rhs "$here/slack-bridge/run-bridge.sh")|" \
-        -e "s|__HOME__|$(_sed_rhs "$HOME")|g" \
-        -e "s|__LOG_PATH__|$(_sed_rhs "$HOME/Library/Logs/com.herdr-control.bridge.log")|g" \
-      "$here/slack-bridge/com.herdr-control.bridge.plist.template" > "$PLIST"
-    # plutil lint, bootout/bootstrap, teardown wait and a running-check all
-    # live in reload_agent — a broken render must never be loaded (launchd
-    # would KeepAlive-loop it) and a failed reload must not be silent.
-    reload_agent com.herdr-control.bridge "$PLIST" || exit 1
-  else
-    echo "  + would install launchd plist -> $PLIST"
-  fi
-fi
-
 # Deferred non-fatal failures: the installer reports them at the END with a
 # nonzero exit, instead of aborting halfway and leaving later agents
 # unrendered — see the hub block below.
@@ -438,7 +387,7 @@ if [ "$HUB" = 1 ]; then
     # production and a rollback is a sha.
     #
     # FAIL SOFT. An `exit 2` here aborted the whole installer before the auth
-    # pair was re-rendered — and `./install.sh --hub --bridge --auth --apply`
+    # pair was re-rendered — and `./install.sh --hub --auth --apply`
     # is the command restart.sh documents as the repair when a plist is wrong.
     # A run intended to fix the control plane would have fixed none of it and
     # said nothing about the two services it skipped, which is the shape of
@@ -446,7 +395,7 @@ if [ "$HUB" = 1 ]; then
     #
     # Same fail-soft shape for the interpreter pin: no versioned python3
     # found is as fatal as a deploy that does not compile, but it must not
-    # abort auth/bridge/remote-mcp rendering below.
+    # abort auth/remote-mcp rendering below.
     if HUB_PY_BIN="$(resolve_hub_python)"; then
       HERDR_DEPLOY_PYTHON="$HUB_PY_BIN"
       if deploy_app "${HUB_REV:-origin/main}"; then
@@ -677,8 +626,7 @@ fi
 # ---- bounded-autonomy auth pair (optional, macOS) ---------------------------
 # `omp auth-broker serve` on :8765 and `omp auth-gateway serve` on :4000, both
 # loopback. They ran for two days as hand-written plists tracked in no repo,
-# which is the same condition that let the Slack bridge sit deadlocked in
-# `op read` unnoticed (see slack-bridge/com.herdr-control.bridge.plist.template).
+# where a launchd job can sit deadlocked in `op read` unnoticed.
 # Install BOTH or neither: the gateway is inert without the broker.
 if [ "$AUTH" = 1 ]; then
   OMP_BIN="$(command -v omp || true)"
@@ -709,15 +657,6 @@ if [ "$AUTH" = 1 ]; then
     echo "  + would install launchd plists -> com.herdr-control.auth-{broker,gateway} (omp: ${OMP_BIN:-none})"
   fi
 fi
-
-cat <<EOF
-
-Next, if you have not already:
-  1. cp slack-bridge/herdr-bridge.env.example ~/.config/herdr-bridge.env
-     and fill it in (Slack app setup: slack-bridge/SETUP.md)
-  2. chmod 600 ~/.config/herdr-bridge.env
-  3. start the bridge:  ./slack-bridge/run-bridge.sh   (or --bridge for launchd)
-EOF
 
 # A deferred failure (currently: a hub deploy that did not compile or could not
 # resolve) exits nonzero HERE, after every other agent has been rendered and

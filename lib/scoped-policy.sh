@@ -339,8 +339,8 @@ _sp_trunk_suite() {                     # wt path snap [trunk]
   case "$path" in "$realwt"/*) rel="${path#"$realwt"/}" ;; *) return 1 ;; esac
   # Scope: the repo's own test entry points only — a root-level verify-*.sh
   # or scripts/ci.sh. Any other tracked script can reach outside the digest
-  # by design (#169 review round 2: slack-bridge/herdr-notify.sh sources
-  # ${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}), so it never takes
+  # by design (#169 review round 2: a script that sources a config file from
+  # $HOME reads state no digest covers), so it never takes
   # this path.
   case "$rel" in verify-*.sh|scripts/ci.sh) ;; *) return 1 ;; esac
   case "$rel" in verify-*/*) return 1 ;; esac

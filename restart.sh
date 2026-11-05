@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # restart.sh — restart the herdr-control control plane, and prove it came back.
 #
-#   ./restart.sh              restart all four services, then verify
+#   ./restart.sh              restart all three services, then verify
 #   ./restart.sh --verify     check only; changes nothing
 #   ./restart.sh --panes      also close every agent pane first (clean slate)
-#   ./restart.sh hub bridge   restart only the named services
+#   ./restart.sh hub auth-broker   restart only the named services
 #   ./restart.sh --deploy     deploy origin/main to the app worktree, then restart
 #   ./restart.sh --deploy=<rev>   deploy that revision (rollback is a sha)
 #
@@ -28,12 +28,12 @@
 #                           uncommitted work — deleting these loses work
 #   ~/.herdr/isolated-worker isolated agent state
 #   .handoffs/ buses        other sessions read them
-# A clean CONTROL PLANE is these four services plus (optionally) panes. Agent
+# A clean CONTROL PLANE is these three services plus (optionally) panes. Agent
 # state is a different thing, and conflating them costs you work.
 #
 # ROLLBACK: these are KeepAlive agents; rerun this script. If a plist itself is
 # wrong, re-render it from source of truth:
-#   ./install.sh --hub --bridge --auth --apply
+#   ./install.sh --hub --auth --apply
 
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -57,7 +57,7 @@ for a in "$@"; do
   esac
 done
 
-# Resolve "hub" / "auth-gateway" to full labels; default to all four.
+# Resolve "hub" / "auth-gateway" to full labels; default to all three.
 # NOTE: callers MUST read this line-by-line, never `for x in $(services)`. The
 # expected-codes field contains spaces, so word-splitting turns "200 302" into
 # two bogus service names. (macOS bash 3.2 has no mapfile; use while-read over
@@ -132,7 +132,7 @@ verify() {
       echo "    repair: ./restart.sh --deploy   (prunes the stale worktree registration)" >&2
       fail=1
     else
-      # Not deployed yet, and the plist does not expect it to be. All four
+      # Not deployed yet, and the plist does not expect it to be. All three
       # services can be up and serving; failing here would be exactly the
       # cried wolf this file's own header warns about.
       echo "not deployed (plist still runs a working checkout — ./install.sh --hub --apply)"
@@ -294,6 +294,6 @@ if [ "$rc" = 0 ]; then
   echo "Control plane up."
 else
   echo "Something did not come back. Re-render from source of truth:" >&2
-  echo "  $here/install.sh --hub --bridge --auth --apply" >&2
+  echo "  $here/install.sh --hub --auth --apply" >&2
 fi
 exit $rc

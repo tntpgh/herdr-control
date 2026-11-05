@@ -60,9 +60,9 @@
 # conductor_unconfigured when none is reachable.
 #
 # The human route (route=human, or a conductor-route request still pending
-# after HERDR_ACTION_STALE_S, default 900s): the tick posts ONE Slack alert
-# (class human-action, lib/slack-level.sh) and serves a formserve decision on
-# the hub, re-serving it when it expires. Expiry is never a decline.
+# after HERDR_ACTION_STALE_S, default 900s): the tick serves a formserve
+# decision on the hub, re-serving it when it expires. Expiry is never a
+# decline.
 # A request whose task reaches a terminal state (completed/failed/cancelled/
 # lost) before a decision is withdrawn by the tick (status `withdrawn`), and
 # its form record, if still open, is flipped to `withdrawn` so /decisions
@@ -85,7 +85,6 @@ fi
 . "$here/lib/pretool-shadow.sh"          # run-registry, pane-guard, action-request, pretool_redact
 
 HA_SEND="${HERDR_ACTION_SEND:-$here/send-to-agent.sh}"
-HA_NOTIFY="${HERDR_ACTION_NOTIFY:-$here/slack-bridge/herdr-notify.sh}"
 HA_FORMSERVE="${HERDR_ACTION_FORMSERVE:-$here/formserve.py}"
 HA_PYTHON="${HERDR_ACTION_PYTHON:-python3}"
 HA_RECORD_PYTHON="${HERDR_ACTION_RECORD_PYTHON:-python3}"
@@ -230,7 +229,7 @@ EOF
 }
 
 cmd_decide() {                          # approve|decline|supersede id [flags]
-  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" asha="" via="" slack_user="" slack_team="" row tj route verdict
+  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" asha="" row tj route verdict
   shift 2 2>/dev/null || die "usage: herdr-action.sh $verb <request_id> --authority conductor|human …"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -238,9 +237,6 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       --review-category) cat="${2:-}"; shift 2 ;;
       --review-reason) why="${2:-}"; shift 2 ;;
       --form) form="${2:-}"; shift 2 ;;
-      --via) via="${2:-}"; shift 2 ;;
-      --slack-user) slack_user="${2:-}"; shift 2 ;;
-      --slack-team) slack_team="${2:-}"; shift 2 ;;
       --action-sha256) asha="${2:-}"; shift 2 ;;
       *) die "unknown argument $1" ;;
     esac
@@ -276,28 +272,6 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       fi
       _ha_decide "$id" "$status" conductor "$(_ha_field "$tj" conductor_pane_id)" "$cat" "$why" "$row" ;;
     human)
-      # SOURCE ONLY, default OFF (HERDR_BOUND_CLEARANCE_SLACK=1 required).
-      # Part B's Route 1: the Slack bridge's own button click, gated by its
-      # existing OAuth allowlist (authorized() in slack-herdr-bridge.py), is
-      # a synchronous human-present decision — the click IS the decision,
-      # with no decoupled form-POST window to race. It does not reuse the
-      # hub-form `--form <id>` path below: that path's identity proof is
-      # "a same-uid local process answered the loopback form", which
-      # menu-occurrence-design.md §3 explicitly retracts as insufficient on
-      # its own. This branch instead trusts the SAME channel herdr-select.sh
-      # already trusts for HERDR_SELECT_VIA=slack-button (human authority
-      # comes only from the bridge's own allowlist check, never
-      # self-asserted) — `decided_by` records the actual Slack user/team for
-      # audit, never "the conductor" or an unverified flag.
-      if [ "$via" = slack-button ]; then
-        [ "${HERDR_BOUND_CLEARANCE_SLACK:-0}" = 1 ] || die "slack-button clearance is disabled (HERDR_BOUND_CLEARANCE_SLACK=1 required)" 8
-        [ -n "$slack_user" ] && [ -n "$slack_team" ] || die "--via slack-button requires --slack-user and --slack-team" 2
-        [ -n "$asha" ] || die "--via slack-button requires --action-sha256" 2
-        [ "$asha" = "$(_ha_field "$row" action_sha256)" ] || die "wrong action_sha256 for request $id — refusing a mismatched/stale digest" 8
-        [ "$route" = human ] || die "request $id is not human-route ($route) — a Slack button may not decide it" 8
-        _ha_decide "$id" "$status" human "slack-button:${slack_user}@${slack_team}" "" "$why" "$row"
-        return
-      fi
       local ans pinned
       # Only the formserve record the hub tick pinned when it served THIS
       # request's form counts — a record written later by anything else does not.
@@ -314,8 +288,8 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
 # a task spawned with no conductor pane configured (HERDR_MCP_CONDUCTOR_PANE
 # absent/stale at spawn time) got outcome=conductor_unconfigured and NOTHING
 # else tried to reach anyone until the next tick's stale-wait-skipping human
-# route -- which does fire on the very same tick, but as a passive hub form
-# plus one Slack-class notify, easy to miss when three near-identical
+# route -- which does fire on the very same tick, but as a passive hub form,
+# easy to miss when three near-identical
 # requests land a minute apart. Before giving up to that fallback, try every
 # registered owner (register-owner.sh; owners table, label -> pane) whose
 # pane is CURRENTLY LIVE (birth matches, still an agent pane -- the same
@@ -487,22 +461,6 @@ _ha_form_status() {                     # form-path -> "<status> <form_id>" (emp
   printf '%s %s\n' "$(jq -r '.status // empty' "$rec" 2>/dev/null)" "$(basename "$rec" .json)"
 }
 
-# One Slack post per request (not per re-served form), and only once the
-# form is CONFIRMED open -- a refused serve never reaches status=open, so
-# this never fires for it (review REVIEW-FORMSERVE-3e67f75.md, S1: "herdr-
-# action still sends its Slack alert pointing at /decisions where no form
-# exists"). The alert says where to decide; the form is what stays open.
-_ha_notify_human_once() {               # id row task-json
-  local id="$1" row="$2" tj="$3"
-  claim_once "actslack_${id}" "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_slack_claimed \
-       "$(jq -nc --arg id "$id" '{request_id:$id}')" || return 0
-  # The command itself stays on this machine (the hub form shows it): a
-  # command line can carry a secret no redactor recognises (webhook paths).
-  bash "$HA_NOTIFY" --class human-action --pane "$(_ha_field "$tj" pane_id)" \
-    "$(_ha_field "$tj" label): needs YOUR OK for one $(_ha_field "$row" tool) action (request $id, $(_ha_field "$row" verdict)) — see it and decide at http://127.0.0.1:8600/decisions" \
-    >/dev/null 2>&1 || true
-}
-
 _ha_human_route() {                     # id row task-json
   local id="$1" row="$2" tj="$3" fp st fid ans n disp
   fp="$(_ha_field "$row" form_path)"
@@ -516,7 +474,6 @@ $(_ha_form_status "$fp")
 EOF
       [ "${st:-}" = open ] || return 0
       _sql "UPDATE action_requests SET form_record=$(_sq "$fid") WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
-      _ha_notify_human_once "$id" "$row" "$tj"
       return 0
     fi
     st="$(jq -r '.status // empty' "$HA_FORMS_DIR/$fid.json" 2>/dev/null)"
@@ -541,13 +498,10 @@ EOF
   _sql "UPDATE action_requests SET form_path=$(_sq "$fp"), form_record='' WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
   append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_form_served \
     "$(jq -nc --arg id "$id" --arg f "$fp" '{request_id:$id, form_path:$f}')" >/dev/null 2>&1 || true
-  # _ha_pin_form only returns 0 once it has observed the form open; if it
-  # is merely slow to start, the next tick takes the branch above (:493-504)
-  # and notifies there instead -- if formserve refused the serve, status
-  # never becomes open and neither branch ever notifies.
-  if _ha_pin_form "$id" "$fp"; then
-    _ha_notify_human_once "$id" "$row" "$tj"
-  fi
+  # _ha_pin_form pins the record once it observes the form open; if formserve
+  # is merely slow to start, the next tick takes the branch above and pins it
+  # there instead.
+  _ha_pin_form "$id" "$fp" >/dev/null 2>&1 || true
 }
 
 # Flip a form record open or expired -> withdrawn under record_store's lock,

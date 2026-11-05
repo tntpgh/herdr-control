@@ -122,8 +122,8 @@ _pw_forced_wake_argv() {
 # full-command (project-contract-plan.md #3b, item 2) is the UNTRUNCATED
 # command text behind the prompt, when the caller has it (omp-notify.sh, from
 # agent-hooks/omp-herdr-control.ts's tool_approval_requested handler) — kept
-# separate from `message`, which stays the display-truncated text the Slack
-# alert and the conductor wake actually show. Recorded on the SAME
+# separate from `message`, which stays the display-truncated text the
+# conductor wake actually shows. Recorded on the SAME
 # input_required row so herdr-select.sh can look it up by prompt_id and
 # classify complete arguments instead of whatever a wrapped TUI panel
 # scraped back. Empty for every caller that does not pass it (claude-notify.sh,
@@ -470,8 +470,8 @@ push_wake() {
     [ -n "${HERDR_DEFERRED_ANSWER_HINT:-}" ] && wake="$wake  ·  ANSWER IT: ${HERDR_DEFERRED_ANSWER_HINT}"
   elif [ -n "${HERDR_PANE_ID:-}" ]; then
     wake="$wake  ·  READ IT: herdr pane read ${HERDR_PANE_ID} --source visible --lines 30"
-    # No --authority needed: every caller without an explicit flag (or the
-    # Slack button) is `peer`, terminal-attached or not, so command policy
+    # No --authority needed: every caller without an explicit flag is
+    # `peer`, terminal-attached or not, so command policy
     # gates this and a destructive prompt comes back exit 8 rather than
     # being auto-approved.
     wake="$wake  ·  ANSWER IT: $_pw_dir/herdr-select.sh ${HERDR_PANE_ID} <option>"
@@ -486,7 +486,7 @@ push_wake() {
   # the audit trail with it, which is the bug the first draft of this shipped.
   #
   # An allow-class, unreserved prompt is one peer-answer.sh takes in seconds.
-  # Waking a conductor (and paging Slack) for `git status` is the noise that
+  # Waking a conductor for `git status` is the noise that
   # teaches its reader to ignore the channel — observed 2026-09-12, an afternoon
   # of workers doing ordinary work. Held, never dropped: grace_realert re-checks
   # and delivers late if the prompt outlives the window. See lib/alert-gate.sh.
@@ -563,12 +563,6 @@ push_wake() {
       "${base}_result_${attempt_uniq}" >/dev/null 2>&1 || true
   fi
 
-  # A conductor wake that did not land is exactly the case Slack's own hold
-  # (lib/alert-gate.sh) cannot see: that mechanism watches the PANE, not
-  # whether the peer notification path actually reached anyone. Give it
-  # HERDR_WAKE_FAIL_ALERT_S to resolve itself before paging directly.
-  [ "$rc" -eq 0 ] || _pw_wake_fail_realert "${HERDR_PANE_ID:-}" "$pid" \
-    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$outcome"
   # A wake that was typed but never submitted is a FAILED wake, and the log now
   # says so rather than implying the conductor was reached.
   [ "$rc" -eq 0 ] && return 0
@@ -628,116 +622,8 @@ release_wake_hold() {
   append_event "$run" "$task" "wake_hold_released" \
     "$(jq -nc --arg pid "$pid" --arg p "$pane" --arg r "$reason" '{prompt_id:$pid, pane:$p, reason:$r}')" \
     >/dev/null 2>&1 || true
-  # MEDIUM-1 (PR #158 review): the held Slack alert (agent-hooks/omp-notify.sh
-  # / claude-notify.sh, armed only at HERDR_SLACK_LEVEL=all) claims this SAME
-  # idempotency key too — `grace_realert_${run}_${task}_${pid}`. So winning
-  # the claim above (needed to stop the conductor-wake timer from
-  # double-waking) ALSO silences that Slack alert if it was still pending,
-  # unless this function sends it itself. Same resolution order as
-  # _pw_wake_fail_realert below; herdr-notify.sh's own alert_claim (pane, key,
-  # TTL) still dedupes against a copy that already posted through the normal
-  # (unheld) path, so calling it here is never a double post. It carries
-  # --class held like the timer's copy: posted at level `all`, suppressed and
-  # logged at `errors`. The hooks' human-stale ERROR timer claims its own
-  # human_stale_* key (HERDR_GRACE_CLAIM_KIND), so this claim never silences
-  # it. The forced wake above is what reaches Main.
   _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd" "$tool" "$pid"
-  (
-    "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1
-    local notify
-    for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
-                  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do
-      [ -n "$notify" ] && [ -f "$notify" ] && break
-    done
-    [ -n "${notify:-}" ] && [ -f "$notify" ] && \
-      bash "$notify" --class held --choices --pane "$pane" "$msg" >/dev/null 2>&1
-  ) </dev/null >/dev/null 2>&1 &
+  ( "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
   return 0
-}
-
-# ---- symptom: the conductor wake failed and nobody has noticed ------------
-# .handoffs/SPEC.md KEEP list: "a wake that failed delivery (refused/
-# unsubmitted) and no one answered within 10 min". Measured on this machine's
-# own registry (48h window): 176 of 353 wake_result events were NOT
-# `submitted` (116 `unknown`, 56 `unsubmitted`, 4 `refused`) — roughly half
-# the time the ONE channel meant to catch a blocked worker (a peer reading
-# the steering queue) silently did not land, with nothing watching for it.
-#
-# lib/alert-gate.sh's grace hold cannot see this: it watches the PANE (is a
-# prompt still up), never whether the wake meant to surface that pane to a
-# peer actually arrived. This is the backstop for THAT gap specifically —
-# it runs only when push_wake's own delivery already failed.
-#
-# Deliberately re-checks the TASK, not just the pane, before paging: the
-# operator may have answered directly in the worker's own terminal, which
-# unblocks the task even though the conductor never got the wake at all —
-# that must read as resolved, not as "still nobody noticed".
-#
-# Runs detached, same discipline as grace_realert: a hook must never hold the
-# agent's turn on a 10-minute sleep. The eventual herdr-notify.sh call goes
-# through the SAME prompt_id dedupe as every other caller (lib/alert-gate.sh
-# alert_claim), so if the primary alert path already posted for this exact
-# prompt, this backstop silently no-ops instead of paging twice.
-_pw_wake_fail_realert() {
-  local pane="$1" pid="$2" run="$3" task="$4" outcome="$5"
-  [ -n "$pane" ] || return 0
-  local secs="${HERDR_WAKE_FAIL_ALERT_S:-600}"
-  case "$secs" in ''|*[!0-9]*) secs=600 ;; esac
-  _ag_trace "armed wakefail ${pid:-noprompt}"      # test seam, lib/alert-gate.sh
-  (
-    _ag_out=stood_down
-    trap '_ag_trace "done wakefail ${pid:-noprompt} $_ag_out"' EXIT
-    sleep "$secs"
-    if [ -n "$run" ] && [ -n "$task" ]; then
-      local st
-      st="$(read_task "$run" "$task" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
-      [ "$st" = "blocked" ] || exit 0
-      # The conductor WAS reached if any attempt for this same prompt
-      # occurrence was submitted. Live 2026-09-26 (event 37775): a page went
-      # out keyed to a redundant second attempt that failed while the first
-      # had been submitted. The owner claim above now stops the redundant
-      # attempt; this still covers a legacy or forced re-delivery failing
-      # after an earlier one landed.
-      local landed
-      landed="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$task") AND type='wake_result'
-            AND json_extract(payload,'\$.wake_key')=$(_sq "wake_${run}_${task}_${pid:-noprompt}")
-            AND json_extract(payload,'\$.outcome')='submitted';" 2>/dev/null)"
-      [ "${landed:-0}" = 0 ] || { _ag_out=conductor_reached; exit 0; }
-    fi
-    # A deferred prompt never paints a panel, so the screen can't confirm it is
-    # still open; the blocked-task and no-landed-attempt checks above decide.
-    [ -n "${HERDR_DEFERRED_PID:-}" ] || prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
-    local notify
-    for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
-                  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do
-      [ -n "$notify" ] && [ -f "$notify" ] && break
-    done
-    [ -n "${notify:-}" ] && [ -f "$notify" ] || exit 0
-    local wf_msg="conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly"
-    if [ -n "${HERDR_DEFERRED_PID:-}" ]; then
-      # No panel to scrape: --choices would find nothing and drop the page.
-      # Post the message itself, naming the exact deferred request.
-      bash "$notify" --class wake-fail --pane "$pane" \
-        "${wf_msg} (deferred request ${HERDR_DEFERRED_PID})${HERDR_DEFERRED_ANSWER_HINT:+ — ${HERDR_DEFERRED_ANSWER_HINT}}" \
-        >/dev/null 2>&1 || true
-    else
-      bash "$notify" --class wake-fail --choices --pane "$pane" "$wf_msg" >/dev/null 2>&1 || true
-    fi
-    _ag_out=fired
-    if [ -n "$run" ] && [ -n "$task" ]; then
-      # Keyed by prompt_id, not a fresh random id: two independent failed-wake
-      # timers for the SAME still-unanswered prompt both reach this line (the
-      # SECOND one's herdr-notify.sh call is silently deduped, exit 0 either
-      # way — see lib/alert-gate.sh alert_claim), so without a deterministic
-      # id the ledger would claim two alerts for a symptom Slack only saw once.
-      local wf_eid=""
-      [ -n "$pid" ] && wf_eid="wakefail_${pid}"
-      append_event "$run" "$task" "wake_fail_alerted" \
-        "$(jq -nc --arg p "$pane" --arg pid "$pid" --arg o "$outcome" --arg s "$secs" \
-           '{pane:$p, prompt_id:$pid, outcome:$o, wait_seconds:($s|tonumber)}')" \
-        "$wf_eid" >/dev/null 2>&1 || true
-    fi
-  ) </dev/null >/dev/null 2>&1 &
-  disown 2>/dev/null || true
 }

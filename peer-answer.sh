@@ -53,7 +53,7 @@
 # audit write, pane recycled) is logged and simply re-examined next round: a
 # transient error must not strand an allow-class prompt.
 #
-# Two locks (mkdir, lib/pending-queue.sh style): one per pane around the
+# Two mkdir locks: one per pane around the
 # keypress so two loops cannot double-Enter, and one per instance keyed by
 # the watch set so a restarted loop refuses to run beside a live one.
 #

@@ -26,10 +26,6 @@ cat > "$work/bin/send" <<EOF
 printf '%s\n' "\$*" >> "$work/sent"
 exit \${FAKE_SEND_RC:-0}
 EOF
-cat > "$work/bin/notify" <<EOF
-#!/bin/bash
-printf '%s\n' "\$*" >> "$work/notified"
-EOF
 cat > "$work/bin/formserve" <<EOF
 #!/bin/bash
 id="\$(date -u +%Y%m%dT%H%M%S)-\$RANDOM\$RANDOM"
@@ -50,7 +46,7 @@ export HERDR_FIXTURE_HERDR="$work/bin/herdr"
 export -f herdr ps
 export PATH="$work/bin:$PATH"
 export HERDR_EXTRA_PATH="$work/bin:${HERDR_EXTRA_PATH:-/opt/homebrew/bin:/usr/local/bin}"
-export HERDR_ACTION_SEND="$work/bin/send" HERDR_ACTION_NOTIFY="$work/bin/notify"
+export HERDR_ACTION_SEND="$work/bin/send"
 export HERDR_ACTION_FORMSERVE="$work/bin/formserve" HERDR_ACTION_PYTHON=bash
 export HERDR_ACTION_NO_SURFACE=1       # surfacing is exercised explicitly below
 
@@ -429,13 +425,9 @@ FAKE_CBIRTH=other bash "$here/herdr-action.sh" surface "$lrid"
   && ok "a recycled conductor pane is not typed into (outcome conductor_unreachable)" || not_ok "unreachable: $(cat "$work/sent")"
 out="$(bashc 'chmod -R u+w tmp/hum2' )"; srid="$(printf '%s' "$out" | field request_id)"
 q "UPDATE action_requests SET route='human', verdict='reserved' WHERE request_id='$srid';"
-: > "$work/notified"
 bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
 fp="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
 [ -r "$fp" ] && grep -q "$srid" "$fp" && ok "tick served a hub decision form for the human request" || not_ok "no form: '$fp'"
-[ "$(grep -c -- "--class human-action" "$work/notified")" -ge 1 ] && [ "$(grep -c "$srid" "$work/notified")" = 1 ] \
-  && ok "one Slack alert (class human-action) across two ticks" || not_ok "notify: $(cat "$work/notified")"
-! grep -q 'chmod' "$work/notified" && ok "the Slack text does not carry the command" || not_ok "command left the machine: $(cat "$work/notified")"
 rec="$HERDR_STATE_ROOT/forms/$(q "SELECT form_record FROM action_requests WHERE request_id='$srid';").json"
 jq -c '.status="expired"' "$rec" > "$rec.t" && mv "$rec.t" "$rec"
 bash "$here/herdr-action.sh" tick
@@ -443,16 +435,15 @@ fp2="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
 [ "$(q "SELECT status FROM action_requests WHERE request_id='$srid';")" = pending ] && [ "$fp2" != "$fp" ] && [ -r "$fp2" ] \
   && ok "expired form: request still pending, a fresh form is served (expiry is not a decline)" || not_ok "expiry: status $(q "SELECT status FROM action_requests WHERE request_id='$srid';")"
 [ "$(q "SELECT count(*) FROM events WHERE type='action_form_expired';")" -ge 1 ] && ok "action_form_expired recorded" || not_ok "no expiry event"
-[ "$(grep -c "$srid" "$work/notified")" = 1 ] && ok "no second Slack post for a re-served form" || not_ok "slack re-posted"
 rec2="$HERDR_STATE_ROOT/forms/$(q "SELECT form_record FROM action_requests WHERE request_id='$srid';").json"
 answer_form "$(basename "$rec2" .json)" "$srid" approve
 bash "$here/herdr-action.sh" tick
 [ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$srid';")" = approved/human ] \
   && ok "tick applies an answered hub form (approved, authority human)" || not_ok "tick apply: $(q "SELECT status, authority FROM action_requests WHERE request_id='$srid';")"
 out="$(bashc 'chmod -R u+rw tmp/stale')"; strid="$(printf '%s' "$out" | field request_id)"
-: > "$work/notified"
 HERDR_ACTION_STALE_S=0 bash "$here/herdr-action.sh" tick
-grep -q "$strid" "$work/notified" && ok "a conductor request left pending past the stale window goes to the human route" || not_ok "stale not escalated"
+[ -n "$(q "SELECT form_path FROM action_requests WHERE request_id='$strid';")" ] \
+  && ok "a conductor request left pending past the stale window goes to the human route (hub form served)" || not_ok "stale not escalated"
 emp="$work/empty"; mkdir -p "$emp"
 t0=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
 HERDR_RUN_STATE_DIR="$emp" bash "$here/herdr-action.sh" tick

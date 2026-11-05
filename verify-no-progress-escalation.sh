@@ -536,16 +536,11 @@ spawn_attempts_after="$(grep -c -- 'spawn implement esc-test-a' "$ORDER_LOG" 2>/
 # wake` calls (its own send/notify hooks faked so this stays fully
 # offline) and prove end-to-end: real git commit sha, real escalation,
 # real quiesce-before-spawn ordering, all via the actual resident entrypoint.
-cat >"$WORK/fake-notify.sh" <<'SH'
-#!/usr/bin/env bash
-exit 0
-SH
 cat >"$WORK/fake-send.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
 export HERDR_STALL_WATCHDOG_SEND="$WORK/fake-send.sh"
-export HERDR_STALL_WATCHDOG_NOTIFY="$WORK/fake-notify.sh"
 
 RUN=taskH; TASK=taskH; PANE=pane-H; BRANCH=esc-test-h
 seed_task "$TASK" "$PANE" "$BRANCH"

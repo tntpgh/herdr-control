@@ -27,7 +27,7 @@
 #   F. research-task-closure defect 2 (2026-10-04): when a task has NO
 #      conductor pane at all, herdr-action.sh now tries every registered,
 #      currently-live owner (register-owner.sh) before falling back to
-#      conductor_unconfigured's existing hub-form/human-notify path — never
+#      conductor_unconfigured's existing hub-form path — never
 #      a new approval authority, a faster NAMED notification so a request
 #      is never silently unrouted. A stale/recycled owner is never routed
 #      to (same liveness proof as the conductor fallback).
@@ -53,10 +53,6 @@ cat > "$work/bin/send" <<EOF
 printf '%s\n' "\$*" >> "$work/sent"
 exit \${FAKE_SEND_RC:-0}
 EOF
-cat > "$work/bin/notify" <<EOF
-#!/bin/bash
-printf '%s\n' "\$*" >> "$work/notified"
-EOF
 cat > "$work/bin/formserve" <<EOF
 #!/bin/bash
 id="\$(date -u +%Y%m%dT%H%M%S)-\$RANDOM\$RANDOM"
@@ -66,7 +62,7 @@ chmod +x "$work/bin/"*
 export PATH="$work/bin:$PATH"
 # config.sh prepends this ahead of PATH in every child; keep pane identity isolated.
 export HERDR_EXTRA_PATH="$work/bin:${HERDR_EXTRA_PATH:-/opt/homebrew/bin:/usr/local/bin}"
-export HERDR_ACTION_SEND="$work/bin/send" HERDR_ACTION_NOTIFY="$work/bin/notify"
+export HERDR_ACTION_SEND="$work/bin/send"
 export HERDR_ACTION_FORMSERVE="$work/bin/formserve" HERDR_ACTION_PYTHON=bash
 export HERDR_ACTION_NO_SURFACE=1       # surfacing is exercised explicitly in section B
 
@@ -260,9 +256,6 @@ bash "$here/herdr-action.sh" tick
 [ "$(_sql "SELECT count(*) FROM events WHERE task_id='task_unconf' AND type='action_form_served';")" = 1 ] \
   && ok "conductor_unconfigured: a hub decision form was served on this SAME tick (age ~0s, HA_STALE_S=999999 — the bypass, not a fast expiry)" \
   || not_ok "no action_form_served for task_unconf after one tick"
-grep -q 'needs YOUR OK' "$work/notified" 2>/dev/null \
-  && ok "conductor_unconfigured: the blocker reached the human notify channel on the same tick" \
-  || not_ok "no human notify for task_unconf: $(cat "$work/notified" 2>/dev/null)"
 [ "$(_sql "SELECT count(*) FROM events WHERE task_id='task_unreach' AND type='action_form_served';")" = 0 ] \
   && ok "conductor_unreachable: still waiting out HA_STALE_S (unchanged pinned behaviour) — no form served yet" \
   || not_ok "task_unreach got a form served despite HA_STALE_S=999999 and age~0s (regression: bypass leaked to the recycled-pane case)"

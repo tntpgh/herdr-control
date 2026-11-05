@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# omp-notify.sh — omp's equivalent of claude-notify.sh: alert when a worker
-# needs input, both to Slack and as a push wake to its conductor.
+# omp-notify.sh — omp's equivalent of claude-notify.sh: when a worker needs
+# input, record it and push a wake to its conductor.
 #
 # ---- what triggers this ------------------------------------------------------
 # omp DOES have a "I am asking the human something" surface, and this hook is
@@ -17,7 +17,7 @@
 # and made the TUI itself feel laggy (measured 2026-09-14).
 #
 # The pane read stays, but only on this path: the EVENT says a human is needed,
-# the pane says WHAT is on screen — the option rows Slack shows and the
+# the pane says WHAT is on screen — the option rows and the
 # prompt_id a later answer is asserted against. An auto-approved tool call now
 # never reaches this script at all, so it costs nothing.
 #
@@ -540,10 +540,8 @@ _push_rc=$?
 # settle onto a DIFFERENT, LATER prompt than the one `_bound_pid` named
 # before the call (the panel genuinely repainted mid-call). push_wake
 # writes the input_required row under that new, correct id — but without
-# this refresh, `_bound_pid` here still names the OLD one, so
-# `_still_bound` (:401) falsely fails against the live (correctly
-# advanced) screen, silently skipping the Slack alert below (:518) for a
-# call that in fact succeeded, and the trace query just below queries by
+# this refresh, `_bound_pid` here still names the OLD one, so the trace
+# query just below queries by
 # the stale id and logs a false `push_attempted_no_tool_row`. Deferred
 # calls never settle against a screen (prompt_id_settled's screen-read
 # branch is skipped whenever HERDR_DEFERRED_PID is set, lib/push-wake.sh),
@@ -561,78 +559,6 @@ if [ -n "$tool" ] && [ "$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq 
   _probe_trace push_attempted_tool_row_present "$_push_rc" "$_push_mode"
 else
   _probe_trace push_attempted_no_tool_row "$_push_rc" "$_push_mode"
-fi
-
-# ---- outbound Slack alert ---------------------------------------------------
-# Same resolution order as claude-notify.sh so a packaged (APM) install and a
-# plain checkout both work without editing: explicit override, then this
-# checkout, then a deployed herdr-ops skill copy.
-for notify in \
-  "${HERDR_NOTIFY:-}" \
-  "$here/slack-bridge/herdr-notify.sh" \
-  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"
-do
-  [ -n "$notify" ] && [ -f "$notify" ] && break
-done
-if [ -n "${notify:-}" ] && [ -f "$notify" ] && _still_bound; then
-  # --pane, not a cwd hint: unlike the Claude hook we already know exactly which
-  # pane asked, because we just confirmed the prompt on it. Passing the pane
-  # explicitly avoids herdr-notify having to disambiguate several panes sharing
-  # one repo cwd — a wrong guess there sends the operator's reply to a different
-  # agent.
-  #
-  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
-  # push_wake): an allow-class, unreserved prompt is one peer-answer.sh takes in
-  # seconds, and paging for it is what turned an afternoon of ordinary worker
-  # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
-  # prompt outlives the grace window the alert is sent after all.
-  #
-  # Classified for lib/slack-level.sh (2026-09-26): neither send is an error by
-  # itself — the conductor is woken for both below — so at the default level
-  # both are suppressed and logged. What IS an error is a human-only prompt
-  # nobody resolved: that escalates as `human-stale` after HERDR_HUMAN_ALERT_S.
-  # A held prompt that stays stuck escalates from agent-edge.sh as `stuck`.
-  # At HERDR_SLACK_LEVEL=all no escalation timer is armed: the immediate post
-  # goes out, exactly as before. The timer is armed AFTER push_wake (above):
-  # grace_realert stands down for any input_required recorded after it was
-  # armed, and push_wake has already recorded THIS prompt's input_required.
-  # Timers key on the bound prompt id, never a fresh read.
-  . "$here/lib/slack-level.sh"
-  human_stale=0
-  if human_must_answer "$pane" "$full_cmd"; then
-    bash "$notify" --class needs-input --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
-    [ "$(slack_level)" = errors ] && human_stale=1
-  elif slack_should_send held; then
-    # Armed only when it could post (level `all`). At `errors` a held timer can
-    # only be suppressed, and it shares grace_realert's claim key with the
-    # conductor re-wake push_wake arms for the same prompt — winning that
-    # claim to post nothing cost the conductor its wake (PR #166 review).
-    grace_realert "$pane" "$_bound_pid" \
-      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --class held --choices --pane "$pane" "$msg"
-  fi
-fi
-
-if [ "${human_stale:-0}" = 1 ]; then
-  # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
-  # re-wake takes grace_realert_*, and must not silence this ERROR post.
-  if [ "$deferred" = true ]; then
-    # No panel: --choices would re-scrape the pane and drop the post, and the
-    # screen cannot say whether this request is still open. _still_bound asks
-    # its own occurrence (requested, unauthorized) at T+grace instead.
-    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-    HERDR_DEFERRED_PID="$_bound_pid" HERDR_GRACE_STILL_OPEN=_still_bound \
-    grace_realert "$pane" "$_bound_pid" \
-      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --class human-stale --pane "$pane" \
-      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s${_deferred_hint:+  ·  ${_deferred_hint}}"
-  else
-    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-    grace_realert "$pane" "$_bound_pid" \
-      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --class human-stale --choices --pane "$pane" \
-      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
-  fi
 fi
 
 exit 0

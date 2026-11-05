@@ -641,7 +641,7 @@ render_hub_plist() {
 # environment. The template deliberately carries none of them: turning the
 # factory on is a separate human decision, never an install default. But
 # install.sh --hub re-renders the WHOLE plist from that template, so every
-# documented repair (restart.sh:36, `install.sh --hub --bridge --auth --apply`)
+# documented repair (restart.sh:36, `install.sh --hub --auth --apply`)
 # used to silently turn a running factory OFF.
 HUB_FACTORY_ENV_KEYS="HERDR_OWNER_DISPATCH HERDR_OWNER_DISPATCH_AUTH_DB HERDR_OWNER_LEASE_DB
 HERDR_OWNER_LEASE_DELIVERY HERDR_OWNER_LEASE_REAP HERDR_QUEUE_SUPERVISOR HERDR_QUEUE_SUPERVISOR_LANES
@@ -707,7 +707,6 @@ stage_plist() {
 
 HERDR_SERVICES=(
   "com.herdr-control.hub|http://127.0.0.1:8600/|200 302"
-  "com.herdr-control.bridge||"
   "com.herdr-control.auth-broker|http://127.0.0.1:8765/|401 200 404"
   "com.herdr-control.auth-gateway|http://127.0.0.1:4000/|401 200 404"
 )

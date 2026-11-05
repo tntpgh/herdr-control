@@ -1,5 +1,5 @@
 ---
-description: Optional standalone tab-naming and attention-classification scripts, independent of the Slack alert path.
+description: Optional standalone tab-naming and attention-classification scripts, independent of the hook wiring.
 globs: ["smart-name.sh", "attention.sh", "docs/herdr-config-snippet.toml"]
 ---
 # Tab Naming & Attention
@@ -7,7 +7,7 @@ globs: ["smart-name.sh", "attention.sh", "docs/herdr-config-snippet.toml"]
 ## Step 9 — optional: tab naming + attention
 
 These two need no hook wiring — they are standalone scripts, plus optional
-herdr keybindings. Independent of the Slack path above.
+herdr keybindings.
 
 ```bash
 ./smart-name.sh --dry-run --all          # see proposed tab names; renames nothing

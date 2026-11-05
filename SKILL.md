@@ -1,6 +1,6 @@
 ---
 name: herdr-control
-description: Drive a herdr multi-agent terminal workspace — route agents into per-project tabs, sort and colour tabs by branch state, spawn worktree sub-tabs at a job-appropriate model, auto-name tabs after the work each pane is doing, surface which agent needs you next with an honest waiting-reason, and answer blocked agents from Slack (including permission prompts) with the choice validated and recorded.
+description: Drive a herdr multi-agent terminal workspace — route agents into per-project tabs, sort and colour tabs by branch state, spawn worktree sub-tabs at a job-appropriate model, auto-name tabs after the work each pane is doing, surface which agent needs you next with an honest waiting-reason, and answer blocked agents (including permission prompts) with the choice validated and recorded.
 ---
 
 # herdr-control
@@ -12,8 +12,8 @@ Two halves, usable independently:
 
 1. **Layout** — put agents where you expect them, and make the tabs that need
    you obvious.
-2. **Slack** — get told when an agent is blocked, see *what it is asking*, and
-   answer from your phone.
+2. **Answering** — get told when an agent is blocked, see *what it is asking*,
+   and answer it (peer automation or the hub decision form).
 
 ---
 
@@ -265,9 +265,9 @@ conductor once per (task, signal, occurrence) — `stall-watchdog.sh` claims
 it, same one-shot shape `attn_track_claim` uses for a live prompt. Still
 unacknowledged past `HERDR_STALL_WATCHDOG_ESCALATE_S` (default 2x the
 threshold), or the conductor is unknown/dead (no pane recorded, or the
-pane's been recycled): it escalates through the SAME alert path a stuck
-prompt does (`slack-bridge/herdr-notify.sh --class stall-watchdog`), so
-Terrence gets a real notification, not just a hub count.
+pane's been recycled): it escalates by recording a `stall_escalated`
+registry event (signal, artifact, reason), so the escalation is on record,
+not just a hub count.
 
 ```bash
 ./stall-ack.sh <task_id>            # "I acted" — stops repeats/escalation
@@ -340,16 +340,15 @@ one-line notice. See `docs/approval-policy.md` §11.
 
 ## omp workers push too
 
-Everything above assumes Claude Code. `install.sh` wires the identical four
-jobs — push-wake, session reconciliation, mid-session reconciliation, alert
-retraction — into an omp session too, through omp's own extension events
+Everything above assumes Claude Code. `install.sh` wires the identical three
+jobs — push-wake, session reconciliation, mid-session reconciliation — into an
+omp session too, through omp's own extension events
 instead of `settings.json` hooks: `tool_call` → alert + push-wake,
 `before_agent_start` → session reconciliation injected as a message,
-`tool_result` → throttled reconciliation + retraction, `agent_end` →
-retraction backstop. Same shared code underneath (`lib/push-wake.sh`,
-`lib/reconcile.sh`) as the Claude hooks — there is exactly one place that
-knows how to notify/reconcile/retract, not two copies that can quietly
-disagree.
+`tool_result` → throttled reconciliation. Same shared code underneath
+(`lib/push-wake.sh`, `lib/reconcile.sh`) as the Claude hooks — there is
+exactly one place that knows how to notify/reconcile, not two copies that can
+quietly disagree.
 
 omp has no event that means "I am asking the human something" — only
 `tool_call`, which fires before *every* tool call, approved or not. Alerting
@@ -369,114 +368,18 @@ in `~/.omp/agent/config.yml`.
 
 ---
 
-## Answering agents from Slack
-
-`slack-bridge/` is a Socket-Mode daemon: outbound alerts as the bot, inbound
-replies routed back to the right pane. One-time Slack app setup is in
-`slack-bridge/SETUP.md`.
-
-An alert for a blocked agent looks like:
-
-```
-🔔 *myproject — Main (api-worker)*  ·  Claude needs your permission to use Edit
-`w2:p1`
-
-Do you want to make this edit to handler.py?
-  *1.* Yes
-  *2.* Yes, and don't ask again this session
-  *3.* No, and tell Claude what to do differently
-_Reply in thread with 1, 2, 3._
-```
-
-The pane is named **Space — Tab** (with the pane label in parens when several
-panes share a tab) because a raw id like `w2:p1` identifies nothing to a human
-reading this on a phone. The id stays as a suffix since it is what you type to
-target a pane by hand.
-
-**Answer it** by replying `2` in the thread — works with no extra Slack
-configuration — or by tapping the button, which requires **Interactivity**
-enabled on the Slack app. Both routes end in the same code.
-
-When there is no numbered list to parse (a non-numbered confirmation, a plan
-approval, or a prompt that was auto-approved before the hook could read it), the
-alert carries **what is on screen** instead, so you are never answering blind.
-
-### Errors only, not status
-
-Slack gets only what the automation cannot fix itself (2026-09-26). Every
-`herdr-notify.sh` caller passes `--class`, and at the default
-`HERDR_SLACK_LEVEL=errors` (`config.sh`, or the env) only error classes post:
-
-| class | fires when | from |
-|---|---|---|
-| `human-stale` | a prompt only a human may answer is still open after `HERDR_HUMAN_ALERT_S` (300s) | omp/claude hooks, `agent-edge.sh` |
-| `stuck` | a worker is still blocked on the same prompt after `HERDR_STUCK_ALERT_S` (900s) | `agent-edge.sh` |
-| `wake-fail` | the conductor wake failed and the prompt is open after `HERDR_WAKE_FAIL_ALERT_S` | `lib/push-wake.sh` |
-| `control-plane` | the hub's herdr subscription is down / back | `hub-connection-alert.sh` |
-| `deploy` | a deploy is overdue / resolved | `deploy-drift-alert.sh` |
-| `unwatched` | a Claude prompt from a session with no herdr pane (no automation can see it) | `claude-notify.sh` |
-
-`needs-input` (the immediate prompt alert and the edge backstop), `held`
-(allow-class prompt past the peer grace), `info`, and an unclassified call are
-**suppressed** and logged one line each to
-`$HERDR_STATE_DIR/slack-suppressed.jsonl`; they stay on the hub. An unknown
-class name posts (a typo must not silence an error). `HERDR_SLACK_LEVEL=all`
-restores every post; `=off` posts nothing. Thresholds and the measurement
-behind them: `lib/slack-level.sh`.
-
-Below the level filter, the symptoms-only rules (.handoffs/SPEC.md,
-2026-09-24) still apply to whatever is posted:
-
-- **KEPT**: an escalate/reserved/deny-class prompt still unanswered — ONE
-  post per (pane, prompt) within `HERDR_ALERT_DEDUP_TTL_S` (default 3600s;
-  the SAME pane asking the SAME question again after that window, or after
-  a Deny, alerts again — the claim is not permanent), however many times the
-  hook re-fires while it sits there; a plain-context prompt (no numbered
-  options — a plan approval, a non-numbered confirmation) dedupes the same
-  way, keyed on `sha256(pane + context)` since it has no prompt_id; a
-  conductor wake that failed delivery (refused/unsubmitted) and is still
-  unanswered after `HERDR_WAKE_FAIL_ALERT_S` (default 600s); the herdr
-  control-plane subscription itself going down or coming back
-  (`hub-connection-alert.sh`, graced by `HERDR_HUB_ALERT_GRACE_S`, default
-  30s, so a reconnect blip never pages); a repo more than 30 minutes behind
-  `origin/main` in its deploy (`deploy-drift-alert.sh`, reusing hub.py's
-  own `deploy_drift_data()` cache and its dashboard card's `>30min` "hot"
-  threshold — one page per drift episode, one recovery line when it clears).
-- **DROPPED**: allow-class prompts (a peer answers them — this is
-  `lib/alert-gate.sh` `human_must_answer`/`HERDR_ALERT_GRACE_S`, upstream of
-  and UNAFFECTED by everything below); a duplicate post for a (pane, prompt)
-  already claimed within the TTL; a post for a prompt that was already
-  answered by the time the send would go out.
-- **`HERDR_SLACK_VERBOSE=1`** restores the pre-filter always-post behaviour,
-  but ONLY downstream of the allow/held decision — it disables the dedupe,
-  the nothing-to-show drop, and the hub-down grace, never the allow-class
-  hold itself. An alert missing because its command classified as allow
-  needs `classify_command` or a wait for `HERDR_ALERT_GRACE_S`, not this
-  flag (`.omp/rules/troubleshooting.md` has both cases split out).
-
-`verify-slack-symptoms.sh` (including the level-filter cases),
-`verify-herdr-live.sh` (edge escalation), `verify-hub-connection-alert.sh`, and
-`verify-deploy-drift-alert.sh` are the acceptance suites for this; run the
-relevant one after touching `herdr-notify.sh`, `lib/slack-level.sh`,
-`lib/alert-gate.sh`, `lib/push-wake.sh`, `agent-edge.sh`,
-`hub-connection-alert.sh`, or `deploy-drift-alert.sh`.
-
-### Replying with free text
+## Replying with free text
 
 ```bash
 ./herdr-deliver.sh --blocked "yes, go with option B"
 ./herdr-deliver.sh w8:p2 "continue; skip the migration for now"
 ```
 
-Routing precedence for an inbound Slack message: a reply **threaded** under an
-alert → that alert's pane; then an explicit `w8:p2 <text>` prefix; then the
-single blocked agent.
-
 ---
 
 ## The safety model
 
-This path puts text from Slack into a live terminal and presses Enter. That is
+This path puts text into a live terminal and presses Enter. That is
 powerful enough to deserve explicit limits, and they are the reason several
 things refuse rather than guess. `docs/approval-policy.md` is the single-page
 version of the invariants below, framed as a contract any new script must
@@ -513,7 +416,7 @@ does not supply actionable options.
 a permission gate, where typed text is inert and the Enter selects the
 *highlighted default*. `send-to-agent.sh` refuses on a prompt signature, and
 re-checks before **every** Enter, since a prompt can appear mid-submit. `--force`
-overrides — from a terminal only, never from Slack.
+overrides — from a terminal only.
 
 **A choice is a choice.** `herdr-select.sh` is the one path allowed to answer
 a prompt. It requires the pane to be showing a prompt *right now*, requires
@@ -595,26 +498,8 @@ instead of a JSON file per task plus an append-only log: a real monotonic
 sequence, `UNIQUE`-keyed dedup for retries, and a state change landing in
 the *same transaction* as its event-log entry.
 
-**Alerts retract themselves.** Answer in the terminal and `herdr-resolve.sh`
-deletes the Slack message, because a stale alert that looks pending teaches you
-to distrust alerts. An alert for a pane herdr no longer lists is deleted too —
-nobody can ever answer it. It is conservative in the direction that matters: a
-still-listed pane that cannot be read, a pane still prompting (numbered *or*
-omp's arrow menu), or an unreachable Slack all **keep** the message. Answering
-in Slack keeps that one message, so your choice and its confirmation survive —
-only that one, so other alerts queued for the same pane still retract.
-`herdr-resolve.sh --dry-run` prints what it would retract and why, touching
-neither Slack nor the queue.
-
-**The allowlist is the only authentication.** `HERDR_BRIDGE_ALLOW_USERS` gates
-everything, and it now gates *approving tool use*, not just sending text. Slack
-member ids are unique per workspace, not globally, so also set
-`HERDR_BRIDGE_TEAM` — otherwise a user carrying the same id in another workspace
-(via a Slack Connect channel) passes the only check you have. Set
-`HERDR_BRIDGE_CHANNEL` to pin the bridge to one channel or your DM.
-
-`HERDR_AGENT_PROCS` only ever *widens* the pane gate and is inherited by the
-bridge subprocess. Treat it as security configuration.
+`HERDR_AGENT_PROCS` only ever *widens* the pane gate. Treat it as security
+configuration.
 
 ---
 

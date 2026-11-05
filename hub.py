@@ -1012,8 +1012,6 @@ def herdr_data(event_limit: int = 100) -> dict:
 # Where they disagree, the page SAYS SO rather than picking silently.
 LIVE: herdr_live.LiveState | None = None
 AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
-HUB_CONNECTION_ALERT = Path(__file__).resolve().parent / "hub-connection-alert.sh"
-DEPLOY_DRIFT_ALERT = Path(__file__).resolve().parent / "deploy-drift-alert.sh"
 # thurber-os docs/project-contract-plan.md §3a — the level-triggered
 # attention controller. See attention-tick.sh's own header for the design;
 # this hub thread only feeds it the CURRENTLY blocked pane ids and reuses
@@ -1114,17 +1112,16 @@ def _edge_supersede(pane_id: str) -> None:
 
 
 def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dict) -> None:
-    """One transition, handed to the shell that owns alerting and answering.
+    """One transition, handed to the shell that owns answering and the registry.
 
-    Fire-and-forget by construction: the edge script does Slack, push-wake and
+    Fire-and-forget by construction: the edge script does registry and
     peer-answer work that must never be able to stall the subscription or the
     page. `before` is empty on first observation (process start or reconnect
     diff) — the script treats that as "reconcile", not "a prompt just
-    appeared", because a fresh hub must not re-alert a prompt already alerted.
+    appeared".
 
     `cwd` comes from LIVE.cwd_of(), not from the served record: absolute paths
-    are not published on the unauthenticated API (see _pane_record), but the
-    script still wants one for its Slack line.
+    are not published on the unauthenticated API (see _pane_record).
     """
     if not AGENT_EDGE.exists():
         return
@@ -1150,35 +1147,6 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
             _EDGE_INFLIGHT_BY_PANE[pane_id] = child
     except OSError as exc:
         _live_log(f"edge spawn failed for {pane_id}: {exc}")
-
-
-def _on_connection_change(connected: bool, err: str | None) -> None:
-    """The herdr subscription itself went up or down — the ONE symptom no
-    per-pane alert can see, because while it is down every consumer (agent-
-    edge.sh's own probe included) is guessing rather than knowing.
-
-    Fires on a genuine flip only (LiveState debounces same-state re-affirms),
-    so this is called at most once per real outage and once per recovery —
-    hub-connection-alert.sh still applies its own grace window before paging,
-    so a reconnect that lands within a few seconds never reaches Slack.
-    """
-    if not HUB_CONNECTION_ALERT.exists():
-        return
-    if not _edge_slot():
-        _live_log(f"connection-alert dropped ({'connected' if connected else 'disconnected'}): "
-                  f"{EDGE_MAX_INFLIGHT} edge slots already in flight")
-        return
-    try:
-        child = subprocess.Popen(
-            ["bash", str(HUB_CONNECTION_ALERT), "connected" if connected else "disconnected",
-             (err or "")[:200]],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        with _EDGE_LOCK:
-            _EDGE_INFLIGHT.append(child)
-    except OSError as exc:
-        _live_log(f"connection-alert spawn failed: {exc}")
 
 
 def live_data() -> dict:
@@ -2112,10 +2080,8 @@ ACTION_SCRIPT = Path(__file__).resolve().parent / "herdr-action.sh"
 def _action_tick() -> None:
     """Hook-approval action requests (docs/design/pretool-approval.md §4):
     wake a conductor that was not woken, and for human-only (or stale)
-    requests post ONE Slack alert and keep a hub decision form open, applying
-    it once answered. Runs from the hub because the hub holds the Slack
-    credential a --no-secrets worker does not. A pass with nothing pending is
-    one SQLite query. Never raises."""
+    requests keep a hub decision form open, applying it once answered. A pass
+    with nothing pending is one SQLite query. Never raises."""
     if not ACTION_SCRIPT.exists():
         return
     try:
@@ -2222,46 +2188,10 @@ def _attention_loop() -> None:
 DEPLOY_DRIFT_PRIME_EVERY_S = 60
 
 
-def _deploy_drift_alert_check(dd: dict) -> None:
-    """.handoffs/SPEC.md KEEP list: 'deploy drift > 30 min'. Reuses the SAME
-    threshold and cache the dashboard card already uses (deploy_drift_rows'
-    `hot = m > 30`) rather than inventing a second notion of "drifted" — see
-    deploy-drift-alert.sh's own header for why this only became reachable
-    once PR #130 landed deploy_drift_data().
-
-    An unverified repo (fetch failed, or an error) leaves the CURRENT alert
-    state alone rather than guessing either direction: a transient fetch
-    failure must not manufacture a false "back in sync" recovery post, and
-    must not manufacture a false "drifted" page either.
-
-    Fire-and-forget, same as _on_agent_edge/_on_connection_change: this runs
-    on the prime-loop thread, which must never die on a spawn failure.
-    """
-    if not DEPLOY_DRIFT_ALERT.exists():
-        return
-    for r in dd.get("repos", []):
-        if r.get("error") or r.get("fetch_ok") is False:
-            continue
-        repo = r.get("repo") or ""
-        if not repo:
-            continue
-        minutes = r.get("behind_minutes") or 0
-        status = "drifted" if minutes > 30 else "synced"
-        try:
-            subprocess.Popen(
-                ["bash", str(DEPLOY_DRIFT_ALERT), repo, status, str(minutes),
-                 r.get("deployed") or "", r.get("main") or ""],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            _live_log(f"deploy-drift-alert spawn failed for {repo}: {exc}")
-
-
 def _deploy_drift_prime_loop() -> None:
     while True:
         try:
-            _deploy_drift_alert_check(CACHES["deploy_drift"].get())
+            CACHES["deploy_drift"].get()
         except Exception:  # noqa: BLE001 — belt and braces: the loop must not die
             pass
         time.sleep(DEPLOY_DRIFT_PRIME_EVERY_S)
@@ -6434,8 +6364,7 @@ def main() -> int:
         # daemon thread: if it cannot reach herdr the hub still serves, with
         # `connected: false` saying plainly that the live rows are absent
         # rather than quietly showing a stale fleet.
-        LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log,
-                                     on_connection_change=_on_connection_change)
+        LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log)
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()

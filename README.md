@@ -47,7 +47,7 @@ refuses to wire anything up if one is missing:
 | `python3` | JSON parsing where a one-liner would be unreadable (`wait-for-blocked.sh`'s pane-scan), `smart-name.sh`'s pane-scrape sanitizer |
 | `jq` | JSON parsing everywhere else — the dominant tool here |
 | `git` | repo-root resolution, worktrees, `sort-tabs.sh`'s branch-state ranking |
-| `curl` | Slack bridge outbound calls (`herdr-notify.sh`, `herdr-resolve.sh`) |
+| `curl` | hub/health probes (`restart.sh`) |
 | `sqlite3` | `lib/run-registry.sh`'s task registry (WAL mode). Ships with macOS; on Linux, install it (`apt install sqlite3` / equivalent) — nothing here vendors or bundles it |
 
 **Optional — real functionality lost, nothing breaks:**
@@ -56,7 +56,7 @@ refuses to wire anything up if one is missing:
 |---|---|---|
 | `gh` (authenticated) | `sort-tabs.sh`'s *reviewed*/*merged*/*waiting* PR-state ranking | set `HERDR_SORT_NO_GH=1` for git-only ranking (dirty/committed/clean) |
 | `fzf` | `--pick` on `open-project.sh`/`quick-action.sh`, quick-action `type: select` | every headless, by-name invocation works unchanged — `--pick` is a convenience layer over the same lookup |
-| `tmux` | conductor-id fallback (`lib/reconcile.sh`), Slack-reply thread-context detection (`herdr-notify.sh`) | falls through to its next identity source; not a hard dependency of anything |
+| `tmux` | conductor-id fallback (`lib/reconcile.sh`) | falls through to its next identity source; not a hard dependency of anything |
 | `bun` | `preview.sh`'s `open` subcommand (drives the omp browser plugin) | every other `preview.sh` action is unaffected |
 | `system_profiler` | `preview.sh`'s display-profile auto-detection (macOS) | fails **open** to `wide`, never silently narrow |
 | `timeout` / `gtimeout` / `perl` | `smart-name.sh`'s AI-summary call gets a real timeout | tries all three in order, in that file — see the note below before assuming any one of them is on PATH |
@@ -101,13 +101,13 @@ ln -s "$PWD"/*.sh ~/.local/bin/
 ### Restarting the control plane
 
 ```bash
-./restart.sh              # restart all four LaunchAgents, then verify
+./restart.sh              # restart all three LaunchAgents, then verify
 ./restart.sh --verify     # health check; changes nothing
 ./restart.sh --panes      # also close every agent pane first (clean slate)
-./restart.sh hub bridge   # only the named services
+./restart.sh hub auth-broker   # only the named services
 ```
 
-The four agents are `hub` (:8600), `bridge`, `auth-gateway` (:4000) and
+The three agents are `hub` (:8600), `auth-gateway` (:4000) and
 `auth-broker` (:8765). **A 401 from the auth pair is healthy** — the listener
 is up and refusing an unauthenticated probe; `restart.sh` encodes the expected
 codes so that is never misread as an outage.
@@ -139,8 +139,6 @@ in `~/.claude/settings.json`. `install.sh` registers three hooks:
 | event | script | why |
 |---|---|---|
 | `Notification` | `agent-hooks/claude-notify.sh` | alert you when an agent needs input |
-| `PostToolUse` | `herdr-resolve.sh` | retract alerts you answered in the terminal |
-| `Stop` | `herdr-resolve.sh` | backstop for the same |
 | `SessionStart` | `agent-hooks/session-reconcile.sh` | report task-state changes missed while no conductor was watching, and detect `lost` tasks — see below |
 | `PostToolUse` | `agent-hooks/interval-reconcile.sh` | same sweep + report, throttled to run at most once per `HERDR_RECONCILE_INTERVAL_S` (default 300s) — the mid-session counterpart to `SessionStart`'s one-time pass |
 
@@ -151,10 +149,9 @@ before swapping it in, and is **idempotent**: a job already wired under a
 different script name is detected and skipped rather than duplicated, so you do
 not end up with every alert firing twice.
 
-Run it with no arguments for a dry run. Add `--bridge` to also install the
-launchd daemon (macOS) from `slack-bridge/com.herdr-control.bridge.plist.template`.
+Run it with no arguments for a dry run.
 
-`install.sh` also symlinks the omp side of the same wiring: `agent-hooks/omp-herdr-control.ts` into `~/.omp/agent/extensions/herdr-control.ts` (or `$PI_CODING_AGENT_DIR/extensions` when set) — omp's own auto-discovery root, so it applies globally and cwd-independently, the same way `~/.claude/settings.json` does for Claude. One symlink gives an omp session the same four jobs the hook table above gives a Claude session (push-wake, session reconciliation, mid-session reconciliation, alert retraction), mapped onto omp's `tool_call` / `before_agent_start` / `tool_result` / `agent_end` extension events instead. It never copies the file — an edit here is live on the next omp session with no reinstall — refuses to clobber a real (non-symlink) file already at that path, and is idempotent and `--repoint`-aware exactly like the Claude hooks above. To disable it without uninstalling, add `disabledExtensions: [extension-module:herdr-control]` to `~/.omp/agent/config.yml`.
+`install.sh` also symlinks the omp side of the same wiring: `agent-hooks/omp-herdr-control.ts` into `~/.omp/agent/extensions/herdr-control.ts` (or `$PI_CODING_AGENT_DIR/extensions` when set) — omp's own auto-discovery root, so it applies globally and cwd-independently, the same way `~/.claude/settings.json` does for Claude. One symlink gives an omp session the same three jobs the hook table above gives a Claude session (push-wake, session reconciliation, mid-session reconciliation), mapped onto omp's `tool_call` / `before_agent_start` / `tool_result` extension events instead. It never copies the file — an edit here is live on the next omp session with no reinstall — refuses to clobber a real (non-symlink) file already at that path, and is idempotent and `--repoint`-aware exactly like the Claude hooks above. To disable it without uninstalling, add `disabledExtensions: [extension-module:herdr-control]` to `~/.omp/agent/config.yml`.
 
 **`config.sh` is the only file you edit** — it holds every machine/personal
 default (which agent to launch, PATH for a minimal environment, the metadata
@@ -263,8 +260,7 @@ Three rules make it safe to build alerting on an event stream:
    exactly that population.
 
 `agent-edge.sh` is the one place a transition becomes action: registry follow,
-a graced Slack backstop for panes whose own hook never alerted
-(`HERDR_EDGE_ALERT_GRACE_S`, default 20s), retraction on unblock, and an audit
+peer-answer, and an audit
 line per edge in `~/.cache/herdr-control/agent-edges.jsonl`. If the hub is
 down or its subscription drops, every consumer falls back to polling — a
 performance change must never be the reason a worker's prompt goes unnoticed.
@@ -374,9 +370,9 @@ silent. A conductor pane that is empty, or whose live birth no longer
 matches what was registered (recycled), skips straight to escalation —
 there is no "wake" to attempt. Unacknowledged past
 `HERDR_STALL_WATCHDOG_ESCALATE_S` (default 2x
-`HERDR_STALL_WATCHDOG_THRESHOLD_S`, 600s): one escalation through the real
-alert path (`lib/alert-gate.sh`'s `alert_claim` + `slack-bridge/herdr-notify.sh
---class stall-watchdog`), the same dedupe primitive `attention-tick.sh` uses
+`HERDR_STALL_WATCHDOG_THRESHOLD_S`, 600s): one escalation recorded as a
+`stall_escalated` registry event (signal, artifact, reason), deduped the same
+way `attention-tick.sh` dedupes
 for its own Main escalation. `./stall-ack.sh <task_id> [signal]` records that
 a human looked — the same honesty `ack.sh`'s ready_review marker keeps, not
 a claim the work is done — and stops repeats/escalation for that fingerprint.
@@ -771,8 +767,8 @@ and who touches which env vars, not asserted from memory:**
 - **Outside-Herdr Layer** — entry points that react to an AGENT CLI's own
   hook/extension system, which herdr's plugin manifest has no way to see:
   `spawn-agent.sh`/`spawn-task.sh`, every `agent-hooks/*`, `herdr-select.sh`,
-  `herdr-deliver.sh`, `herdr-resolve.sh`, `send-to-agent.sh`,
-  `wait-for-blocked.sh`, the Slack bridge — plus the libs ONLY they touch:
+  `herdr-deliver.sh`, `send-to-agent.sh`,
+  `wait-for-blocked.sh` — plus the libs ONLY they touch:
   `lib/run-registry.sh`, `lib/push-wake.sh`, `lib/reconcile.sh`,
   `lib/posture.sh`, `lib/command-policy.sh` (confirmed by grep: these three
   are the only files anywhere in the repo that reference
@@ -930,12 +926,11 @@ unaffected. See `lib/pane-guard.sh`'s `require_pane_birth_match`.
 ### omp workers push too
 
 Everything above talks about Claude Code because that was the only
-integration for a while. `install.sh` now wires the identical four jobs into
+integration for a while. `install.sh` now wires the identical three jobs into
 an omp session too — see "What `install.sh` does" above for the symlink —
 mapped onto omp's own event names: `tool_call` → alert + push-wake,
 `before_agent_start` → session reconciliation injected as a message,
-`tool_result` → throttled mid-session reconciliation + alert retraction,
-`agent_end` → retraction backstop. Same shared code underneath
+`tool_result` → throttled mid-session reconciliation. Same shared code underneath
 (`lib/push-wake.sh`, `lib/reconcile.sh`) as the Claude hooks — Claude and omp
 cannot drift into two different notions of "the worker needs you."
 
@@ -1166,23 +1161,6 @@ session, or before `install.sh` has run) — see "Wake persistence across
 conductor sessions" above for the push half.
 
 
-## Answer agents from Slack (optional, two-way)
-
-`herdr-deliver.sh` delivers a message to an agent (or `--blocked` = the one that's
-waiting). The `slack-bridge/` builds a **two-way** conversation with a Slack bot:
-
-- **Outbound** — `herdr-notify.sh --pane <id> "<text>"` posts an alert to your DM
-  as the bot and records `ts→pane`.
-- **Inbound** — a Socket-Mode daemon (`slack-herdr-bridge.py`, run via
-  `run-bridge.sh`) routes your reply to a pane: (1) a reply **threaded** under an
-  alert → that alert's pane; (2) an explicit `w8:p2 <text>` prefix; (3) the single
-  blocked agent. Fail-closed to an allowlist of your Slack user id(s).
-
-So a blocked worker DMs you and you answer *in the thread* — it lands in the right
-pane, from your phone, no terminal. One-time Slack-app setup in
-`slack-bridge/SETUP.md`. Wire `herdr-notify.sh` into your agent's notify hook to
-replace a one-way webhook.
-
 ## How it works (worth knowing before you review)
 
 A few herdr API facts these rely on, since they aren't obvious from the CLI:
@@ -1201,7 +1179,7 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
   lock — a live agent's own status hook can overwrite the pane it occupies.
 - **Only agent *sessions* become tabs.** In-process sub-agents are not panes.
 - **A friendly name (`lib/pane-name.sh`'s `pane_display_name`, used by
-  `herdr-notify.sh` and `attention.sh`) silently falls back to the raw pane
+  `attention.sh`) silently falls back to the raw pane
   id (`w1:p2`) whenever `herdr pane list`/`workspace list`/`tab list` fail —
   on purpose ("an alert with an ugly name beats no alert"), not a naming
   bug. Confirmed live 2026-08-05: this machine's `herdr` CLI (protocol 19)
@@ -1277,7 +1255,7 @@ text, or call `op`. Do not put service credentials back into interactive-shell
 startup files. Rotation must update the pre-resolved service file separately
 from 1Password; an injected old value continues to win until the service's
 environment is refreshed. The KB child receives only its Neon credential and
-basic process environment, not the broker, Slack, or search tokens.
+basic process environment, not the broker or search tokens.
 
 **Unknown is not never:** missing credentials, timeout, query errors, or a
 missing KB module/table mean `unavailable` with unknown execution history.
@@ -1368,7 +1346,6 @@ or queries Neon.
 | `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive); `--submit-only` presses/confirms text ALREADY in the composer (e.g. an operator typed directly and the Enter didn't land) |
 | `herdr-select.sh` | answer a prompt — numbered digit or omp's arrow menu — by pressing the right key(s); `--authority peer\|human` gates auto-answer through command policy |
-| `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
 | `wake-on-evidence.sh` | poll a peer's `.handoffs/events.jsonl` for a marker, then wake |
 | `install.sh` | wire the hooks into Claude Code and the omp extension symlink (idempotent, dry-run by default) |
 | `verify-run-registry.sh` | 42-check verification of the SQLite run registry — sequencing, dedup, transactions, migration from the old file layout |
@@ -1385,7 +1362,7 @@ or queries Neon.
 | `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
 | `agent-hooks/session-reconcile.sh` | the `SessionStart` hook: reconcile the run registry (detect `lost` tasks) and report state changes missed since this conductor last checked in |
 | `agent-hooks/interval-reconcile.sh` | the throttled `PostToolUse` hook: same sweep + report, mid-session |
-| `agent-hooks/omp-herdr-control.ts` | omp extension module (symlinked by `install.sh`) mapping `tool_call`/`before_agent_start`/`tool_result`/`agent_end` to the same four jobs the Claude hooks do |
+| `agent-hooks/omp-herdr-control.ts` | omp extension module (symlinked by `install.sh`) mapping `tool_call`/`before_agent_start`/`tool_result` to the same three jobs the Claude hooks do |
 | `agent-hooks/omp-notify.sh` | omp's equivalent of `claude-notify.sh` — polls for a painted prompt before alerting, silent otherwise, so it's safe on every `tool_call` |
 | `agent-hooks/omp-reconcile.sh` | omp's equivalent of `session-reconcile.sh` + `interval-reconcile.sh`, invoked from `before_agent_start`/`tool_result` |
 | | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |
@@ -1403,7 +1380,6 @@ or queries Neon.
 | `lib/reconcile.sh` | the reconciliation sweep + report, shared by `session-reconcile.sh` and `interval-reconcile.sh` |
 | `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed, plus multi-agent portability status |
 | `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |
-| `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
 | `chrome-relay.py` | keeps the REAL Chrome up for omp and Zero (default data dir, `Profile 1`: OMP Browser Relay + 1Password + ChatGPT). No args opens a window; `--status [--json]` reports Chrome/relay/extension health (synced to Zero's `get_status` as `browser`); `--ensure` is the `com.herdr-control.chrome-relay` LaunchAgent tick (`install.sh --apply --chrome`): start Chrome in the background if it is down, then close omp-profile Chromes (`~/.omp/browser-profiles/*`, which otherwise capture a Dock click) that are >2 min old and had no CDP client on two ticks in a row; `--pause HOURS` / `--resume` when you quit Chrome on purpose |
 | `verify-chrome-relay.py` | the kill decision: real vs omp-profile classification, stale DevToolsActivePort, the two-tick idle rule, pid reuse (CI: `.github/workflows/chrome-relay.yml`) |
