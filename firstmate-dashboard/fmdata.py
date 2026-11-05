@@ -5,6 +5,11 @@ Everything here is a read: `fm-tasks-axi.sh list|show`, `fm-crew-state.sh`,
 one write the dashboard makes (an inbox note) lives in server.py, behind the
 same CLI the captain would type.
 
+The two per-task reads are cached, since re-running them every refresh cost
+about half a core: a crew's `fm-crew-state.sh` reading until its state files
+change or it is CREW_MAX_AGE_S old (each crew row says when it was read), and
+a `show` while `data/backlog.md` and the task's list row are unchanged.
+
 Evolution-loop signals are the one read that leaves the machine: the alert
 issues named in `state/evolution-loop.seen` are looked up with `gh issue view`
 at most once per SIGNAL_REFRESH_S, so a closed alert drops off the bounty
@@ -29,6 +34,14 @@ import time
 from pathlib import Path
 
 CMD_TIMEOUT_S = 15
+# fm-crew-state.sh is most of a snapshot's CPU (~0.3 s per crew). A crew is
+# re-read when its state/<id>.meta or .status changes (every event a crew
+# reports lands there), else its cached reading is reused; one cached reading
+# at least CREW_MAX_AGE_S old is re-read per refresh, so a change only a
+# pane or a no-mistakes run shows is picked up within max(CREW_MAX_AGE_S,
+# crews x refresh interval).
+CREW_MAX_AGE_S = 60
+CREW_ROTATE = 1
 # Crew states (fm-crew-state.sh's vocabulary) that want a human or firstmate.
 ATTENTION_STATES = ("blocked", "failed", "parked")
 PR_URL = re.compile(r"https://[^\s\"'<>()]+/(?:pull|merge_requests)/\d+")
@@ -167,6 +180,15 @@ def _iso(epoch: float | None) -> str | None:
     return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _stamp(path: Path) -> tuple[int, int, int] | None:
+    """A file's (inode, size, mtime_ns): any rewrite or append changes it."""
+    try:
+        s = path.stat()
+    except OSError:
+        return None
+    return (s.st_ino, s.st_size, s.st_mtime_ns)
+
+
 class Home:
     """One Firstmate home. `root` holds bin/ (the code), `home` holds state/
     and data/ (FM_HOME); they are the same directory in the usual layout."""
@@ -182,6 +204,11 @@ class Home:
         self._done_titles: dict[str, str] = {}
         self._slugs: dict[str, str] = {}
         self._issues: dict[tuple[str, str], dict] = {}
+        # task id -> {"stamp", "at", "cs"}: the last crew-state reading.
+        self._crew: dict[str, dict] = {}
+        # task id -> (key, record): a `show` is reused while the backlog file
+        # and the task's list row are unchanged.
+        self._shows: dict[str, tuple[tuple, dict]] = {}
         self._lock = threading.Lock()
 
     def env(self) -> dict:
@@ -341,19 +368,41 @@ class Home:
         hold_ids = {r["id"] for r in holds}
         live = [r for r in rows if r.get("state") == "in_flight"]
         metas = {r["id"]: parse_meta(self.state / f"{r['id']}.meta") for r in live}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            shows = {r["id"]: pool.submit(self.show, r["id"])
+        now = time.time()
+        backlog = _stamp(self.data / "backlog.md")  # None for a non-markdown backlog: never cached
+        show_keys = {r["id"]: (backlog, json.dumps(r, sort_keys=True))
                      for r in rows if r["id"] in hold_ids or r["title_truncated"]}
-            states = {r["id"]: pool.submit(self.crew_state, r["id"]) for r in live if metas[r["id"]]}
+        # Stamped before the reads, so a write during one is re-read next refresh.
+        stamps = {r["id"]: (_stamp(self.state / f"{r['id']}.meta"), _stamp(self.state / f"{r['id']}.status"))
+                  for r in live if metas[r["id"]]}
+        with self._lock:
+            full = {tid: rec for tid, (key, rec) in self._shows.items() if backlog and show_keys.get(tid) == key}
+            crew = {tid: e for tid, e in self._crew.items() if tid in stamps}
+        reread = [tid for tid in stamps if tid not in crew or crew[tid]["stamp"] != stamps[tid]]
+        stale = sorted((crew[tid]["at"], tid) for tid in stamps
+                       if tid in crew and tid not in reread and now - crew[tid]["at"] >= CREW_MAX_AGE_S)
+        reread += [tid for _, tid in stale[:CREW_ROTATE]]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            shows = {tid: pool.submit(self.show, tid) for tid in show_keys if tid not in full}
+            states = {tid: pool.submit(self.crew_state, tid) for tid in reread}
             receipts_f = pool.submit(self.receipts)
             issues_f = [pool.submit(self.issue, *k) for k in self.signal_keys()]
 
-        full = {}
+        for tid, f in states.items():
+            try:
+                crew[tid] = {"stamp": stamps[tid], "at": now, "cs": f.result()}
+            except CommandError as e:  # not cached: retried next refresh
+                crew[tid] = {"stamp": None, "at": now, "cs": {"state": "unknown", "source": "none", "detail": str(e)}}
+        with self._lock:
+            self._crew = {tid: e for tid, e in crew.items() if e["stamp"] is not None}
+
         for tid, f in shows.items():
             try:
                 full[tid] = f.result()
-            except CommandError as e:
+            except CommandError as e:  # not cached: retried next refresh
                 errors.append(str(e))
+        with self._lock:
+            self._shows = {tid: (key, full[tid]) for tid, key in show_keys.items() if backlog and tid in full}
         for r in rows:
             if r["id"] in full and full[r["id"]].get("title"):
                 r["title"], r["title_truncated"] = full[r["id"]]["title"], False
@@ -383,11 +432,9 @@ class Home:
         in_flight = []
         for r in live:
             meta = metas[r["id"]]
-            if r["id"] in states:
-                try:
-                    cs = states[r["id"]].result()
-                except CommandError as e:
-                    cs = {"state": "unknown", "source": "none", "detail": str(e)}
+            if r["id"] in crew:
+                e = crew[r["id"]]
+                cs = {**e["cs"], "observed_at": _iso(e["at"])}
             else:
                 cs = {"state": "unknown", "source": "none", "detail": "no state/<id>.meta"}
             last, mtime, prs = self.status_tail(r["id"])
