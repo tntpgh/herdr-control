@@ -1,5 +1,5 @@
 name: remote-mcp
-# The herdr-mcp Worker (OAuth + MCP + Durable Object) and its Mac publisher.
+# The Bebop Worker (OAuth + MCP + Durable Object) and its Mac publisher.
 # The Worker suite runs the real
 # OAuth 2.1 + PKCE flow and every tool in workerd; the publisher suite builds
 # snapshots from a fixture hub and delivers to a fake herdr-deliver. The
@@ -77,6 +77,8 @@ jobs:
       # The Firstmate publisher: needs this job's node + the Worker's locked zod,
       # because every body it sends is validated against state.ts's own SyncSchema.
       - run: python3 ../verify-fm-publisher.py
+      # The Mac's per-client scope profiles must equal the Worker's CLIENT_GRANTS.
+      - run: python3 ../scripts/verify-issue-client.py
 
   authorization:
     runs-on: ubuntu-latest

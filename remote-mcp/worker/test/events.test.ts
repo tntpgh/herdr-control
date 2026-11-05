@@ -77,7 +77,7 @@ async function deliveredExchangeAndReply(access_token: string, clientMsgId: stri
 describe("owner.reply_ready: envelope and acceptance", () => {
   it("is minted atomically with the status transition, carries no reply text, and is visible only to the original sender", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
 
     const reply = { exchange_id: id, owner_label: "conductor", body: "the secret answer is 42",
@@ -111,7 +111,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
 
   it("a retried sync recovers the SAME event (no second row, same cursor) -- duplicate_same_payload", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
     const reply = { exchange_id: id, owner_label: "conductor", body: "ok", responded_at: new Date().toISOString(),
       artifact_revision: "rev1", session: "w1:p1" };
@@ -137,7 +137,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
 
   it("a guarded/no-op update (body differs, or the exchange was never delivered) emits no event", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
     await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
       { exchange_id: id, owner_label: "conductor", body: "v1", responded_at: new Date().toISOString(),
@@ -159,7 +159,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
   it("an injected throwing event insert rolls back the whole reply (status stays delivered), proving the " +
     "transactionSync wrapper actually rolls back a thrown exception, not just the specific rejected-outcome branch", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
     const reply = { exchange_id: id, owner_label: "conductor", body: "boom", responded_at: new Date().toISOString(),
       artifact_revision: "rev1", session: "w1:p1" };
@@ -184,7 +184,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
 
   it("a pre-seeded conflicting stable event_id makes the full sync NOT commit acceptance", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token);
     const mine = await senderOf(id);
 
@@ -216,7 +216,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
 
   it("a never-delivered (still-queued) exchange gets neither a reply-acceptance transition nor an event", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
       { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
     const id = sent.data.exchange_id;
@@ -299,7 +299,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
 
   it("publisher-originated input cannot forge owner.reply_ready or any other event: there is no field that sets type/event_id/visibility", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     // A hostile publisher reply payload trying to smuggle envelope-shaped
     // extras onto the one field it can reach (owner_replies) -- SyncSchema
     // (zod, no .passthrough()) strips unknown keys; the Worker's own
@@ -330,7 +330,7 @@ describe("owner.reply_ready: envelope and acceptance", () => {
     // contract -- so a publisher that predates this branch (sends exactly
     // the fields syncBody() already sent before Phase 1) still works.
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const id = await deliveredExchange(access_token, "legacy1");
     const res = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
       { exchange_id: id, owner_label: "conductor", body: "legacy reply", responded_at: new Date().toISOString(),
@@ -394,7 +394,7 @@ describe("event detail integrity", () => {
         expect(next.scanned_through_cursor).toBe(next.latest_cursor);
         return page.scanned_through_cursor;
       });
-      const { access_token } = await oauthToken(["herdr:read"]);
+      const { access_token } = await oauthToken(["fm:read"]);
       const listed = await callTool<EventPage>(access_token, "list_events", { since_cursor: 0 });
       expect(listed.isError).toBe(false);
       expect(listed.data.events.find((ev) => ev.type === "failed")?.detail).toEqual({ detail_error: "invalid_json" });
@@ -428,7 +428,7 @@ describe("list_events/wait_for_events: pruning, scope and pagination", () => {
 
   it("owner.reply_ready events expire after 30 days (they have no remote task) and raise the replay floor; younger ones survive", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const oldId = await deliveredExchangeAndReply(access_token, "cm-old");
     const newId = await deliveredExchangeAndReply(access_token, "cm-new");
     const oldCursor = await runInDurableObject(fleet(), (_o: HerdrState, state) => {
@@ -460,7 +460,7 @@ describe("list_events/wait_for_events: pruning, scope and pagination", () => {
 
   it("scanned_through_cursor advances through a page of entirely-filtered (another sender's) owner events, so catch-up never stalls", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     for (let i = 0; i < 5; i++) await deliveredExchangeAndReply(access_token, `other${i}`);
     const after = caller("someone-else@teamthurber.com", "c2");
     const page = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, after, 100));
@@ -471,7 +471,7 @@ describe("list_events/wait_for_events: pruning, scope and pagination", () => {
 
   it("watcher recipe: catches up a reply created before startup, then observes a later one via wait_for_events", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:request"]);
     const pre = await deliveredExchangeAndReply(access_token, "pre-watcher");
 
     // 1. Capture cursor and scope.

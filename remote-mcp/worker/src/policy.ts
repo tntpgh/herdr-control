@@ -1,36 +1,132 @@
-// Pure policy: connection state, message-target resolution, message text
-// rules, rate limits. No I/O, so every rule here is unit-tested directly.
+// Pure policy: connection state, scopes and client grants, the tool
+// catalog, message text rules, rate limits. No I/O, so every rule here is
+// unit-tested directly.
 import type { Env, Snapshot, TaskRow } from "./types";
-import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
+import { FM_DECIDE_NOTE, FM_PEER, FM_READ, FM_REPORTS, FM_REQUEST, SCOPE_OWNER_MESSAGE, SCOPE_READ } from "./types";
 
 // The scopes this deployment will grant and honour. A token's scopes are
-// always intersected with this, so turning a switch off takes effect on
-// the next request, not when existing tokens expire. Task scopes are three,
-// not one, because research and implement are separately consentable (a
-// client can be trusted to start a read-only research task and never ticked
-// for implement at all) and herdr:task.cancel covers both cancel and resume.
+// always intersected with this, so turning a switch off takes effect on the
+// next request, not when existing tokens expire. Read and reports are always
+// offered; every scope that queues a note for Firstmate needs the owner
+// inbox switch, because the inbox is the only route a note can take.
 export function offeredScopes(env: Env): string[] {
-  const scopes = [SCOPE_READ];
-  if (env.MESSAGING_ENABLED === "true") scopes.push(SCOPE_MESSAGE);
-  if (env.TASKS_ENABLED === "true") scopes.push(SCOPE_TASK_START, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_CANCEL);
-  if (env.OWNER_INBOX_ENABLED === "true") scopes.push(SCOPE_OWNER_MESSAGE);
+  const scopes = [FM_READ, FM_REPORTS];
+  if (env.OWNER_INBOX_ENABLED === "true") scopes.push(FM_REQUEST, FM_DECIDE_NOTE, FM_PEER);
   return scopes;
+}
+
+// The only OAuth clients that may hold any scope at all, by their
+// Client-ID Metadata Document URL (the provider fetches and verifies the
+// document, so the id is the app's own HTTPS URL, not a self-declared name).
+// Each gets only what it actually used on herdr-mcp: Dot relays the captain's
+// decisions, so it may file decision notes; Duet never did, so it may not.
+// Any other client -- including every Dynamic Client Registration -- is
+// refused at consent and at /mcp. Widening a client is a code change and a
+// security review.
+export interface ClientGrant { label: string; scopes: readonly string[] }
+export const CLIENT_GRANTS: Readonly<Record<string, ClientGrant>> = {
+  "https://chatgpt.com/oauth/client.json": { label: "dot", scopes: [FM_READ, FM_REPORTS, FM_REQUEST, FM_DECIDE_NOTE, FM_PEER] },
+  "https://claude.ai/oauth/mcp-oauth-client-metadata": { label: "duet", scopes: [FM_READ, FM_REPORTS, FM_REQUEST, FM_PEER] },
+};
+
+export function clientGrant(clientId: string): ClientGrant | null {
+  return Object.hasOwn(CLIENT_GRANTS, clientId) ? CLIENT_GRANTS[clientId]! : null;
+}
+
+export function clientLabel(clientId: string): string {
+  return clientGrant(clientId)?.label ?? "unknown";
+}
+
+// herdr-mcp scopes on tokens granted before the fm:* cutover, honoured only
+// while LEGACY_HERDR_SCOPES is "true". herdr:message.owner never maps to
+// fm:decide-note: a structured decision note is new, so it needs a fresh
+// consent. Every other herdr scope (message, task.*) maps to nothing.
+export const LEGACY_SCOPE_MAP: Readonly<Record<string, readonly string[]>> = {
+  [SCOPE_READ]: [FM_READ, FM_REPORTS],
+  [SCOPE_OWNER_MESSAGE]: [FM_REQUEST, FM_PEER],
+};
+
+// What a token may actually do right now: its granted scopes (legacy ones
+// mapped while the switch is on), intersected with what this deployment
+// offers and with the client's ceiling. Empty for any client not in
+// CLIENT_GRANTS -- default deny.
+export function effectiveScopes(env: Env, clientId: string, granted: readonly string[]): string[] {
+  const ceiling = clientGrant(clientId)?.scopes;
+  if (!ceiling) return [];
+  const legacy = env.LEGACY_HERDR_SCOPES === "true";
+  const held = new Set<string>();
+  for (const s of granted) {
+    if (s.startsWith("fm:")) held.add(s);
+    else if (legacy && Object.hasOwn(LEGACY_SCOPE_MAP, s)) for (const m of LEGACY_SCOPE_MAP[s]!) held.add(m);
+  }
+  const offered = offeredScopes(env);
+  return offered.filter((s) => held.has(s) && ceiling.includes(s));
+}
+
+// Every tool the MCP server can expose, with the scopes any one of which
+// admits it and its own per-client rate limit (on top of the global
+// per-client throttle in state.ts). A tool is registered for a caller only
+// when one of its scopes is effective, and the gate re-checks both before
+// it runs. write: the call queues something (its own audit row records the
+// outcome); every other tool only reads.
+export interface ToolPolicy {
+  scopes: readonly string[];
+  per_minute: number;
+  per_hour: number;
+  write: boolean;
+}
+const read = (per_minute: number, per_hour: number, scopes: readonly string[] = [FM_READ]): ToolPolicy =>
+  ({ scopes, per_minute, per_hour, write: false });
+export const TOOL_CATALOG: Readonly<Record<string, ToolPolicy>> = {
+  get_status: read(20, 600),
+  get_posture: read(20, 600),
+  list_agents: read(20, 600),
+  list_tasks: read(20, 600),
+  get_task: read(30, 900),
+  list_blockers: read(20, 600),
+  list_decisions: read(20, 600),
+  get_decision: read(30, 900),
+  list_events: read(20, 600),
+  wait_for_events: read(10, 300),
+  get_consumer_position: read(10, 120),
+  commit_consumer_position: read(10, 120),
+  rebase_consumer_position: read(10, 120),
+  get_task_result: read(30, 600, [FM_REPORTS]),
+  list_reports: read(20, 300, [FM_REPORTS]),
+  get_report: read(30, 600, [FM_REPORTS]),
+  send_owner_message: { scopes: [FM_REQUEST], per_minute: 10, per_hour: 120, write: true },
+  request_task: { scopes: [FM_REQUEST], per_minute: 2, per_hour: 12, write: true },
+  answer_decision: { scopes: [FM_DECIDE_NOTE], per_minute: 4, per_hour: 30, write: true },
+  get_owner_message_status: read(30, 900, [FM_REQUEST, FM_DECIDE_NOTE]),
+  get_owner_reply: read(30, 900, [FM_REQUEST, FM_DECIDE_NOTE]),
+  send_peer_message: { scopes: [FM_PEER], per_minute: 10, per_hour: 120, write: true },
+  list_peer_messages: read(20, 600, [FM_PEER]),
+};
+
+export function toolPolicy(tool: string): ToolPolicy | null {
+  return Object.hasOwn(TOOL_CATALOG, tool) ? TOOL_CATALOG[tool]! : null;
+}
+
+export function toolAllowed(tool: string, scopes: readonly string[]): boolean {
+  return toolPolicy(tool)?.scopes.some((s) => scopes.includes(s)) ?? false;
 }
 
 // What this deployment is and allows, so anyone can check it before
 // connecting (/healthz) and after (get_status). Contains no secret.
 export interface ServerInfo {
   build_sha: string;
-  messaging_enabled: boolean;
-  tasks_enabled: boolean;
   owner_inbox_enabled: boolean;
+  legacy_herdr_scopes: boolean;
   scopes_offered: string[];
+  clients: Record<string, string[]>;
 }
 
 export function serverInfo(env: Env): ServerInfo {
-  return { build_sha: env.BUILD_SHA, messaging_enabled: env.MESSAGING_ENABLED === "true",
-    tasks_enabled: env.TASKS_ENABLED === "true", owner_inbox_enabled: env.OWNER_INBOX_ENABLED === "true",
-    scopes_offered: offeredScopes(env) };
+  const offered = offeredScopes(env);
+  const clients: Record<string, string[]> = {};
+  for (const g of Object.values(CLIENT_GRANTS)) clients[g.label] = offered.filter((s) => g.scopes.includes(s));
+  return { build_sha: env.BUILD_SHA, owner_inbox_enabled: env.OWNER_INBOX_ENABLED === "true",
+    legacy_herdr_scopes: env.LEGACY_HERDR_SCOPES === "true", scopes_offered: offered, clients };
 }
 
 export type ConnectionState = "connected" | "degraded" | "disconnected" | "never_connected";

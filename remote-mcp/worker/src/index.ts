@@ -1,59 +1,59 @@
-// herdr-mcp: an OAuth 2.1 authorization server + MCP resource in one Worker.
+// Bebop (formerly herdr-mcp): an OAuth 2.1 authorization server + MCP
+// resource in one Worker, Firstmate's remote surface for Dot and Duet.
 //
 //   /mcp                     MCP (Streamable HTTP), bearer token required
 //   /authorize               consent; Cloudflare Access (Google SSO) in front,
-//                            Access JWT re-verified here, email allowlisted
+//                            Access JWT re-verified here, email allowlisted,
+//                            client allowlisted (policy.ts CLIENT_GRANTS)
 //   /oauth/token, /register  handled by @cloudflare/workers-oauth-provider
 //   /.well-known/*           RFC 9728 / RFC 8414 discovery (provider)
 //   /ingest/sync             the Mac publisher's HMAC-signed push
-import OAuthProvider, { AuthorizationError, CimdFetchError, OAuthError } from "@cloudflare/workers-oauth-provider";
-import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
+//
+// Served at PUBLIC_URL (bebop.teamthurber.com) and, during the hostname
+// cutover, at each ALIAS_URLS origin (herdr-mcp.teamthurber.com). Each
+// origin gets its own provider: issuer, resource and metadata URLs follow
+// the request's origin, and a token is only valid at the origin that issued
+// it. Any other host is refused.
+import OAuthProvider, { AuthorizationError, CimdFetchError, getOAuthApi, OAuthError } from "@cloudflare/workers-oauth-provider";
+import type { ConsentDescription, OAuthHelpers, OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
-import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, OWNER_LABEL, serverInfo } from "./policy";
+import { clientGrant, DEFAULT_LIMITS, effectiveScopes, MAX_LIMITS, offeredScopes, OWNER_LABEL, serverInfo } from "./policy";
+import { NOTE_SCOPE } from "./state";
 import type { ScopedSender } from "./state";
 import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
-import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
+import { FM_DECIDE_NOTE, FM_PEER, FM_READ, FM_REPORTS, FM_REQUEST, SCOPE_MESSAGE } from "./types";
 
 export { HerdrState } from "./state";
 
 const escape = (v: string) => v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 const SCOPE_TEXT: Record<string, string> = {
-  [SCOPE_READ]: "Read fleet status: agents, tasks, blockers, task results.",
-  [SCOPE_MESSAGE]: "Send one-line notes to live task agents (audited, rate-limited, never an approval or command).",
-  [SCOPE_TASK_START]: "Start read-only research tasks (no git writes, no push) and read their answers.",
-  [SCOPE_TASK_IMPLEMENT]: "Start implement tasks that commit and push their own branch, and read their answers.",
-  [SCOPE_TASK_CANCEL]: "Cancel or resume a task this connection started.",
-  [SCOPE_OWNER_MESSAGE]: "Send a note to a named owning session (conductor, a dedicated tab) -- written to a file, read by a human/agent, never typed or auto-approved; own rate limit.",
+  [FM_READ]: "Read fleet status: tasks, crewmates, blockers, open captain decisions, Firstmate's posture, events.",
+  [FM_REPORTS]: "Read scout/ship reports and task results (redacted on the Mac).",
+  [FM_REQUEST]: "Send notes and task requests to Firstmate -- written to its inbox file, judged by Firstmate, never auto-actioned and never the captain's word.",
+  [FM_DECIDE_NOTE]: "Send a note about an open captain decision -- never the captain's answer; Firstmate confirms with the captain before anything is released.",
+  [FM_PEER]: "Exchange notes with another labelled app (Dot <-> Duet).",
 };
 
-function consentPage(d: ConsentDescription, handle: string, email: string, offered: string[]): string {
-  const origin = d.clientDomain
-    ? `Published by <strong>${escape(d.clientDomain)}</strong>.`
-    : "This app registered itself; its name is not verified.";
-  const boxes = offered.map((s) => {
-    // read is pre-ticked; every other scope (message, task.*) must be ticked deliberately.
-    const checked = s === SCOPE_READ ? "checked" : "";
+function consentPage(d: ConsentDescription, handle: string, email: string, scopes: string[], label: string): string {
+  const boxes = scopes.map((s) => {
+    // read is pre-ticked; every other scope must be ticked deliberately.
+    const checked = s === FM_READ ? "checked" : "";
     return `<label><input type="checkbox" name="scope" value="${s}" ${checked}> <code>${s}</code> — ${escape(SCOPE_TEXT[s]!)}</label>`;
   }).join("<br>");
-  const notes = [
-    !offered.includes(SCOPE_MESSAGE) ? "Messaging agents is turned off on this server." : "",
-    !offered.includes(SCOPE_TASK_START) && !offered.includes(SCOPE_TASK_IMPLEMENT) ? "Starting tasks is turned off on this server." : "",
-  ].filter(Boolean).join(" ");
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>herdr-mcp: authorize ${escape(d.clientName)}</title>
+<title>Bebop: authorize ${escape(d.clientName)}</title>
 <style>body{font:15px system-ui;background:#111;color:#eee;max-width:640px;margin:40px auto;padding:0 16px}
 code{color:#9cf}label{display:block;margin:8px 0}button{font:inherit;padding:6px 16px;margin-right:8px}</style>
-<h1>Allow <em>${escape(d.clientName)}</em> to use herdr-mcp?</h1>
-<p>${origin} Tokens go to <strong>${escape(d.redirectHost)}</strong>.</p>
+<h1>Allow <em>${escape(d.clientName)}</em> to use Bebop?</h1>
+<p>Allow-listed app <strong>${escape(label)}</strong>, published by <strong>${escape(d.clientDomain ?? "")}</strong>. Tokens go to <strong>${escape(d.redirectHost)}</strong>.</p>
 ${d.redirectIsLoopback ? "<p><strong>This sends access to an app on a local computer.</strong> Continue only if you just started this sign-in.</p>" : ""}
-<p>Signed in as ${escape(email)} (Cloudflare Access). Read and message scopes can never run commands, press keys, or answer approvals; the task scopes below can start a sandboxed worker in an allow-listed repo, nothing more.</p>
+<p>Signed in as ${escape(email)} (Cloudflare Access). No scope can run a command, press a key, answer an approval, or answer a captain hold. Only what this app is allowed is listed.</p>
 <form method="post" action="/authorize">
 <input type="hidden" name="handle" value="${escape(handle)}">
 ${boxes}
-${notes ? `<p>${notes}</p>` : ""}
 <p><button name="decision" value="approve">Allow</button><button name="decision" value="deny">Deny</button></p>
 </form>`;
 }
@@ -65,13 +65,17 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   const who = await verifyAccess(request, env);
   if (!who) return text("Not authorized: a Cloudflare Access session for an allowed account is required.", 403);
   const oauth = env.OAUTH_PROVIDER;
+  const notAllowed = () => text("This app is not on Bebop's client allowlist; no access can be granted to it.", 403);
   try {
     if (request.method === "GET") {
       const req = await oauth.parseAuthRequest(request);
+      const grant = clientGrant(req.clientId);
+      if (!grant) return notAllowed();
+      const scopes = offeredScopes(env).filter((s) => grant.scopes.includes(s));
       const details = await oauth.describeConsent(req);
       const consent = await oauth.beginConsent(req);
       consent.headers.set("content-type", "text/html; charset=utf-8");
-      return new Response(consentPage(details, consent.handle, who.email, offeredScopes(env)), { headers: consent.headers });
+      return new Response(consentPage(details, consent.handle, who.email, scopes, grant.label), { headers: consent.headers });
     }
     if (request.method === "POST") {
       const form = await request.formData();
@@ -84,12 +88,18 @@ async function authorize(request: Request, env: Env): Promise<Response> {
       const picked = form.getAll("scope").map(String).filter((s) => offered.includes(s));
       if (picked.length === 0) return text("Pick at least one scope.", 400);
       const approved = await oauth.approveConsent(request, handle, { scope: picked });
+      // The handle names the client; the form does not. Re-check it here and
+      // grant only within its ceiling, whatever was posted.
+      const grant = clientGrant(approved.request.clientId);
+      if (!grant) return notAllowed();
+      const scope = approved.request.scope.filter((s) => grant.scopes.includes(s));
+      if (scope.length === 0) return text("None of the picked scopes is allowed for this app.", 400);
       const details = await oauth.describeConsent(approved.request);
       const { redirectTo } = await oauth.completeAuthorization({
         request: approved.request,
         userId: who.email,
         metadata: { access_sub: who.sub, client_name: details.clientName },
-        scope: approved.request.scope,
+        scope,
         props: { email: who.email, client_name: details.clientName },
       });
       approved.headers.set("location", redirectTo);
@@ -106,10 +116,12 @@ async function authorize(request: Request, env: Env): Promise<Response> {
 
 // Does this (actor, client_id) still hold a live grant with the scope its own
 // queued item needs? Checked right before delivery/leasing, so a revoked or
-// expired grant stops a message already queued (scope herdr:message) or a
-// task command already queued (scope herdr:task.start/implement, per
-// request -- a research start and an implement start need different
-// scopes, so this takes the scope per-request rather than one for all).
+// expired grant -- or a client dropped from CLIENT_GRANTS, or a legacy scope
+// once LEGACY_HERDR_SCOPES is off -- stops a note already queued. The scope
+// is per request (each owner-note kind needs its own; NOTE_SCOPE), and is
+// judged as effectiveScopes, the same rule /mcp applies. The dormant
+// herdr:message/task gates name scopes effectiveScopes never yields, so if
+// those switches were ever turned back on every old item would be revoked.
 // (KV listing can lag a deletion by up to ~60 s.)
 async function grantGate(env: Env, enabled: boolean, requests: ScopedSender[], nowMs: number): Promise<DeliveryGate> {
   if (!enabled || requests.length === 0) return { revoked: [], hold: false };
@@ -129,13 +141,14 @@ async function grantGate(env: Env, enabled: boolean, requests: ScopedSender[], n
         cursor = page.cursor;
       } while (cursor);
       for (const r of requests.filter((req) => req.actor === actor)) {
-        if (!liveScopesByClient.get(r.client_id)?.has(r.scope)) revoked.push({ actor: r.actor, client_id: r.client_id });
+        const live = effectiveScopes(env, r.client_id, [...(liveScopesByClient.get(r.client_id) ?? [])]);
+        if (!live.includes(r.scope)) revoked.push({ actor: r.actor, client_id: r.client_id, ...(r.kind ? { kind: r.kind } : {}) });
       }
     }
     return { revoked, hold: false };
   } catch (error) {
     // Fail closed without losing queued work: deliver/lease nothing this tick.
-    console.error("herdr-mcp: grant check failed; holding the queue", error);
+    console.error("bebop: grant check failed; holding the queue", error);
     return { revoked: [], hold: true };
   }
 }
@@ -150,7 +163,8 @@ async function ingest(request: Request, env: Env): Promise<Response> {
   const gate = await grantGate(env, env.MESSAGING_ENABLED === "true", msgSenders, now);
   const cmdGate = await grantGate(env, env.TASKS_ENABLED === "true",
     [...(await stub.pendingCommandSenders(now)), ...(await stub.activeTaskSenders())], now);
-  const ownerSenders: ScopedSender[] = (await stub.pendingOwnerSenders(now)).map((s) => ({ ...s, scope: SCOPE_OWNER_MESSAGE }));
+  const ownerSenders: ScopedSender[] = (await stub.pendingOwnerSenders(now))
+    .map((s) => ({ ...s, scope: NOTE_SCOPE[s.kind ?? "message"] }));
   const ownerGate = await grantGate(env, env.OWNER_INBOX_ENABLED === "true", ownerSenders, now);
   const out = await stub.sync(Date.now(), check.nonce, check.body, gate, cmdGate, ownerGate);
   if (!out.ok) return Response.json({ error: out.reason }, { status: out.status });
@@ -238,7 +252,7 @@ async function adminLimits(request: Request, env: Env): Promise<Response> {
 // signing as /admin/grants. A label names ONE verified (user, client_id)
 // connection for send_peer_message/list_peer_messages; clients can never set
 // one. `set` refuses a client_id with no live grant for that user, or whose
-// grant lacks herdr:message.owner (the peer tools' scope), so a typo cannot
+// grant has no effective fm:peer (the peer tools' scope), so a typo cannot
 // bind a label to nothing. Bodies:
 //   {"op":"list"}
 //   {"op":"set","label":"duet","user":"<email>","client_id":"<id>"}
@@ -280,7 +294,7 @@ async function adminPeers(request: Request, env: Env): Promise<Response> {
       cursor = page.cursor;
     } while (cursor);
     if (!found) return Response.json({ error: "no_such_client" }, { status: 404 });
-    if (!scopes.has(SCOPE_OWNER_MESSAGE)) return Response.json({ error: "grant_lacks_scope" }, { status: 400 });
+    if (!effectiveScopes(env, clientId, [...scopes]).includes(FM_PEER)) return Response.json({ error: "grant_lacks_scope" }, { status: 400 });
     await stub.setPeerLabel(now, label, user, clientId);
   } else if (op === "remove" && !(await stub.removePeerLabel(label))) {
     return Response.json({ error: "no_such_label" }, { status: 404 });
@@ -297,15 +311,18 @@ const defaultHandler = {
     if (pathname === "/admin/limits") return adminLimits(request, env);
     if (pathname === "/admin/peers") return adminPeers(request, env);
     if (pathname === "/" || pathname === "/healthz") {
-      return Response.json({ service: "herdr-mcp", mcp: `${env.PUBLIC_URL}/mcp`, auth: "OAuth 2.1 + PKCE", ...serverInfo(env) },
-        { headers: { "cache-control": "no-store" } });
+      const origin = new URL(request.url).origin;
+      return Response.json({
+        service: "bebop", mcp: `${origin}/mcp`, canonical_mcp: `${canonicalOrigin(env)}/mcp`,
+        host_role: origin === canonicalOrigin(env) ? "canonical" : "alias", auth: "OAuth 2.1 + PKCE", ...serverInfo(env),
+      }, { headers: { "cache-control": "no-store" } });
     }
     return text("Not found", 404);
   },
 };
 
-export function makeProvider(publicUrl: string, scopes: string[]): OAuthProvider<Env> {
-  return new OAuthProvider<Env>({
+function providerOptions(publicUrl: string, scopes: string[]): OAuthProviderOptions<Env> {
+  return {
     apiRoute: "/mcp",
     apiHandler: mcpHandler,
     defaultHandler,
@@ -313,11 +330,11 @@ export function makeProvider(publicUrl: string, scopes: string[]): OAuthProvider
     tokenEndpoint: "/oauth/token",
     clientRegistrationEndpoint: "/oauth/register",
     scopesSupported: scopes,
-    requiredScopes: [SCOPE_READ],
+    requiredScopes: [FM_READ],
     resourceMetadata: {
       resource: `${publicUrl}/mcp`,
       authorization_servers: [publicUrl],
-      resource_name: "herdr-mcp (Team Thurber agent fleet status)",
+      resource_name: "Bebop (Team Thurber Firstmate fleet)",
     },
     accessTokenTTL: 3600,
     refreshTokenTTL: 30 * 86_400,
@@ -327,18 +344,40 @@ export function makeProvider(publicUrl: string, scopes: string[]): OAuthProvider
     tokenExchangeCallback: ({ grantType, props, env }) => {
       const email = (props as GrantProps).email;
       if (grantType === "refresh_token" && !emailAllowed(env, email)) {
-        throw new OAuthError("invalid_grant", { description: "This account is no longer allowed to use herdr-mcp." });
+        throw new OAuthError("invalid_grant", { description: "This account is no longer allowed to use Bebop." });
       }
     },
-  });
+  };
 }
 
-// The provider is configured once per isolate from vars, which only change on deploy.
-let provider: OAuthProvider<Env> | null = null;
+const canonicalOrigin = (env: Env) => new URL(env.PUBLIC_URL).origin;
+
+// Every origin this deployment answers on: the canonical one, then aliases.
+function servedOrigins(env: Env): string[] {
+  const aliases = (env.ALIAS_URLS ?? "").split(",").map((s) => s.trim()).filter(Boolean).map((u) => new URL(u).origin);
+  return [canonicalOrigin(env), ...aliases];
+}
+
+// One provider (and its helpers) per served origin, built once per isolate
+// from vars, which only change on deploy. All of them share OAUTH_KV, so a
+// grant made on the alias keeps refreshing there until its client
+// reconnects at PUBLIC_URL.
+const providers = new Map<string, { provider: OAuthProvider<Env>; helpers: OAuthHelpers }>();
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    provider ??= makeProvider(env.PUBLIC_URL, offeredScopes(env));
-    return provider.fetch(request, env, ctx);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const origin = new URL(request.url).origin;
+    if (!servedOrigins(env).includes(origin)) return text("Unknown host", 421);
+    let served = providers.get(origin);
+    if (!served) {
+      const options = providerOptions(origin, offeredScopes(env));
+      served = { provider: new OAuthProvider<Env>(options), helpers: getOAuthApi(options, env) };
+      providers.set(origin, served);
+    }
+    // The provider only installs env.OAUTH_PROVIDER when it is unset, and the
+    // isolate's env object outlives a request: without a per-request copy the
+    // first origin's helpers would parse every other origin's /authorize and
+    // refuse its resource as invalid_target.
+    return served.provider.fetch(request, { ...env, OAUTH_PROVIDER: served.helpers }, ctx);
   },
 };

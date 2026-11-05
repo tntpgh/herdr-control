@@ -9,7 +9,19 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   HERDR_STATE: DurableObjectNamespace<HerdrState>;
   OAUTH_PROVIDER: OAuthHelpers;
-  PUBLIC_URL: string; // https://herdr-mcp.teamthurber.com
+  // The canonical origin: https://bebop.teamthurber.com. Issuer, resource
+  // and metadata URLs follow the request's host (index.ts serves one OAuth
+  // provider per origin), so this is the name clients are told to use.
+  PUBLIC_URL: string;
+  // Comma-separated extra origins served during a hostname cutover (the old
+  // https://herdr-mcp.teamthurber.com). Tokens are bound to the origin that
+  // issued them, so a client keeps working on its old host until it
+  // reconnects at PUBLIC_URL. Any other host is refused.
+  ALIAS_URLS?: string;
+  // "true" maps herdr:* scopes on tokens granted before the fm:* cutover to
+  // their fm:* equivalents (policy.ts LEGACY_SCOPE_MAP); anything else honors
+  // fm:* only. Turn off once every client has re-consented.
+  LEGACY_HERDR_SCOPES?: string;
   ACCESS_TEAM_DOMAIN: string; // thurberteam.cloudflareaccess.com
   ACCESS_AUD: string; // AUD of the path-scoped Access app on /authorize
   ALLOWED_EMAILS: string; // comma-separated; the only humans who may grant a token
@@ -136,6 +148,61 @@ export interface TaskRow {
   remote_task_id?: string | null;
   verified?: boolean | null;
   verify_detail?: string | null;
+  // Firstmate's own typed fields (fm_publisher.py). pr_url is the task's PR,
+  // never a path; kind is scout|ship|...; yolo is whether the task runs
+  // without per-command approval. All optional: an older publisher sends none.
+  pr_url?: string | null;
+  kind?: string | null;
+  mode?: string | null;
+  yolo?: boolean | null;
+}
+
+// Firstmate's attention posture, from fm-inbox.sh ready. present: the
+// captain is attended and Firstmate answers live; away/quiet: notes queue
+// and wait; unknown: the Mac could not read it this tick.
+export type FirstmatePosture = "present" | "away" | "quiet" | "unknown";
+export interface FirstmateSummary {
+  posture: FirstmatePosture;
+  can_receive: boolean;
+  observed_at: string | null;
+}
+
+export interface DecisionOption {
+  key: string;
+  text: string;
+  recommended: boolean;
+}
+export interface DecisionCall {
+  call: string;
+  text: string;
+  options: DecisionOption[];
+  recommendation: string | null;
+}
+// A captain hold: a question only the captain answers. answer_decision
+// records a NOTE about one for Firstmate; nothing here is ever resolved
+// remotely.
+export interface DecisionRow {
+  task_id: string;
+  title: string;
+  repo: string | null;
+  question: string;
+  calls: DecisionCall[];
+  recommendation: string | null;
+  bucket: string | null;
+  since: string | null;
+  age_days: number | null;
+  origin: string | null;
+  report_id: string | null;
+}
+
+// One scout/ship report Firstmate published; the body is a ResultDoc with
+// task_id=report_id and source "report.md". Never a path.
+export interface ReportRow {
+  report_id: string;
+  kind: string;
+  title: string | null;
+  task_id: string | null;
+  updated_at: string | null;
 }
 
 export interface BlockerRow {
@@ -183,6 +250,10 @@ export interface Snapshot {
   // means no owner is registered, or an older publisher: send_owner_message
   // then refuses every target with owner_not_registered.
   owners?: { label: string; live: boolean }[] | null;
+  // Firstmate-only blocks (fm_publisher.py); absent from an older publisher.
+  firstmate?: FirstmateSummary | null;
+  decisions?: DecisionRow[] | null;
+  reports?: ReportRow[] | null;
 }
 
 export interface SyncBody {
@@ -241,7 +312,18 @@ export interface OwnerOutboxItem {
   sender_client: string;
   client_name: string;
   attempts: number;
+  // What this note is. message: free text; task_request: a request that
+  // Firstmate run a task (meta: project, task_kind, objective); decision_note:
+  // a remote note about a captain hold (meta: task_id). Every kind is a note
+  // Firstmate judges -- none is ever auto-actioned or the captain's word.
+  kind: OwnerNoteKind;
+  meta: Record<string, string>;
+  // The Worker's own label for sender_client (policy.ts CLIENT_GRANTS), or
+  // "unknown". The publisher prefers it over its local labels file.
+  sender_label: string;
 }
+
+export type OwnerNoteKind = "message" | "task_request" | "decision_note";
 
 export interface OwnerAck {
   exchange_id: string;
@@ -312,9 +394,12 @@ export interface CommandAck {
 }
 
 // Who queued a message: the grant's user (email) and the OAuth client.
+// `kind` narrows an owner-note revocation to the notes that needed a scope
+// the sender no longer holds (absent: every note from that sender).
 export interface Sender {
   actor: string;
   client_id: string;
+  kind?: OwnerNoteKind;
 }
 
 // The Worker's grant check, handed to the DO's sync. `revoked`: senders whose
@@ -332,12 +417,21 @@ export interface GrantProps {
   [key: string]: unknown;
 }
 
+// Firstmate scopes (Phase 2). Least privilege, one per kind of effect:
+export const FM_READ = "fm:read"; // fleet status, tasks, decisions, posture, events
+export const FM_REPORTS = "fm:reports"; // report and task-result bodies
+export const FM_REQUEST = "fm:request"; // notes to Firstmate: messages, task requests
+export const FM_DECIDE_NOTE = "fm:decide-note"; // notes about a captain decision
+export const FM_PEER = "fm:peer"; // app-to-app peer notes
+export const FM_SCOPES = [FM_READ, FM_REPORTS, FM_REQUEST, FM_DECIDE_NOTE, FM_PEER] as const;
+
+// herdr-mcp scopes. Never offered any more: herdr:read and
+// herdr:message.owner on tokens granted before the cutover map to fm:*
+// while LEGACY_HERDR_SCOPES is on; the rest name dormant Durable Object
+// paths (send_message, start_task) that Phase 3 removes.
 export const SCOPE_READ = "herdr:read";
 export const SCOPE_MESSAGE = "herdr:message";
 export const SCOPE_TASK_START = "herdr:task.start";
 export const SCOPE_TASK_IMPLEMENT = "herdr:task.implement";
 export const SCOPE_TASK_CANCEL = "herdr:task.cancel";
-// send_owner_message/get_owner_message_status/get_owner_reply, addressed to
-// a NAMED owning session, never a task's agent -- a separate route and
-// scope from herdr:message (SPEC: ZERO-LOOP-001 #5).
 export const SCOPE_OWNER_MESSAGE = "herdr:message.owner";

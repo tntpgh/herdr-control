@@ -9,9 +9,18 @@ const { publicKey, privateKey } = await generateKeyPair("RS256", { extractable: 
 const pub = { ...(await exportJWK(publicKey)), kid: "test-kid", alg: "RS256", use: "sig" };
 const priv = { ...(await exportJWK(privateKey)), kid: "test-kid", alg: "RS256" };
 
+// Client ID Metadata Documents the OAuth provider fetches for a CIMD
+// client_id: the two allow-listed apps, and one stranger that is not on the
+// list. Each names the helper's REDIRECT so the full flow can run.
+const REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect";
+const CIMD: Record<string, string> = {
+  "https://chatgpt.com/oauth/client.json": "ChatGPT",
+  "https://claude.ai/oauth/mcp-oauth-client-metadata": "Claude",
+  "https://stranger.example/oauth/client.json": "Stranger",
+};
+
 // Bindings are fixed per isolate, so each feature mode is a project.
-const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
-    ownerInbox: "true" | "false" = "false", consumers: "true" | "false" = "false") =>
+const worker = (ownerInbox: "true" | "false", consumers: "true" | "false" = "false", messaging: "true" | "false" = "false") =>
   cloudflareTest({
     wrangler: { configPath: "./wrangler.jsonc" },
     miniflare: {
@@ -19,7 +28,7 @@ const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
         ACCESS_AUD: "test-aud",
         INGEST_KEY: "k".repeat(48),
         MESSAGING_ENABLED: messaging,
-        TASKS_ENABLED: tasks,
+        TASKS_ENABLED: "false",
         OWNER_INBOX_ENABLED: ownerInbox,
         EVENT_CONSUMERS_ENABLED: consumers,
         TEST_ACCESS_PRIVATE_JWK: JSON.stringify(priv),
@@ -29,6 +38,11 @@ const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
         if (url.hostname === "thurberteam.cloudflareaccess.com" && url.pathname === "/cdn-cgi/access/certs") {
           return Response.json({ keys: [pub] });
         }
+        const name = CIMD[request.url];
+        if (name) {
+          return Response.json({ client_id: request.url, client_name: name, redirect_uris: [REDIRECT],
+            token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] });
+        }
         return new Response("blocked in tests", { status: 599 });
       },
     },
@@ -37,17 +51,15 @@ const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
 export default defineConfig({
   test: {
     projects: [
-      { plugins: [worker("true")], test: { name: "messaging", include: ["test/flow.test.ts"] } },
-      { plugins: [worker("true", "true")], test: { name: "tasks", include: ["test/tasks.test.ts"] } },
+      // messaging=true only to prove the dormant send_message path stays shut
+      // to every MCP client even with the old switch on.
+      { plugins: [worker("false", "false", "true")], test: { name: "flow", include: ["test/flow.test.ts"] } },
       { plugins: [worker("false")], test: { name: "read-only", include: ["test/readonly.test.ts"] } },
-      { plugins: [worker("true", "false", "true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },
-      { plugins: [worker("true", "false", "true")], test: { name: "events", include: ["test/events.test.ts"] } },
-      { plugins: [worker("true", "false", "true", "true")], test: { name: "consumers", include: ["test/consumers.test.ts"] } },
-      // Needs BOTH tasks=true (herdr:task.start/implement/cancel actually
-      // offered, so denying them to duet/zero is a deliberate scope choice,
-      // not an availability no-op) and ownerInbox=true (the peer-inbox
-      // tools duet/zero DO get): no existing project combines the two.
-      { plugins: [worker("true", "true", "true")], test: { name: "client-identity", include: ["test/client-identity.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "events", include: ["test/events.test.ts"] } },
+      { plugins: [worker("true", "true")], test: { name: "consumers", include: ["test/consumers.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "client-identity", include: ["test/client-identity.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "firstmate", include: ["test/firstmate.test.ts"] } },
     ],
   },
 });

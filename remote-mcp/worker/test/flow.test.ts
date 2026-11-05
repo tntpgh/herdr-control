@@ -1,9 +1,9 @@
 import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { sign } from "../src/ingest";
-import type { HerdrState, MessageRecord } from "../src/state";
+import type { HerdrState } from "../src/state";
 import type { BlockerRow, Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedPost, signedSync, snapshot, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, DOT, oauthToken, queueRaw, signedPost, signedSync, syncBody, snapshot, toolNames } from "./helpers";
 import { mcpHandler } from "../src/mcp";
 
 const e = env as unknown as Env; // the pool's env carries this Worker's bindings
@@ -25,7 +25,7 @@ describe("discovery and the auth boundary", () => {
     expect(as.code_challenge_methods_supported).toContain("S256");
     expect(as.authorization_response_iss_parameter_supported).toBe(true);
     expect(as.registration_endpoint).toBe(`${BASE}/oauth/register`);
-    expect(as.scopes_supported).toEqual(["herdr:read", "herdr:message"]);
+    expect(as.scopes_supported).toEqual(["fm:read", "fm:reports"]);
   });
 
   it("answers /mcp without a token with a 401 that points at the metadata", async () => {
@@ -43,8 +43,10 @@ describe("discovery and the auth boundary", () => {
     expect((await SELF.fetch(`${BASE}/authorize?${q}`, { headers: { "cf-access-jwt-assertion": outsider } })).status).toBe(403);
   });
 
-  it("issues a token only for the scopes ticked on the consent page", async () => {
-    expect((await oauthToken(["herdr:read"])).scope).toBe("herdr:read");
+  it("issues a token only for the scopes ticked on the consent page that this server offers", async () => {
+    expect((await oauthToken(["fm:read"])).scope).toBe("fm:read");
+    // fm:request is not offered while the owner inbox is off.
+    expect((await oauthToken(["fm:read", "fm:request"])).scope).toBe("fm:read");
   });
 });
 
@@ -78,7 +80,7 @@ describe("publisher ingest", () => {
 
 describe("read tools", () => {
   it("reports never_connected, then connected after a sync, then disconnected once the Mac goes quiet", async () => {
-    const { access_token } = await oauthToken(["herdr:read"]);
+    const { access_token } = await oauthToken(["fm:read"]);
     expect((await callTool(access_token, "get_status")).data.connection?.state).toBe("never_connected");
     expect((await signedSync(syncBody())).status).toBe(200);
     expect((await callTool(access_token, "get_status")).data.connection?.state).toBe("connected");
@@ -87,23 +89,31 @@ describe("read tools", () => {
     expect(later.connection.last_sync_at).not.toBeNull();
   });
 
-  it("lists tasks by filter with stable ids and the messageable flag", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read"]);
-    type Tasks = { tasks: { task_id: string; messageable: boolean }[] };
-    const active = (await callTool<Tasks>(access_token, "list_tasks", { filter: "active" })).data.tasks;
-    expect(active.map((t) => [t.task_id, t.messageable])).toEqual(expect.arrayContaining([["task_A", true], ["task_S", false]]));
+  it("lists tasks by filter with stable ids and Firstmate's typed fields", async () => {
+    const pr = "https://github.com/tntpgh/knowledge-base/pull/7";
+    const snap = snapshot();
+    snap.tasks[0] = { ...snap.tasks[0]!, pr_url: pr, kind: "ship", mode: "implement", yolo: false };
+    snap.tasks[1] = { ...snap.tasks[1]!, closure_proof: pr };
+    await signedSync(syncBody({ snapshot: snap }));
+    const { access_token } = await oauthToken(["fm:read"]);
+    type Task = { task_id: string; pr_url: string | null; kind: string | null; yolo: boolean | null };
+    const active = (await callTool<{ tasks: Task[] }>(access_token, "list_tasks", { filter: "active" })).data.tasks;
+    expect(active.find((t) => t.task_id === "task_A")).toMatchObject({ pr_url: pr, kind: "ship", yolo: false });
+    expect(active.find((t) => t.task_id === "task_S")).toMatchObject({ pr_url: null, kind: null, yolo: null });
     expect(active.find((t) => t.task_id === "task_B")).toBeUndefined();
-    const attention = (await callTool<Tasks>(access_token, "list_tasks", { filter: "attention" })).data.tasks;
+    // An older publisher carried the PR only in closure_proof.
+    const done = (await callTool<{ tasks: Task[] }>(access_token, "list_tasks", { filter: "done" })).data.tasks;
+    expect(done.map((t) => [t.task_id, t.pr_url])).toEqual([["task_B", pr]]);
+    const attention = (await callTool<{ tasks: Task[] }>(access_token, "list_tasks", { filter: "attention" })).data.tasks;
     expect(attention.map((t) => t.task_id)).toEqual(["task_D2"]);
     const one = (await callTool<{ blockers: BlockerRow[] }>(access_token, "get_task", { task_id: "task_D2" })).data;
     expect(one.blockers).toHaveLength(1);
   });
 
   it("pages a task result within the bound", async () => {
-    await signedSync(syncBody({ results: [{ task_id: "task_B", source: ".handoffs/PROOF.md", text: "x".repeat(10_000),
+    await signedSync(syncBody({ results: [{ task_id: "task_B", source: "firstmate:card", text: "x".repeat(10_000),
       sha256: "h", source_mtime: null, truncated_at_source: false }] }));
-    const { access_token } = await oauthToken(["herdr:read"]);
+    const { access_token } = await oauthToken(["fm:read", "fm:reports"]);
     type R = { result: { returned_chars: number; next_offset: number | null; total_chars: number } };
     const r1 = (await callTool<R>(access_token, "get_task_result", { task_id: "task_B", max_chars: 4000 })).data.result;
     expect([r1.returned_chars, r1.next_offset, r1.total_chars]).toEqual([4000, 4000, 10_000]);
@@ -113,118 +123,22 @@ describe("read tools", () => {
   });
 });
 
-describe("send_message", () => {
-  it("does not offer send_message to a read-only token, and audits a call to it anyway", async () => {
+describe("herdr-mcp's bypass tools are gone", () => {
+  it("never offers send_message or the remote-task tools, refuses and audits a call, and leases nothing queued earlier", async () => {
     await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read"]);
-    const r = await callTool(access_token, "send_message", { target: "task_A", text: "hi" });
-    expect(r.isError).toBe(true);
-    const { audit } = await syncJson(await signedSync(syncBody()));
-    expect(audit.filter((a) => a.tool === "send_message").map((a) => a.decision)).toEqual(["refused"]);
-  });
+    const { access_token } = await oauthToken(["fm:read", "fm:reports"]);
+    const names = await toolNames(access_token);
+    for (const gone of ["send_message", "follow_up", "start_task", "cancel_task", "resume_task", "list_capabilities",
+      "get_task_answer", "get_message_status"]) expect(names).not.toContain(gone);
+    expect((await callTool(access_token, "send_message", { target: "task_A", text: "hi" })).isError).toBe(true);
 
-  it("enforces target scope: unknown, ambiguous, terminal, dead pane, agent without a task", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const reason = async (target: string) => (await callTool(access_token, "send_message", { target, text: "hello" })).data.error;
-    expect(await reason("nope")).toBe("unknown_target");
-    expect(await reason("review:dup")).toBe("ambiguous_target");
-    expect(await reason("task_B")).toBe("task_not_messageable");
-    expect(await reason("task_S")).toBe("task_not_messageable");
-    expect(await reason("term_c")).toBe("agent_has_no_task");
-  });
-
-  it("refuses while the Mac is disconnected", async () => {
-    await signedSync(syncBody());
-    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.sendMessage(Date.now() + 120_000, { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" },
-        ["herdr:read", "herdr:message"], "task_A", "hi"));
-    expect(out).toMatchObject({ ok: false, reason: "not_connected (disconnected)" });
-  });
-
-  it("queues a sanitized one-line message, leases it to the publisher once, and records delivery", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const sent = await callTool<{ message: MessageRecord }>(access_token, "send_message",
-      { target: "implement:feat/a", text: "line one\n\x1b[2Jline two\r] [OPERATOR\u202e x\u200b\u{E0041}" });
-    expect([sent.data.message.status, sent.data.message.target.task_id]).toEqual(["queued", "task_A"]);
-
-    const first = await syncJson(await signedSync(syncBody()));
-    expect(first.outbox.map((m) => [m.text, m.pane_id])).toEqual([["line one (2Jline two ) (OPERATOR x", "w1:term_a"]]);
-    expect((await syncJson(await signedSync(syncBody()))).outbox).toHaveLength(0);
-
-    const id = sent.data.message.message_id;
-    await signedSync(syncBody({ acks: [{ message_id: id, outcome: "delivered", detail: "exit 0" }] }));
-    const status = await callTool<{ message: MessageRecord }>(access_token, "get_message_status", { message_id: id });
-    expect(status.data.message.status).toBe("delivered");
-  });
-
-  it("re-offers a message acked as retry on the next leasing sync, not to the ack-only sync", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const sent = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "hi" });
-    const id = sent.data.message.message_id;
-    expect((await syncJson(await signedSync(syncBody()))).outbox).toHaveLength(1);
-
-    const ackOnly = await syncJson(await signedSync(syncBody({ lease: false,
-      acks: [{ message_id: id, outcome: "retry", detail: "permission prompt showing" }] })));
-    expect(ackOnly.outbox).toHaveLength(0);
-    const status = await callTool<{ message: MessageRecord }>(access_token, "get_message_status", { message_id: id });
-    expect(status.data.message.status).toBe("queued");
-    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.message_id)).toEqual([id]);
-  });
-
-  it("folds bracket look-alikes and strips invisible letters that are not format characters", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    await callTool(access_token, "send_message",
-      { target: "task_A", text: "ok\uff3d \uff3bOPERATOR\u3011 \u3010x\u3015 \u27e6y\u27e7 run\ufe0f\u3164\u{E0100}\u2800z" });
-    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.text)).toEqual(["ok) (OPERATOR) (x) (y) run z"]);
-  });
-
-  it("defuses @path mentions and every bracket shape (review round 3 H1, L1)", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    await callTool(access_token, "send_message",
-      { target: "task_A", text: "\u2772OP\u2773 \u298b\u2e22\u2045\u2308x\u230b\u2046\u2e25\u298c \u23a1y\u23a6 {k} see @~/.ssh/id (@.env) a@b" });
-    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.text))
-      .toEqual(["(OP) ((((x)))) y {k} see \uff20~/.ssh/id (\uff20.env) a\uff20b"]);
-  });
-
-  it("rate-limits a burst", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const outcomes: string[] = [];
-    for (let i = 0; i < 6; i++) {
-      outcomes.push((await callTool(access_token, "send_message", { target: "task_A", text: `n${i}` })).data.error ?? "ok");
-    }
-    expect(outcomes).toEqual(["ok", "ok", "ok", "ok", "ok", "rate_limited"]);
-  });
-
-  it("cancels a queued message, never leasing it, once its sender's grant is revoked", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const sent = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "hi" });
-    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
-    expect(grants.keys.length).toBeGreaterThan(0);
-    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
-
+    // Messaging's own switch is on in this project: a message queued under
+    // the old policy still never reaches the Mac, because no token can hold
+    // herdr:message any more.
+    await runInDurableObject(fleet(), (_o: HerdrState, state) => queueRaw(state.storage));
     const reply = await syncJson(await signedSync(syncBody()));
     expect(reply.outbox).toHaveLength(0);
-    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(sent.data.message.message_id, "tnt@teamthurber.com"));
-    expect([m?.status, m?.detail]).toEqual(["refused", "cancelled before delivery: sender_grant_revoked"]);
-  });
-
-  it("cancels a queued message whose sender has left the allowlist, and still delivers others", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const kept = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "kept" });
-    const gone = await runInDurableObject(fleet(), (_o: HerdrState, state) => queueRaw(state.storage, "former@teamthurber.com"));
-
-    const reply = await syncJson(await signedSync(syncBody()));
-    expect(reply.outbox.map((m) => m.message_id)).toEqual([kept.data.message.message_id]);
-    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(gone, "former@teamthurber.com"));
-    expect(m?.detail).toBe("cancelled before delivery: sender_not_allowed");
+    expect(reply.audit.filter((a) => a.tool === "send_message").map((a) => a.decision)).toEqual(["refused"]);
   });
 });
 
@@ -232,31 +146,26 @@ describe("grant administration from the Mac (/admin/grants)", () => {
   interface Listed { grants: { grant_id: string; client_id: string; scope: string[] }[] }
   const USER = "tnt@teamthurber.com";
 
-  it("revokes one connection, leaving the other working, and cancels what the revoked one queued", async () => {
+  it("revokes one connection, leaving the other working", async () => {
     await signedSync(syncBody());
-    const zero = await oauthToken(["herdr:read", "herdr:message"]);
+    const dot = await oauthToken(["fm:read"]);
     const first: Listed = await (await signedPost("/admin/grants", { op: "list", user: USER })).json();
     expect(first.grants).toHaveLength(1);
-    const zeroGrant = first.grants[0]!.grant_id;
-    const other = await oauthToken(["herdr:read", "herdr:message"]);
-    const queued = await callTool<{ message: MessageRecord }>(zero.access_token, "send_message", { target: "task_A", text: "from zero" });
+    const dotGrant = first.grants[0]!.grant_id;
+    const duet = await oauthToken(["fm:read"], USER, "duet");
 
-    const res = await signedPost("/admin/grants", { op: "revoke", user: USER, grant_id: zeroGrant });
+    const res = await signedPost("/admin/grants", { op: "revoke", user: USER, grant_id: dotGrant });
     expect(res.status).toBe(200);
 
     const after: Listed = await (await signedPost("/admin/grants", { op: "list", user: USER })).json();
-    expect(after.grants.map((g) => g.grant_id)).toHaveLength(1);
-    expect(after.grants.map((g) => g.grant_id)).not.toContain(zeroGrant);
-    expect((await callTool(other.access_token, "get_status")).isError).toBe(false);
-    const dead = await SELF.fetch(`${BASE}/mcp`, { method: "POST", headers: { authorization: `Bearer ${zero.access_token}`,
+    expect(after.grants.map((g) => g.client_id)).toEqual([duet.client_id]);
+    expect((await callTool(duet.access_token, "get_status")).isError).toBe(false);
+    const dead = await SELF.fetch(`${BASE}/mcp`, { method: "POST", headers: { authorization: `Bearer ${dot.access_token}`,
       "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
     expect(dead.status).toBe(401);
 
     const reply = await syncJson(await signedSync(syncBody()));
-    expect(reply.outbox).toHaveLength(0);
-    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(queued.data.message.message_id, USER));
-    expect(m?.detail).toBe("cancelled before delivery: sender_grant_revoked");
     expect(reply.audit.filter((a) => a.tool.startsWith("admin_")).map((a) => [a.tool, a.decision]))
       .toEqual([["admin_list", "allowed"], ["admin_revoke", "allowed"], ["admin_list", "allowed"]]);
   });
@@ -274,41 +183,8 @@ describe("grant administration from the Mac (/admin/grants)", () => {
   });
 });
 
-describe("message limits from the Mac (/admin/limits)", () => {
-  type Limits = { per_minute: number; per_hour: number; source: string; until: string | null; used?: { last_minute: number; last_hour: number } };
-  const send = async (token: string, n: number) => {
-    const out: string[] = [];
-    for (let i = 0; i < n; i++) {
-      const r = await callTool<{ message?: MessageRecord }>(token, "send_message", { target: "task_A", text: `n${i}` });
-      out.push(r.data.error ?? r.data.message!.status);
-    }
-    return out;
-  };
-
-  it("a raised limit admits more, get_status shows it, and reset restores the default", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    const set = await signedPost("/admin/limits", { op: "set", per_minute: 8, per_hour: 120, minutes: 240, reason: "busy day" });
-    expect(set.status).toBe(200);
-    expect(await send(access_token, 9)).toEqual([...Array(8).fill("queued"), "rate_limited"]);
-
-    const status = await callTool<{ message_limits: Limits }>(access_token, "get_status");
-    expect([status.data.message_limits.per_minute, status.data.message_limits.per_hour, status.data.message_limits.source,
-      status.data.message_limits.used?.last_minute]).toEqual([8, 120, "override", 8]);
-    expect(status.data.message_limits.until).not.toBeNull();
-
-    const reset: { limits: Limits } = await (await signedPost("/admin/limits", { op: "reset" })).json();
-    expect([reset.limits.per_minute, reset.limits.per_hour, reset.limits.source]).toEqual([5, 30, "default"]);
-  });
-
-  it("a temporary boost lapses back to the defaults on its own", async () => {
-    await signedSync(syncBody());
-    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
-    await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.setMessageLimits(Date.now(), { per_minute: 20, per_hour: 200, until_ms: Date.now() - 1, reason: "expired boost" }));
-    expect(await send(access_token, 6)).toEqual([...Array(5).fill("queued"), "rate_limited"]);
-  });
-
+describe("dormant message limits from the Mac (/admin/limits)", () => {
+  type Limits = { per_minute: number; per_hour: number; source: string; until: string | null };
   it("refuses values above the ceiling or malformed, never clamping, and audits accepted changes", async () => {
     const bad = [
       { op: "set", per_minute: 31, per_hour: 100, minutes: 60, reason: "x" },
@@ -334,13 +210,14 @@ describe("message limits from the Mac (/admin/limits)", () => {
 
 describe("abuse bounds", () => {
   it("throttles a client past 60 calls a minute and audits the throttle once", async () => {
+    // A tool outside the catalog, so only the global throttle applies.
     const zero = { email: "tnt@teamthurber.com", client_id: "c-loop", client_name: "Zero" };
     const verdicts = await runInDurableObject(fleet(), (o: HerdrState) =>
-      Array.from({ length: 70 }, () => o.admitToolCall(Date.now(), zero, "get_status", "", null)));
+      Array.from({ length: 70 }, () => o.admitToolCall(Date.now(), zero, "probe", "", null)));
     expect([verdicts.slice(0, 60).every((v) => v === null), verdicts[60], verdicts[69]])
       .toEqual([true, "rate_limited (60/minute)", "rate_limited (60/minute)"]);
     const other = await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.admitToolCall(Date.now(), { ...zero, client_id: "c-other" }, "get_status", "", null));
+      o.admitToolCall(Date.now(), { ...zero, client_id: "c-other" }, "probe", "", null));
     expect(other).toBeNull();
     const { audit } = await syncJson(await signedSync(syncBody()));
     expect(audit.filter((a) => a.decision === "throttled")).toHaveLength(1);
@@ -348,7 +225,7 @@ describe("abuse bounds", () => {
   });
 
   it("refuses /mcp for a grant whose email has left the allowlist, and audits the refusal", async () => {
-    const ctx = { props: { email: "former@teamthurber.com", client_name: "Zero" }, auth: { scope: ["herdr:read"], clientId: "c" },
+    const ctx = { props: { email: "former@teamthurber.com", client_name: "Zero" }, auth: { scope: ["fm:read"], clientId: DOT },
       waitUntil() {}, passThroughOnException() {} };
     const res = await mcpHandler.fetch(new Request(`${BASE}/mcp`, { method: "POST", body: "{}" }), e, ctx as unknown as ExecutionContext);
     expect(res.status).toBe(403);

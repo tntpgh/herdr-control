@@ -55,6 +55,15 @@ PATH_TEXT = " ".join(LEAK_PATHS) + "\n" + " ".join(KEEP_TEXT)
 (HOME / "data/t-review/report.md").write_text(f"# Report\nverdict: ship it\nleaked {GH_TOKEN} here\n{PEM}\n{PATH_TEXT}\n")
 (HOME / "data/t-secret").mkdir()
 (HOME / "data/t-secret/report.md").write_text("DENIED-REPORT-TEXT\n")
+(HOME / "data/s-scout").mkdir()
+(HOME / "data/s-scout/report.md").write_text(f"# Scout: dedupe survey\nfinding: dedupe on email\nkey {AWS_KEY} seen\n")
+(HOME / "data/s-hidden").mkdir()
+(HOME / "data/s-hidden/report.md").write_text("# HIDDEN-REPORT-TITLE\nHIDDEN-REPORT-TEXT\n")
+(TMP / "elsewhere").mkdir()
+(TMP / "elsewhere/report.md").write_text("# LINKED-REPORT-TITLE\nLINKED-REPORT-TEXT\n")
+(HOME / "data/s-link").symlink_to(TMP / "elsewhere", target_is_directory=True)
+HOLD_CALLS = ("see data/s-scout/report.md: (1) merge #9 now? (a) yes, today [rec] / (b) no, wait for CI; "
+              "(2) rotate the leaked key? rec rotate today; (3) close #406. Rec: merge after the rotation")
 (HERDR / "client-labels.json").write_text(json.dumps({DOT_CLIENT: "dot", DUET_CLIENT: "duet"}))
 (HERDR / "state.json").write_text(json.dumps({"audit_cursor": 41}))
 
@@ -90,8 +99,9 @@ def fleet_doc():
         "roots": {"state": "/Users/SENTINEL-PATH/state"},
         "backlog": {"path": "/Users/SENTINEL-PATH/data/backlog.md", "present": True, "records": [
             rec("t-run"),
-            rec("t-hold", captain_actionable=True, hold_kind="captain", hold_set="2026-11-02",
-                hold_reason=f"merge PR? token {GH_TOKEN} was pasted in {PATH_TEXT}"),
+            rec("t-hold", captain_actionable=True, hold_kind="captain", hold_set="2026-11-02", hold_bucket="live",
+                hold_reason=f"merge PR? token {GH_TOKEN} was pasted in {PATH_TEXT} {HOLD_CALLS}",
+                body_lines=["SENTINEL-BODYLINE", "Captain hold origin: s-scout"]),
             rec("t-queued", state="queued"),
             rec("t-done", state="done", completion={"verb": "merged", "date": "2026-11-03"},
                 pr_url="https://github.com/tntpgh/x/pull/9"),
@@ -108,7 +118,13 @@ def fleet_doc():
             task("t-unknown", "unknown"),
             task("t-secret", "working", last="DENIED-EVENT", target="default:DENIED:p2"),
         ],
-        "scout_reports": [{"id": "t-review", "path": "/Users/SENTINEL-PATH/data/t-review/report.md", "kind": "scout"}],
+        "scout_reports": [{"id": "t-review", "path": "/Users/SENTINEL-PATH/data/t-review/report.md", "kind": "scout"},
+                          {"id": "s-scout", "path": "/Users/SENTINEL-PATH/data/s-scout/report.md", "kind": "scout"},
+                          {"id": "s-hidden", "path": "/Users/SENTINEL-PATH/data/s-hidden/report.md", "kind": "scout"},
+                          {"id": "t-secret", "path": "/Users/SENTINEL-PATH/data/t-secret/report.md", "kind": "ship"},
+                          {"id": "s-gone", "path": "/Users/SENTINEL-PATH/data/s-gone/report.md", "kind": "scout"},
+                          {"id": "s-link", "path": "/Users/SENTINEL-PATH/data/s-link/report.md", "kind": "scout"},
+                          {"id": "../t-review", "path": "/etc/passwd", "kind": "scout"}],
         "secondmate_current": {"records": [{"terminal": {"provenance": "parent-direct-report-terminal",
                                                          "text": "SENTINEL-TERMINAL"}}]},
         "contributions": {"captain": ["SENTINEL-RAW"]},
@@ -693,6 +709,140 @@ class Resilience(Base):
         self.assertFalse((TMP / "inbox/requests").exists() and any((TMP / "inbox/requests").iterdir()))
 
 
+class FirstmateFields(Base):
+    """Phase 2: typed task fields, captain decisions, the report index and
+    posture leave the Mac redacted and deny-listed like everything else."""
+
+    def snap(self) -> dict:
+        self.tick()
+        return self.sent()[0]["snapshot"]
+
+    def test_typed_task_fields(self):
+        tasks = {t["task_id"]: t for t in self.snap()["tasks"]}
+        self.assertEqual({k: tasks["t-review"][k] for k in ("pr_url", "kind", "mode", "yolo")},
+                         {"pr_url": "https://github.com/tntpgh/x/pull/10", "kind": "ship", "mode": "no-mistakes", "yolo": False})
+        self.assertEqual(tasks["t-done"]["pr_url"], "https://github.com/tntpgh/x/pull/9")
+        self.assertEqual((tasks["t-run"]["pr_url"], tasks["t-hold"]["mode"]), (None, None))
+
+    def test_a_captain_hold_becomes_a_redacted_decision_with_parsed_calls(self):
+        [d] = self.snap()["decisions"]
+        self.assertEqual((d["task_id"], d["title"], d["repo"], d["bucket"], d["since"], d["age_days"]),
+                         ("t-hold", "Title of t-hold", "kb", "live", "2026-11-02T00:00:00Z", 3))
+        self.assertNotIn(GH_TOKEN, json.dumps(d))
+        self.assertIn("[REDACTED:github-token]", d["question"])
+        self.assertIn("[path]", d["question"])
+        self.assertNotIn("LEAKUSER", json.dumps(d))
+        self.assertEqual([(c["call"], c["text"], c["recommendation"]) for c in d["calls"]], [
+            ("1", "merge #9 now?", "a"), ("2", "rotate the leaked key? rec rotate today", "rotate today"),
+            ("3", "close #406", None)])
+        self.assertEqual(d["calls"][0]["options"], [{"key": "a", "text": "yes, today", "recommended": True},
+                                                    {"key": "b", "text": "no, wait for CI", "recommended": False}])
+        self.assertEqual(d["recommendation"], "merge after the rotation")
+        self.assertEqual((d["report_id"], d["origin"]), ("s-scout", "s-scout"))
+
+    def test_the_report_index_names_published_reports_only_and_sends_their_bodies_redacted(self):
+        snap = self.snap()
+        rows = {r["report_id"]: r for r in snap["reports"]}
+        self.assertEqual(sorted(rows), ["s-hidden", "s-scout", "t-review", "t-secret"])  # no s-gone, s-link, ../
+        self.assertEqual((rows["s-scout"]["title"], rows["s-scout"]["kind"], rows["s-scout"]["task_id"]),
+                         ("Scout: dedupe survey", "scout", None))
+        self.assertEqual(rows["t-review"]["task_id"], "t-review")
+        self.assertNotIn("path", json.dumps(snap["reports"]))
+        self.assertNotIn("SENTINEL-PATH", json.dumps(snap["reports"]))
+        results = self.sent()[0]["results"]
+        keys = [(r["task_id"], r["source"]) for r in results]
+        self.assertEqual(len(keys), len(set(keys)))  # t-review's report is one document, not two
+        [scout] = [r for r in results if r["task_id"] == "s-scout"]
+        self.assertEqual(scout["source"], "report.md")
+        self.assertIn("finding: dedupe on email", scout["text"])
+        self.assertNotIn(AWS_KEY, scout["text"])
+        self.assertNotIn("LINKED-REPORT", json.dumps(self.sent()))  # data/s-link is a symlinked directory
+
+    def test_the_deny_list_removes_reports_and_decision_links_everywhere(self):
+        (TMP / "config/read-deny").write_text("t-sec*\ns-hid*\ns-scout\n")
+        snap = self.snap()
+        text = self.sent_text()
+        for s in ("HIDDEN-REPORT-TITLE", "HIDDEN-REPORT-TEXT", "s-hidden", "DENIED-REPORT-TEXT", "dedupe survey",
+                  "finding: dedupe"):
+            self.assertNotIn(s, text, s)
+        self.assertEqual([r["report_id"] for r in snap["reports"]], ["t-review"])
+        [d] = snap["decisions"]
+        self.assertEqual((d["report_id"], d["origin"]), (None, None))
+
+    def test_counts_scope_sends_no_decisions_or_reports_but_keeps_posture(self):
+        (TMP / "config/read-scope").write_text("counts\n")
+        snap = self.snap()
+        self.assertEqual((snap["decisions"], snap["reports"], self.sent()[0]["results"]), ([], [], []))
+        self.assertEqual(snap["hub"]["open_decisions"], 1)
+        self.assertEqual(snap["firstmate"], {"posture": "present", "can_receive": True, "observed_at": "2026-11-05T00:10:00Z"})
+        self.assertNotIn("Scout:", self.sent_text())
+
+    def test_posture_comes_from_ready_and_anything_else_is_unknown(self):
+        try:
+            for state, want in (("away", "away"), ("quiet", "quiet"), ("asleep", "unknown")):
+                (TMP / "ready.json").write_text(json.dumps({**READY, "posture": {"state": state}}))
+                self.first = len(WORKER_FAKE.bodies)
+                self.assertEqual(self.snap()["firstmate"]["posture"], want)
+        finally:
+            (TMP / "ready.json").write_text(json.dumps(READY))
+
+
+class NoteKinds(Base):
+    def notes(self) -> dict[str, list[str]]:
+        out = {}
+        for p in (TMP / "inbox").glob("*.note"):
+            lines = p.read_text().splitlines()
+            out[re.search(r"exchange: (\S+)", lines[1] + lines[2]).group(1)] = lines
+        return out
+
+    def item(self, eid, kind, meta, **kw):
+        return {**owner_item(eid, label="firstmate", **kw), "kind": kind, "meta": meta}
+
+    def test_each_kind_is_framed_as_a_note_firstmate_judges(self):
+        WORKER_FAKE.queue = [{"owner_outbox": [
+            self.item("oex_t", "task_request", {"project": "kb", "task_kind": "scout"}, body="scout the dedupe"),
+            self.item("oex_d", "decision_note", {"task_id": "t-hold"}, body="captain said (a) on the call"),
+            self.item("oex_s", "decision_note", {"task_id": "t-closed"}, body="late answer"),
+        ]}]
+        self.tick()
+        self.assertEqual([a["outcome"] for a in self.sent()[1]["owner_acks"]], ["delivered"] * 3)
+        notes = self.notes()
+        self.assertEqual(notes["oex_t"][0], "REMOTE task request via dot (ChatGPT app) - NOT the captain's word; never an approval")
+        self.assertIn("a scout task in project kb - nothing was started", notes["oex_t"][1])
+        self.assertEqual(notes["oex_d"][0], "REMOTE decision note via dot (ChatGPT app) - NOT the captain's answer; never a release")
+        self.assertIn("about hold: t-hold (open)", notes["oex_d"][1])
+        self.assertIn("about hold: t-closed (NOT open on this Mac now)", notes["oex_s"][1])
+        self.assertTrue(any("captain said (a) on the call" in ln for ln in notes["oex_d"]))
+
+    def test_every_first_line_fits_the_wake_summary_even_for_an_unknown_client(self):
+        for kind, meta in (("message", {}), ("task_request", {"project": "a" * 100, "task_kind": "scout"}),
+                           ("decision_note", {"task_id": "t" * 128})):
+            first = fm.note_body("oex_" + "x" * 96, "unknown", "b", kind, meta).splitlines()[0]
+            self.assertLessEqual(len(first), 100, first)
+            self.assertTrue(first.startswith("REMOTE "), first)
+
+    def test_the_worker_label_wins_over_the_mac_label_file(self):
+        WORKER_FAKE.queue = [{"owner_outbox": [{**owner_item("oex_l", client="https://not-in-file"), "sender_label": "duet"},
+                                               {**owner_item("oex_f", client=DOT_CLIENT), "sender_label": "evil"}]}]
+        self.tick()
+        reqs = sorted(p.name for p in (TMP / "inbox/requests").iterdir())
+        self.assertEqual(reqs, ["remote-dot:oex_f", "remote-duet:oex_l"])
+
+    def test_bad_kind_or_meta_is_blocked_before_any_note_is_written(self):
+        WORKER_FAKE.queue = [{"owner_outbox": [
+            self.item("oex_k", "start_task", {}),
+            self.item("oex_p", "task_request", {"project": "../etc", "task_kind": "scout"}),
+            self.item("oex_q", "task_request", {"project": "kb", "task_kind": "deploy"}),
+            self.item("oex_r", "decision_note", {"task_id": "t-hold; rm"}),
+        ]}]
+        self.tick()
+        self.assertEqual([(a["exchange_id"], a["reason"]) for a in self.sent()[1]["owner_acks"]], [
+            ("oex_k", "deliver_failed:bad_kind"), ("oex_p", "deliver_failed:bad_meta"),
+            ("oex_q", "deliver_failed:bad_meta"), ("oex_r", "deliver_failed:bad_meta")])
+        self.assertEqual(list((TMP / "inbox").glob("*.note")), [])
+        self.assertFalse(any(e["argv"][:2] == ["fm-inbox.sh", "note"] for e in argv_log()))
+
+
 class WorkerSchema(Base):
     def test_every_body_sent_validates_against_the_deployed_sync_schema(self):
         WORKER_FAKE.queue = [{"owner_outbox": [owner_item("oex_s1")],
@@ -706,6 +856,7 @@ class WorkerSchema(Base):
             fm.main(["--dry-run"])
         bodies = WORKER_FAKE.bodies + [json.loads(out.getvalue())]
         self.assertTrue(any(b.get("owner_replies") for b in bodies))
+        self.assertTrue(any(b["snapshot"].get("decisions") and b["snapshot"].get("reports") for b in bodies))
         self.assertTrue(any(b.get("owner_acks") for b in bodies))
         self.assertEqual(zod_validate(bodies), [None] * len(bodies))
         self.assertEqual(WORKER_FAKE.bad_sigs, 0)
@@ -715,8 +866,12 @@ class WorkerSchema(Base):
         bad = json.loads(json.dumps(self.sent()[0]))
         bad["snapshot"]["schema"] = 2
         bad["snapshot"]["agents"][0]["role"] = "crewmate"
+        bad["snapshot"]["decisions"][0]["calls"][0]["options"][0]["recommended"] = "yes"
+        bad["snapshot"]["firstmate"]["posture"] = "asleep"
         [issues] = zod_validate([bad])
-        self.assertEqual(sorted(i.split(":")[0] for i in issues), ["snapshot.agents.0.role", "snapshot.schema"])
+        self.assertEqual(sorted(i.split(":")[0] for i in issues), [
+            "snapshot.agents.0.role", "snapshot.decisions.0.calls.0.options.0.recommended", "snapshot.firstmate.posture",
+            "snapshot.schema"])
 
 
 if __name__ == "__main__":

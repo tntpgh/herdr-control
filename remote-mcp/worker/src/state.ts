@@ -7,10 +7,10 @@ import { DurableObject } from "cloudflare:workers";
 import { createHash, createHmac } from "node:crypto";
 import { z } from "zod";
 import { emailAllowed } from "./access";
-import { connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage } from "./policy";
+import { clientLabel, connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage, toolPolicy } from "./policy";
 import type { Connection, MessageLimits } from "./policy";
-import type { CommandAck, CommandAuthorization, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskModeConfig, TaskRow } from "./types";
-import { SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
+import type { CommandAck, CommandAuthorization, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerNoteKind, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskModeConfig, TaskRow } from "./types";
+import { FM_DECIDE_NOTE, FM_PEER, FM_READ, FM_REQUEST, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
 const ExtState = z.enum(["enabled", "disabled", "missing", "unknown"]);
@@ -33,6 +33,7 @@ const SyncSchema = z.object({
       closure_reason: nstr, closure_proof: nstr, pane_id: nstr, agent_id: nstr, agent_live: z.boolean(), has_result: z.boolean(),
       has_answer: z.boolean().optional(),
       remote_task_id: nstr.optional(), verified: z.boolean().nullable().optional(), verify_detail: nstr.optional(),
+      pr_url: nstr.optional(), kind: nstr.optional(), mode: nstr.optional(), yolo: z.boolean().nullable().optional(),
     })).max(2000),
     blockers: z.array(z.object({
       task_id: nstr, label: nstr, pane_id: nstr, agent_id: nstr, kind: str, tool: nstr, summary: nstr, since: nstr,
@@ -57,6 +58,22 @@ const SyncSchema = z.object({
     }).nullable().optional().catch(null),
     // label + liveness only -- never pane_id/cwd (README "What leaves the Mac").
     owners: z.array(z.object({ label: str, live: z.boolean() })).max(200).nullable().optional(),
+    // Firstmate-only blocks (fm_publisher.py), all optional so an older
+    // publisher's body still validates.
+    firstmate: z.object({
+      posture: z.enum(["present", "away", "quiet", "unknown"]), can_receive: z.boolean(), observed_at: nstr,
+    }).nullable().optional(),
+    decisions: z.array(z.object({
+      task_id: str, title: str, repo: nstr, question: str,
+      calls: z.array(z.object({
+        call: z.string().max(20), text: str, recommendation: nstr,
+        options: z.array(z.object({ key: z.string().max(20), text: str, recommended: z.boolean() })).max(12),
+      })).max(20),
+      recommendation: nstr, bucket: nstr, since: nstr, age_days: z.number().nullable(), origin: nstr, report_id: nstr,
+    })).max(200).nullable().optional(),
+    reports: z.array(z.object({
+      report_id: str, kind: str, title: nstr, task_id: nstr, updated_at: nstr,
+    })).max(500).nullable().optional(),
   }),
   results: z.array(z.object({
     task_id: str, source: str, text: z.string().max(70_000), sha256: str, source_mtime: nstr, truncated_at_source: z.boolean(),
@@ -88,6 +105,9 @@ export interface AuditRow {
   at: string;
   actor: string;
   client_id: string;
+  // policy.ts clientLabel(client_id) at the time of the call: dot | duet |
+  // unknown ("" for system rows and rows older than the column).
+  client_label: string;
   tool: string;
   target: string;
   decision: string; // allowed | refused | queued | delivered | refused_at_delivery | failed | expired | retry
@@ -155,6 +175,7 @@ export type SendOutcome =
 
 export interface OwnerMessageRecord {
   exchange_id: string;
+  kind: OwnerNoteKind;
   created_at: string;
   updated_at: string;
   status: string; // queued | delivered | blocked:<reason> | replied
@@ -347,6 +368,21 @@ const AUDIT_KEEP_MS = 180 * 86_400_000;
 const CALLS_PER_MINUTE = 60;
 const CALLS_PER_DAY = 2000;
 
+// A note to Firstmate, by kind (sendOwnerMessage). Each kind is audited
+// under the tool that queued it and needs its own scope.
+export type OwnerNote =
+  | { kind: "message" }
+  | { kind: "task_request"; project: string; task_kind: string }
+  | { kind: "decision_note"; task_id: string };
+const NOTE_TOOL: Record<OwnerNoteKind, string> = {
+  message: "send_owner_message", task_request: "request_task", decision_note: "answer_decision",
+};
+export const NOTE_SCOPE: Record<OwnerNoteKind, string> = {
+  message: FM_REQUEST, task_request: FM_REQUEST, decision_note: FM_DECIDE_NOTE,
+};
+// A Firstmate project name (a repo directory name), re-checked on the Mac.
+export const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
 const iso = (ms: number) => new Date(ms).toISOString();
 
 // Cross-language receipt contract: only JSON values supplied by our typed
@@ -495,6 +531,13 @@ export class HerdrState extends DurableObject<Env> {
       actor TEXT NOT NULL, client_id TEXT NOT NULL, tool TEXT NOT NULL, target TEXT NOT NULL, decision TEXT NOT NULL,
       reason TEXT NOT NULL, message_id TEXT NOT NULL, detail TEXT NOT NULL)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS audit_by_client ON audit(client_id, actor, at)`);
+    // Firstmate phase 2: every row names the client's label (dot/duet/unknown)
+    // so the audit trail reads without a client_id lookup, and per-tool rate
+    // limits count by tool.
+    if (!this.sql.exec<{ name: string }>(`PRAGMA table_info(audit)`).toArray().some((c) => c.name === "client_label")) {
+      this.sql.exec(`ALTER TABLE audit ADD COLUMN client_label TEXT NOT NULL DEFAULT ''`);
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS audit_by_tool ON audit(client_id, actor, tool, at)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)`);
     // start_task/cancel_task/resume_task's own correlation row -- the local
     // task, once spawned, is a perfectly normal registry task synced through
@@ -593,6 +636,13 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS owner_messages_dedupe
       ON owner_messages(sender_actor, sender_client, client_msg_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS owner_messages_by_status ON owner_messages(status, created_at)`);
+    // Firstmate phase 2: what each note is (message | task_request |
+    // decision_note) and its validated structured fields, so the publisher
+    // frames each kind with its own "never the captain's word" envelope.
+    if (!this.sql.exec<{ name: string }>(`PRAGMA table_info(owner_messages)`).toArray().some((c) => c.name === "kind")) {
+      this.sql.exec(`ALTER TABLE owner_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'`);
+      this.sql.exec(`ALTER TABLE owner_messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'`);
+    }
     // Duet<->Dot coordination (README section of that name). UNIQUE(actor,
     // client_id): one label per connection, so INSERT OR REPLACE of a new
     // label for an already-labelled connection drops its old one.
@@ -619,11 +669,12 @@ export class HerdrState extends DurableObject<Env> {
     return Number.isFinite(n) && n > 0 ? n : 90;
   }
 
-  private audit(nowMs: number, row: Omit<AuditRow, "seq" | "at">): void {
+  private audit(nowMs: number, row: Omit<AuditRow, "seq" | "at" | "client_label">): void {
     this.sql.exec(
-      `INSERT INTO audit (at, actor, client_id, tool, target, decision, reason, message_id, detail) VALUES (?,?,?,?,?,?,?,?,?)`,
-      nowMs, row.actor, row.client_id, row.tool, row.target.slice(0, 300), row.decision, row.reason.slice(0, 300),
-      row.message_id, row.detail.slice(0, 500),
+      `INSERT INTO audit (at, actor, client_id, client_label, tool, target, decision, reason, message_id, detail)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      nowMs, row.actor, row.client_id, row.client_id ? clientLabel(row.client_id) : "", row.tool, row.target.slice(0, 300),
+      row.decision, row.reason.slice(0, 300), row.message_id, row.detail.slice(0, 500),
     );
   }
 
@@ -674,6 +725,14 @@ export class HerdrState extends DurableObject<Env> {
     ).toArray().map((r) => ({ ...r, synced_at: iso(r.synced_at) }));
   }
 
+  // Size and hash of every synced document from one source (list_reports:
+  // source "report.md"), without the text.
+  resultsBySource(source: string): { task_id: string; size: number; sha256: string; synced_at: string }[] {
+    return this.sql.exec<{ task_id: string; size: number; sha256: string; synced_at: number }>(
+      `SELECT task_id, length(text) AS size, sha256, synced_at FROM results WHERE source=?`, source,
+    ).toArray().map((r) => ({ ...r, synced_at: iso(r.synced_at) }));
+  }
+
   // Bounds every client's call volume, and with it audit growth. Over the
   // limit, one "throttled" row is written per window and later calls in that
   // window are refused without a row, so a flood cannot grow storage.
@@ -693,13 +752,43 @@ export class HerdrState extends DurableObject<Env> {
     return reason;
   }
 
-  // One audited decision per tool call: throttle first, then the scope verdict
-  // the caller computed. Returns the refusal reason, or null when allowed.
-  admitToolCall(nowMs: number, caller: Caller, tool: string, target: string, scopeRefusal: string | null): string | null {
-    const limited = this.throttled(nowMs, caller, tool);
+  // One tool's own limit (policy.ts TOOL_CATALOG), per client: the global
+  // throttle above bounds volume, this bounds what one tool can do -- a
+  // client may read freely and still file only a couple of task requests a
+  // minute. Same one-row-per-window shape, under its own decision name so
+  // the global throttle's own row is never suppressed by it.
+  private toolThrottled(nowMs: number, caller: Caller, tool: string): string | null {
+    const policy = toolPolicy(tool);
+    if (!policy) return null;
+    const count = (sinceMs: number) => this.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit WHERE client_id=? AND actor=? AND tool=? AND at > ?
+         AND decision NOT IN ('throttled','throttled_tool')`, caller.client_id, caller.email, tool, sinceMs,
+    ).one().n;
+    const window = count(nowMs - 60_000) >= policy.per_minute ? 60_000 : count(nowMs - 3_600_000) >= policy.per_hour ? 3_600_000 : 0;
+    if (!window) return null;
+    const reason = `rate_limited_tool (${window === 60_000 ? `${policy.per_minute}/minute` : `${policy.per_hour}/hour`} for ${tool})`;
+    const noted = this.sql.exec(`SELECT 1 FROM audit WHERE client_id=? AND actor=? AND tool=? AND decision='throttled_tool' AND at > ?`,
+      caller.client_id, caller.email, tool, nowMs - window).toArray().length > 0;
+    if (!noted) {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target: "", decision: "throttled_tool", reason,
+        message_id: "", detail: "" });
+    }
+    return reason;
+  }
+
+  // One audited decision per tool call: throttle first (global, then the
+  // tool's own limit), then the scope verdict the caller computed. Returns
+  // the refusal reason, or null when allowed. A write tool passes
+  // auditAllowed=false: its own Durable Object method writes the one row
+  // (queued / refused / duplicate) for the call.
+  admitToolCall(nowMs: number, caller: Caller, tool: string, target: string, scopeRefusal: string | null,
+    auditAllowed = true): string | null {
+    const limited = this.throttled(nowMs, caller, tool) ?? (scopeRefusal ? null : this.toolThrottled(nowMs, caller, tool));
     if (limited) return limited;
-    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target,
-      decision: scopeRefusal ? "refused" : "allowed", reason: scopeRefusal ?? "", message_id: "", detail: "" });
+    if (scopeRefusal || auditAllowed) {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target,
+        decision: scopeRefusal ? "refused" : "allowed", reason: scopeRefusal ?? "", message_id: "", detail: "" });
+    }
     return scopeRefusal;
   }
 
@@ -767,34 +856,61 @@ export class HerdrState extends DurableObject<Env> {
       `SELECT DISTINCT actor, client_id FROM messages WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
   }
 
+  // Every note to a Firstmate-side owner goes through here: a free-text
+  // message, a task request, or a note about a captain decision. All three
+  // are written to the owner's inbox FILE by the publisher, framed as a
+  // remote note -- never typed into a pane, never auto-actioned, never the
+  // captain's word. What differs is the scope each needs, the tool name it
+  // is audited under, and the structured fields validated here.
   sendOwnerMessage(nowMs: number, caller: Caller, scopes: string[], ownerLabel: string, rawBody: string,
-      clientMsgId: string): SendOwnerMessageOutcome {
+      clientMsgId: string, note: OwnerNote = { kind: "message" }): SendOwnerMessageOutcome {
+    const tool = NOTE_TOOL[note.kind];
+    const meta: Record<string, string> = note.kind === "task_request" ? { project: note.project, task_kind: note.task_kind }
+      : note.kind === "decision_note" ? { task_id: note.task_id } : {};
+    const metaDetail = Object.entries(meta).map(([k, v]) => ` ${k}=${v.slice(0, 100)}`).join("");
     const refuse = (reason: string): SendOwnerMessageOutcome => {
-      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_owner_message", target: ownerLabel,
-        decision: "refused", reason, message_id: "", detail: `chars=${rawBody.length}` });
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target: ownerLabel,
+        decision: "refused", reason, message_id: "", detail: `chars=${rawBody.length}${metaDetail}` });
       return { ok: false, reason };
     };
-    const limited = this.throttled(nowMs, caller, "send_owner_message");
+    // The tool's own limit is re-checked here, in the same synchronous call
+    // as the insert: the gate's check runs in an earlier Durable Object call,
+    // so a batch of concurrent calls would all pass it before any row lands.
+    const limited = this.throttled(nowMs, caller, tool) ?? this.toolThrottled(nowMs, caller, tool);
     if (limited) return { ok: false, reason: limited };
     if (this.env.OWNER_INBOX_ENABLED !== "true") return refuse("owner_inbox_disabled");
-    if (!scopes.includes(SCOPE_OWNER_MESSAGE)) return refuse(`missing_scope ${SCOPE_OWNER_MESSAGE}`);
+    const needed = NOTE_SCOPE[note.kind];
+    if (!scopes.includes(needed)) return refuse(`missing_scope ${needed}`);
     if (!clientMsgId || clientMsgId.length > 200) return refuse("bad_client_msg_id");
     // Dedup BEFORE any other validation: a retried send with the same id
     // must return the ORIGINAL outcome even if, say, this retry's body
     // would itself fail to sanitize -- the caller is retrying, not asking
     // a new question (SPEC: "a repeat returns the original exchange_id
-    // and state").
-    const existing = this.sql.exec<{ exchange_id: string; status: string }>(
-      `SELECT exchange_id, status FROM owner_messages WHERE sender_actor=? AND sender_client=? AND client_msg_id=?`,
+    // and state"). The same id reused for a different KIND of note is not
+    // a retry, and never returns another kind's exchange.
+    const existing = this.sql.exec<{ exchange_id: string; status: string; kind: string }>(
+      `SELECT exchange_id, status, kind FROM owner_messages WHERE sender_actor=? AND sender_client=? AND client_msg_id=?`,
       caller.email, caller.client_id, clientMsgId).toArray()[0];
-    if (existing) return { ok: true, exchange_id: existing.exchange_id, state: existing.status };
+    if (existing) {
+      if (existing.kind !== note.kind) return refuse("client_msg_id_reused");
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target: ownerLabel,
+        decision: "duplicate", reason: "", message_id: existing.exchange_id, detail: `chars=${rawBody.length}${metaDetail}` });
+      return { ok: true, exchange_id: existing.exchange_id, state: existing.status };
+    }
     if (!OWNER_LABEL.test(ownerLabel)) return refuse("owner_label_invalid");
+    if (note.kind === "task_request") {
+      if (!PROJECT_NAME.test(note.project)) return refuse("bad_project");
+      if (note.task_kind !== "scout" && note.task_kind !== "ship") return refuse("bad_task_kind (scout|ship)");
+    }
     const { snapshot, connection: conn } = this.view(nowMs);
     if (!snapshot || conn.state === "disconnected" || conn.state === "never_connected") {
       return refuse(`not_connected (${conn.state})`);
     }
     if (!(snapshot.owners ?? []).some((o) => o.label === ownerLabel)) return refuse("owner_not_registered");
-    const text = sanitizeOwnerMessage(rawBody);
+    if (note.kind === "decision_note" && !(snapshot.decisions ?? []).some((d) => d.task_id === note.task_id)) {
+      return refuse("no_open_decision");
+    }
+    const text = note.kind === "task_request" ? sanitizeObjective(rawBody) : sanitizeOwnerMessage(rawBody);
     if (!text.ok) return refuse(text.reason);
     const recent = this.sql.exec<{ created_at: number }>(
       `SELECT created_at FROM owner_messages WHERE sender_actor=? AND created_at > ?`, caller.email, nowMs - 3_600_000,
@@ -805,13 +921,13 @@ export class HerdrState extends DurableObject<Env> {
     const id = `oex_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
     this.sql.exec(
       `INSERT INTO owner_messages (exchange_id, created_at, updated_at, expires_at, sender_actor, sender_client,
-        sender_client_name, client_msg_id, owner_label, body, status, detail, attempts, lease_until)
-       VALUES (?,?,?,?,?,?,?,?,?,?,'queued','',0,0)`,
+        sender_client_name, client_msg_id, owner_label, body, status, detail, attempts, lease_until, kind, meta)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'queued','',0,0,?,?)`,
       id, nowMs, nowMs, nowMs + MESSAGE_TTL_MS, caller.email, caller.client_id, caller.client_name.slice(0, 80),
-      clientMsgId, ownerLabel, text.text,
+      clientMsgId, ownerLabel, text.text, note.kind, JSON.stringify(meta),
     );
-    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_owner_message", target: ownerLabel,
-      decision: "queued", reason: "", message_id: id, detail: `chars=${text.text.length}` });
+    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target: ownerLabel,
+      decision: "queued", reason: "", message_id: id, detail: `chars=${text.text.length}${metaDetail}` });
     return { ok: true, exchange_id: id, state: "queued" };
   }
 
@@ -820,14 +936,14 @@ export class HerdrState extends DurableObject<Env> {
   // null only from in-DO test assertions that never held a token.
   ownerMessageStatus(exchangeId: string, actor: string, client: string | null = null): OwnerMessageRecord | null {
     const m = this.sql.exec<{ exchange_id: string; created_at: number; updated_at: number; status: string; detail: string;
-      attempts: number; owner_label: string; delivered_at: number | null; body: string }>(
-      `SELECT exchange_id, created_at, updated_at, status, detail, attempts, owner_label, delivered_at, body
+      attempts: number; owner_label: string; delivered_at: number | null; body: string; kind: string }>(
+      `SELECT exchange_id, created_at, updated_at, status, detail, attempts, owner_label, delivered_at, body, kind
        FROM owner_messages WHERE exchange_id=? AND sender_actor=? AND (? IS NULL OR sender_client=?)`,
       exchangeId, actor, client, client,
     ).toArray()[0];
     if (!m) return null;
     return {
-      exchange_id: m.exchange_id, created_at: iso(m.created_at), updated_at: iso(m.updated_at),
+      exchange_id: m.exchange_id, kind: m.kind as OwnerNoteKind, created_at: iso(m.created_at), updated_at: iso(m.updated_at),
       status: m.status, detail: m.detail, attempts: m.attempts, owner_label: m.owner_label,
       delivered_at: m.delivered_at === null ? null : iso(m.delivered_at), body_chars: m.body.length,
     };
@@ -853,9 +969,10 @@ export class HerdrState extends DurableObject<Env> {
 
   // Re-check grants for pending delivery AND confirmed deliveries awaiting
   // a reply. The reply path must not extend access after grant revocation.
+  // Per kind, because each kind needs its own scope (NOTE_SCOPE).
   pendingOwnerSenders(nowMs: number): Sender[] {
-    return this.sql.exec<{ actor: string; client_id: string }>(
-      `SELECT DISTINCT sender_actor AS actor, sender_client AS client_id FROM owner_messages
+    return this.sql.exec<{ actor: string; client_id: string; kind: OwnerNoteKind }>(
+      `SELECT DISTINCT sender_actor AS actor, sender_client AS client_id, kind FROM owner_messages
        WHERE status='delivered' OR (status IN ('queued','delivering') AND expires_at > ?)`, nowMs).toArray();
   }
 
@@ -888,16 +1005,20 @@ export class HerdrState extends DurableObject<Env> {
         decision: "refused", reason, message_id: "", detail: `chars=${rawBody.length}${taskId ? ` task=${taskId}` : ""}` });
       return { ok: false, reason };
     };
-    const limited = this.throttled(nowMs, caller, "send_peer_message");
+    const limited = this.throttled(nowMs, caller, "send_peer_message") ?? this.toolThrottled(nowMs, caller, "send_peer_message");
     if (limited) return { ok: false, reason: limited };
     if (this.env.OWNER_INBOX_ENABLED !== "true") return refuse("owner_inbox_disabled");
-    if (!scopes.includes(SCOPE_OWNER_MESSAGE)) return refuse(`missing_scope ${SCOPE_OWNER_MESSAGE}`);
+    if (!scopes.includes(FM_PEER)) return refuse(`missing_scope ${FM_PEER}`);
     if (!clientMsgId || clientMsgId.length > 200) return refuse("bad_client_msg_id");
     // Dedupe first, as sendOwnerMessage: a retry returns the original note.
     const existing = this.sql.exec<{ message_id: string; recipient_label: string; task_id: string }>(
       `SELECT message_id, recipient_label, task_id FROM peer_messages WHERE sender_actor=? AND sender_client=? AND client_msg_id=?`,
       caller.email, caller.client_id, clientMsgId).toArray()[0];
-    if (existing) return { ok: true, message_id: existing.message_id, to: existing.recipient_label, task_id: existing.task_id };
+    if (existing) {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_peer_message", target: to,
+        decision: "duplicate", reason: "", message_id: existing.message_id, detail: `chars=${rawBody.length}` });
+      return { ok: true, message_id: existing.message_id, to: existing.recipient_label, task_id: existing.task_id };
+    }
     const me = this.sql.exec<{ label: string }>(`SELECT label FROM peer_labels WHERE actor=? AND client_id=?`,
       caller.email, caller.client_id).toArray()[0]?.label;
     if (!me) return refuse("sender_not_labelled");
@@ -1355,7 +1476,7 @@ export class HerdrState extends DurableObject<Env> {
 
   async getConsumerPosition(nowMs: number, caller: Caller, scopes: string[], consumerId: string): Promise<ConsumerPosition> {
     if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
-    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!scopes.includes(FM_READ)) return { result: "insufficient_scope" };
     if (!consumerId || consumerId.length > 200) return { result: "invalid_arguments" };
     const hash = await this.consumerScopeHash(caller, scopes);
     return this.consumerPosition(nowMs, caller, consumerId, hash, null);
@@ -1364,7 +1485,7 @@ export class HerdrState extends DurableObject<Env> {
   async commitConsumerPosition(nowMs: number, caller: Caller, scopes: string[], consumerId: string,
       expectedCommittedCursor: number, newCursor: number, leaseEpoch: number): Promise<ConsumerPosition> {
     if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
-    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!scopes.includes(FM_READ)) return { result: "insufficient_scope" };
     if (!consumerId || consumerId.length > 200
         || ![expectedCommittedCursor, newCursor, leaseEpoch].every((n) => Number.isSafeInteger(n) && n >= 0)) {
       return { result: "invalid_arguments" };
@@ -1378,7 +1499,7 @@ export class HerdrState extends DurableObject<Env> {
       expectedCommittedCursor: number, resumeCursor: number, leaseEpoch: number,
       currentAuthorizationScopeHash: string, reconciled: boolean): Promise<ConsumerPosition> {
     if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
-    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!scopes.includes(FM_READ)) return { result: "insufficient_scope" };
     if (!consumerId || consumerId.length > 200 || reconciled !== true
         || !/^[0-9a-f]{64}$/.test(currentAuthorizationScopeHash)
         || ![expectedCommittedCursor, resumeCursor, leaseEpoch].every((n) => Number.isSafeInteger(n) && n >= 0)) {
@@ -1511,6 +1632,10 @@ export class HerdrState extends DurableObject<Env> {
     const parsed = SyncSchema.safeParse(json);
     if (!parsed.success) return { ok: false, status: 400, reason: `bad_shape: ${parsed.error.issues[0]?.path.join(".")}` };
     const body = parsed.data;
+    // A revocation with a kind covers only that kind's notes (its scope was
+    // lost); without one, every note from that sender.
+    const ownerRevokedFor = (actor: string, client: string, kind: OwnerNoteKind) => ownerGate.revoked.some((s) =>
+      s.actor === actor && s.client_id === client && (s.kind === undefined || s.kind === kind));
 
     this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('snapshot', ?)`, JSON.stringify(body.snapshot));
     this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('last_sync_ms', ?)`, String(nowMs));
@@ -1769,8 +1894,8 @@ export class HerdrState extends DurableObject<Env> {
       // echo back the REQUESTED owner_label on every result so the Mac
       // can key by (owner_label, exchange_id), not exchange_id alone.
       const m = this.sql.exec<{ owner_label: string; status: string; detail: string; reply_body: string | null;
-        sender_actor: string; sender_client: string; expires_at: number }>(
-        `SELECT owner_label, status, detail, reply_body, sender_actor, sender_client, expires_at FROM owner_messages WHERE exchange_id=?`,
+        sender_actor: string; sender_client: string; expires_at: number; kind: OwnerNoteKind }>(
+        `SELECT owner_label, status, detail, reply_body, sender_actor, sender_client, expires_at, kind FROM owner_messages WHERE exchange_id=?`,
         r.exchange_id).toArray()[0];
       if (!m || m.owner_label !== r.owner_label) {
         ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "ignored:missing" });
@@ -1800,8 +1925,7 @@ export class HerdrState extends DurableObject<Env> {
       }
       // Even a confirmed notice is not permission to accept after revocation.
       const refusal = this.env.OWNER_INBOX_ENABLED !== "true" ? "owner_inbox_disabled"
-        : !emailAllowed(this.env, m.sender_actor)
-          || ownerGate.revoked.some((s) => s.actor === m.sender_actor && s.client_id === m.sender_client)
+        : !emailAllowed(this.env, m.sender_actor) || ownerRevokedFor(m.sender_actor, m.sender_client, m.kind)
           ? "sender_revoked" : null;
       if (refusal || ownerGate.hold) {
         const outcome = refusal ? `ignored:blocked:${refusal}`
@@ -1884,13 +2008,12 @@ export class HerdrState extends DurableObject<Env> {
     // off switch itself is reported separately since it is not about the
     // sender at all).
     const ownerEnabled = this.env.OWNER_INBOX_ENABLED === "true";
-    const ownerRevoked = new Set(ownerGate.revoked.map((s) => `${s.actor}\n${s.client_id}`));
-    for (const m of this.sql.exec<{ exchange_id: string; owner_label: string; sender_actor: string; sender_client: string }>(
-      `SELECT exchange_id, owner_label, sender_actor, sender_client FROM owner_messages
+    for (const m of this.sql.exec<{ exchange_id: string; owner_label: string; sender_actor: string; sender_client: string; kind: OwnerNoteKind }>(
+      `SELECT exchange_id, owner_label, sender_actor, sender_client, kind FROM owner_messages
        WHERE status='queued' OR (status='delivering' AND lease_until < ?)`, nowMs).toArray()) {
       const why = !ownerEnabled ? "owner_inbox_disabled"
         : !emailAllowed(this.env, m.sender_actor) ? "sender_revoked"
-        : ownerRevoked.has(`${m.sender_actor}\n${m.sender_client}`) ? "sender_revoked" : null;
+        : ownerRevokedFor(m.sender_actor, m.sender_client, m.kind) ? "sender_revoked" : null;
       if (!why) continue;
       this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=?, lease_until=0 WHERE exchange_id=?`,
         `blocked:${why}`, why, nowMs, m.exchange_id);
@@ -2153,8 +2276,10 @@ export class HerdrState extends DurableObject<Env> {
     }
 
     const dueOwners = body.lease && !ownerGate.hold ? this.sql.exec<{ exchange_id: string; owner_label: string; client_msg_id: string;
-      body: string; sender_actor: string; sender_client: string; sender_client_name: string; attempts: number }>(
-      `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client, sender_client_name, attempts FROM owner_messages
+      body: string; sender_actor: string; sender_client: string; sender_client_name: string; attempts: number;
+      kind: OwnerNoteKind; meta: string }>(
+      `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client, sender_client_name, attempts, kind, meta
+       FROM owner_messages
        WHERE ((status='queued' AND lease_until <= ?) OR (status='delivering' AND lease_until < ?))
          AND detail <> 'deliver_failed:4' AND expires_at > ? ORDER BY created_at LIMIT 20`,
       nowMs, nowMs, nowMs).toArray() : [];
@@ -2196,8 +2321,8 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM peer_messages WHERE created_at < ?`, nowMs - 30 * 86_400_000);
     this.sql.exec(`DELETE FROM task_shares WHERE remote_task_id NOT IN (SELECT remote_task_id FROM remote_tasks)`);
 
-    const audit = this.sql.exec<{ seq: number; at: number; actor: string; client_id: string; tool: string; target: string;
-      decision: string; reason: string; message_id: string; detail: string }>(
+    const audit = this.sql.exec<{ seq: number; at: number; actor: string; client_id: string; client_label: string; tool: string;
+      target: string; decision: string; reason: string; message_id: string; detail: string }>(
       `SELECT * FROM audit WHERE seq > ? ORDER BY seq LIMIT 500`, body.audit_cursor).toArray()
       .map((r) => ({ ...r, at: iso(r.at) }));
     const cursor = audit.length ? audit[audit.length - 1]!.seq : body.audit_cursor;
@@ -2214,6 +2339,7 @@ export class HerdrState extends DurableObject<Env> {
         owner_outbox: dueOwners.map((m) => ({
           exchange_id: m.exchange_id, owner_label: m.owner_label, client_msg_id: m.client_msg_id, body: m.body,
           sender: m.sender_actor, sender_client: m.sender_client, client_name: m.sender_client_name, attempts: m.attempts + 1,
+          kind: m.kind, meta: JSON.parse(m.meta) as Record<string, string>, sender_label: clientLabel(m.sender_client),
         })),
         audit, audit_cursor: cursor,
         owner_reply_results: ownerReplyResults,
