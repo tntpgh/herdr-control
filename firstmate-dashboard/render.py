@@ -358,7 +358,7 @@ var change=!!s.fingerprint&&s.fingerprint!==fp,wait=change&&typing();
 if(Date.now()-Date.parse(s.generated)>C.stale*1000)say('warn','data '+rel(s.generated).replace(' ago','')+' old',
 'No read of the Firstmate home has finished since '+new Date(s.generated).toLocaleTimeString()+'.');
 else if(wait)say('wait','update waiting','The fleet changed. The page holds still while you write an answer: send or clear it to update.');
-else{say('ok','live','Read '+rel(s.generated)+'; checked every '+C.poll+'s.');ph=1-ph;live.classList.remove('p0','p1');live.classList.add('p'+ph)}
+else say('ok','live','Read '+rel(s.generated)+'; checked every '+C.poll+'s.');
 if(change&&!wait)swap(s.fingerprint);times(document)
 }).catch(function(){say('bad','offline','The dashboard server is not answering; this is the last data it sent.')})}
 function swap(nfp){if(busy)return;busy=true;fetch(location.pathname+location.search,{cache:'no-store'}).then(function(r){
@@ -373,7 +373,8 @@ open.forEach(function(i){var e=document.getElementById(i);if(e)e.open=true});
 if(fid){var f=document.getElementById(fid);if(f)f.focus({preventScroll:true})}
 hot.forEach(function(k){var e=document.getElementById(k);if(e)e.classList.add(k in sigs?'fm-changed':'fm-new')});
 sigs=ns;apply();times(main);watchArt();
-if(hot.length&&say1)say1.textContent='Dashboard updated: '+hot.length+(hot.length===1?' item changed.':' items changed.')
+if(hot.length){ph=1-ph;live.classList.remove('p0','p1');live.classList.add('p'+ph);
+if(say1)say1.textContent='Dashboard updated: '+hot.length+(hot.length===1?' item changed.':' items changed.')}
 }).catch(function(){}).then(function(){busy=false})}
 setInterval(tick,C.poll*1000)})();"""
 POLL_S = 15
