@@ -17,7 +17,7 @@
 		<string>__FM_HOME__</string>
 		<string>--port</string>
 		<string>__PORT__</string>
-		__TAILNET_ARGS__
+		<!-- __TAILNET_ARGS__ (launchd.sh replaces this whole line) -->
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
