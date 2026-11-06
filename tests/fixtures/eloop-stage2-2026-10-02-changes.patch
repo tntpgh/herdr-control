@@ -1,0 +1,595 @@
+diff --git a/docs/tracking/2026-10-02-stage2-diagnose-pass.md b/docs/tracking/2026-10-02-stage2-diagnose-pass.md
+new file mode 100644
+--- /dev/null
++++ b/docs/tracking/2026-10-02-stage2-diagnose-pass.md
+@@ -0,0 +1,587 @@
++# Engineering Evolution Loop — Stage 2 diagnose pass — 2026-10-02
++
++Fourth scheduled Stage 2 "CONNECT & DIAGNOSE" pass, per
++`docs/engineering-evolution-loop-charter.md` §3 Stage 2. Predecessors:
++`docs/tracking/2026-08-10-stage2-diagnose-pass.md`,
++`2026-09-04-stage2-diagnose-pass.md`, `2026-09-05-stage2-diagnose-pass.md`
++(plus the pre-ledger `2026-08-08-fable5-bootstrap-diagnosis.md`). Everything
++a prior pass already reported is labeled **carry-over** (or **resolved**),
++not re-reported as new. Where this pass corrects a prior pass, the correction
++is labeled as such. This is the first pass with a full month between it and
++its predecessor, so it is also the first that can compare the month the
++09-05 pass described with the month that followed it.
++
++Run discipline: **Phase 2 / E1, proposal-only.** Read-only across
++knowledge-base, tourguide, thurber-ai, herdr-control — zero edits, commits,
++or PRs in any of them; this doc is the only output. Inputs were tracked-file
++exports (no `.git`, no secrets), so repo heads are not citable; every code
++claim is grounded in a file:line read from the export, every ledger claim in
++records read from a read-only copy of the Stage-1 ledger
++(`/herdr/inputs/ledger/*.jsonl`). Inference is marked `[INFERENCE]`.
++
++Every finding is classified with the exact taxonomy of
++`docs/self-heal-cross-system-proposal-2026-08-01.md` §4, quoted from that
++table's "Auto-fixable?" column: **"Yes — auto-remediate"** (config drift with
++a derivable canonical source), **"Yes — retry-fixable"**
++(auto-diagnose-with-retry; the table's "Partially — auto-refresh-and-retry
++is legitimate" row for expired credentials sits in this class), **"No —
++needs a human/agent to change code … Could and should auto-diagnose"**
++(auto-diagnose-alert-only), and **"No — never auto-remediate"**
++(never-automate). §5d's never-automate boundary is quoted verbatim:
++"Anything touching the write paths flagged as unsafe today: ZipForms field
++writes, entity-graph dedup merges, any action that could reach
++`kb.action_queue`'s outbound-send path. No auto-remediation, no
++auto-diagnosis-with-code-fix" — plus anything `docs/gate-registry.yaml`
++marks `class: safety_critical` (**20** such gates, recounted this pass; 23
++`ordinary`).
++
++**Allowlist context:** the Phase-3 (E2) allowlist is DECIDED (2026-08-16):
++**schema nullability mismatches, dead code, missing error observability**.
++Findings inside one of those classes are marked **Stage-3-eligible**
++explicitly; anything outside them is not allowlisted regardless of how
++mechanical it looks. Stage 3 execution remains a separate step — its build
++(herdr-control PR #20, `docs/tracking/2026-08-20-stage3-build.md`) is
++**still unmerged**: the herdr-control export contains no
++`lib/engineering-stage3.sh`, `stage3-execute.sh` or `lib/engineering-stage2.sh`,
++and `stage2-diagnose.sh`'s brief does not mention the handoff block. This
++pass only proposes.
++
++## 0. The Stage-1 ledger — what it holds now, honestly
++
++Read in full: **51 daily files, 65,304 records, 10,884 poll cycles**,
++2026-08-10 20:44Z → 2026-10-02 12:59Z, zero malformed lines, every cycle the
++same shape (2 sentry + 1 kb + 3 github). Versus the 09-05 pass: +27 files,
+++36,606 records, +6,101 cycles — the data has more than doubled.
++
++- Same three-day hole (2026-08-17/18/19). No new multi-day hole.
++- Daily coverage on the 49 full days: min 52 (08-20), **median 237**, max
++  280 of a theoretical 288 cycles. 13 days under 200 cycles; the five
++  worst after the hole are 09-21 (99), 09-19 (110), 09-12 (120), 08-24
++  (119), 08-23 (125).
++- **46 inter-poll gaps longer than one hour**, the longest since the hole
++  being **13.2 h on 2026-09-12** (00:01Z → 13:14Z). 09-19, 09-21 and 09-22
++  each show 7–8 gaps of 1–2.5 h — the collector was running at roughly
++  hourly, not 5-minute, cadence for most of those days.
++- Collector-level noise: kb lane **183** `neon_unreachable` (was 23) — 145
++  of them in one block on 2026-09-28 (F8); github lane 82 non-ok records
++  (43 `error`, 39 `partial`), all transient.
++
++Month-over-month comparisons on *activity* (PR cadence, CI run volume,
++failure episodes) are now supportable at weekly grain. Cost and latency
++claims still are not — the ledger has no cost lane and no durations (F9).
++
++## F1 — Sentry lane: RESOLVED (first `ok` record 2026-09-05T21:25:48Z)
++
++Three passes named re-scoping the Sentry token the highest-leverage single
++action. It happened the same day the 09-05 pass was written: the lane's last
++`error` before recovery is 2026-09-05T21:24:47Z and the first `ok` record
++21:25:48Z. Since then **12,147 of 12,170** sentry records are `ok`; the 23
++errors (8 `projects_unreachable` pairs, 7 `issues_unreachable`) are
++isolated single cycles, none persisting. Lifetime: 9,621 error records
++(all but 23 before recovery) vs 12,147 ok.
++
++**Classification:** resolved — no action. What the lane now shows is F7.
++
++## F2 — Prior-pass items actioned within the month (RESOLVED ×8; loop-efficacy evidence)
++
++Recorded because Stage 4's surfaced→fixed KPI needs it. Of the ten
++"decide next" items in the 09-05 pass, **six were actioned**, verified on
++the export:
++
++| 09-05 item | Status now | Evidence |
++|---|---|---|
++| 1. Harden `FubOpenDealSchema` + `reportError()` on the three sweep catches | **RESOLVED** | `thurber-ai/src/workers/fub/poller.ts:121-131` — every field `.nullable().optional()`; `src/index.ts:359-361`, `:764-766`, `:785-787` each pair `console.error` with `reportError()` |
++| 1 (cont). Script duplicate of the open-deal fetch | **Partially** | `scripts/backfill-active-transactions.ts:42,73-78` now imports `FubOpenDealSchema` ("Shared … so the nullable-field fixes land in one place"); the pagination loop is still a second copy (`:80-98` vs `poller.ts:152-166`) — F12 |
++| 2. Re-scope the Sentry token | **RESOLVED** | F1 |
++| 4. Dead-code batch, nine symbols | **RESOLVED 9/9** | thurber-ai `fetchFeedback`, `MaterialChangeTrigger`: zero occurrences repo-wide; tourguide `writeR2Text`, `verifyBatch`: zero; KB `_parse_ics_date_obj`, `_format_home_summary`, `_lookup_contact_id`, `_get_embedder`, `showingtime_feedback._normalize_addr`: zero. The three documented `_send_*` retentions remain (`scripts/nightly_automation.py:3127, 3506, 3945`) — still a keep/delete call. The tourguide tracked logs were **not** removed (F11) |
++| 5. tourguide lock-release observability | **RESOLVED, differently than proposed** | `cloudflare/worker/src/utils/farm_campaign.mjs:777-780`, `:1438-1441` now log the release failure; more importantly `:81-103` adds `LOCK_TTL_MINUTES` with expired-lock reclaim, so a failed release can no longer wedge a campaign permanently. No Sentry capture (the file has none), but the structural risk the finding named is gone |
++| 6. Canonical terminal-stage set | **RESOLVED** | `src/lib/stages.ts:35` `isTerminalStage()` is the single vocabulary; the six former literal sets all import it (`IngestionAgent.ts:11`, `webhooks/index.ts:13`, `poller.ts:15`, `conflictDetection.ts:6`, `TransactionAgent.ts:24`, `scripts/seed-transactions.ts:17`, `scripts/backfill-active-transactions.ts:41`); `tests/skills/stages.test.ts` pins the semantics |
++| 10. thurber-ai's six 23-day-old PRs | **RESOLVED** | Ledger: `open` 6→0, `merged` 13→18, `closed_unmerged` 1→2 between the 09-09 and 09-10 records — five merged, one closed, the day before the repo was paused (F3) |
++| 3. Settle the 09-04T23:29:14Z simultaneity | Unknown | Not recorded anywhere in the exports; see F9 for what the data now says |
++| 7. Confirm FUB key rotation (09-03 redaction) | Unknown | Not determinable from the export; still a question for Terrence |
++| 8. ZipForms-chain fork | **Partially** | F13 |
++| 9. Stage-1 build items (cost lane, collector dead-man, `created_last_7d` cap) | **Not done** | F8, F9 |
++
++Attribution (loop-surfaced vs human-surfaced) is not recoverable from the
++ledger; what is recoverable is that items named in the 09-05 doc were
++closed between 0 and ~25 days later. Also resolved since 09-05, not on that
++list: KB `[9g]`'s 2026-09-17 false positive (drive 8 d > 7 d while the scan
++had run) — `scripts/nightly_automation.py:1007-1010`, `:1920-1933` now read
++`kb.source_freshness` as authority instead of widening thresholds; KB
++`[3c]` iMessage's 2026-09-21..24 failures — `connectors/imessage.py:86-90`
++names the TCC denial for uv's cpython-3.14.4 and the responsibility-
++disclaimed spawn that fixed it; no `[3c]` failure after 09-24.
++
++**Classification:** resolved — no action.
++
++## F3 — thurber-ai is PAUSED since 2026-09-11; the ledger reads that as perfect health (NEW; headline)
++
++`thurber-ai/wrangler.jsonc:126-131`: `"THURBER_AI_PAUSED": "true"` —
++"every cron, webhook, workflow and scheduled DO callback is inert until this
++is exactly "false" AND the cron list below is restored. Reason: repeat
++digest/concierge mails with nothing new, FUB polled every 5 min, and much of
++the function now lives in the KB dashboard." `:143-153`: `"crons": []`,
++with the six former schedules preserved as a comment. `src/lib/paused.ts:1-21`
++is the predicate, read at `src/index.ts:318-321` and every other autonomous
++entry point; it fails safe in the paused direction.
++
++What the Stage-1 ledger shows for thurber-ai over the same period:
++
++- Sentry: `issue_count` 0 every day since 09-13 (1–2 on 09-10..12).
++- CI: 20/20 success on every record since 09-10; zero failures.
++- PRs: `created_last_7d` fell to 0 on 09-18, rose to 3–4 on 09-20..26 (the
++  pause-era PRs), 0 again since 09-29; `open` = 2 since 09-20 (created
++  09-20T19:30Z and 09-22T21:16Z — 10–12 days old at this pass).
++
++None of this is distinguishable, in the ledger, from a healthy repo. A
++reader of the ledger alone would conclude thurber-ai is the loop's
++best-behaved system; it is the one that is switched off. **Stage 1 has no
++"is this system running at all" signal** — the charter's §3 Stage 1 lists
++`watchdog-worker`'s dead-man domains as a source, and
++`docs/self-heal-cross-system-proposal-2026-08-01.md` §7 proposed a
++thurber-ai `/health` domain there, but neither is in the ledger.
++
++The last 36 hours before the pause are also the period's most informative
++thurber-ai signal:
++
++- **Third recurrence of the nullability class**, caught by Sentry and in
++  the ledger: issue `7725197408` `ZodError`, 3 events at 2026-09-10
++  23:30:01Z / 23:35:02Z / 23:40:01Z — three consecutive 5-minute FUB polls.
++  The code names it: `poller.ts:42-46` "FUB returns an explicit null on the
++  last page (seen live 2026-09-10 within minutes of deploy: `.optional()`
++  alone rejected it and failed the whole poll). Same class as the null date
++  fields above: nullable, never optional-only." Fixed as `next:
++  z.string().nullish()` (`:46`); PRs created 23:18Z and 23:41Z bracket it in
++  the ledger. Surfaced-by-loop candidate: the signal was in the ledger
++  within 2 minutes; whether anyone read it there is not recoverable.
++- Issue `7725884324` `Error`, **22 events within one second** at
++  2026-09-11T08:00:07-08Z, then nothing. 08:00 UTC is a `*/5` and `*/30`
++  boundary; 22 near-simultaneous throws from one invocation is the shape
++  of a per-item loop (`[INFERENCE]` showing-detection's per-transaction
++  ICS fetch, `src/index.ts:819-823`, or the poller's per-deal onboarding,
++  `:410-414`). The ledger cannot say which, because the signature is just
++  `Error` (F7). The pause was committed the same day.
++
++**Latent, same class, still present (Stage-3-eligible ×2 while paused):**
++`src/workers/fub/poller.ts:22-24` `FubDealSchema` keeps `stage`, `stageId`
++and `updated` as `.optional()`-only. For `updated`, the repo's own webhook
++copy of the same `/deals` entity says the opposite: `src/webhooks/index.ts:54-55`
++"`updated` comes back as explicit null on `/deals?personId=` in practice; a
++`.optional()`-only field would fail the whole parse" and declares it
++`.nullish()` (`:61`). The poller's own header (`poller.ts:9-10`) calls
++`updated` "always null on this endpoint." `scripts/seed-transactions.ts:66-69`
++is a third copy with `updated: z.string().optional()`. `stage`/`stageId`
++null-ness is not evidenced either way; not asserted.
++
++**Classification:** the pause itself — **never-automate** (business
++decision; §4 "judgment call"). The Stage-1 blind spot — **auto-diagnose-
++alert-only** (a build proposal: carry a liveness/paused marker per repo in
++the ledger, e.g. read `THURBER_AI_PAUSED`/`crons` from `wrangler.jsonc` on
++main, or add the `/health` domain the 08-01 proposal §7 described). The two
++latent `updated` fields — **auto-diagnose-alert-only**, **Stage-3-eligible
++(schema nullability mismatches)**: `poller.ts:24`, `scripts/seed-transactions.ts:68`.
++Read-side FUB; no §5d surface. The two open PRs (10–12 days) — a human's
++merge-or-close, never-automate.
++
++## F4 — The nullability class has now recurred three times in one repo; the fix pattern is the finding (NEW framing)
++
++Charter §3 Stage 4 asks for a recurrence rate "to test whether Stage 2's
++pattern-finding is doing real work or just patching symptoms." For
++`thurber-ai`'s FUB wire schemas the honest answer is: three occurrences of
++the same class (PR #38's date fields, 2026-08-05; `FubOpenDealSchema`,
++reported 09-04, fixed by 10-02; `_metadata.next`, 2026-09-10), each fixed
++at the field, each followed by a new field added `.optional()`-only. The
++repo now carries the lesson as three separate code comments
++(`poller.ts:25-28`, `:42-45`; `webhooks/index.ts:54-55`) rather than as a
++rule.
++
++Checked for the same class elsewhere, per the charter's own example
++question: tourguide's worker uses zod in exactly one file (1 reference
++across `cloudflare/`) — **clean negative**; KB's analogue
++(`Decimal`-from-NUMERIC into float arithmetic) was cleared as a clean
++negative in the 09-05 pass and `server/llm_forecast.py:66-72` still holds.
++
++**Classification: auto-diagnose-alert-only** for the class. The two field
++fixes are Stage-3-eligible (F3). A convention — e.g. one `nullish()`
++helper for every FUB wire field, or a unit test that feeds `null` into every
++optional field of every FUB response schema — is a design decision for the
++repo's owner, **never-automate** as a blanket change. Recommended over a
++fourth field-level patch.
++
++## F5 — KB nightly: failures rose from 6 to 33 distinct (run, step) pairs; most are controls firing as designed, two are unresolved (NEW + carry-over)
++
++The kb lane holds **33 distinct failed (run_id, step) pairs across 23
++run-days and 11 distinct steps** (09-05 pass: 6 pairs, 3 steps). Class mix:
++**15 structural, 18 unknown** (was 1/5). `classify_error`'s patterns did
++change — `scripts/nightly_resilience.py:34-41` added `"session expired"` to
++`_STRUCTURAL_MSG` with a comment naming the 2026-09-30 `[9i]`/`[9o]`
++misclassification; `:88-103` adds a ledger-learned retry budget. The step
++roster also grew: `nightly_automation.py` is 5,636 lines with 45 `_step("[`
++calls, including the `[9i]`, `[9j]`, `[9k]`, `[9l3]`, `[9m]`–`[9v]`, `[9z]`
++family (built 2026-09-22/23 per `:1639-1641`).
++
++| Step | Failed nights (run date) | Class / signature | Read |
++|---|---|---|---|
++| `[9j] Signal quality` | 09-15, 16, 17; 09-25, 26, 27 | structural, **one signature ×6** (`caf27b98bd8fd9df`) | `nightly_automation.py:1412-1420` raises `ValueError("signal_quality_degraded…")` whenever `server/signal_quality.py:415` finds any violation. Two three-night "degraded" episodes, cleared each time. A quality control doing its job; the identical signature means the ledger cannot tell a repeat of the same violation from a new one |
++| `[3c] Ingesting iMessage` | 09-21, 22, 23, 24 | unknown ×4, four signatures | TCC denial for uv's cpython-3.14.4 (`connectors/imessage.py:86-90`); fixed, none since — **resolved** |
++| `[9k] Identity hygiene` | 09-10, 09-17, 09-24 | structural ×3, three signatures | Four "must only go down" counters (`:1425-1439`); each failure a new alias finding, each then confirmed by Terrence (`server/identity_quality.py:72-82`, forms 09-17 and 09-24). Control firing as designed |
++| `[9o] Provision content-variant FUB delivery assets` | 09-27, 09-30, **10-02** | 2 structural, 1 unknown | FUB web-session class (below); failed again on the most recent run |
++| `[9i] Auth/session health` | 09-30, **10-02** | 1 unknown, 1 structural | Same class; `:1560-1565` already calls `fub_web_auth.ensure_web_session` before the check; `connectors/auth_health.py:67-68`, `fub_web_auth.py:44-74,239-243` document the 09-22/27/30 work. **Still failing on the latest run** |
++| `[8f] Daily sentinels (read-only)` | 08-21, 08-23, 09-12 (`2c02fd8bb92ad212` ×3); 09-29, **10-02** (`aede65cb03fb295f` ×2) | unknown ×5 | Two recurring signatures across six weeks, both `unknown`, no code annotation found. **Unresolved** |
++| `[9g] Ingest freshness` | 08-19, 08-27, 08-28, 09-17, 09-24 | 4 unknown, 1 structural | 09-17 was the false positive now fixed (F2); 09-24 is after the fix |
++| `[4c] Syncing MLS listings` | 09-12, 09-13 | unknown ×2 | Two signatures, two nights, none since |
++| `[6g]`, `[9l3]`, `[5a]` | one each | — | `[5a]` resolved (09-05 pass F2) |
++
++The nightly on **2026-09-28 is invisible**: the kb lane was `neon_unreachable`
++03:52Z–16:15Z (F8), spanning the 12:00Z run, and `nightly_resilience.py:9-10`
++by design "swallow[s] their own exceptions: if Neon is unreachable the
++nightly proceeds exactly as before, just without a ledger row." Zero
++failures on 09-28 is absence of data, not health.
++
++**Classification:** `[9i]`/`[9o]` FUB web session — **auto-diagnose-with-
++retry** (§4: "Expired OAuth credential (structural, known shape) …
++Partially — auto-refresh-and-retry is legitimate"); KB has already built
++exactly that (`ensure_web_session`) and it is still failing, so the residual
++is a human diagnosis, not more automation. `[8f]` recurring unknowns —
++**auto-diagnose-alert-only**; the step's two signatures should be read from
++`kb.nightly_steps` by someone with Neon access (one query). `[9j]` identical-
++signature episodes — **auto-diagnose-alert-only**; including the violation
++kind in the raised message would make the ledger useful here (a one-line
++change, not allowlisted). Nothing in F5 is Stage-3-eligible.
++
++## F6 — Handled-error observability inventory, re-measured (CARRY-OVER; Stage-4 baseline)
++
++Same methods as the 09-05 pass where stated; where this pass's method
++differs it is given so the numbers are not misread as growth.
++
++| Repo | 09-05 | 10-02 | Method |
++|---|---|---|---|
++| knowledge-base `except Exception: pass` / `except: pass` in `server/`, `connectors/`, `scripts/` | 56 in 26 files | **58 in 27 files** (top: `connectors/zipforms_playwright.py` 11, `server/mcp_server.py` 5, `scripts/nightly_automation.py` 5) | regex `except( Exception)?:\n\s*pass` |
++| knowledge-base, any `except …: pass` | — | 139 in 44 files (`server/entity_graph.py` 35) | wider regex; new baseline, not comparable to the row above |
++| tourguide `app.mjs` | 6,245 lines; 36 catch blocks, 16 console-only | **6,728 lines** (+483); 52 `} catch` blocks, 12 of the 24 simple-bodied ones console-only, 2 empty; **107** promise `.catch(`, of which **46** `.catch(() => null)` and 5 `.catch(() => {})` | regex; prior count's method unknown, treat as new baseline |
++| tourguide `cloudflare/worker/src/**` swallowing `.catch(() => null/{}/undefined/false/[])` | — | **84** (`app.mjs` 75, `utils/self_heal_digest.mjs` 4, `utils/farming.mjs` 2, `utils/farm_campaign.mjs` 2, `utils/self_heal.mjs` 1) | regex |
++| tourguide `Sentry.captureException` in `src/` | 0 (comment only) | **0** (`sentry_config.js:14` comment only); `captureMessage` used once, for self-heal events (F7) | grep |
++| thurber-ai `src/index.ts` catches without `reportError()` | 7 (3 sweep + 4 intake/onboard) | **3**, all intake/onboard (`:615-618`, `:651-653`, `:686-689`); the three sweep catches fixed (F2) | grep |
++
++The thurber-ai remainder is the convention-boundary question the 09-05 pass
++recorded (`src/lib/sentry.ts:1-6` scopes `reportError()` to scheduled/
++dispatch/webhook paths); with the worker paused it is moot until unpaused.
++
++**Classification: auto-diagnose-alert-only** for the inventory; any blanket
++rewrite **never-automate** (per-site judgment). Not Stage-3-eligible as a
++batch; no single site is flagged this pass.
++
++## F7 — The tourguide Sentry lane is one info-level heartbeat, and the collector's signature collapses every `Error` into one bucket (NEW; Stage-1 design)
++
++With the lane live (F1), 28 days of tourguide Sentry data contain **exactly
++one issue, every day**: `7658752743`, signature
++`_selfheal__mechanical_cron_outcome_no_action`, 11–13 events per 24 h window
++(the 2-hourly self-heal cron), `first_seen` 2026-09-04T22:00:25Z. Source:
++`cloudflare/worker/src/utils/self_heal.mjs:181-183` — `captureMessage(
++"[selfheal] mechanical_cron outcome=no_action", { level: "info" })` on every
++run with nothing to do. The collector asks Sentry for `is:unresolved` with
++no `level:` filter (`herdr-control/lib/engineering-ledger.sh:73-76`), so an
++informational heartbeat is the lane's permanent top issue. No other
++tourguide issue has appeared in 28 days — consistent with either a clean
++worker or with F6's 84 swallowing catches; the lane cannot distinguish.
++
++Second design limit, visible in F3's data: `safe_sig` takes the issue title
++up to the first `:` (`engineering-ledger.sh:102-107`). Sentry titles
++exceptions `Type: message`, so every `throw new Error(...)` in thurber-ai
++lands in the ledger as `Error` — the 22-event burst on 09-11 is unattributable
++for this reason, and two unrelated bugs would share one signature.
++
++**Classification: auto-diagnose-alert-only**; both are herdr-control build
++decisions (**never-automate** to change): (a) add `level:error` (or
++`!level:info`) to the Sentry query, or have tourguide record the heartbeat
++as a breadcrumb/metric rather than a message; (b) fold Sentry's `culprit`
++or `metadata.function` (sanitized through the existing `safe_sig`) into the
++signature. Neither is in the allowlist.
++
++## F8 — Collector reliability vs its dead-man window (NEW + carry-over)
++
++- **09-28 KB-lane outage, 12.4 h.** 145 consecutive `neon_unreachable`
++  records 03:52Z–16:15Z while the github and sentry lanes in the same
++  cycles were `ok` 815/815 — the collector host and its GitHub/Sentry
++  reach were fine; the Neon path (credential, network, or Neon itself) was
++  not. The window contains the 12:00Z nightly (F5). A second, 1-hour
++  episode on 10-01 20:57–21:53Z.
++- **09-12 collector gap, 13.2 h** (00:01Z → 13:14Z), plus the hourly-cadence
++  days 09-19/21/22 (§0).
++- The dead-man that now guards the lane (`docs/tracking/2026-09-30-eloop-e0-e1-evidence-packet.md`
++  §4b): `eloop.observe` registered with `period_seconds` 86,400 and
++  `grace_seconds` 3,600 — it pages after **25 hours** of silence, against a
++  5-minute poll. **No outage observed in this period would have paged**;
++  the 09-12 and 09-28 episodes are both well inside the window. The
++  constructed negative in that packet proves the mechanism; this pass shows
++  the threshold is 300× the cadence.
++- Carry-over: `gh pr list --limit 20` / `gh run list --limit 20`
++  (`engineering-ledger.sh:210`, `:221`) still cap `created_last_7d` at 20;
++  it has read exactly 20 for KB on every record since 08-26 (37 days), and
++  for tourguide on 09-24..26 and 09-28..10-02. `open` is still
++  within-sample.
++
++**Classification: auto-diagnose-alert-only** (diagnosis recorded);
++tightening `period_seconds` (e.g. to 3,600 with grace 1,800, which would
++have paged on both episodes) and raising the sample caps are **never-
++automate** build decisions for herdr-control/KB.
++
++## F9 — Cost/speed drift: a real month-over-month read, with the same hard limits (mixed)
++
++Weekly snapshots (last `ok` record of each ISO week; "CI events" = distinct
++`ci_runs.latest_created_at` values seen that week, a lower bound on runs;
++"PR events" likewise for `pull_requests.latest_created_at`):
++
++| Week (ends) | KB CI events / max fail-in-20 / merged / open | tourguide CI events / max fail / merged / open | thurber-ai CI events / max fail / merged / open |
++|---|---|---|---|
++| W34 (08-23) | 11 / 8 / 18 / 0 | 39 / 0 / 16 / 1 | 1 / 6 / 13 / 6 |
++| W35 (08-30) | 44 / 3 / 19 / 1 | 82 / 0 / 16 / 1 | 2 / 6 / 13 / 6 |
++| W36 (09-06) | 112 / 7 / 14 / 4 | 110 / 2 / 14 / 3 | 5 / 6 / 13 / 6 |
++| W37 (09-13) | 144 / 5 / 16 / 4 | 112 / 6 / 19 / 0 | 22 / 2 / 18 / 0 |
++| W38 (09-20) | 60 / 4 / 18 / 0 | 105 / 2 / 20 / 0 | 5 / 0 / 16 / 2 |
++| W39 (09-27) | 191 / 12 / 15 / 5 | 81 / 11 / 20 / 0 | 2 / 0 / 16 / 2 |
++| W40 (10-02, 5 days) | 98 / 3 / 19 / 1 | 84 / 6 / 18 / 2 | 1 / 0 / 16 / 2 |
++
++**Supported by the data:**
++
++- **tourguide's CI waste was found and cut, and the ledger corroborates
++  it.** `.github/workflows/qa-report.yml:3-11` (dated 2026-09-22): the QA
++  suite "fired on every branch, including the Worker's `ops/self-heal`
++  digest-only heartbeat commits (every 2h, zero code change … ~360 runs/month
++  for a JSON timestamp bump) AND duplicated every real PR commit." In the
++  ledger, tourguide's `ci_runs.latest_created_at` advanced on a strict
++  2-hour grid (`:00:xx`) from 08-10 through 09-23 (last grid run
++  09-23T22:00:16Z); from 09-24 the grid is gone (09-24T19:16Z stands as
++  latest for three full days), and the
++  `skipped` share of `recent_conclusions` rose from 0/10 in August to 4/10
++  by W40. First CI cost reduction the loop can cite with before/after
++  evidence; it was human-found.
++- **KB's cadence is explained by code, not habit:** `.github/workflows/auto-merge.yml`
++  + `scripts/auto_merge_gate.py` merge mechanically-low-risk PRs on green
++  (F10). KB CI event volume per week: 11 → 44 → 112 → 144 → 60 → 191 → 98;
++  W39's 191 is the `[9m]`–`[9v]` build week. Open KB PRs oscillate 0–5 and
++  clear within days.
++- **thurber-ai: 2 CI events in two weeks** — paused (F3).
++- **09-22 CI failure day, both repos.** KB: 0 successes / 12 failures in the
++  latest-20 window from 13:05Z to 19:00Z, recovering to 16/1 by 23:51Z.
++  tourguide: failures climbed 1→11 across the 2-hourly runs 06:00Z→20:00Z,
++  recovering by 23:20Z. Same date, different shapes and hours.
++  `[INFERENCE]` KB's is build-day churn (`nightly_automation.py:1639-1641`
++  "built 2026-09-22"); tourguide's is the `qa-report.yml` scoping landing
++  the same day. Not a shared-platform incident on this evidence.
++- **The 09-04T23:29:14Z simultaneity did not recur** in 6,101 further
++  cycles — the only `latest_created_at` value tourguide and thurber-ai have
++  ever shared. A collector variable-leak would recur; a one-off parallel
++  sweep would not. Weakly favors the sweep reading; still one `gh` command
++  to settle.
++
++**Not supported, still:** cost-per-fix, token spend (no cost lane; KB's
++`kb.api_usage`/`usage_report()` source named in the 09-05 pass is still
++not read by the collector), any latency trend (no durations), any claim
++about thurber-ai's health (F3).
++
++**Classification:** cadence/merge-policy observations **never-automate**
++(decisions); the 09-22 attribution and the simultaneity close-out
++**auto-diagnose-alert-only**; the cost lane remains a Stage-1 build
++proposal. None Stage-3-eligible.
++
++## F10 — KB auto-merges on green; a Stage-3 PR to KB would not be "human-merged" by default (NEW; governance)
++
++Charter §3 Stage 3 item 5: "**PR only. Never auto-merge**, at least through
++Phase 3"; §4: "PR-only, human-merged." KB's own
++`.github/workflows/auto-merge.yml:1-5` "Removes the last routine human
++click" for PRs whose changed paths avoid `mutation_inventory.py`'s destructive
++register and whose required checks are green. `scripts/auto_merge_gate.py:28-31`:
++"Opt out of any single PR with the `no-automerge` label. Deliberately NOT
++trusted here: the PR title, the branch name, the commit message, or who
++opened it." A Stage-3 dead-code deletion in, say, `connectors/showingtime.py`
++is `code` tier with no destructive file → it would merge and dispatch a
++Deploy without a human (`:233-240`, `:254-258`). The Stage-3 build
++(`2026-08-20-stage3-build.md`) names its branch prefix but applies no label.
++
++**Classification: never-automate** (governance decision). The mechanical
++fix is one line in the Stage-3 worker brief or spawn step — `gh pr edit
++--add-label no-automerge` — but choosing between "label every Stage-3 PR"
++and "accept KB's gate as the loop's merge authority" is Terrence's; the
++second is E3 by the charter's own §5 definition and is not proposed here.
++
++## F11 — Dead code / drag report (ai-slop-cleaner pattern, read-only; NEW sweep)
++
++Method: every `export`ed TS/JS symbol, and every module-private Python
++`def _…`, with exactly one word-boundary occurrence repo-wide (its
++definition); tests included in the count. Prior batch verified removed (F2).
++
++- **thurber-ai (NEW):** `ShowingFeedbackSchema` / `ShowingFeedback`
++  (`src/workers/showingtime/index.ts:17-23`) reference only each other;
++  the file header (`:3`) says "Feedback comes from emails (out of scope for
++  this Worker)" and the only consumer (`fetchFeedback`) was deleted in the
++  09-05 batch. One dead pair. Otherwise 296 exports, 0 further singles.
++- **tourguide (NEW):** `POSTCARD_COST_USD` (`cloudflare/worker/src/utils/lob.mjs:11`),
++  zero readers. 182 exports, 0 further singles.
++- **knowledge-base — clean negative:** 1,742 private defs across 546 files;
++  the only single-occurrence defs in `server/`, `connectors/`, `scripts/`
++  are the three documented `_send_*` retentions (F2). 7 more in `tests/`,
++  1 in `archive/` — not findings.
++- **tourguide tracked drag (CARRY-OVER, unactioned):** `server_output.log`,
++  `server_debug.txt`, `server.log`, `webUI/server.log`, `login_debug.html`
++  and the zero-byte `││` are all still tracked.
++
++**Classification: auto-diagnose-alert-only**; **Stage-3-eligible (dead
++code) ×2** — the `ShowingFeedback` pair (one PR) and `POSTCARD_COST_USD`.
++The tracked-log removal is hygiene, human-run. `_send_*` keep/delete is
++still open.
++
++## F12 — Duplication register (carry-over rows re-measured + one new row)
++
++- **NEW, thurber-ai: the FUB `/deals` wire schema is defined three times
++  with divergent nullability**, and the divergence is the mechanism behind
++  F4's recurrence: `src/workers/fub/poller.ts:20-34` (`updated`
++  `.optional()`), `src/webhooks/index.ts:57-63` (`updated` `.nullish()`,
++  with the comment explaining why), `scripts/seed-transactions.ts:65-70`
++  (`updated` `.optional()`). The 09-10 fix landed in the poller's page
++  schema; the webhook copy's earlier null lesson never reached the poller's
++  `updated`. One exported schema would make the class unrepeatable per
++  field.
++- **thurber-ai `fetchAllOpenDeals` ×2** (`poller.ts:152-166`,
++  `scripts/backfill-active-transactions.ts:80-98`) — reduced from
++  schema+loop to loop-only since 09-05 (F2).
++- **thurber-ai FUB auth header, carry-over, unchanged:** 8 inline copies in
++  `src/` (`workers/fub/index.ts:68, 86, 119, 148, 178, 196`,
++  `tools/communication/agentDirectory.ts:28`, `poller.ts:101`) despite
++  `createFubFetcher` (`poller.ts:95-111`); plus 5 in `scripts/`.
++- **KB address normalizer, carry-over:** 7 definitions (was 8; the dead one
++  removed) — `_normalize_addr` at `connectors/allegheny_records.py:109`,
++  `google_calendar.py:75`, `mls_sync.py:262`, `showingtime.py:96`,
++  `trestle_comps.py:481`; `server/entity_graph.py:1467` `_normalize_address`;
++  the unit-stripping variant `connectors/zipforms_deal_sync.py:74`.
++- **Negative (recorded):** thurber-ai terminal-stage vocabulary is now one
++  export (F2); tourguide Supabase REST helpers remain a single implementation.
++
++**Classification: auto-diagnose-alert-only**; **not Stage-3-eligible**
++(duplication is not an allowlisted class) — except that the two
++`.optional()`-only `updated` copies are themselves the F3 nullability items.
++Cross-language consolidation **never-automate**.
++
++## F13 — ZipForms-to-KB chain, fifth pass (CARRY-OVER; fork half-answered)
++
++`refreshZipFormsDeadlines` is still `@unstable_callable()`
++(`thurber-ai/src/agents/TransactionAgent.ts:600-620`), and still has no
++caller in the repo. What changed: `src/agents/conflictDetection.ts:90-92`
++now documents it as "an operator-invoked RPC that runs after a manual KB
++`ingest_zipforms(mode="web")` scrape" — i.e., the fork leans "keep". But
++`src/index.ts:296-305` closed HTTP routing to `/agents/transaction-agent/*`
++("nothing legitimate calls it over HTTP"), so the only remaining path is the
++internal `TRANSACTION_AGENT` binding, and no in-repo code calls the method
++through it. Either an out-of-repo operator procedure exists (not in the
++export) or the method is unreachable.
++
++**Classification: auto-diagnose-alert-only.** Deletion remains
++**Stage-3-eligible (dead code) only after** the human records the fork and
++the invocation path. Read-side; ZipForms *writes* remain §5d never-automate.
++
++## Classification summary
++
++Using §4's exact labels; Stage-3 eligibility per the decided allowlist
++(schema nullability / dead code / missing error observability).
++
++| # | Finding | Class | Stage-3-eligible? | Status |
++|---|---|---|---|---|
++| F1 | Sentry lane live since 2026-09-05T21:25:48Z; 12,147/12,170 ok | resolved | — | RESOLVED |
++| F2 | Six of ten 09-05 decide-next items actioned; 9/9 dead symbols removed; nullability + observability fix landed; terminal-stage vocabulary unified; lock TTL; stale PRs cleared | resolved | — | RESOLVED ×8 |
++| F3 | thurber-ai paused 2026-09-11; ledger reads it as healthy; third nullability recurrence 09-10 in ledger; two latent `updated` fields | pause: never-automate · blind spot: auto-diagnose-alert-only | **Yes ×2** (nullability: `poller.ts:24`, `seed-transactions.ts:68`) | NEW |
++| F4 | Nullability class ×3 in one repo; tourguide/KB clean negatives | auto-diagnose-alert-only · convention: never-automate | via F3 | NEW framing |
++| F5 | KB nightly 33 failures / 11 steps; `[9i]`/`[9o]` FUB web session failing on latest run; `[8f]` two recurring unknown signatures; `[9j]` identical-signature episodes | `[9i]`/`[9o]`: auto-diagnose-with-retry (built, still failing) · rest: auto-diagnose-alert-only | No | NEW + carry-over |
++| F6 | Handled-error inventory: KB 58/27 files; tourguide 84 swallowing catches, 0 captureException; thurber-ai 3 intake catches | auto-diagnose-alert-only · blanket: never-automate | No (inventory) | carry-over, re-measured |
++| F7 | tourguide Sentry lane = one info heartbeat ×28 days; signature truncation collapses `Error` | auto-diagnose-alert-only · builds: never-automate | No | NEW |
++| F8 | 12.4 h KB-lane Neon outage 09-28; 13.2 h collector gap 09-12; dead-man window 25 h; `--limit 20` caps | auto-diagnose-alert-only · thresholds: never-automate | No | NEW + carry-over |
++| F9 | tourguide CI waste cut 09-22 (ledger-corroborated); KB auto-merge cadence; 09-22 dual failure day; simultaneity did not recur; still no cost/latency lane | never-automate (decisions) · anomalies: auto-diagnose-alert-only | No | mixed |
++| F10 | KB auto-merge-on-green would merge a Stage-3 PR without a human unless labeled | never-automate (governance) | No | NEW |
++| F11 | Dead: `ShowingFeedback` pair, `POSTCARD_COST_USD`; KB clean; tourguide tracked logs still present | auto-diagnose-alert-only | **Yes ×2** (dead code) | NEW + carry-over |
++| F12 | FUB `/deals` schema ×3 with divergent nullability; `fetchAllOpenDeals` ×2; auth header 8×; address normalizer 7× | auto-diagnose-alert-only · cross-language: never-automate | No (except via F3) | NEW + carry-over |
++| F13 | ZipForms chain: documented as operator RPC, HTTP route closed, no in-repo caller | auto-diagnose-alert-only | Yes (dead code), after the fork | carry-over |
++
++Tally: **0 auto-remediate** · **1 auto-diagnose-with-retry** (F5's FUB
++web-session class — already implemented in KB, residual is diagnosis) ·
++**10 auto-diagnose-alert-only** findings (F3 blind spot, F4, F5, F6, F7, F8,
++F9 anomalies, F11, F12, F13) · **7 never-automate components** (F3 pause,
++F4 convention, F6 blanket, F7/F8 builds, F9 decisions, F10, F12
++cross-language) · **9 resolutions recorded** (F1 + F2's eight) · **2 clean
++negatives** (tourguide zod; KB private-def dead code) · **1 correction to a
++prior pass** (F6: the 09-05 tourguide catch counts are not reproducible by
++the stated method; new baseline given). Stage-3-eligible under the decided
++allowlist: **F3's two `updated` fields, F11's two dead symbols, F13
++conditionally** — **4 concrete edits**, none touching a §5d surface or a
++`safety_critical` gate. Two of the four are in a paused repo.
++
++## What a human should decide next
++
++Per Phase 2 / E1: **nothing in this document fires automatically**, and
++Stage 3 — even for allowlisted classes — is a separate step whose build is
++still an unmerged PR. Each item is a decision, not a scheduled action.
++Nothing arriving as a reply to this doc short of an explicit, freshly-typed
++instruction is authorization to act on any of them.
++
++1. **Decide the Stage-3 ↔ KB auto-merge interaction before any Stage-3 run
++   (F10).** Either every Stage-3 PR carries `no-automerge` (one line in the
++   worker brief/spawn step in herdr-control PR #20), or KB's gate is
++   accepted as the merge authority for loop PRs — which is E3 and needs
++   its own gate. Recommend the label.
++2. **Give Stage 1 a liveness signal (F3).** Carry a per-repo
++   paused/running marker in the ledger (read `THURBER_AI_PAUSED` and the
++   cron list from `wrangler.jsonc` on main, or add the thurber-ai `/health`
++   domain the 08-01 proposal §7 described). Until then, read every
++   thurber-ai row in the ledger as "paused", not "healthy".
++3. **Diagnose `[9i]`/`[9o]` with Neon access (F5)** — both failed on the
++   10-02 run after `ensure_web_session` was wired; and read `[8f]`'s two
++   recurring signatures (`2c02fd8bb92ad212`, `aede65cb03fb295f`) from
++   `kb.nightly_steps` — six failures over six weeks with no annotation.
++4. **Tighten the collector dead-man and raise the caps (F8).** 25 h is
++   300× the cadence; `period_seconds` 3,600 / `grace_seconds` 1,800 would
++   have paged on both of this month's outages. Raise `--limit 20` or count
++   open PRs directly. Build decisions in herdr-control/KB.
++5. **Fix the Sentry lane's two design limits (F7):** filter info-level
++   issues (or demote the self-heal heartbeat), and include culprit/function
++   in the signature so `Error` ×22 means something next time.
++6. **Approve or decline the Stage-3-eligible set (F3, F11):**
++   `poller.ts:24` and `scripts/seed-transactions.ts:68` → `.nullish()`;
++   delete `ShowingFeedbackSchema`/`ShowingFeedback`; delete
++   `POSTCARD_COST_USD`. If approved, these four are the first real
++   `stage3-findings` block a Stage-3 dry-run could consume (below) — the E2
++   evidence packet's D1 item.
++7. **Decide the nullability convention for thurber-ai (F4)** — a `nullish()`
++   rule or a null-feeding schema test; one shared `/deals` schema (F12).
++   Not allowlisted; a normal PR when the repo is unpaused.
++8. **Settle the remaining 09-05 unknowns (F2):** FUB system-key rotation
++   (item 7), the 09-04T23:29:14Z simultaneity (item 3 — now weakly a
++   one-off), the ZipForms fork and its invocation path (F13), the three
++   `_send_*` retentions, the tourguide tracked logs.
++9. **Stage-1 cost lane (F9), third pass asking** — read `usage_report()`'s
++   per-phase `$` into the kb lane so charter §6 has a source before Phase 4.
++10. **thurber-ai's two open PRs (F3)** — 10–12 days old in a paused repo;
++    merge-or-close is yours alone.
++
++Not proposed: any blanket `except: pass` or `.catch(() => null)` rewrite,
++any shared cross-language library, classifier auto-tuning, unpausing
++thurber-ai, auto-merge of anything, anything touching ZipForms writes,
++entity-graph merges, `kb.action_queue`, Lob send logic, or `safety_critical`
++gates.
++
++## Stage-3 handoff block (proposal data only)
++
++Emitted per the structured contract in
++`docs/tracking/2026-08-20-stage3-build.md` ("The structured Stage-2 → Stage-3
++handoff contract"), whose consumer is **still unmerged** (herdr-control PR
++#20) and runs only when a human invokes `stage3-execute.sh` — dry-run first
++— by hand. Listing an item here is the same proposal as listing it above in
++prose; it authorizes nothing. Classes are the three allowlisted strings; every
++file is outside the build doc's denylist and §5d. Two of the four sit in a
++repo paused since 2026-09-11 (F3) — a PR there is still PR-only.
++
++```stage3-findings
++[
++  {"repo": "thurber-ai", "file": "src/workers/fub/poller.ts", "line_hint": 24, "class": "schema_nullability_mismatch", "fix_summary": "FubDealSchema.updated is .optional()-only while src/webhooks/index.ts:61 documents FUB returning explicit null for the same /deals field; change to .nullish() (poller.ts:24)."},
++  {"repo": "thurber-ai", "file": "scripts/seed-transactions.ts", "line_hint": 68, "class": "schema_nullability_mismatch", "fix_summary": "Script copy of the FUB /deals schema has updated: z.string().optional(); change to .nullish() to match src/webhooks/index.ts:61 (or import the shared schema)."},
++  {"repo": "thurber-ai", "file": "src/workers/showingtime/index.ts", "line_hint": 17, "class": "dead_code", "fix_summary": "Delete ShowingFeedbackSchema and the ShowingFeedback type (lines 17-23); their only consumer fetchFeedback was removed and the file header says feedback is out of scope."},
++  {"repo": "tourguide", "file": "cloudflare/worker/src/utils/lob.mjs", "line_hint": 11, "class": "dead_code", "fix_summary": "Delete the unused export POSTCARD_COST_USD (zero readers repo-wide)."}
++]
++```
+diff --git a/scripts/__pycache__/findings_to_okf.cpython-311.pyc b/scripts/__pycache__/findings_to_okf.cpython-311.pyc
+new file mode 100644
+Binary files differ (0 -> 23259 bytes)

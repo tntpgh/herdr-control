@@ -6,9 +6,16 @@
 # worker idled, died, or was never briefed.
 #
 # What this pins:
-#   * the SCHEDULED path refuses to spawn an unattended unisolated executory
-#     worker (2026-09-04 policy) and emits a failed isolation-required row —
-#     an actionable page, not a fake success and not a silent no-op;
+#   * the SCHEDULED path never spawns a host pane — an unattended,
+#     unisolated executory worker is forbidden by policy (2026-09-04) — and
+#     instead runs INSIDE the isolated worker (2026-09-05 isolation_first
+#     decision), accepting its returned patch only when the sole change is
+#     the tracking doc; anything else is a failed row, patch not applied,
+#     with a doc-only hunk extracted as a PROPOSAL for human review
+#     (2026-10-21) — an actionable outcome either way, never a fake success
+#     and never a silent no-op;
+#   * a first-Friday no-op reports `skipped`, not `succeeded` — scheduler
+#     liveness is not a diagnosis outcome (2026-10-21);
 #   * --record-completion only emits `succeeded` after verifying a tracking
 #     doc actually COMMITTED on the pass branch (not inherited from
 #     origin/main), and records the truth in the run registry — including the
@@ -101,6 +108,25 @@ rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
 [ "$rc" = "1" ] && grep -q 'out-of-scope' "$EMITLOG" && grep -q -- '--state failed' "$EMITLOG" \
   && ok "patch touching code is refused with a failed row" || bad "rc=$rc emit: $(cat "$EMITLOG")"
 [ ! -e "$HERDR_WT_DIR/thurber-os/$BR_TODAY" ] && ok "no branch/worktree created for a refused patch" || bad "worktree created for out-of-scope patch"
+PROPOSAL="$WORK/iso/task-1/artifacts/doc-only-proposal.patch"
+[ -s "$PROPOSAL" ] && grep -q "diff --git a/$DOC b/$DOC" "$PROPOSAL" \
+  && ok "doc-only hunk extracted as a PROPOSAL artifact, never auto-applied" || bad "no proposal patch at $PROPOSAL"
+! grep -q 'runtime/x.py' "$PROPOSAL" 2>/dev/null \
+  && ok "proposal contains ONLY the doc hunk, not the out-of-scope file" || bad "proposal leaked out-of-scope content"
+grep -q "$PROPOSAL" "$EMITLOG" \
+  && ok "failed-row note points at the extracted proposal" || bad "emit log missing proposal pointer: $(cat "$EMITLOG")"
+# Conductor acceptance requirement (2026-10-21): SKIPPED, REFUSED and
+# DIAGNOSIS-COMPLETED must stay three distinct, non-conflatable outcomes.
+# Salvaging the doc-only hunk as a PROPOSAL must not let a refused run be
+# recorded as completed -- prove it the same way a human/conductor would
+# try: attempt --record-completion against the refused run's own branch
+# name. No worktree/commit was ever created for a refused run (asserted
+# above), so this can only ever refuse, never emit `succeeded`.
+: > "$EMITLOG"
+rc2=$(run_stage2 --record-completion "$BR_TODAY")
+[ "$rc2" = "2" ] && ! grep -q -- '--state succeeded' "$EMITLOG" \
+  && ok "REFUSED stays refused: a salvaged proposal artifact is not recordable as DIAGNOSIS-COMPLETED" \
+  || bad "rc=$rc2 trying to complete a refused run: $(cat "$EMITLOG")"
 
 printf worker_failed > "$STUB_MODE_FILE"; : > "$EMITLOG"; rm -rf "$WORK/iso"
 rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
@@ -108,6 +134,40 @@ rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
   && ok "worker failure is a failed row, never success" || bad "rc=$rc emit: $(cat "$EMITLOG")"
 unset STAGE2_ISOLATED_WORKER
 rm -rf "$WORK/thurber-os" "$WORK/origin.git"
+
+printf '== scheduled: first-Friday NO-OP reports skipped, not succeeded ==\n'
+# STAGE2_ASSUME_NOT_FIRST_FRIDAY forces the skip branch deterministically,
+# independent of the real wall-clock date (2026-10-21).
+: > "$EMITLOG"
+rc=$(STAGE2_ASSUME_NOT_FIRST_FRIDAY=1 run_stage2 --scheduled)
+[ "$rc" = "0" ] && ok "no-op exits 0" || bad "exit $rc: $(cat "$WORK/s2.err")"
+grep -q -- '--state skipped' "$EMITLOG" \
+  && ok "no-op reports state=skipped" || bad "emit log: $(cat "$EMITLOG")"
+grep -q -- '--state succeeded' "$EMITLOG" \
+  && bad "no-op still claims succeeded (scheduler liveness is not a diagnosis outcome)" \
+  || ok "no-op no longer claims succeeded"
+grep -qE '^spawned .* pane=' "$WORK/s2.out" \
+  && bad "skip path reached a host spawn" || ok "skip path spawns nothing"
+
+printf '== output contract: the real 2026-10-02 refused patch (preserved evidence) ==\n'
+# tests/fixtures/eloop-stage2-2026-10-02-changes.{json,patch} are byte-for-byte
+# copies of the artifacts that caused the real 2026-10-02 refusal
+# (.handoffs/SPEC.md T4 Facts: "patch touches more than the tracking doc").
+# Exercises the SAME jq scope check and extractor stage2-diagnose.sh runs,
+# against the SAME bytes that actually tripped it -- not a synthetic stand-in.
+REAL_DOC="docs/tracking/2026-10-02-stage2-diagnose-pass.md"
+REAL_JSON="$here/tests/fixtures/eloop-stage2-2026-10-02-changes.json"
+REAL_PATCH="$here/tests/fixtures/eloop-stage2-2026-10-02-changes.patch"
+REAL_TOUCHED="$(jq -r '[.added[].path, .modified[].path, .deleted[].path, .symlinks_created[]?.path?] | map(select(. != null)) | join("\n")' "$REAL_JSON")"
+[ "$REAL_TOUCHED" != "$REAL_DOC" ] && printf '%s\n' "$REAL_TOUCHED" | grep -q 'pycache' \
+  && ok "real patch's change list fails the scope check and names the offending pyc path" \
+  || bad "real 10-02 touched set: $REAL_TOUCHED"
+REAL_PROPOSAL="$WORK/real-10-02-proposal.patch"
+python3 "$here/lib/extract-doc-only-patch.py" "$REAL_PATCH" "$REAL_DOC" > "$REAL_PROPOSAL" \
+  && grep -q "diff --git a/$REAL_DOC b/$REAL_DOC" "$REAL_PROPOSAL" \
+  && ! grep -q 'pycache' "$REAL_PROPOSAL" \
+  && ok "doc-only hunk extracts cleanly from the real refused patch, pyc excluded" \
+  || bad "extraction from the real patch failed"
 
 printf '== record-completion: no committed doc -> refused, no succeeded row ==\n'
 # A real repo with a real origin/main, so the inherited-doc guard is exercised
