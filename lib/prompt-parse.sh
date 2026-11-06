@@ -1722,3 +1722,175 @@ prompt_occurrence_display() {           # <pane>
     printf 'no_prompt\n'
   fi
 }
+
+# ---- operational fix (proposal, herdr-control#267 follow-up): Deny is
+# always pressable on tall write panels, even when the footer is clipped
+# -------------------------------------------------------------------------
+# docs/design/stuck-save-operational-fix.md. `_menu_gate`/`prompt_menu_options`
+# above require the LITERAL "navigate"/"select" footer hint text; a write
+# panel tall enough to push that one trailing line out of the capture makes
+# both fail, and `_current_offer` (herdr-select.sh:420-436) then falls
+# through to the numbered-prompt parser, which can match an unrelated
+# Steering block instead -- the "Deny-not-pressable" bug (confirmed,
+# verify-write-panel-267-repro.sh's "Deny-not-pressable repro").
+#
+# This is a SEPARATE, narrower detector, not a change to the hardened
+# pass-1/pass-2 state machine above (poisoning checks, F8/F9 fixes,
+# multiple security-review rounds) -- rewriting that in place was the
+# explicit "not small/local" call in the design doc. It is zero-caller:
+# `_current_offer` is untouched, so no live pane's resolution changes.
+#   - requires a real "Allow tool:" header line, so it never fires on
+#     ordinary pane text that happens to end in the words Approve/Deny;
+#   - requires EXACTLY ONE such header in the window -- two is the
+#     injection shape pass 1's poisoning defense exists for, so this
+#     refuses rather than risk being fooled by a fake second header;
+#   - requires the window to NOT already satisfy `_menu_gate` -- if the
+#     footer IS present, the existing hardened parser is authoritative,
+#     never bypassed by this;
+#   - requires Deny then (going up, blanks only between) Approve as the
+#     last two non-blank content rows, same adjacency rule pass 2 uses
+#     for its footer-anchored walk, just without the footer requirement.
+#
+# herdr-control security review REVIEW-PARSER-a1f9feb.md (REJECT, HIGH):
+# the checks above only prove a CANDIDATE pair's TEXT reads "Approve"/
+# "Deny" -- nothing ties either row to omp's own UI chrome. For a
+# write/edit panel, `Content:` is the exact payload under adversarial
+# review (the same threat model `_cp_write_content_verdict` already
+# treats as real for a forged `Allow tool:` line buried in Content,
+# docs/design/write-panel-ceiling-267.md:266 -- this applies it to the
+# screen-scraping side instead). Demonstrated directly: a window with NO
+# real omp menu at all, where Content's own trailing two lines are
+# crafted to read " Approve"/"Deny" (forged-highlighted or not), resolved
+# cleanly in both modes; a genuine pair earlier plus a forged pair later
+# resolved to the forged (trailing) one, silently discarding the real one.
+# Pure text content can forge this signal with no ANSI bytes required.
+#
+# Two independent closes, neither alone sufficient, both required:
+#   - UNIQUENESS: a genuine pair earlier plus a forged pair later must
+#     refuse, not silently pick one -- count every stripped line in the
+#     WHOLE window (not just the trailing two) that reads exactly
+#     "Approve" or "Deny"; more than one of either refuses. Closes the
+#     earlier-real-pair-plus-later-forgery case but NOT a window holding
+#     only a single, pure forgery (unique by construction).
+#   - TRUSTED-CONTENT CROSS-CHECK: the caller must supply the occurrence's
+#     own recorded `Content:` (`prompt-occurrence.py proposal`'s `.body`,
+#     the same complete-payload source #277's human review already reads,
+#     independent of anything painted on screen), verified `ok` BEFORE
+#     this call -- not optional, not best-effort. If that content itself
+#     contains a line that strips to exactly "Approve" or "Deny", this
+#     function cannot tell a genuine omp menu row from Content manufacturing
+#     one, for ANY window shape, and refuses outright regardless of what is
+#     on screen. If the caller could not verify trusted content at all
+#     (occurrence missing, stale, wrong tool, worktree mismatch -- anything
+#     `proposal_check` itself would refuse on), this function refuses too:
+#     "could not verify" is never treated as "nothing to cross-check."
+# Activating this means wiring it as a fallback in `_current_offer` only
+# AFTER both existing passes fail and the numbered-prompt parser also
+# fails to gate ambiguously (a separate, reviewed change) -- not done here.
+_prompt_footer_clipped_options() {       # <mode> <trusted_ok:0|1> [trusted_content]; window on stdin
+  local mode="$1" trusted_ok="${2:-0}" trusted="${3:-}" win
+  win="$(cat)"
+  if _menu_gate "$win"; then
+    return 1  # the real footer is present; defer to the hardened parser
+  fi
+  case "$win" in *"Allow tool:"*) ;; *) return 1 ;; esac
+  local header_count
+  header_count="$(printf '%s\n' "$win" \
+    | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+    | grep -c 'Allow tool:')"
+  [ "$header_count" = 1 ] || return 1
+  # Trusted content was never captured, or the caller's own verification of
+  # it (prompt-occurrence.py proposal, the #277 complete-payload source)
+  # failed -- cannot rule out forgery, so this entire detector is unusable
+  # for this occurrence, regardless of what the window shows.
+  [ "$trusted_ok" = 1 ] || return 1
+  # Walk the window as an array so the highlight check (below, selected
+  # mode) can look at the ORIGINAL ansi-carrying line for the two rows
+  # options mode already located by their stripped text -- stripping ansi
+  # globally up front, as the old implementation did, throws away exactly
+  # the byte that tells Approve from Deny apart as "currently highlighted".
+  local -a raw clean
+  local i=0 line stripped
+  while IFS= read -r line || [ -n "$line" ]; do
+    raw[i]="$line"
+    stripped="$(printf '%s' "$line" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[[:space:]│|>›*✓✗●○-]*//; s/[[:space:]│|]*$//')"
+    clean[i]="$stripped"
+    i=$((i + 1))
+  done <<EOF_WIN
+$win
+EOF_WIN
+  local n=$i j
+  local -a idx=()
+  for ((j = 0; j < n; j++)); do
+    [ -n "${clean[j]}" ] && idx+=("$j")
+  done
+  local cnt=${#idx[@]}
+  [ "$cnt" -ge 2 ] || return 1
+  local approve_i="${idx[cnt-2]}" deny_i="${idx[cnt-1]}"
+  [ "${clean[approve_i]}" = Approve ] && [ "${clean[deny_i]}" = Deny ] || return 1
+  # UNIQUENESS (REVIEW-PARSER-a1f9feb, Attack 3): a genuine pair earlier in
+  # the window plus a forged pair trailing it must refuse, not silently
+  # trust the trailing one. Count every stripped line in the WHOLE window.
+  local approve_n=0 deny_n=0
+  for ((j = 0; j < n; j++)); do
+    case "${clean[j]}" in
+      Approve) approve_n=$((approve_n + 1)) ;;
+      Deny) deny_n=$((deny_n + 1)) ;;
+    esac
+  done
+  [ "$approve_n" = 1 ] && [ "$deny_n" = 1 ] || return 1
+  # TRUSTED-CONTENT CROSS-CHECK (REVIEW-PARSER-a1f9feb Attack 1/2, widened
+  # by REVIEW-PARSER-1d00122 MEDIUM): a per-LINE exact match missed a
+  # wrap-reflow case -- a single long Content line with no embedded
+  # newline, if omp's own box-rendering wraps it to display width such
+  # that the final wrapped segment happens to read exactly "Approve"/
+  # "Deny", never appears as an isolated LINE in the raw (unwrapped)
+  # trusted content, even though the literal word is right there. Search
+  # the whole trusted content for the word ANYWHERE (word-bounded so
+  # "Disapprove"/"Denying" do not false-positive), not just a line that
+  # already happens to match exactly -- this still catches Attack 1/2 (the
+  # word WAS already isolated on its own line there too) and additionally
+  # catches any wrap boundary that could isolate it on screen, without
+  # having to know or reproduce omp's actual render width.
+  if [ -n "$trusted" ]; then
+    printf '%s' "$trusted" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+      | grep -qE '(^|[^A-Za-z])(Approve|Deny)([^A-Za-z]|$)' && return 1
+  fi
+  case "$mode" in
+    options)
+      printf '1\tApprove\n2\tDeny\n'
+      return 0
+      ;;
+    selected)
+      # Same highlight signal pass 2 uses (lib/prompt-parse.sh:785,
+      # \x1b[48;2;R;G;Bm, a 24-bit background colour SGR): checked on the
+      # row's RAW (ansi-carrying) text, before the stripping above. Both or
+      # neither highlighted -> empty, same as the hardened parser's own
+      # `invalid = invalid or bool(selected)` rule -- never guess.
+      local approve_hl=0 deny_hl=0
+      printf '%s' "${raw[approve_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && approve_hl=1
+      printf '%s' "${raw[deny_i]}" | grep -qE $'\x1b''\[48;2;[0-9]+;[0-9]+;[0-9]+m' && deny_hl=1
+      if [ "$approve_hl" = 1 ] && [ "$deny_hl" = 0 ]; then printf '1'; return 0; fi
+      if [ "$deny_hl" = 1 ] && [ "$approve_hl" = 0 ]; then printf '2'; return 0; fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# Pane-level wrappers, same shape as prompt_menu_options()/prompt_menu_selected()
+# above -- each reads the window itself so a caller never has to know
+# _menu_window exists. Used by herdr-select.sh's _current_offer and its
+# navigation loop AFTER the hardened parser has already failed, so neither
+# competes with or duplicates it. <trusted_ok>/<trusted_content> (REVIEW-
+# PARSER-a1f9feb): the caller must have ALREADY verified the occurrence's
+# real Content (prompt-occurrence.py proposal) before calling either of
+# these -- see _prompt_footer_clipped_options above for why.
+prompt_footer_clipped_options() {        # <pane> <trusted_ok:0|1> [trusted_content]
+  _menu_window "$1" | _prompt_footer_clipped_options options "${2:-0}" "${3:-}"
+}
+prompt_footer_clipped_selected() {       # <pane> <trusted_ok:0|1> [trusted_content]
+  _menu_window "$1" | _prompt_footer_clipped_options selected "${2:-0}" "${3:-}"
+}
